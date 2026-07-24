@@ -3662,6 +3662,9 @@ export class WooWorld {
       if (!surface || !this.canCarryFeatures(actor)) return;
       const features = this.featureList(actor);
       if (features.includes(surface)) return;
+      // Bounded collision check covers any live/custom actor class reaching this
+      // choke point (createAgent, promote, wizard set_object_flags).
+      this.assertSurfaceComposable(actor, surface);
       this.setProp(actor, "features", [...features, surface]);
       this.bumpFeaturesVersion(actor);
     }
@@ -3693,6 +3696,74 @@ export class WooWorld {
       if ((await this.remoteHostForObject(agent)) !== null || (await this.remoteHostForObject(account)) !== null) {
         throw wooError("E_CROSS_HOST_WRITE", "programmer provisioning requires the agent and its account to be co-resident", { agent, account });
       }
+    }
+
+    /**
+     * Refuse to compose a surface onto an actor whose own kind ancestry defines
+     * a verb the surface also defines. Parent-chain lookup wins over features
+     * (features.md FT2), so such a name would silently shadow the surface verb
+     * and leave a half-working authoring surface. This is the bounded, per-actor
+     * analogue of scripts/guard-programmer-surface-collision.ts: the guard
+     * covers bundled kinds at build time, this covers any live/custom actor
+     * class at attach time — walking only the actor's and the surface's
+     * ancestry, never the world. Verbs on the classes the two chains share
+     * (e.g. $player, $actor) are inherited by both and never collide.
+     */
+    private assertSurfaceComposable(actor: ObjRef, surface: ObjRef): void {
+      const actorChain = this.localAncestry(actor);
+      const actorInChain = new Set(actorChain);
+      const surfaceChain = this.localAncestry(surface);
+      const ncaIndex = surfaceChain.findIndex((cls) => actorInChain.has(cls));
+      const surfaceSpecific = ncaIndex >= 0 ? surfaceChain.slice(0, ncaIndex) : surfaceChain;
+      const nca = ncaIndex >= 0 ? surfaceChain[ncaIndex] : null;
+      const actorNcaIndex = nca ? actorChain.indexOf(nca) : actorChain.length;
+      const actorSpecific = actorChain.slice(0, actorNcaIndex);
+      const surfaceNames = new Set<string>();
+      for (const cls of surfaceSpecific) for (const verb of this.object(cls).verbs) surfaceNames.add(verb.name);
+      const collisions = new Set<string>();
+      for (const cls of actorSpecific) for (const verb of this.object(cls).verbs) if (surfaceNames.has(verb.name)) collisions.add(verb.name);
+      if (collisions.size > 0) {
+        throw wooError("E_INVARG", `cannot compose surface ${surface} onto ${actor}: kind ancestry shadows surface verb(s) ${[...collisions].sort().join(", ")}`, { actor, surface, verbs: [...collisions].sort() });
+      }
+    }
+
+    /**
+     * The single flag/surface/quota transition behind every AP6 path (create,
+     * promote, demote, revoke). Idempotent and self-repairing:
+     *
+     *  - The programmer flag and the account's `programmer_agent_count` counter
+     *    move only on an actual state change, so re-promoting an already-flagged
+     *    agent does not double-count.
+     *  - The authoring surface is reconciled UNCONDITIONALLY. A legacy agent
+     *    left flag-true-without-surface (pre-composition provisioning), or an
+     *    agent left surface-without-flag by a raw `set_object_flags` clear, heals
+     *    on the next promote/demote call rather than silently retaining half a
+     *    capability.
+     *  - Every real transition records an audit entry, so atomicity spans flag,
+     *    surface, quota, AND audit (plan §8.10).
+     *
+     * Co-residency (plan §5.1) is asserted before the account counter is
+     * touched, and quota before a promote transition, so a refusal happens with
+     * nothing mutated rather than half-applied across a host boundary.
+     */
+    private async setProgrammerAgentState(actor: ObjRef, account: ObjRef, programmer: boolean, auditAction: string): Promise<void> {
+      const currently = this.object(actor).flags.programmer === true;
+      const transition = currently !== programmer;
+      if (programmer) this.assertSurfaceComposable(actor, this.programmerSurface() ?? actor);
+      if (transition) {
+        if (programmer) this.assertProgrammerAgentQuota(account);
+        // The transition writes the account counter; refuse across a host
+        // boundary before mutating anything.
+        await this.assertProgrammerProvisioningColocated(actor, account);
+        this.object(actor).flags.programmer = programmer;
+        this.markObjectDirty(actor);
+        const delta = programmer ? 1 : -1;
+        const next = Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + delta);
+        this.setProp(account, "programmer_agent_count", next);
+        this.recordWizardAction(actor, auditAction, { actor, account, programmer });
+      }
+      // Surface reconciliation is unconditional so partial legacy state heals.
+      this.reconcileProgrammerSurface(actor, programmer);
     }
 
     private rotateAgentKey(human: ObjRef, agent: ObjRef, force: boolean): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
@@ -9651,9 +9722,24 @@ export class WooWorld {
       changes[key] = { from: prev, to: raw };
     }
     if (Object.keys(changes).length === 0) return { ...obj.flags };
+    // The programmer flag and the authoring surface travel together. A raw
+    // flag flip here (the auth.md §A11 backup-wizard path, or a wizard directly
+    // granting programmer) reconciles the surface too, so this path can never
+    // leave a flag-without-surface or surface-without-flag inconsistency for
+    // has_surface to disagree with. No quota accounting: set_object_flags is the
+    // deliberate quota-bypassing wizard primitive.
+    if (changes.programmer) this.reconcileProgrammerSurface(target, changes.programmer.to);
     this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
     this.markObjectDirty(target);
     return { ...obj.flags };
+  }
+
+  /** Attach or remove the published programmer surface to match a flag state.
+   *  Both directions are idempotent; used by the wizard flag path and shared
+   *  provisioning transition so flag and surface never drift apart. */
+  private reconcileProgrammerSurface(actor: ObjRef, programmer: boolean): void {
+    if (programmer) this.attachProgrammerSurface(actor);
+    else this.removeProgrammerSurface(actor);
   }
 
   private bumpFeaturesVersion(objRef: ObjRef): void {
@@ -10892,20 +10978,14 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        const wasProgrammer = this.object(agent).flags.programmer === true;
-        // Refuse before any mutation if the flag/surface (agent scope) and the
-        // quota counter (account scope) cannot commit together (plan §5.1).
-        if (wasProgrammer) await this.assertProgrammerProvisioningColocated(agent, account);
+        // Strip programmer state through the shared transition first: it clears
+        // the flag, removes the surface, decrements the quota, and refuses
+        // cross-host before any of that — idempotent if already non-programmer.
+        await this.setProgrammerAgentState(agent, account, false, "agent_demoted_from_programmer");
         const key = this.propOrNull(agent, "api_key_id");
         if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
         this.setProp(agent, "deactivated_at", Date.now());
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        if (wasProgrammer) {
-          this.object(agent).flags.programmer = false;
-          this.markObjectDirty(agent);
-          this.removeProgrammerSurface(agent);
-          this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
-        }
         this.recordWizardAction(ctx.actor, "agent_revoked", { actor: agent, reason: typeof args[1] === "string" ? args[1] : null });
         return true;
       });
@@ -10913,29 +10993,14 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        if (!this.object(agent).flags.programmer) {
-          this.assertProgrammerAgentQuota(account);
-          // Co-residency precondition: refuse rather than half-apply the flag,
-          // surface, and quota across a host boundary (plan §5.1).
-          await this.assertProgrammerProvisioningColocated(agent, account);
-          this.object(agent).flags.programmer = true;
-          this.markObjectDirty(agent);
-          this.attachProgrammerSurface(agent);
-          this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
-        }
+        await this.setProgrammerAgentState(agent, account, true, "agent_promoted_to_programmer");
         return true;
       });
       this.nativeHandlers.set("human_demote_agent_from_programmer", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        if (this.object(agent).flags.programmer) {
-          await this.assertProgrammerProvisioningColocated(agent, account);
-          this.object(agent).flags.programmer = false;
-          this.markObjectDirty(agent);
-          this.removeProgrammerSurface(agent);
-          this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
-        }
+        await this.setProgrammerAgentState(agent, account, false, "agent_demoted_from_programmer");
         return true;
       });
       this.nativeHandlers.set("human_rotate_agent_key", (ctx, args) => {

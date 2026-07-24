@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import { createWorld } from "../src/core/bootstrap";
 import type { WooWorld } from "../src/core/world";
 
@@ -26,6 +27,22 @@ async function createAgent(world: WooWorld, human: string, name: string, program
 }
 
 describe("programmer surface (feature-composed)", () => {
+  it("drops task perms to the actor in every surface-guarded prog wrapper (§8.8, no exceptions)", () => {
+    const manifest = JSON.parse(readFileSync("catalogs/prog/manifest.json", "utf8"));
+    const offenders: string[] = [];
+    for (const cls of manifest.classes ?? []) {
+      for (const verb of cls.verbs ?? []) {
+        const source: string = verb.source ?? "";
+        // A wrapper that gates on the surface (has_surface) runs $wiz-owned and
+        // must drop to the actor before caller-controlled work. Wizard-only
+        // verbs (no surface fallback) and pure listings are out of scope.
+        if (!source.includes("has_surface(")) continue;
+        if (!source.includes("set_task_perms(actor)")) offenders.push(`${cls.local_name}:${verb.name}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("provisions a programmer agent that keeps its $agent kind and gains the surface as a feature", async () => {
     const world = createWorld();
     const { human, account } = await provisionHuman(world, "kind@example.com");
@@ -106,8 +123,12 @@ describe("programmer surface (feature-composed)", () => {
     const world = createWorld();
     const { human } = await provisionHuman(world, "noface@example.com");
     const agent = await createAgent(world, human, "nofacebot", false);
-    // Grant the flag directly (wizard action) but attach no surface.
-    world.setObjectFlags("$wiz", agent, { programmer: true });
+    // Construct the flag-without-surface state directly. Normal paths keep flag
+    // and surface consistent (setObjectFlags now reconciles the surface), so
+    // this state is only reachable via legacy/corrupted data — which is exactly
+    // what this invariant guards against.
+    world.object(agent).flags.programmer = true;
+    world.setProp(agent, "features", []);
     expect(world.object(agent).flags.programmer).toBe(true);
     expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
 
@@ -205,6 +226,101 @@ describe("programmer surface (feature-composed)", () => {
     ])) as CallResult;
     expect(foreign.op).toBe("error");
     expect(world.object("foreign_box").verbs.find((v) => v.name === "sneak")).toBeUndefined();
+  });
+
+  it("repairs a legacy programmer agent (flag set, surface missing) on the next promote", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "legacy@example.com");
+    const agent = await createAgent(world, human, "legacybot", false);
+    // Simulate a pre-composition legacy agent: the flag was set but no surface
+    // was ever attached, and the quota already counts it.
+    world.object(agent).flags.programmer = true;
+    world.setProp(agent, "features", []);
+    world.setProp(account, "programmer_agent_count", 1);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+
+    // promote is idempotent and repairing: it attaches the surface without
+    // double-counting the (already-counted) agent.
+    const up = (await world.directCall("up", human, human, "promote_agent_to_programmer", [agent])) as CallResult;
+    expect(up.op).toBe("result");
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    // And the repaired agent can now author.
+    const created = (await world.directCall("mk", agent, agent, "create", ["$thing", { name: "Rep" }])) as CallResult;
+    expect(created.op).toBe("result");
+  });
+
+  it("removes a stranded surface when a raw flag-clear left the feature behind", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "stranded@example.com");
+    const agent = await createAgent(world, human, "strandedbot", true);
+    // Simulate an admin who cleared the flag directly on the object, leaving the
+    // surface feature (and thus builder capability) behind.
+    world.object(agent).flags.programmer = false;
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
+
+    const down = (await world.directCall("down", human, human, "demote_agent_from_programmer", [agent])) as CallResult;
+    expect(down.op).toBe("result");
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+  });
+
+  it("keeps the wizard flag and the surface consistent through set_object_flags", async () => {
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "adminflag@example.com");
+    const agent = await createAgent(world, human, "adminflagbot", false);
+    // Wizard grants programmer directly — surface follows the flag.
+    world.setObjectFlags("$wiz", agent, { programmer: true });
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
+    // Wizard clears it — surface follows again.
+    world.setObjectFlags("$wiz", agent, { programmer: false });
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+  });
+
+  it("refuses to compose the surface onto a kind that shadows a surface verb", async () => {
+    const world = createWorld();
+    // $block (isa $actor) defines its own set_property and look, which the
+    // builder surface also defines. Composing the surface would silently shadow
+    // them, so attachment must refuse.
+    world.createObject({ id: "test_block", name: "Test Block", parent: "$block", owner: "$wiz" });
+    expect(() => world.setObjectFlags("$wiz", "test_block", { programmer: true })).toThrow(/shadows surface verb/);
+    expect(world.actorHasSurface("test_block", "$programmer")).toBe(false);
+  });
+
+  it("promote leaves flag, surface, quota, and audit unchanged when quota is exhausted (§8.10 atomicity)", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "quota@example.com");
+    world.setProp(account, "programmer_grant_quota", 0); // no room
+    const agent = await createAgent(world, human, "quotabot", false);
+    const auditBefore = (world.propOrNull("$system", "wizard_actions") as unknown[]).length;
+
+    const res = (await world.directCall("up", human, human, "promote_agent_to_programmer", [agent])) as CallResult;
+    expect(res.op).toBe("error");
+    expect((res as any).error.code).toBe("E_QUOTA_EXCEEDED");
+    // Nothing moved.
+    expect(world.object(agent).flags.programmer ?? false).toBe(false);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+    expect((world.propOrNull("$system", "wizard_actions") as unknown[]).length).toBe(auditBefore);
+  });
+
+  it("promote refuses across a host boundary with nothing mutated (§5.1 co-residency)", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "xhost@example.com");
+    const agent = await createAgent(world, human, "xhostbot", false);
+    const auditBefore = (world.propOrNull("$system", "wizard_actions") as unknown[]).length;
+    // Force only the agent to look remote relative to the executing scope, so
+    // ordinary dispatch still works but co-residency fails.
+    const origRemote = (world as any).remoteHostForObject.bind(world);
+    (world as any).remoteHostForObject = async (ref: string, memo: unknown) =>
+      ref === agent ? "other-host" : origRemote(ref, memo);
+
+    const res = (await world.directCall("up", human, human, "promote_agent_to_programmer", [agent])) as CallResult;
+    expect(res.op).toBe("error");
+    expect((res as any).error.code).toBe("E_CROSS_HOST_WRITE");
+    expect(world.object(agent).flags.programmer ?? false).toBe(false);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+    expect((world.propOrNull("$system", "wizard_actions") as unknown[]).length).toBe(auditBefore);
   });
 
   it("leaves target state unchanged when a verb install hits a stale version (§8.9)", async () => {
