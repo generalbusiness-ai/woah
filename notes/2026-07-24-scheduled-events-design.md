@@ -215,7 +215,9 @@ Croquet catches up because it is simulating shared computation. A
 persistent world with month-scale eviction must not wake up and execute
 604,800 ticks.
 
-### D7. The minimum interval floor is ~1s, not 16ms
+### D7. The minimum interval floor is 60s, not 16ms
+
+**Decided: 60 seconds.**
 
 VTN18.5 proposes a 16ms floor, inherited from Croquet's frame budget.
 Every one of those ticks here is a **full committed turn**: a sequencer
@@ -224,10 +226,20 @@ envelope is p95 ≤ 750ms for submits. 60 committed turns per second per
 scope is not a rate this system has, and offering it in the DSL invites
 authors to build things that cannot work.
 
-Proposed: default floor **1000ms**, world-configurable down to **250ms**,
-hard floor **100ms**. Faster than that belongs on the live plane or in the
-browser, and `VTN18.10`'s live/committed table is the right guidance to
-keep and promote.
+The floor is the minimum interval between consecutive deliveries of the
+same `(target, verb)` pair in a scope. A world may **raise** it via
+`$server_options`; lowering it is a substrate change, not a knob. The
+consequence is deliberate and should be stated plainly to authors:
+**the committed plane is not for animation.** A minute is the finest grain
+a durable, ordered, audited, replayable turn is offered at. Sub-minute
+behaviour belongs on the live plane or in the browser, and `VTN18.10`'s
+live/committed table is the guidance to keep and promote.
+
+This also disposes of a whole class of cost question. At a 60s floor the
+worst case a single armed chain can impose is 1440 committed turns per
+day, which is a rate a scope reaches from ordinary conversation. §10's
+load-lane question shrinks from "does this change the AE gate" to
+bookkeeping.
 
 The floor is applied at delivery (deferring the entry), not at recording,
 so a chain asking for faster than the floor gets the floor rather than an
@@ -247,8 +259,29 @@ rule, so each entry declares an idle policy:
 - **`always`** (default for one-shots): fires with nobody watching.
   Required for deadlines, expiries, and pushes. Costs one turn, once.
 
-A periodic `always` chain is the expensive case and should require the
-scope owner's authority, plus a metric that makes them countable per world.
+**Decided: arming an `always` entry requires wizard authority.** The
+periodic `always` chain — a timer that bills forever in a scope nobody
+visits — is the one shape here that can cost a world real money with no
+user present, so it sits behind the flag that already means "this operator
+accepted the consequences". Ordinary catalog code gets `while_active`,
+which is what ambient behaviour actually wants.
+
+Two things follow that need saying:
+
+- The common one-shot — "remind me in 10 minutes", "auto-close in 24h" —
+  *is* an `always` entry by D8's default, and users are not wizards. So
+  the wiz-only rule must attach to **arming an `always` entry directly**,
+  not to the shapes built on it: a wizard-owned catalog verb
+  (`$scheduling:remind_in`, `:deadline`) arms `always` on the caller's
+  behalf under its own owner's authority, exactly as any other privileged
+  verb wraps a privileged builtin. That is the normal woo pattern, and it
+  puts the quota and the sanity checks in one auditable place.
+- Which means the rule's real effect is: *you cannot arm an unattended
+  timer without going through code a wizard wrote.* That is the intent.
+  It should be spelled out that way in the spec, or the first author to
+  read "wiz-only" will conclude reminders are impossible.
+
+Per-world counting of live `always` entries is a named metric.
 
 ### D9. Fired turns are session-less actor-authority DIRECT turns
 
@@ -259,9 +292,19 @@ so the verb can tell it was woken and how late.
 
 **Consequence worth stating loudly:** `tell(actor, ...)` is live, not
 durable. A reminder that fires while its actor is disconnected is *lost*.
-Reminders must land as durable acts on the scope log (a note, an act, a
-message object), and the catalog surface in §9 must make the durable path
-the easy one.
+
+**Decided: the substrate does not enforce durable landing.** A scheduled
+verb may `tell` into the void, and does so silently. The reasons to accept
+that: the substrate cannot tell a notification from a computation, so any
+enforcement would be a heuristic on verb bodies; and a scheduled turn that
+*legitimately* has no output (a state advance, a lease expiry) is the
+common case, so "warn on tell-only" would be noise.
+
+The cost is real and lands on catalog authors, so the mitigation has to be
+in the surface rather than the check: `$scheduling:remind_in` writes a
+durable act **and** tells, in that order, so the easy path is the correct
+one and an author who hand-rolls `tell` has opted out deliberately. The
+builtin's spec text carries the warning. See §9.
 
 ### D10. Cross-scope scheduling is not a primitive
 
@@ -278,11 +321,32 @@ schedule(target, verb, args, delay_ms, key)             -> schedule_id  (upsert)
 schedule_at(target, verb, args, at_ms [, key])          -> schedule_id
 cancel_schedule(schedule_id)                            -> bool
 schedules()                                             -> list of pending entries for `this`
+
+fork(delay_seconds, target, verb, args...)              -> schedule_id   (sugar)
 ```
 
+- **`fork` is retained as sugar** (decided). It compiles to `schedule`,
+  keeping the LambdaMOO spelling that authors and the `notes/lambdamoo-*`
+  reference material use. Three things are not negotiable about the sugar
+  and must be documented at the call site:
+  - `fork` takes **seconds**, `schedule` takes **milliseconds**. The sugar
+    multiplies. Do not "harmonise" this by changing `fork` — the v1
+    spelling is the whole point of keeping it.
+  - `fork(1, ...)` is floored to 60s by D7, silently. A v1 author's
+    instinct for `fork` is sub-second; the compile-time error or the doc
+    line has to catch that instinct, because the runtime will not.
+  - There is **no block form**. `fork(60) { ... }` implied a closure over
+    the forking frame's locals; a scheduled entry carries values in a
+    durable row, not a captured frame. The DSL as it stands compiles
+    `fork(seconds, obj, verb, args...)` and never had the block form, so
+    nothing is lost — but `language.md:79` shows the block form and must
+    be corrected.
 - `target` must be in the calling scope. Any object, not just `this`: the
   fire-time permission check is the ordinary one, so this grants nothing
   a live call would not.
+- **Absolute times are UTC epoch milliseconds** (decided). No timezone
+  parameter, no local-time interpretation, no calendar. `schedule_at`
+  takes the same clock `now()` returns.
 - `schedules()` is not decoration. Invisible timers are unmaintainable;
   an author needs to see what a room has armed, and an operator needs it
   more. Bounded by the per-object cap, so no enumeration concern.
@@ -334,21 +398,24 @@ scope-local row family, not owner storage.
   (implemented); a later planner subscription arms an immediate wake
   (implemented).
 
-## 8. Retire `fork` / `suspend`
+## 8. Retire the parked-task path; keep `fork` as a spelling
 
-They are unreachable (§1A), unused by any catalog, and they describe a
-single-host execution model this system no longer has. Leaving them
-compilable is a trap: the next author to reach for a timer will find them
-in `language.md:79`, use them, and ship something that silently does
-nothing.
+The v1 machinery is unreachable (§1A), unused by any catalog, and it
+describes a single-host execution model this system no longer has. Leaving
+it compilable is a trap: the next author to reach for a timer will find it
+in `language.md:79`, use it, and ship something that silently does nothing.
+
+What survives is the **word** `fork`, not the mechanism behind it.
 
 Plan:
 
-1. `fork(seconds) { ... }` in the DSL compiles to a `schedule()` of a
-   synthesized verb, or is removed outright. Removal is cleaner — the
-   block form implies a closure over locals that scheduled turns
-   deliberately do not have (args are values in a durable row, not a
-   captured frame).
+1. `fork(delay_seconds, target, verb, args...)` becomes sugar over
+   `schedule` (decided; see §5). The DSL keyword stays; the `FORK` opcode
+   and everything under it goes. `language.md:79`'s block form
+   `fork(60) { player:tell(...) }` is corrected, not preserved — the DSL
+   compiler never implemented a block form
+   (`src/core/dsl-compiler.ts:1154` compiles the argument form), so the
+   spec example has been wrong independently of all this.
 2. `suspend()` and `read()` have no replacement and should be removed.
    `suspend` was a "checkpoint a long mutation" tool
    (`spec/protocol/hosts.md:65`); the coherence layer's turn atomicity
@@ -376,25 +443,41 @@ scheduling is not tangled with the diff that removes the thing it replaces.
 
 The substrate primitive is not the deliverable; these are.
 
-**`$scheduling` feature (core catalog)** — thin wrapper making the three
-shapes obvious:
+**`$scheduling` feature (core catalog)** — the wrapper is not a
+convenience, it is where the wiz-only rule from D8 is discharged. These
+verbs are wizard-owned and arm `always` entries under their own owner's
+authority on an ordinary caller's behalf:
 
 ```
-verb :remind_in(delay_ms, text) — one-shot, durable landing (D9)
-verb :start_ticking(rate_ms)    — stable-key chain, while_active (D8)
+verb :remind_in(delay_ms, text)   — one-shot; writes the durable act, THEN tells (D9)
+verb :deadline(at_ms, verb, args) — one-shot always, cancellable by key
+verb :start_ticking(rate_ms)      — stable-key chain, while_active (D8); not wiz-only
 verb :stop_ticking()
-verb :deadline(at_ms, verb, args) — one-shot, always, cancellable by key
+verb :pending()                   — what this object has armed, for humans
 ```
+
+`:remind_in` doing the durable write before the `tell` is the whole
+mitigation for D9's decided silence. It should be a comment in the source,
+not folklore.
 
 **Deadlines in workflows.** `spec/operations/workflows.md:188` says
 "after 24h, auto-cancel ... Not built-in." This makes it built-in, and the
 workflow spec should gain the transition-on-deadline shape.
 
-**Reminders in the note/tasks catalogs.** The durable-landing rule from D9
-means a reminder is an act on the log, which the acts model already knows
-how to project. A scheduled fire is itself a natural act type with
-provenance pointing at the scheduling act — the composition lever we
-already use for room content.
+**Reminders in the note/tasks catalogs.** `:remind_in` lands an act on the
+log, which the acts model already knows how to project. A scheduled fire
+is itself a natural act type with provenance pointing at the scheduling
+act — the composition lever we already use for room content.
+
+**No calendars in v1** (decided). Absolute times are UTC epoch
+milliseconds; there is no timezone parameter and no recurrence syntax.
+"Every weekday at 9am Pacific" is a woocode function that computes the next
+UTC instant and a chain that re-arms to it — buildable on day one by
+whoever needs it, and it needs a timezone database this world does not
+have. Note the consequence honestly: a daily chain armed at a fixed offset
+will drift across DST for anyone who thinks in local time. That is the
+correct place for the seam, but it should be written down rather than
+discovered.
 
 **Escalation timers in casework.** "Escalate if unacknowledged in 15m" is
 `schedule` + `cancel_schedule` on the ack path, with a stable key per case.
@@ -410,13 +493,12 @@ today and can stay as-is; the design doc for plugs should state the test.
 
 ## 10. Rate reality check
 
-At the D7 floor of 1s, one `always` chain per scope across a large world is
-a permanent per-scope cost with no user present. D8 exists precisely to
-make that impossible by default. Before implementation, the load lane
-should answer: what does a scope with an armed 1s `always` chain cost per
-day in DO wall-time and requests, and how many such chains can one world
-carry before the AE gate moves? That number, not taste, sets whether the
-default floor is 1s or 10s.
+Settled by D7 and D8 together. At a 60s floor, the worst an armed chain can
+do is 1440 committed turns per day — below the traffic a single
+conversational room generates — and `always` chains, the only ones that
+run unattended, are wiz-only. There is no load-lane question left to answer
+before implementation; the metric that counts live `always` entries per
+world is the ongoing check.
 
 ## 11. Spec edits implied
 
@@ -427,7 +509,7 @@ default floor is 1s or 10s.
 | `spec/protocol/coherence.md` §CO3 | `schedules` / `cancellations` graduate from "target shape" to implemented; drop `caller_perms` from the referenced request type. |
 | `spec/semantics/` (new or in `core.md`) | The `schedule` / `cancel_schedule` / `schedules` builtins: signature, determinism rule, namespacing, quotas, errors. |
 | `spec/semantics/tasks.md` | Rewrite per §8.4; fix the false `status: implemented`. |
-| `spec/semantics/language.md` | Drop `fork`/`suspend` from the examples. |
+| `spec/semantics/language.md` | Drop `suspend`; correct the `fork` example from the never-implemented block form to the argument form, in seconds, with the floor noted. |
 | `spec/semantics/recycle.md` | Cancel-on-recycle for a recycled target's entries. |
 | `spec/protocol/v2-turn-network.md` §VTN18 | Mark superseded-by CO16 for the carried parts; the draft's VTN18.5/18.6/18.8 are corrected by D7/D5/D3 and must not read as current. |
 | `spec/operations/workflows.md` | Deadline transitions stop being deferred. |
@@ -443,7 +525,9 @@ default floor is 1s or 10s.
    id namespacing enforced at validation. Tests at the `src/net` unit lane
    and the fake-DO lane.
 3. **VM builtins** (four-registry lockstep), determinism via `logicalNow`,
-   per-turn call cap.
+   per-turn call cap, and the `fork` sugar in `dsl-compiler.ts` — which
+   lands in the same commit as the builtins it desugars to, so `fork` is
+   never briefly unresolvable.
 4. **Delivery envelope**: floor, idle policy, no-catch-up, fire-time
    context block, error-frame-and-drop on failure.
 5. **`$scheduling` feature + one real user**: the casework escalation timer
@@ -454,21 +538,37 @@ default floor is 1s or 10s.
    from `tasks.md:50` (alarms across multi-day boundaries) is still
    unanswered and is deploy-only.
 
-## 13. Open questions
+## 13. Decisions taken (2026-07-24)
 
-Real forks, not rhetorical:
+The five open questions are closed:
 
-1. **Floor.** Is 1s the right default, or should the first release ship 10s
-   and lower it once §10 has numbers? Shipping too fast is unrecoverable —
-   authors build on it.
-2. **`fork` removal vs. redirect.** Delete the DSL surface, or keep
-   `fork(delay) target:verb(args)` as sugar over `schedule`? Sugar keeps
-   LambdaMOO muscle memory; deletion keeps one obvious way.
-3. **`always` chains: who may arm one?** Scope owner, wizard, or anyone
-   within quota? This is the main recurring-cost lever in a big world.
-4. **Reminder landing.** Should the substrate refuse `tell`-only scheduled
-   verbs, or is the durable-landing rule (D9) guidance for catalog authors
-   only? Enforcement is hard; silence is a bad user experience.
-5. **Timezones.** "Every weekday at 9am local" needs a timezone and a
-   calendar in woocode. Is that in scope for the first catalog surface, or
-   does v1 ship delays and absolute times only?
+1. **Delivery floor: 60s.** One minute is the finest grain the committed
+   plane offers. Worlds may raise it; lowering is a substrate change.
+   (D7 rewritten.)
+2. **`fork` stays as sugar** over `schedule`, seconds-denominated, no block
+   form. The parked-task mechanism underneath it is still deleted. (§5, §8.)
+3. **`always` entries are wizard-only to arm directly**; user-facing
+   one-shots reach them through wizard-owned `$scheduling` verbs. (D8.)
+4. **No substrate enforcement of durable landing** — a scheduled `tell` into
+   the void is silent. Mitigated in the catalog surface, not the engine.
+   (D9, §9.)
+5. **UTC epoch milliseconds and delays only.** No timezones, no calendars,
+   no recurrence syntax in v1; DST drift for local-time chains is a known
+   and documented consequence. (§5, §9.)
+
+Nothing here blocks the spec edits in §11.
+
+## 14. Still unanswered (not blocking)
+
+- **Multi-day alarm durability.** `tasks.md:50`'s open question — that
+  alarms set across multi-day boundaries fire reliably and that hibernated
+  state is fully reconstructible from durable storage alone — has never
+  been tested, and the workerd lane cannot answer it (`AGENTS.md`:
+  fidelity is a ladder). It is deploy-only, and the 365-day horizon in §6
+  rests on it. First real `always` deadline in production is the test.
+- **Planner failover.** CO16 addresses one deterministically-chosen planner
+  and calls multi-planner election out of scope; a scope whose planner is
+  persistently down abandons its outbox lane, which is the named
+  divergence. Scheduled turns make that path load-bearing for the first
+  time — abandonment now means "the deadline silently never fired".
+  Worth a metric and an alert before the first `always` user ships.
