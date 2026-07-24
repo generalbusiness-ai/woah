@@ -312,6 +312,7 @@ async function main(): Promise<void> {
   const rounds = Math.max(1, Number(value("--rounds", "50")));
   const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
   const roundDelayMs = Math.max(0, Number(value("--round-delay-ms", "0")));
+  const setupSettleMs = Math.max(0, Number(value("--setup-settle-ms", "0")));
   const claimConcurrency = Math.max(1, Number(value("--claim-concurrency", "16")));
   const turnConcurrency = Math.max(1, Number(value("--turn-concurrency", "64")));
   canaryFetchTimeoutMs = Math.max(1_000, Number(value("--fetch-timeout-ms", String(DEFAULT_CANARY_FETCH_TIMEOUT_MS))));
@@ -385,6 +386,14 @@ async function main(): Promise<void> {
     });
     outcomes.push(...enterBatch);
     console.error(`canary progress: entered ${enterBatch.length}/${enterGuests.length} guests`);
+    // Admission intentionally exercises session mint, presence fencing, and
+    // durable fanout. A warm-capacity measurement may separate that setup
+    // storm from turns explicitly; keep the delay opt-in and report it so a
+    // result can never masquerade as immediate post-admission capacity.
+    if (setupSettleMs > 0) {
+      console.error(`canary progress: settling setup for ${setupSettleMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, setupSettleMs));
+    }
 
     for (let round = 0; round < rounds; round += 1) {
       const requests = guests.flatMap((guest, actorIndex) =>
@@ -499,6 +508,7 @@ async function main(): Promise<void> {
     requests_per_actor: requestsPerActor,
     claim_concurrency: claimConcurrency,
     turn_concurrency: turnConcurrency,
+    setup_settle_ms: setupSettleMs,
     round_delay_ms: roundDelayMs,
     phase_outcomes: phaseOutcomes,
     accepted: outcomes.length - failures.length,
