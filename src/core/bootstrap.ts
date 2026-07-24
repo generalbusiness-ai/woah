@@ -333,9 +333,7 @@ const PLAYER_EXAMINE_DETAILED_SOURCE = `verb :examine_detailed(name) rxd {
     try { aliases = target.aliases; } except err { aliases = []; }
     try { if (target.description) { description = target.description; } } except err { description = "(No description set.)"; }
     let specs = obvious_verbs(target);
-    let dull = [$root, $room, $player, $prog, $builder];
     for spec in specs {
-      if (spec["definer"] in dull) { continue; }
       let command = spec["command"];
       let dobj = "any";
       let prep = "any";
@@ -1181,6 +1179,14 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "mcp_endpoint_url", "/mcp");
   seedProp(world, "$system", "default_agent_quota", 5);
   seedProp(world, "$system", "default_programmer_grant_quota", 0);
+  // Catalog classes whose command-shaped verbs are "obvious plumbing" and are
+  // hidden from examine/command listings. Catalog data so the obvious-verb
+  // projection names no *catalog* class: each catalog appends its own via an
+  // append_unique set_property seed_hook (chat -> $room, prog -> $builder). The
+  // substrate base classes ($root, $player) are always dull and are unioned in
+  // by core (they are bootstrap seeds it may name); they are intentionally not
+  // stored here.
+  define(world, "$system", "dull_command_definers", [], "list<obj>", "r");
   define(world, "$system", "help_dbs", [], "list<obj>", "r");
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
   define(world, "$actor", "features", [], "list<obj>", "r");

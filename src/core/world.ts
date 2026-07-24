@@ -3601,8 +3601,14 @@ export class WooWorld {
       if (programmer) this.assertProgrammerAgentQuota(account);
       const { actor } = this.provisionActorInternal("$agent", human, { ...attrs, name, purpose }, human);
       if (programmer) {
+        // Kind stays in ancestry ($agent); the authoring surface is composed on
+        // as a feature (plan §4.1). Flag + feature + quota all mutate in this
+        // one handler, so the turn transcript commits them atomically. The agent
+        // is freshly provisioned in this scope, hence co-resident by
+        // construction — no cross-host guard needed on the create path.
         this.object(actor).flags.programmer = true;
         this.markObjectDirty(actor);
+        this.attachProgrammerSurface(actor);
       }
       const key = this.createApiKeyForOwner(human, actor, name);
       this.setProp(actor, "api_key_id", key.id);
@@ -3629,6 +3635,64 @@ export class WooWorld {
       const count = Number(this.propOrNull(account, "programmer_agent_count") ?? 0);
       const quota = Number(this.propOrNull(account, "programmer_grant_quota") ?? 0);
       if (count >= quota) throw wooError("E_QUOTA_EXCEEDED", "programmer agent quota exceeded", { account, quota, count });
+    }
+
+    /**
+     * The authoring surface a catalog has published for programmer
+     * provisioning, or null when none is installed. Core reads this purely as
+     * data ($system.programmer_surface, published by the prog catalog's
+     * seed_hook) — it never names $programmer. When unpublished, provisioning
+     * still sets the flag and quota; the actor simply has no authoring surface
+     * until a catalog installs one (plan §4.4).
+     */
+    private programmerSurface(): ObjRef | null {
+      const raw = this.propOrNull("$system", "programmer_surface");
+      return typeof raw === "string" && this.objects.has(raw) ? raw : null;
+    }
+
+    /**
+     * Attach the published programmer surface to an actor with provisioning
+     * authority. This is the canonical attachment path (plan §4.3): it bypasses
+     * the participant :can_be_attached_by policy because it runs only inside the
+     * authority operation already permitted to set the programmer flag. No-op
+     * when no surface is published or it is already attached.
+     */
+    private attachProgrammerSurface(actor: ObjRef): void {
+      const surface = this.programmerSurface();
+      if (!surface || !this.canCarryFeatures(actor)) return;
+      const features = this.featureList(actor);
+      if (features.includes(surface)) return;
+      this.setProp(actor, "features", [...features, surface]);
+      this.bumpFeaturesVersion(actor);
+    }
+
+    /**
+     * Remove the published programmer surface from an actor (demotion). No-op
+     * when unpublished or not attached. A separately granted builder feature is
+     * untouched; only the published programmer surface is removed.
+     */
+    private removeProgrammerSurface(actor: ObjRef): void {
+      const surface = this.programmerSurface();
+      if (!surface || !this.canCarryFeatures(actor)) return;
+      const features = this.featureList(actor);
+      if (!features.includes(surface)) return;
+      this.setProp(actor, "features", features.filter((item) => item !== surface));
+      this.bumpFeaturesVersion(actor);
+    }
+
+    /**
+     * Programmer promotion/demotion mutates two objects — the agent (flag +
+     * attached surface) and its account ($programmer quota counter). The
+     * transition is atomic only when both commit in one authoritative scope
+     * (plan §5.1), so we refuse up front rather than half-apply across a host
+     * boundary. In-memory and single-host worlds are always co-resident; this
+     * guards the Net placement where an agent cluster and its account cluster
+     * can differ.
+     */
+    private async assertProgrammerProvisioningColocated(agent: ObjRef, account: ObjRef): Promise<void> {
+      if ((await this.remoteHostForObject(agent)) !== null || (await this.remoteHostForObject(account)) !== null) {
+        throw wooError("E_CROSS_HOST_WRITE", "programmer provisioning requires the agent and its account to be co-resident", { agent, account });
+      }
     }
 
     private rotateAgentKey(human: ObjRef, agent: ObjRef, force: boolean): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
@@ -5959,11 +6023,41 @@ export class WooWorld {
     return this.canBypassPerms(actor) || verb.owner === actor || verb.perms.includes("r");
   }
 
+  /**
+   * Surface membership: does `actor` carry the authoring surface `surfaceClass`?
+   *
+   * True when the class is on the actor's own parent chain (legacy $builder /
+   * $programmer *descendants*) OR is reachable through one of the actor's
+   * attached features (the feature-composed provisioning shape: an $agent that
+   * keeps its kind ancestry and gains $programmer as a feature). Feature
+   * resolution mirrors the dispatcher's FT2 walk in resolveVerb — each attached
+   * feature is considered together with its own parent chain, so attaching
+   * $programmer (which inherits $builder) satisfies both the programmer and the
+   * builder surface.
+   *
+   * This is the single predicate behind every surface guard: the DSL
+   * has_surface() builtin and the native assert helpers below both route
+   * through it, so ancestry and feature composition can never diverge on who
+   * may author. It is generic over `surfaceClass`; core names no particular
+   * catalog class here.
+   */
+  actorHasSurface(actor: ObjRef, surfaceClass: ObjRef): boolean {
+    if (this.inheritsFrom(actor, surfaceClass)) return true;
+    if (this.canCarryFeatures(actor)) {
+      for (const feature of this.featureList(actor)) {
+        if (this.inheritsFrom(feature, surfaceClass)) return true;
+      }
+    }
+    return false;
+  }
+
   private assertProgrammerActor(actor: ObjRef, surfaceClass: ObjRef): void {
     const obj = this.object(actor);
     if (obj.flags.wizard === true) return;
+    // Proxy guard (§8.5): the surface class itself is never a valid actor, even
+    // though actorHasSurface would match it reflexively via ancestry.
     if (actor === surfaceClass) throw wooError("E_PERM", "programmer class surface required", { actor, surface: surfaceClass });
-    if (!this.inheritsFrom(actor, surfaceClass)) throw wooError("E_PERM", "programmer class surface required", { actor, surface: surfaceClass });
+    if (!this.actorHasSurface(actor, surfaceClass)) throw wooError("E_PERM", "programmer class surface required", { actor, surface: surfaceClass });
     if (obj.flags.programmer === true) return;
     throw wooError("E_PERM", "programmer flag required", actor);
   }
@@ -5971,7 +6065,7 @@ export class WooWorld {
   private assertBuilderActor(actor: ObjRef, surfaceClass: ObjRef): void {
     if (this.isWizard(actor)) return;
     if (actor === surfaceClass) throw wooError("E_PERM", "builder class surface required", { actor, surface: surfaceClass });
-    if (this.inheritsFrom(actor, surfaceClass)) return;
+    if (this.actorHasSurface(actor, surfaceClass)) return;
     throw wooError("E_PERM", "builder class surface required", { actor, surface: surfaceClass });
   }
 
@@ -10794,41 +10888,52 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         return this.listAgentsForHuman(ctx.thisObj) as unknown as WooValue;
       });
-      this.nativeHandlers.set("human_revoke_agent", (ctx, args) => {
+      this.nativeHandlers.set("human_revoke_agent", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
+        const wasProgrammer = this.object(agent).flags.programmer === true;
+        // Refuse before any mutation if the flag/surface (agent scope) and the
+        // quota counter (account scope) cannot commit together (plan §5.1).
+        if (wasProgrammer) await this.assertProgrammerProvisioningColocated(agent, account);
         const key = this.propOrNull(agent, "api_key_id");
         if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
         this.setProp(agent, "deactivated_at", Date.now());
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        if (this.object(agent).flags.programmer) {
+        if (wasProgrammer) {
           this.object(agent).flags.programmer = false;
           this.markObjectDirty(agent);
+          this.removeProgrammerSurface(agent);
           this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
         }
         this.recordWizardAction(ctx.actor, "agent_revoked", { actor: agent, reason: typeof args[1] === "string" ? args[1] : null });
         return true;
       });
-      this.nativeHandlers.set("human_promote_agent_to_programmer", (ctx, args) => {
+      this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
         if (!this.object(agent).flags.programmer) {
           this.assertProgrammerAgentQuota(account);
+          // Co-residency precondition: refuse rather than half-apply the flag,
+          // surface, and quota across a host boundary (plan §5.1).
+          await this.assertProgrammerProvisioningColocated(agent, account);
           this.object(agent).flags.programmer = true;
           this.markObjectDirty(agent);
+          this.attachProgrammerSurface(agent);
           this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
         }
         return true;
       });
-      this.nativeHandlers.set("human_demote_agent_from_programmer", (ctx, args) => {
+      this.nativeHandlers.set("human_demote_agent_from_programmer", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
         if (this.object(agent).flags.programmer) {
+          await this.assertProgrammerProvisioningColocated(agent, account);
           this.object(agent).flags.programmer = false;
           this.markObjectDirty(agent);
+          this.removeProgrammerSurface(agent);
           this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
         }
         return true;
@@ -11388,10 +11493,28 @@ export class WooWorld {
     return out;
   }
 
+  /**
+   * Classes whose command verbs are "obvious plumbing" and are hidden from
+   * examine/command listings. The substrate base classes ($root, $player) are
+   * always dull — they are bootstrap seeds core may name. *Catalog* classes
+   * ($room, $builder, ...) contribute themselves through
+   * $system.dull_command_definers, so core never branches on a catalog class
+   * identity (AGENTS.md layering). Both obvious-verb projections filter through
+   * this.
+   */
+  private dullCommandDefiners(): Set<ObjRef> {
+    const dull = new Set<ObjRef>(["$root", "$player"]);
+    const raw = this.propOrNull("$system", "dull_command_definers");
+    if (Array.isArray(raw)) for (const item of raw) if (typeof item === "string") dull.add(item);
+    return dull;
+  }
+
   obviousVerbSpecsForActor(actor: ObjRef, target: ObjRef): WooValue[] {
     const out: WooValue[] = [];
     const seen = new Set<string>();
+    const dull = this.dullCommandDefiners();
     for (const definer of this.localAncestry(target)) {
+      if (dull.has(definer)) continue;
       for (const verb of this.object(definer).verbs) {
         if (!this.canReadVerb(actor, verb)) continue;
         const command = verb.arg_spec && typeof verb.arg_spec === "object" && !Array.isArray(verb.arg_spec)
@@ -11546,7 +11669,7 @@ export class WooWorld {
   }
 
   obviousCommandVerbs(target: ObjRef, options: { actor?: ObjRef; executableOnly?: boolean } = {}): VerbDef[] {
-    const dullClasses = new Set<ObjRef>(["$root", "$room", "$player", "$prog", "$builder"]);
+    const dullClasses = this.dullCommandDefiners();
     const out: VerbDef[] = [];
     const seen = new Set<string>();
     for (const definer of this.localAncestry(target)) {

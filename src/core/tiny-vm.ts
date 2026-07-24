@@ -199,7 +199,14 @@ export const BUILTIN_NAMES = [
   // Bounded ordering slot query (P2.4): the O(1) {count, index, before,
   // after, child_index} answer a MUTATION reads instead of the parent's full
   // ordered_children list. Appended last to keep every bytecode index stable.
-  "ordered_neighbors"
+  "ordered_neighbors",
+  // Surface membership predicate: has_surface(actor, class) is true when the
+  // actor carries the authoring surface `class` through its parent chain OR
+  // through an attached feature. Catalog authoring guards call this instead of
+  // isa() so a feature-composed programmer (kept under $agent, with $programmer
+  // attached as a feature) resolves the same as a legacy $programmer descendant.
+  // Appended last to keep every existing bytecode index stable.
+  "has_surface"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1105,6 +1112,13 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
         return frame.ctx.world.isDescendantOfChecked(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), frame.ctx.hostMemo);
+      }
+      case "has_surface": {
+        // Surface membership = ancestry OR attached-feature chain. The actor is
+        // the local calling actor and the surface class is a bundled seed, so
+        // the resolution is local (matching the substrate's own surface guards).
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "has_surface expects actor and surface class");
+        return frame.ctx.world.actorHasSurface(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]));
       }
       case "is_recycled": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_recycled expects one object");

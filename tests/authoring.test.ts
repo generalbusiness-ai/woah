@@ -194,7 +194,9 @@ describe("authoring", () => {
 
     expect(world.object("$builder").parent).toBe("$player");
     expect(world.object("$programmer").parent).toBe("$builder");
-    expect(world.object("$wiz").parent).toBe("$programmer");
+    // $wiz keeps its substrate kind; the surface is composed on as a feature.
+    expect(world.object("$wiz").parent).toBe("$player");
+    expect(world.actorHasSurface("$wiz", "$programmer")).toBe(true);
     expect(world.objects.has("the_builder")).toBe(false);
     expect(world.objects.has("the_programmer")).toBe(false);
 
