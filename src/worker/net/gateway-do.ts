@@ -5237,6 +5237,31 @@ export class NetGatewayDO {
     const getSockets = this.state.getWebSockets?.bind(this.state);
     if (!Array.isArray(body.observations) || body.observations.length === 0) return;
     const liveBody = live ? body as LiveFanoutBody : null;
+    // A relation mirror describes who is present, not who has a carrier on
+    // THIS gateway. HTTP-only sessions receive their own observations on the
+    // turn reply and cannot consume peer fanout. Snapshot hibernating sockets
+    // once and skip the scope-indexed audience scan entirely when neither
+    // transport exists; a 512-member room with zero sockets must remain O(1)
+    // per inbound fanout on each gateway shard.
+    const sockets = getSockets ? getSockets() : [];
+    if (sockets.length === 0 && this.mcpQueues.size === 0) {
+      this.metric({
+        kind: "net_push_no_carriers",
+        scope: body.scope,
+        route: live ? "live" : "committed",
+        observations: body.observations.length
+      });
+      return;
+    }
+    const attachments = sockets
+      .map((socket) => ({ socket, attachment: this.socketAttachment(socket) }))
+      .filter((entry): entry is { socket: WebSocket; attachment: GatewaySocketAttachment } => entry.attachment !== null);
+    const socketsBySession = new Map<string, WebSocket[]>();
+    for (const { socket, attachment } of attachments) {
+      const tagged = socketsBySession.get(attachment.session) ?? [];
+      tagged.push(socket);
+      socketsBySession.set(attachment.session, tagged);
+    }
     // Phase 2: filter by the materialized owner_scope (indexed) so the scan
     // is O(occupants of body.scope), NOT O(all mirrored sessions). The
     // owner→scope classification happened once at write time (ownerScopeFor).
@@ -5326,7 +5351,7 @@ export class NetGatewayDO {
         ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
         observations: visible
       });
-      for (const ws of getSockets ? getSockets(row.member) : []) {
+      for (const ws of socketsBySession.get(row.member) ?? []) {
         try {
           ws.send(frame);
           framesSent += 1;
@@ -5351,11 +5376,7 @@ export class NetGatewayDO {
       // but scanning the whole shard registry on every healthy push would
       // violate the occupant-bounded hot path. Pay this diagnostic only on
       // the anomaly and report counts, never bearer session ids.
-      const sockets = getSockets();
-      const attachments = sockets
-        .map((socket) => this.socketAttachment(socket))
-        .filter((attachment): attachment is GatewaySocketAttachment => attachment !== null);
-      const attachedSessions = new Set(attachments.map((attachment) => attachment.session));
+      const attachedSessions = new Set(attachments.map(({ attachment }) => attachment.session));
       const liveSessionAudience = new Set([
         ...(liveBody?.audienceSessions ?? []),
         ...(liveBody?.observationSessionAudiences ?? []).flat()
@@ -5375,8 +5396,8 @@ export class NetGatewayDO {
         presence_socket_matches: rows.filter((row) => attachedSessions.has(row.member)).length,
         live_session_audience: liveSessionAudience.size,
         live_actor_audience: liveActorAudience.size,
-        attached_session_audience_matches: attachments.filter(({ session }) => liveSessionAudience.has(session)).length,
-        attached_actor_audience_matches: attachments.filter(({ actor }) => liveActorAudience.has(actor)).length
+        attached_session_audience_matches: attachments.filter(({ attachment }) => liveSessionAudience.has(attachment.session)).length,
+        attached_actor_audience_matches: attachments.filter(({ attachment }) => liveActorAudience.has(attachment.actor)).length
       });
     }
   }

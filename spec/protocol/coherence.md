@@ -1001,7 +1001,10 @@ One write path per fact (CO9), concretized:
     a fanout delayed beyond both bounded windows may appear once redundantly.
     Delivery is never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
-    catch-up is deliberately NOT promised in Phase 4.
+    catch-up is deliberately NOT promised in Phase 4. A gateway shard with
+    neither hibernating sockets nor live MCP session state has no peer-delivery
+    carrier and MUST skip the presence-mirror audience scan; HTTP-only callers
+    already receive their own observations on the turn reply.
   - **Direct live observation delivery:** an accepted effect-free direct turn
     uses the same CO13 presence mirror but a separate unsequenced carrier.
     The validating scope sends `{type:"live_observations", scope, echo_id?,

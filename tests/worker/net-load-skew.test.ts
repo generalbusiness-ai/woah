@@ -288,7 +288,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     h.close();
   });
 
-  it("large audience: fanout scan and push track room occupancy, not total mirrored sessions", async () => {
+  it("large audience: carrier-free shards skip the scan; active carriers scan only room occupancy", async () => {
     const OCCUPANTS = 24;
     const h = await buildSkewHarness({ actors: OCCUPANTS });
     // The gateway receives the room's fanout (the client shard's
@@ -305,6 +305,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
         delta: { op: "add"; row: { relation: string; owner: string; member: string; body?: unknown } },
         sourceScope: string
       ): void;
+      mcpSessionState(session: string, actor: string): unknown;
     };
     for (let i = 0; i < OCCUPANTS; i += 1) {
       gw.applyRelationDelta({
@@ -329,18 +330,29 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
       }, "room:skew_annex");
     }
 
-    // One turn in the hot room; its fanout returns to this gateway
-    // (subscribed by the pull) and pushes to the room's audience.
-    const turn = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-1", h.guests[0]));
+    // HTTP-only sessions have no peer-observation carrier. The submitting
+    // session receives its observation on the turn reply, so this shard must
+    // not scan the 24-row presence mirror merely to discover zero delivery.
+    const carrierFree = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-no-carrier", h.guests[0]));
+    expect(carrierFree.reply.status).toBe("accepted");
+    await h.settle();
+    expect(capture.metrics.some((m) => m.kind === "net_push_no_carriers" && m.scope === h.roomScope)).toBe(true);
+    expect(capture.metrics.some((m) => m.kind === "net_presence_scan" && m.scope === h.roomScope)).toBe(false);
+
+    // Once one local MCP feed exists, the gateway must resolve its audience.
+    // The scan remains bounded to the target room rather than the 3x larger
+    // off-room mirror.
+    gw.mcpSessionState("s_test_0", h.guests[0]);
+    capture.metrics.length = 0;
+    const turn = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-with-carrier", h.guests[1]));
     expect(turn.reply.status).toBe("accepted");
     await h.settle();
-
     const scans = capture.metrics.filter((m) => m.kind === "net_presence_scan" && m.scope === h.roomScope);
     const pushes = capture.metrics.filter((m) => m.kind === "net_push" && m.scope === h.roomScope);
     expect(scans.length).toBeGreaterThanOrEqual(1);
     expect(pushes.length).toBeGreaterThanOrEqual(1);
-    // THE INVARIANT: audience == room occupants; the 3x off-room sessions
-    // never enter the scan (indexed owner_scope filter, N+1 fixed).
+    // THE INVARIANT: when delivery is possible, audience == room occupants;
+    // the 3x off-room sessions never enter the indexed owner_scope scan.
     for (const scan of scans) expect(scan.presence_scan_rows).toBe(OCCUPANTS);
     for (const push of pushes) {
       expect(push.audience).toBe(OCCUPANTS);
