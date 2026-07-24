@@ -144,6 +144,11 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
       expect(progNames, `${verb} missing from ${JSON.stringify(progNames.filter((n) => n.startsWith(p)))}`).toContain(`${p}__${verb}`);
     }
 
+    // The removed "all" scope is rejected by the MCP validator, not silently
+    // degraded to the local closure (§7 / no global enumeration).
+    const scopeAll = await call(progSession, "woo_list_reachable_tools", { scope: "all" });
+    expect(scopeAll.result?.isError, JSON.stringify(scopeAll).slice(0, 300)).toBe(true);
+
     // (4) The non-programmer agent sees NO authoring tools — the surface gates
     // the tool set, not merely the flag.
     const plainSession = await open(plainToken);

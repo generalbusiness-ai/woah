@@ -359,6 +359,20 @@ describe("programmer surface (feature-composed)", () => {
     expect((world.propOrNull("$system", "wizard_actions") as unknown[]).length).toBe(auditBefore);
   });
 
+  it("rejects authoring search scope 'all' — no global object enumeration (§7)", async () => {
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "scopeall@example.com");
+    const agent = await createAgent(world, human, "scopebot", true);
+    // The bounded scopes still work...
+    const ok = (await world.directCall("s-ok", agent, agent, "search", ["x", { scope: "owned" }])) as CallResult;
+    expect(ok.op).toBe("result");
+    // ...but "all" (the removed global-enumeration scope) is refused.
+    const res = (await world.directCall("s-all", agent, agent, "search", ["x", { scope: "all" }])) as CallResult;
+    expect(res.op).toBe("error");
+    expect((res as any).error.code).toBe("E_INVARG");
+    expect((res as any).error.message).toContain("all");
+  });
+
   it("leaves target state unchanged when a verb install hits a stale version (§8.9)", async () => {
     const world = createWorld();
     const { human } = await provisionHuman(world, "stale@example.com");
