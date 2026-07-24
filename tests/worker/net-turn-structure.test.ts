@@ -67,6 +67,7 @@ type TurnStructureReport = {
   sync_rpc: number;
   rpc_ms: number;
   rpc_max_ms: number;
+  rpc_max_phase: string;
   rpc_depth: number;
   queue_ms: number;
   wall_ms: number;
@@ -188,6 +189,7 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     expect(structure?.rpc_depth).toBe(structure?.sync_rpc);
     expect(structure?.rpc_ms).toBeGreaterThanOrEqual(0);
     expect(structure?.rpc_max_ms).toBeLessThanOrEqual(structure?.rpc_ms ?? 0);
+    expect(structure?.rpc_max_phase).not.toBe("");
     expect(structure?.wall_ms).toBeGreaterThanOrEqual(structure?.rpc_ms ?? 0);
 
     // The deployed canary reads AE, not sampled tail. Prove both DO shells
@@ -195,6 +197,7 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     const turnPoint = analytics.filter((point) => point.blobs?.[0] === "net_turn_structure").at(-1);
     const submitPoint = analytics.find((point) => point.blobs?.[0] === "net_scope_submit");
     expect(turnPoint?.indexes).toEqual(["net-gateway:gateway-structure"]);
+    expect(turnPoint?.blobs?.[5]).toBe(structure?.rpc_max_phase);
     expect(turnPoint?.blobs?.[7]).toBe("accepted");
     expect(turnPoint?.doubles?.[4]).toBe(structure?.wall_ms);
     expect(submitPoint?.indexes).toEqual(["net-scope:scope-flat"]);
@@ -269,6 +272,18 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
     expect(settled).toContain("late");
     expect(structure.rpc_depth).toBe(2);
     expect(structure.sync_rpc).toBe(5);
+  });
+
+  it("retains the phase paired with the slowest successful RPC step", async () => {
+    const { TurnStructure } = await import("../../src/worker/net/gateway-do");
+    const structure = new TurnStructure();
+    await structure.rpc(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 8));
+    }, { phase: "slow_probe" });
+    await structure.rpc(async () => undefined, { phase: "fast_probe" });
+
+    expect(structure.rpc_max_ms).toBeGreaterThanOrEqual(1);
+    expect(structure.rpc_max_phase).toBe("slow_probe");
   });
 
   it("a group that would cross the cap refuses whole (no partial fan-out)", async () => {

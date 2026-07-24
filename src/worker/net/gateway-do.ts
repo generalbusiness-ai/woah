@@ -453,6 +453,12 @@ export class TurnStructure {
    * meaning as reads parallelize. Wall-clock (Date.now), metrics-grade. */
   rpc_ms = 0;
   rpc_max_ms = 0;
+  /** Phase name paired with rpc_max_ms. Successful turns must retain the
+   * same attribution that failure details provide; otherwise a deployed
+   * latency tail says how long the stall was but not which authority step
+   * owned it. The first zero-millisecond step wins when workerd freezes the
+   * clock, so every turn still carries a bounded, known phase. */
+  rpc_max_phase = "";
   /** NC8a critical-path depth: serial RPC STEPS. A single rpc() is one
    * step; an rpcGroup of K parallel calls is ALSO one step (they overlap),
    * while sync_rpc still counts all K. depth < sync_rpc therefore
@@ -494,7 +500,10 @@ export class TurnStructure {
     } finally {
       const ms = Date.now() - started;
       this.rpc_ms += ms;
-      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+      if (this.rpc_max_phase === "" || ms > this.rpc_max_ms) {
+        this.rpc_max_ms = ms;
+        this.rpc_max_phase = phase;
+      }
     }
   }
   /** One PARALLEL step of independent RPCs (NC8b "parallelize
@@ -518,7 +527,10 @@ export class TurnStructure {
     } finally {
       const ms = Date.now() - started;
       this.rpc_ms += ms;
-      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+      if (this.rpc_max_phase === "" || ms > this.rpc_max_ms) {
+        this.rpc_max_ms = ms;
+        this.rpc_max_phase = phase;
+      }
     }
   }
 }
@@ -569,6 +581,8 @@ type TurnStructureReport = {
   rpc_ms: number;
   /** NC8a: the single slowest RPC step. */
   rpc_max_ms: number;
+  /** NC8a: bounded phase name paired with rpc_max_ms. */
+  rpc_max_phase: string;
   /** NC8a: serial RPC steps (parallel groups count once) — how deep the
    * turn's cross-authority chain ran; depth < sync_rpc measures paid
    * parallelism. */
@@ -1282,6 +1296,7 @@ export class NetGatewayDO {
         snapshot_cells: structure.snapshot_cells,
         rpc_ms: structure.rpc_ms,
         rpc_max_ms: structure.rpc_max_ms,
+        rpc_max_phase: structure.rpc_max_phase,
         rpc_depth: structure.rpc_depth,
         queue_ms: structure.queue_ms,
         wall_ms: Date.now() - structure.started
@@ -1323,6 +1338,7 @@ export class NetGatewayDO {
       snapshot_cells: structure.snapshot_cells,
       rpc_ms: structure.rpc_ms,
       rpc_max_ms: structure.rpc_max_ms,
+      rpc_max_phase: structure.rpc_max_phase,
       rpc_depth: structure.rpc_depth,
       queue_ms: structure.queue_ms,
       wall_ms: Date.now() - structure.started
@@ -1347,7 +1363,10 @@ export class NetGatewayDO {
       ...(request.principal?.customer ? { customer: request.principal.customer } : {}),
       ...(request.principal?.actor ? { actor: request.principal.actor } : {}),
       ...(traceId ? { trace_id: traceId } : {}),
-      ...report
+      ...report,
+      // Reuse the stable AE phase axis instead of spending a new blob. For a
+      // turn-level event it denotes the phase paired with rpc_max_ms.
+      phase: report.rpc_max_phase
     });
     // AU8 span tree: root `net.turn` + phase children from the measured
     // report buckets. Adopted contexts follow the caller's sampled flag;

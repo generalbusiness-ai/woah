@@ -609,7 +609,7 @@ aggregation; the `/admin/stats` panel queries the AE SQL API.
 
 ```ts
 env.METRICS.writeDataPoint({
-  blobs:   [/* fixed-width 18-slot dimension map; see "Slot map" below */],
+  blobs:   [/* fixed-width 20-slot dimension map; see "Slot map" below */],
   doubles: [/* fixed-width 20-slot numeric map; see "Slot map" below */],
   indexes: [host_key]                  // the only high-cardinality index
 });
@@ -625,7 +625,7 @@ hosts. This also matches the dashboard's primary pivot — "by component".
 
 #### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
 
-The slot map is fixed-width: every data point fills all 18 blobs and 20
+The slot map is fixed-width: every data point fills all 20 blobs and 20
 doubles. Axes the event doesn't carry land as empty strings (blob) or 0
 (double). New axes get a NEW slot; existing slots are never reordered
 or repurposed.
@@ -637,7 +637,7 @@ or repurposed.
 | `blobs[2]`  | `class`     | `do_constructor`, `do_handler` |
 | `blobs[3]`  | `route`     | `do_handler.route`, `cross_host_rpc.route`, `shadow_*_step.route`, browser turn route |
 | `blobs[4]`  | `method`    | `do_handler.method`, `mcp_request.method`, browser IndexedDB/WebSocket method |
-| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase` |
+| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase`; for `net_turn_structure`, the bounded phase paired with `rpc_max_ms` |
 | `blobs[6]`  | `what`      | `storage_direct_write.what`, browser cache/IndexedDB store |
 | `blobs[7]`  | `status`    | `"ok" \| "error" \| "timeout"` |
 | `blobs[8]`  | `error`     | error code (`E_*`) or diagnostic event code |

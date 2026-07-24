@@ -161,6 +161,7 @@ describe("metrics-sink", () => {
         wall_ms: 185,
         rpc_ms: 170,
         rpc_max_ms: 91,
+        phase: "submit",
         rpc_depth: 3,
         sync_rpc: 4,
         attempt: 1,
@@ -173,6 +174,7 @@ describe("metrics-sink", () => {
       expect(point.indexes).toEqual(["net-gateway:net-api-3"]);
       expect(point.blobs?.[SLOT_KIND]).toBe("net_turn_structure");
       expect(point.blobs?.[SLOT_SCOPE]).toBe("room:the_chatroom");
+      expect(point.blobs?.[SLOT_PHASE]).toBe("submit");
       expect(point.doubles?.[DBL_MS]).toBe(0);
       expect(point.doubles?.[DBL_SAMPLE_RATE]).toBe(1);
       expect(point.doubles?.[DBL_QUEUE_MS]).toBe(9);
