@@ -6881,7 +6881,12 @@ function rejectForeignMcpOrigin(request: Request, target: URL): Response | null 
   return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
 }
 
-type NetMcpToolScope = "active" | "here" | "object" | "space" | "all";
+// "all" is intentionally NOT a scope. It had no branch in mcpToolPage and
+// silently fell through to the local structural closure (identical to
+// "active"), implying a global tool enumeration that Big-World forbids
+// (spec/semantics/distribution.md). Removed so a caller asking for "all" gets a
+// clear error instead of a misleading partial view.
+type NetMcpToolScope = "active" | "here" | "object" | "space";
 
 type NetMcpToolDraft = {
   object: string;
@@ -6911,8 +6916,8 @@ function mcpRecord(value: unknown): Record<string, unknown> {
 
 function mcpToolScope(value: unknown): NetMcpToolScope {
   if (value === undefined || value === null || value === "") return "active";
-  if (value === "active" || value === "here" || value === "object" || value === "space" || value === "all") return value;
-  throw new Error("scope must be one of active, here, object, space, all");
+  if (value === "active" || value === "here" || value === "object" || value === "space") return value;
+  throw new Error("scope must be one of active, here, object, space");
 }
 
 function mcpLimit(value: unknown, fallback: number, cap: number): number {
@@ -7040,7 +7045,7 @@ const MCP_TOOL_DEFS = [
     inputSchema: {
       type: "object",
       properties: {
-        scope: { type: "string", enum: ["active", "here", "object", "space", "all"] },
+        scope: { type: "string", enum: ["active", "here", "object", "space"] },
         object: { type: "string" },
         query: { type: "string" },
         limit: { type: "number" },
