@@ -635,9 +635,25 @@ that only runs under `test:full` does not hold the line):
    emitted as the `net_turn_structure` metric so the deployed profile
    emits the evidence CO10 is measured against. The curated
    `tests/worker/net-turn-structure.test.ts` asserts the warm same-scope
-   structure (1 attempt, ≤ 3 sync RPCs — `/head` + `/submit` + the
-   post-accept `installTouched` `/closure` — and 0 reconstructions),
+   structure (1 attempt, ≤ 3 sync RPCs — an optional `/head`, `/submit`,
+   and the post-accept `installTouched` `/closure` — and 0
+   reconstructions),
    cross-checked against a per-destination RPC log.
+
+   A gateway MAY retain the exact planning-scope `/head` reply, including
+   its object-allocation counter, and plan a later turn optimistically
+   against that same base. This is a bounded derived cache, never an
+   authority certificate: `/submit` still applies CO4's bounded
+   retained-head proof and validates every read and the re-derived
+   post-state against current authority. Compacted owner reads continue to
+   require an exact current base. A create reads the allocation cell, so a
+   stale counter conflicts like any other stale read; a base outside the
+   retained tail rejects `stale_head`. A fanout that advances the cached
+   scope invalidates the entry. An accepted turn retains the entry only
+   when its returned head exactly equals the cached base (the cell-touchless
+   direct case); a head-changing commit invalidates it. Thus stale cache
+   state can cost one repair but cannot bless a stale read, allocate from a
+   stale counter, or commit an invalid post-state.
 4. **Differential gate** (build-time, Plan 002 Phase 2): v2 and `src/net/`
    produce equal committed state and observation streams on the shared
    smoke scenario; divergence is a stop.

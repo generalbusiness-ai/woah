@@ -5,7 +5,7 @@
 // and write classifies to that one scope — no foreign attestation, no
 // rider, no cross-scope hop. CO10's warm-turn structure then bounds it:
 //   1 attempt, ≤ 3 cross-host RPCs on the synchronous reply path
-//   (/head + /submit + the post-accept installTouched /closure),
+//   (optional /head + /submit + post-accept installTouched /closure),
 //   0 authority reconstructions.
 //
 // The gate reads TurnResult.structure (the counters the gateway now emits
@@ -78,6 +78,7 @@ type TurnBody = {
   reply: CommitReply;
   attempt: number;
   trace: AttemptTraceEntry[];
+  result?: unknown;
   structure?: TurnStructureReport;
 };
 
@@ -107,6 +108,16 @@ describe("D2 / CO10 warm-turn structural budget", () => {
       null
     );
     expect(installed.ok).toBe(true);
+    const peekInstalled = installVerb(
+      world,
+      "strn_box",
+      "peek",
+      `verb :peek() rxd {
+        return this.counter;
+      }`,
+      null
+    );
+    expect(peekInstalled.ok).toBe(true);
     const placed = await world.directCall("strn-genesis-place", actor, actor, "moveto", ["strn_room"], { sessionId: session.id });
     expect(placed.op).toBe("result");
 
@@ -174,7 +185,7 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     expect(structure, "TurnResult must carry the D2 structure report").toBeTruthy();
     expect(structure?.attempt).toBe(1); // no repair round
     expect(structure?.reconstructions).toBe(0); // warm view: no refresh/reseed
-    expect(structure?.sync_rpc).toBeLessThanOrEqual(3); // /head + /submit + installTouched
+    expect(structure?.sync_rpc).toBeLessThanOrEqual(3); // optional /head + /submit + installTouched
     expect(structure?.scope_row_writes).toBeGreaterThan(0); // the counter cell moved
     expect(structure?.scope).toBe(SCOPE);
 
@@ -201,6 +212,52 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     expect(turnPoint?.blobs?.[7]).toBe("accepted");
     expect(turnPoint?.doubles?.[4]).toBe(structure?.wall_ms);
     expect(submitPoint?.indexes).toEqual(["net-scope:scope-flat"]);
+
+    // A cell-touchless direct turn preserves the exact authority head. Its
+    // first call learns the allocation counter; the second omits /head and
+    // still submits against that exact cached base.
+    const peekRequest = (key: string) => ({
+      ...turnRequest(key),
+      call: { ...bump(key), verb: "peek" }
+    });
+    rpcLog.length = 0;
+    const peek1 = await call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("strn-peek-1"));
+    expect(peek1.reply.status).toBe("accepted");
+    expect(rpcLog).toEqual(["/net/head", "/net/submit"]);
+
+    rpcLog.length = 0;
+    const peek2 = await call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("strn-peek-2"));
+    expect(peek2.reply.status).toBe("accepted");
+    expect(peek2.attempt).toBe(1);
+    expect(rpcLog).toEqual(["/net/submit"]);
+    expect(peek2.structure?.sync_rpc).toBe(1);
+
+    // Advance the authority through another gateway while the first retains
+    // its old hint and derived counter cell. The stale hint may cost a
+    // rejected attempt, but the submit CAS plus normal repair must converge
+    // to the new value; it can never certify the old read.
+    const peerState = netState("gateway-structure-peer");
+    const peer = new NetGatewayDO(peerState.state, gatewayEnv);
+    await call(peer, gatewayEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+    const peerBump = await call<TurnBody>(peer, gatewayEnv, "/turn", turnRequest("strn-peer-bump"));
+    expect(peerBump.reply.status).toBe("accepted");
+
+    rpcLog.length = 0;
+    const repairedPeek = await call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("strn-peek-stale"));
+    expect(repairedPeek.reply.status).toBe("accepted");
+    expect(repairedPeek.result).toBe(3);
+    expect(repairedPeek.trace.map((entry) => entry.code)).toContain("E_READ_VERSION");
+    expect(rpcLog[0]).toBe("/net/submit"); // the stale cached base was tried
+    expect(rpcLog).toContain("/net/closure"); // current counter value repaired
+
+    // The repairing accept returned a different authority head, so retaining
+    // the old allocation hint would be wrong. The following turn must learn a
+    // matching head/counter again before it plans.
+    rpcLog.length = 0;
+    const postRepairPeek = await call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("strn-peek-post-repair"));
+    expect(postRepairPeek.reply.status).toBe("accepted");
+    expect(rpcLog).toEqual(["/net/head", "/net/submit"]);
+    peerState.close();
 
     scopeState.close();
     gatewayState.close();

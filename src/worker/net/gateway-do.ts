@@ -707,6 +707,12 @@ const CLIENT_MINT_RATE_BURST = 20;
  * traffic into a multi-Hz repair loop. The next request may retry after this
  * bounded brake; success is cached naturally by the repaired view page. */
 const GUEST_RESET_REPAIR_BACKOFF_MS = 5_000;
+/** Planning-head hints are an optimistic latency cache, not authority.
+ * Bound them independently of world size; hibernation or eviction merely
+ * restores the ordinary /head path. */
+const PLANNING_HEAD_CACHE_CAP = 256;
+
+type PlanningHead = { head: ScopeHead; catalog_epoch?: string; object_counter?: number };
 
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
@@ -716,6 +722,11 @@ export class NetGatewayDO {
    * purpose: hibernation merely makes the next large direct read re-pull a
    * full closure; correctness never depends on retaining this optimization. */
   private readonly completeHeads = new Map<string, ScopeHead>();
+  /** Exact `/head` replies retained only to avoid a serial warm-path hop.
+   * `/submit` still proves the retained base and validates current reads and
+   * post-state at authority, so a stale entry can cost repair but cannot
+   * authorize stale state. */
+  private readonly planningHeads = new Map<string, PlanningHead>();
   /** Per-subscriber outbox continuity, distinct from authority `seen`.
    * A scope head may advance without emitting a row for this gateway. */
   private readonly deliverySeen = new Map<string, number>();
@@ -1520,21 +1531,26 @@ export class NetGatewayDO {
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
       let base: ScopeHead | null = null;
-      // Planning-scope head prefetch (client-shell phase i): fetched
-      // BEFORE planning so the authority's allocation counter reaches
-      // the planner — a create must mint an id fresh at the authority.
+      // Planning-scope head (client-shell phase i): learned from /head or an
+      // exact prior reply and supplied BEFORE planning so the authority's
+      // allocation counter reaches the planner — a create must mint an id
+      // fresh at the retained base and validates that read at submit.
       // Reused as the submit base when the commit scope IS the planning
       // scope (the warm common case), keeping the warm turn at the same
       // sync-RPC count as before; a cross-scope selection re-fetches
       // from its own destination below.
-      let planningHead: Awaited<ReturnType<typeof this.scopeHead>> | null = null;
+      let planningHead: PlanningHead | null = null;
       if (resubmit) {
         planned = resubmit.planned;
         base = resubmit.base;
         resubmit = null;
       } else {
         try {
-          planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
+          planningHead = this.cachedPlanningHead(request.planningScope, request.catalog_epoch);
+          if (planningHead === null) {
+            planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
+            this.rememberPlanningHead(request.planningScope, request.catalog_epoch, planningHead);
+          }
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
           const complete = this.completeHeads.get(request.planningScope);
           const compactOwnedReads = complete?.seq === planningHead.head.seq &&
@@ -1822,6 +1838,12 @@ export class NetGatewayDO {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true, phase: "submit_disambiguate" })) as CommitReply;
       }
       if (reply.status === "accepted") {
+        // Retain the optimistic allocation/head hint only for an exact
+        // head-stable accept. Any authoritative mutation (including a create)
+        // changes the returned head and forces the next turn through /head.
+        if (reply.scope === request.planningScope) {
+          this.reconcilePlanningHead(request.planningScope, request.catalog_epoch, reply.head);
+        }
         // Make an accepted presence transition visible at its room authority
         // before the client can issue a dependent roster read. This delivers
         // the same idempotent fact as the committing scope's durable outbox;
@@ -1924,12 +1946,16 @@ export class NetGatewayDO {
 
       switch (reply.reason) {
         case "stale_head": {
+          this.forgetPlanningHead(targetScope);
           const live = await this.tryRecovery(trace, () => structure.rpc(() => this.scopeHead(destination), { phase: "stale_head_refresh" }));
           // Phase 5: epoch check OUTSIDE tryRecovery (the M9 pattern) —
           // a genuine epoch disagreement is terminal and must escape the
           // retry loop, while a FAILED head fetch stays on the budget
           // path (recovery_error names it; a later round may converge).
-          if (live !== undefined) this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+          if (live !== undefined) {
+            this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+            this.rememberPlanningHead(targetScope, request.catalog_epoch, live);
+          }
           const fresh = live?.head;
           const headMoved = fresh !== undefined && (
             fresh.seq !== submit.base.seq ||
@@ -6900,8 +6926,60 @@ export class NetGatewayDO {
   /** The scope's /head reply, epoch included (Phase 5: the epoch was
    * previously discarded here — the one uniform place every turn path
    * already touches). */
-  private async scopeHead(destination: string): Promise<{ head: ScopeHead; catalog_epoch?: string; object_counter?: number }> {
-    return (await this.host.rpc(destination, "/head")) as { head: ScopeHead; catalog_epoch?: string };
+  private async scopeHead(destination: string): Promise<PlanningHead> {
+    return (await this.host.rpc(destination, "/head")) as PlanningHead;
+  }
+
+  /** Read and LRU-touch one optimistic planning hint. Epoch skew is a miss,
+   * never a reason to let the fail-fast check consume a prior catalog's
+   * derived counter. */
+  private cachedPlanningHead(scope: string, epoch: string): PlanningHead | null {
+    const cached = this.planningHeads.get(scope);
+    if (cached === undefined) return null;
+    if (cached.catalog_epoch !== undefined && cached.catalog_epoch !== epoch) {
+      this.planningHeads.delete(scope);
+      return null;
+    }
+    this.planningHeads.delete(scope);
+    this.planningHeads.set(scope, cached);
+    return cached;
+  }
+
+  private rememberPlanningHead(scope: string, epoch: string, head: PlanningHead): void {
+    const cached = {
+      ...head,
+      // Production /head always carries the epoch. Fixture replies may omit
+      // it; stamp the epoch whose turn validated the reply so it cannot cross
+      // a later catalog activation inside this gateway.
+      catalog_epoch: head.catalog_epoch ?? epoch
+    };
+    this.planningHeads.delete(scope);
+    this.planningHeads.set(scope, cached);
+    while (this.planningHeads.size > PLANNING_HEAD_CACHE_CAP) {
+      const oldest = this.planningHeads.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.planningHeads.delete(oldest);
+    }
+  }
+
+  private forgetPlanningHead(scope: string): void {
+    this.planningHeads.delete(scope);
+  }
+
+  /** A head-stable direct turn preserves the cached allocation floor. Any
+   * changed authority head discards it; the next turn pays /head and learns
+   * the matching counter before it can plan a create. */
+  private reconcilePlanningHead(scope: string, epoch: string, accepted: ScopeHead): void {
+    const cached = this.planningHeads.get(scope);
+    if (
+      cached === undefined
+      || cached.catalog_epoch !== epoch
+      || cached.head.seq !== accepted.seq
+      || cached.head.hash !== accepted.hash
+      || cached.head.generation !== accepted.generation
+    ) {
+      this.forgetPlanningHead(scope);
+    }
   }
 
   /** Phase 5 fail-fast: a turn whose stamp disagrees with the scope's
@@ -7456,6 +7534,11 @@ export class NetGatewayDO {
     // excludes the leaver). The seq gate above makes the push
     // at-most-once per socket per turn: redeliveries never reach here.
     if (applied) {
+      // The authority advanced beyond any planning hint retained for this
+      // scope. Invalidate before callbacks can start another turn; a missing
+      // fanout is still safe because /submit validates the retained base,
+      // current reads, and post-state before accepting.
+      this.forgetPlanningHead(body.scope);
       if (
         completeBefore &&
         body.seq === completeBefore.seq + 1 &&
