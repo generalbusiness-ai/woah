@@ -1806,6 +1806,14 @@ export class NetGatewayDO {
       if (envelopeBytes > WARM_ENVELOPE_BYTE_LIMIT && warm && planned.ownedReadsCompacted) {
         const attestationCells = Object.values(submit.attestations ?? {})
           .reduce((count, attestation) => count + attestation.cells.length, 0);
+        // This branch is already a terminal protocol defect. Account for each
+        // sibling independently so the next occurrence identifies the actual
+        // amplification source instead of reporting only transcript bytes.
+        // JSON field sizes are diagnostic (their braces/keys do not add up to
+        // the whole body exactly); the authoritative ceiling above remains the
+        // byte size of the complete serialized submit RPC body.
+        const diagnosticBytes = (value: unknown): number =>
+          new TextEncoder().encode(JSON.stringify(value)).byteLength;
         const readBuckets = new Map<string, number>();
         for (const read of submit.transcript.reads) {
           let owner = "unresolved";
@@ -1817,6 +1825,12 @@ export class NetGatewayDO {
           `oversized compacted warm envelope: ${envelopeBytes} bytes; ` +
           `wire_reads=${submit.transcript.reads.length} attestation_cells=${attestationCells} ` +
           `transcript_bytes=${new TextEncoder().encode(JSON.stringify(submit.transcript)).byteLength} ` +
+          `submit_bytes=${diagnosticBytes(submit)} ` +
+          `attestations_bytes=${diagnosticBytes(submit.attestations ?? {})} ` +
+          `rider_destinations_bytes=${diagnosticBytes(submitBody.rider_destinations)} ` +
+          `relate_destinations_bytes=${diagnosticBytes(submitBody.relate_destinations)} ` +
+          `live_audience_bytes=${diagnosticBytes(planned.liveAudience ?? {})} ` +
+          `origin_gateway_bytes=${diagnosticBytes(originGateway ?? "")} ` +
           `read_buckets=${JSON.stringify(Object.fromEntries(readBuckets))}`
         );
       }
