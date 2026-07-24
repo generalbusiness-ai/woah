@@ -980,13 +980,11 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // nor blocked the peer delivery, which the s2 assertion above proves.
     expect(frames(socketC).filter((frame) => frame.type === "observations")).toHaveLength(0);
 
-    // Phase 2 invariant: the fanout scan touched exactly the ANNEX
-    // occupants (s1, s2, s4 — three rows), NOT the off-scope s3, and never
-    // the whole session_presence table. This is the O(occupants) property
-    // the owner_scope index gives: adding sessions in OTHER scopes cannot
-    // grow this count.
+    // Phase 2 invariant: the fanout scan touched exactly the ANNEX sessions
+    // with carriers on this shard (s1, s2 — two rows), NOT socket-less s4 or
+    // off-scope s3. Cost follows local carriers, not room population.
     logSpy.mockRestore();
-    expect(scanRows).toEqual([3]);
+    expect(scanRows).toEqual([2]);
 
     // SECURITY: the only correlation value the peer learns is a one-way
     // digest. Reusing it as an idempotency key must execute the peer's own

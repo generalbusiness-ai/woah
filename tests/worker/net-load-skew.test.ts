@@ -340,8 +340,8 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     expect(capture.metrics.some((m) => m.kind === "net_presence_scan" && m.scope === h.roomScope)).toBe(false);
 
     // Once one local MCP feed exists, the gateway must resolve its audience.
-    // The scan remains bounded to the target room rather than the 3x larger
-    // off-room mirror.
+    // The indexed intersection reads that one local in-room carrier, not the
+    // other 23 occupants or the 3x larger off-room mirror.
     gw.mcpSessionState("s_test_0", h.guests[0]);
     capture.metrics.length = 0;
     const turn = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-with-carrier", h.guests[1]));
@@ -351,11 +351,12 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     const pushes = capture.metrics.filter((m) => m.kind === "net_push" && m.scope === h.roomScope);
     expect(scans.length).toBeGreaterThanOrEqual(1);
     expect(pushes.length).toBeGreaterThanOrEqual(1);
-    // THE INVARIANT: when delivery is possible, audience == room occupants;
-    // the 3x off-room sessions never enter the indexed owner_scope scan.
-    for (const scan of scans) expect(scan.presence_scan_rows).toBe(OCCUPANTS);
+    // THE INVARIANT: scan/audience == local in-scope carriers. Neither other
+    // occupants nor the 3x off-room sessions enter the indexed intersection.
+    for (const scan of scans) expect(scan.presence_scan_rows).toBe(1);
     for (const push of pushes) {
-      expect(push.audience).toBe(OCCUPANTS);
+      expect(push.audience).toBe(1);
+      expect(push.mcp_sessions).toBe(1);
       expect(push.observations).toBeGreaterThanOrEqual(1);
     }
     h.close();

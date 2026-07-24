@@ -669,7 +669,7 @@ or repurposed.
 | `doubles[16]` | `abandoned` | outbox rows abandoned by a drain pass |
 | `doubles[17]` | `audience` | net push audience rows |
 | `doubles[18]` | `frames` | net WebSocket frames sent |
-| `doubles[19]` | `presence_scan_rows` | indexed presence rows scanned |
+| `doubles[19]` | `presence_scan_rows` | in-scope local carrier rows matched by the indexed presence intersection |
 
 The canonical v2 event union is `MetricEvent` in `src/core/types.ts`; net
 metrics remain structurally typed beside the frozen stack. This table is the

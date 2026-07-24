@@ -817,6 +817,12 @@ export class NetGatewayDO {
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
+    // Observation delivery intersects one scope with the bounded sessions
+    // that have a live carrier on this gateway. Keep member as the final key
+    // so that intersection never scans every occupant of a large room.
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope_member ON net_gateway_relation (relation, owner_scope, member)"
+    );
     // The authenticated read/auth query shapes (all O(matching rows), never
     // a table scan): presence-of-a-member (relation, member); the contents
     // membership check and the roster read (relation, owner, member — the
@@ -5262,21 +5268,34 @@ export class NetGatewayDO {
       tagged.push(socket);
       socketsBySession.set(attachment.session, tagged);
     }
-    // Phase 2: filter by the materialized owner_scope (indexed) so the scan
-    // is O(occupants of body.scope), NOT O(all mirrored sessions). The
-    // owner→scope classification happened once at write time (ownerScopeFor).
-    // NC8a: member + body in ONE query — the previous per-member body
-    // re-read was an N+1 that scaled fanout SQL with audience size.
-    const rows = sqlRows<{ member: string; body: string | null }>(
-      this.state.storage.sql.exec(
-        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ?",
-        SESSION_PRESENCE_RELATION,
-        body.scope
-      )
-    );
-    // Load-gate evidence (CO10): rows scanned must track occupants, flat as
-    // total off-scope sessions grow.
-    this.metric({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length });
+    // Phase 2: intersect the scope-indexed mirror with THIS shard's bounded
+    // carrier sessions. Presence is global authority state; peer observation
+    // delivery is local transport state. Scanning every room occupant because
+    // one local socket exists recreates O(V*N) fanout across gateway shards.
+    // Chunk the IN set below SQLite's conservative bind ceiling; the composite
+    // (relation, owner_scope, member) index makes cost O(local carriers).
+    const carrierSessions = [...new Set([...socketsBySession.keys(), ...this.mcpQueues.keys()])].sort();
+    const rows: Array<{ member: string; body: string | null }> = [];
+    for (let offset = 0; offset < carrierSessions.length; offset += GATEWAY_CARRIER_QUERY_CHUNK) {
+      const chunk = carrierSessions.slice(offset, offset + GATEWAY_CARRIER_QUERY_CHUNK);
+      const placeholders = chunk.map(() => "?").join(",");
+      rows.push(...sqlRows<{ member: string; body: string | null }>(
+        this.state.storage.sql.exec(
+          `SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ? AND member IN (${placeholders})`,
+          SESSION_PRESENCE_RELATION,
+          body.scope,
+          ...chunk
+        )
+      ));
+    }
+    // Load-gate evidence (CO10): rows scanned track local in-scope carriers,
+    // flat as either room population or off-scope sessions grow.
+    this.metric({
+      kind: "net_presence_scan",
+      scope: body.scope,
+      presence_scan_rows: rows.length,
+      carrier_sessions: carrierSessions.length
+    });
     if (rows.length === 0) return;
     // Session -> actor for the directed-observation filter below: the
     // presence row body carries the session's actor (CO13 applier).
@@ -7596,6 +7615,8 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 /** MCP adapter bounds (client-shell phase i). */
 const MCP_QUEUE_CAP = 256;
 const MCP_SESSION_STATE_CAP = 512;
+/** Conservative SQLite bind chunk for scope ∩ local-carrier queries. */
+const GATEWAY_CARRIER_QUERY_CHUNK = 64;
 const MCP_STANDARD_TOOL_PAGE = 128;
 const MCP_DISCOVERY_DEFAULT_PAGE = 64;
 const MCP_DISCOVERY_MAX_PAGE = 256;
