@@ -1068,9 +1068,14 @@ One write path per fact (CO9), concretized:
     high-water, and a disconnected recipient loses it. Presence-derived
     audience enumerations are not completeness proofs: every destination
     shard resolves `presence` mode against its own scope-indexed relation
-    slice. Explicit/private audiences retain actor/session filtering. The
-    submitting client gets the full observation on `turn_result`; the shared
-    echo digest suppresses a redundant live frame during rolling failure.
+    slice. The Net carrier MUST NOT copy the planner's session-audience lists:
+    session ids are bearer credentials and routing them once per observation
+    makes envelope size depend on stale derived session history. It carries the
+    parallel audience-mode vector plus non-secret actor refs for
+    `explicit`/private observations; each destination gateway maps those actors
+    to its own indexed, in-scope carrier sessions. The submitting client gets
+    the full observation on `turn_result`; the shared echo digest suppresses a
+    redundant live frame during rolling failure.
   - **Installed catalog read:** authenticated clients may read the bounded
     `$catalog_registry.installed_catalogs` value through `GET /net-api/catalogs`.
     The response exposes ledger records only, not the property cell definition

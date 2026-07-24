@@ -39,7 +39,7 @@ import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./cells";
 import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
-import type { LiveAudience } from "./live";
+import { compactNetLiveAudience, type LiveAudience } from "./live";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
@@ -409,17 +409,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     snapshotCells: planStore.size,
     ...(call.route === "direct" && run.frame.op === "result"
       ? {
-          liveAudience: {
-            ...(run.frame.audienceActors !== undefined ? { audienceActors: run.frame.audienceActors } : {}),
-            ...(run.frame.observationAudiences !== undefined ? { observationAudiences: run.frame.observationAudiences } : {}),
-            ...(run.frame.audienceSessions !== undefined ? { audienceSessions: run.frame.audienceSessions } : {}),
-            ...(run.frame.observationSessionAudiences !== undefined
-              ? { observationSessionAudiences: run.frame.observationSessionAudiences }
-              : {}),
-            ...(run.frame.observationAudienceModes !== undefined
-              ? { observationAudienceModes: run.frame.observationAudienceModes }
-              : {})
-          }
+          liveAudience: compactNetLiveAudience(run.frame)
         }
       : {})
   };

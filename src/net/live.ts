@@ -10,6 +10,35 @@ import type { DirectLiveAudience } from "../core/types";
  */
 export type LiveAudience = DirectLiveAudience;
 
+/**
+ * Reduce an executor's exact local audience to the routing proof Net needs.
+ *
+ * Session ids are bearer credentials and can accumulate in a derived planner
+ * view until their owner deletion reaches that shard. They must not ride the
+ * scope submit or be repeated once per observation. Presence-mode delivery is
+ * deliberately re-resolved from each destination gateway's local indexed
+ * relation slice; explicit delivery needs only the non-secret actor refs.
+ *
+ * The no-mode branch is rolling compatibility for an older executor frame. A
+ * current frame always carries the parallel mode vector.
+ */
+export function compactNetLiveAudience(audience: DirectLiveAudience): LiveAudience {
+  const modes = audience.observationAudienceModes;
+  if (modes === undefined) {
+    return {
+      ...(audience.audienceActors !== undefined ? { audienceActors: audience.audienceActors } : {}),
+      ...(audience.observationAudiences !== undefined ? { observationAudiences: audience.observationAudiences } : {})
+    };
+  }
+  const perObservation = audience.observationAudiences ?? [];
+  return {
+    observationAudienceModes: modes,
+    observationAudiences: modes.map((mode, index) =>
+      mode === "explicit" ? (perObservation[index] ?? []) : []
+    )
+  };
+}
+
 export type LiveFanoutBody = LiveAudience & {
   scope: string;
   observations: unknown[];

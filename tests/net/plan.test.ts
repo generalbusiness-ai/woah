@@ -261,6 +261,74 @@ describe("compact room-roster planning", () => {
     expect(lookPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
   });
 
+  it("keeps reusable-actor session history out of the Net live carrier", async () => {
+    const world = createWorld();
+    const primary = world.auth("guest:compact-live-audience");
+    const room = world.object(primary.actor).location ?? "$nowhere";
+    const now = Date.now();
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      player: index === 0 ? primary.actor : `remote_${index}`,
+      name: `Remote ${index}`,
+      connected: true,
+      connected_at: now - 5_000,
+      connected_seconds: 5,
+      idle_seconds: 0,
+      last_login_at: now - 5_000,
+      location: room,
+      location_name: room,
+      presence: "awake"
+    }));
+    // Reusable pool actors acquire multiple short-lived sessions over time.
+    // Model a gateway whose derived view has not yet received every owner
+    // deletion: the executor may enumerate those exact local sessions, but
+    // the Net carrier must route by actor rather than repeating bearer ids
+    // for every tell_lines/who observation.
+    for (let index = 0; index < 40; index += 1) {
+      world.ensureSessionForActor(
+        `s_net-api-7_${index.toString(16).padStart(32, "0")}`,
+        primary.actor,
+        "guest",
+        now + 600_000,
+        room
+      );
+    }
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-live-audience",
+        route: "direct",
+        scope: SCOPE,
+        session: primary.id,
+        actor: primary.actor,
+        target: primary.actor,
+        verb: "who_all",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-live-audience",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+
+    expect(plan.liveAudience?.audienceSessions).toBeUndefined();
+    expect(plan.liveAudience?.observationSessionAudiences).toBeUndefined();
+    expect(plan.liveAudience?.observationAudienceModes).toContain("explicit");
+    expect(plan.liveAudience?.observationAudiences?.flat()).toEqual(
+      expect.arrayContaining([primary.actor])
+    );
+    expect(submitEnvelopeBytes({
+      submit: plan.submit,
+      rider_destinations: {},
+      relate_destinations: {},
+      live_audience: plan.liveAudience
+    })).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+  });
+
   it.each([
     ["pinboard", "the_pinboard"],
     ["outliner", "the_outline"],
