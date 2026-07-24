@@ -110,12 +110,32 @@ The workerd Outliner scale lane also passed its 1,000-row/eight-viewer
 budgets: warm view p95 126 ms, 145,510–145,523-byte views, mutation-to-peer
 push p95 55 ms, and invalidation-to-current p95 1,008 ms.
 
-## Remaining gate
+## Formal AE result
 
-The formal NC8 latency decision is **unevaluated**, not passed or failed.
-`npm run metrics:net-ae` requires `CF_ACCOUNT_ID` and a
-`CF_ANALYTICS_TOKEN`; the available Wrangler OAuth identity cannot read the
-dataset. Once those credentials are available, run the AE-weighted query over
-the clean stabilization windows and apply the normative p95/p99, timeout,
-refusal, repair-loop, and fanout-gap criteria. Until then, the canary is
-functionally stabilized but not release-accepted.
+On 2026-07-24, the dataset query was run over the isolated post-bake window
+`2026-07-24T15:39:25Z` through `15:41:30Z`:
+
+```sh
+npm run metrics:net-ae -- \
+  --dataset woo_v1_net_canary \
+  --from 2026-07-24T15:39:25Z --to 2026-07-24T15:41:30Z \
+  --min-turns 500
+```
+
+The formal NC8 latency and integrity gate passed:
+
+- 704 AE-weighted turn samples across seven gateway shards;
+- server wall p50/p95/p99 137/465/1,655 ms, below the 750 ms p95 and
+  5,000 ms p99 ceilings;
+- queue p99 0 ms;
+- zero turn errors, RPC timeouts, queue refusals, reconstructions, fanout
+  gaps, degraded installs/adoptions, outbox delivery failures, or
+  abandonments; and
+- mean attempt exactly 1 on every participating shard.
+
+The weighted sample count is expected to differ from the driver's 600 requests:
+the acceptance query applies Analytics Engine's `_sample_interval` weight.
+This result closes the previously unevaluated deployed latency half for the
+paced 30-actor canary. It does not replace the separate larger-occupancy,
+geographic, sustained-rate, memory-growth, or induced-delay work still listed
+under NC8.
