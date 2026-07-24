@@ -3,6 +3,7 @@ import {
   fetchCanaryGuestClaim,
   guestsNeedingEnter,
   jsonFetch,
+  mapWithConcurrency,
   summarizeWhoCheck,
   whoCheckFailsAcceptance,
   type CanaryGuest,
@@ -123,5 +124,34 @@ describe("deployed canary request deadline", () => {
     expect(result.body).toMatchObject({ actor: "guest_net_retry", session: "s_retry" });
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
+  });
+});
+
+describe("deployed canary concurrency bounds", () => {
+  it("preserves result order without exceeding the requested in-flight limit", async () => {
+    let active = 0;
+    let peak = 0;
+    const results = await mapWithConcurrency([3, 1, 2, 0], 2, async (delay, index) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      active -= 1;
+      return `result-${index}`;
+    });
+
+    expect(peak).toBe(2);
+    expect(results).toEqual(["result-0", "result-1", "result-2", "result-3"]);
+  });
+
+  it("stops scheduling new work after the first failure and settles started work", async () => {
+    const started: number[] = [];
+    await expect(mapWithConcurrency([0, 1, 2, 3], 2, async (item) => {
+      started.push(item);
+      if (item === 1) throw new Error("stop");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return item;
+    })).rejects.toThrow("stop");
+
+    expect(started).toEqual([0, 1]);
   });
 });

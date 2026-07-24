@@ -176,6 +176,40 @@ type JsonFetchResult = Awaited<ReturnType<typeof jsonFetch>>;
 type JsonFetcher = (url: string, init: RequestInit) => Promise<JsonFetchResult>;
 
 /**
+ * Bounded, order-preserving async map.
+ *
+ * Large canaries must neither serialize 512 session mints past their TTL nor
+ * dump 1,024 turns into a gateway's deliberate queue-depth refusal. On the
+ * first error, already-started work settles but no new item starts; callers'
+ * finally blocks can therefore clean every resource they recorded.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const concurrency = Math.max(1, Math.min(items.length || 1, Math.floor(limit)));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  let firstError: unknown;
+  const run = async (): Promise<void> => {
+    while (firstError === undefined) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      try {
+        results[index] = await worker(items[index]!, index);
+      } catch (error) {
+        firstError = error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => run()));
+  if (firstError !== undefined) throw firstError;
+  return results;
+}
+
+/**
  * Claim one deterministic guest across ambiguous transport failures.
  *
  * The claim_id is an idempotency bearer: every attempt must replay the exact
@@ -277,6 +311,8 @@ async function main(): Promise<void> {
   const rounds = Math.max(1, Number(value("--rounds", "50")));
   const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
   const roundDelayMs = Math.max(0, Number(value("--round-delay-ms", "0")));
+  const claimConcurrency = Math.max(1, Number(value("--claim-concurrency", "16")));
+  const turnConcurrency = Math.max(1, Number(value("--turn-concurrency", "64")));
   canaryFetchTimeoutMs = Math.max(1_000, Number(value("--fetch-timeout-ms", String(DEFAULT_CANARY_FETCH_TIMEOUT_MS))));
   const room = value("--room", "the_chatroom");
   const enforceWho = args.includes("--enforce-who");
@@ -292,7 +328,7 @@ async function main(): Promise<void> {
   let whoCheck: WhoCheckSummary | null = null;
 
   try {
-    for (let i = 0; i < actors; i += 1) {
+    await mapWithConcurrency(Array.from({ length: actors }, (_, index) => index), claimConcurrency, async (i) => {
       // Keep one claim bearer across transport retries. The edge routes it to
       // one shard and the gateway derives the same actor/session submit, so a
       // timeout after commit cannot leak a second anonymous identity.
@@ -305,16 +341,20 @@ async function main(): Promise<void> {
       if (!response.ok || typeof body.actor !== "string" || typeof body.session !== "string") {
         throw new Error(`guest ${i} failed: ${response.status} ${JSON.stringify(body)}`);
       }
-      guests.push({
+      const guest = {
         actor: body.actor,
         session: body.session,
         elastic: body.elastic === true,
         activeScope: typeof body.active_scope === "string" ? body.active_scope : null
-      });
+      } satisfies CanaryGuest;
+      // Record each accepted resource before the worker resolves so a later
+      // sibling failure cannot hide it from the outer finally cleanup.
+      guests.push(guest);
       if (guests.length % 64 === 0 || guests.length === actors) {
         console.error(`canary progress: claimed ${guests.length}/${actors} guests`);
       }
-    }
+      return guest;
+    });
 
     // Establish co-presence: every guest enters the shared room so its session
     // activeScope is that room. The who_all check below is presence-scoped
@@ -323,7 +363,8 @@ async function main(): Promise<void> {
     // guest sitting in its own cluster would correctly see only itself and the
     // completeness assertion would be meaningless. Failures here are recorded
     // like any other turn outcome.
-    const enterBatch = await Promise.all(guestsNeedingEnter(guests, room).map(async (guest, index): Promise<Outcome> => {
+    const enterGuests = guestsNeedingEnter(guests, room);
+    const enterBatch = await mapWithConcurrency(enterGuests, turnConcurrency, async (guest, index): Promise<Outcome> => {
       const started = performance.now();
       try {
         const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
@@ -340,9 +381,9 @@ async function main(): Promise<void> {
       } catch (err) {
         return { phase: "enter", status: 0, ms: Math.round(performance.now() - started), code: "E_FETCH", accepted: false, detail: String(err).slice(0, 1_000) };
       }
-    }));
+    });
     outcomes.push(...enterBatch);
-    console.error(`canary progress: entered ${enterBatch.length}/${guestsNeedingEnter(guests, room).length} guests`);
+    console.error(`canary progress: entered ${enterBatch.length}/${enterGuests.length} guests`);
 
     for (let round = 0; round < rounds; round += 1) {
       const requests = guests.flatMap((guest, actorIndex) =>
@@ -353,7 +394,7 @@ async function main(): Promise<void> {
             : { guest, verb: "look", args: [] };
         })
       );
-      const batch = await Promise.all(requests.map(async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
+      const batch = await mapWithConcurrency(requests, turnConcurrency, async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
         const started = performance.now();
         try {
           const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
@@ -397,7 +438,7 @@ async function main(): Promise<void> {
             detail: `${String(err)}${cause}`.slice(0, 1_000)
           };
         }
-      }));
+      });
       outcomes.push(...batch);
       console.error(`canary progress: load round ${round + 1}/${rounds} completed (${batch.length} turns)`);
       if (roundDelayMs > 0 && round + 1 < rounds) {
@@ -412,7 +453,7 @@ async function main(): Promise<void> {
     // the run on any partial or inconclusive result.
     if (!skipWho) whoCheck = await runWhoCheck(base, guests, run);
   } finally {
-    await Promise.all(guests.map(async (guest) => {
+    await mapWithConcurrency(guests, turnConcurrency, async (guest) => {
       let last = { status: 0, detail: "close request did not run" };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
@@ -429,7 +470,7 @@ async function main(): Promise<void> {
         if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
       closeFailures.push({ actor: guest.actor, ...last });
-    }));
+    });
   }
 
   const failures = outcomes.filter((outcome) => !outcome.accepted);
@@ -455,6 +496,8 @@ async function main(): Promise<void> {
     close_failures: closeFailures,
     turns: outcomes.length,
     requests_per_actor: requestsPerActor,
+    claim_concurrency: claimConcurrency,
+    turn_concurrency: turnConcurrency,
     round_delay_ms: roundDelayMs,
     phase_outcomes: phaseOutcomes,
     accepted: outcomes.length - failures.length,
