@@ -292,6 +292,41 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-18-tasks-taskboard-rename");
   });
 
+  it("re-composes $wiz's programmer surface after an old under-$programmer reparent", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "prog"]);
+
+    // Fresh install already has the composed shape.
+    expect(world.object("$wiz").parent).toBe("$player");
+    expect(world.actorHasSurface("$wiz", "$programmer")).toBe(true);
+    expect(world.propOrNull("$system", "programmer_surface")).toBe("$programmer");
+
+    // Simulate a historical world: $wiz reparented under the surface class, the
+    // feature never attached, the surface reference unpublished, and the repair
+    // marker not yet recorded.
+    world.chparentAuthoredObject("$wiz", "$wiz", "$programmer");
+    world.setProp("$wiz", "features", []);
+    world.setProp("$system", "programmer_surface", null);
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-07-24-wiz-programmer-surface");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    installLocalCatalogs(world, ["chat", "prog"]);
+
+    // Repaired: kind returns to substrate, surface re-composed as a feature, and
+    // the surface reference republished.
+    expect(world.object("$wiz").parent).toBe("$player");
+    expect(world.isDescendantOf("$wiz", "$programmer")).toBe(false);
+    expect(world.actorHasSurface("$wiz", "$programmer")).toBe(true);
+    expect(world.propOrNull("$system", "programmer_surface")).toBe("$programmer");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-07-24-wiz-programmer-surface");
+
+    // Idempotent: rerunning does not duplicate the feature.
+    installLocalCatalogs(world, ["chat", "prog"]);
+    const feats = world.getProp("$wiz", "features") as string[];
+    expect(feats.filter((f) => f === "$programmer").length).toBe(1);
+  });
+
   it("repairs older demoworld installs where the garden missed $conversational", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
