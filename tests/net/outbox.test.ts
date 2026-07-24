@@ -125,6 +125,73 @@ describe("outbox drain (D1 semantics)", () => {
   });
 });
 
+describe("batched lane delivery (deliverLane — one request per lane prefix)", () => {
+  const noRow = async () => {
+    throw new Error("per-row deliver must not run in lane mode");
+  };
+
+  it("delivers the whole due prefix in one ordered call; success marks every row", async () => {
+    const outbox = new Outbox();
+    outbox.enqueue("shard-1", body(2));
+    outbox.enqueue("shard-1", body(1));
+    outbox.enqueue("shard-2", body(1));
+    const calls: Array<{ destination: string; seqs: number[] }> = [];
+    const result = await outbox.drain(1000, noRow, undefined, async (destination, rows) => {
+      calls.push({ destination, seqs: rows.map((r) => r.body.seq) });
+    });
+    // One call per lane, rows in seq order inside each.
+    expect(calls).toEqual([
+      { destination: "shard-1", seqs: [1, 2] },
+      { destination: "shard-2", seqs: [1] }
+    ]);
+    expect(result.delivered).toHaveLength(3);
+    expect(outbox.pending()).toHaveLength(0);
+  });
+
+  it("a batch failure is prefix-atomic: every row keeps one attempt and retries whole after backoff", async () => {
+    const outbox = new Outbox({ backoffMs: () => 500 });
+    outbox.enqueue("shard-1", body(1));
+    outbox.enqueue("shard-1", body(2));
+    let fail = true;
+    const lane = async () => {
+      if (fail) throw new Error("destination down");
+    };
+    const first = await outbox.drain(1000, noRow, undefined, lane);
+    expect(first.failed.sort()).toEqual(["shard-1/the_room/1", "shard-1/the_room/2"]);
+    expect(first.delivered).toEqual([]);
+    // Inside backoff: the lane head gates the WHOLE prefix.
+    const early = await outbox.drain(1200, noRow, undefined, lane);
+    expect(early.delivered).toEqual([]);
+    expect(early.skipped_backoff).toEqual(["shard-1/the_room/1"]);
+    // Past backoff: the prefix redelivers whole, in order (receiver seq
+    // gate makes any duplicate a no-op — CO2.5).
+    fail = false;
+    const late = await outbox.drain(1600, noRow, undefined, lane);
+    expect(late.delivered).toEqual(["shard-1/the_room/1", "shard-1/the_room/2"]);
+  });
+
+  it("a mid-backoff head halts the prefix and a yield defers the lane untouched", async () => {
+    const outbox = new Outbox({ backoffMs: () => 500 });
+    outbox.enqueue("shard-1", body(1));
+    let fail = true;
+    await outbox.drain(1000, noRow, undefined, async () => {
+      if (fail) throw new Error("down");
+    });
+    fail = false;
+    // Row 2 enqueued behind the mid-backoff head: nothing may deliver.
+    outbox.enqueue("shard-1", body(2));
+    const gated = await outbox.drain(1200, noRow, undefined, async () => {});
+    expect(gated.delivered).toEqual([]);
+    expect(gated.skipped_backoff).toEqual(["shard-1/the_room/1"]);
+    // Yield before the batch: rows untouched (no attempt counted).
+    const beforeAttempts = outbox.pending().map((r) => r.attempts);
+    const yielded = await outbox.drain(1600, noRow, () => true, async () => {});
+    expect(yielded.yielded).toBe(true);
+    expect(yielded.delivered).toEqual([]);
+    expect(outbox.pending().map((r) => r.attempts)).toEqual(beforeAttempts);
+  });
+});
+
 describe("backoff jitter (NC8, review item 8)", () => {
   it("is deterministic per row, bounded to ±25%, and spreads across rows", () => {
     // Deterministic: the same row backs off identically across reruns

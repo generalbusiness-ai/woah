@@ -6,7 +6,7 @@
 // to its subscriber gateway, whose GET /net/relation serves the roster.
 // Local deltas ride the commit's own FanoutBody.relations. Fake-DO lane
 // with real per-instance SQLite, mirroring net-scope-fanout.test.ts.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -185,6 +185,82 @@ function scopeRelationRows(state: NetScopeDurableState): Array<{ key: string }> 
 }
 
 type RelationRead = { relation: string; owner: string; members: Array<{ member: string; body?: unknown }> };
+
+describe("lane-batched /net/fanout receive (2026-07-22 gateway occupancy)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("applies batch rows serially with the seq gate and stamps net_gateway_fanout_applied", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gatewayState = netState("gateway-batch-receive");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const row = (seq: number) => ({
+      scope: ROOM_SCOPE,
+      seq,
+      delivery_seq: seq,
+      cells: [],
+      observations: []
+    });
+    // Batch of two: both advance the per-scope seq gate, in order.
+    const first = await call<{ applied: boolean[] }>(gateway, gatewayEnv, "/fanout", {
+      kind: "woo.net.fanout_batch.v1",
+      rows: [row(1), row(2)]
+    });
+    expect(first.applied).toEqual([true, true]);
+    // Redelivered batch: the seq gate no-ops every row (CO2.5) — the
+    // retry-whole-prefix contract the sender relies on.
+    const replay = await call<{ applied: boolean[] }>(gateway, gatewayEnv, "/fanout", {
+      kind: "woo.net.fanout_batch.v1",
+      rows: [row(1), row(2)]
+    });
+    expect(replay.applied).toEqual([false, false]);
+    // A bare single body keeps the pre-batch wire shape and reply.
+    const single = await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", row(3));
+    expect(single.applied).toBe(true);
+    // Receive-side occupancy stamp: one event per request with the row
+    // count on it (batch, replay, single).
+    const stamps = metricLines
+      .filter((line) => line.includes("net_gateway_fanout_applied"))
+      .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { rows: number; applied: number; ms: number });
+    expect(stamps.map((s) => ({ rows: s.rows, applied: s.applied }))).toEqual([
+      { rows: 2, applied: 2 },
+      { rows: 2, applied: 0 },
+      { rows: 1, applied: 1 }
+    ]);
+    for (const s of stamps) expect(typeof s.ms).toBe("number");
+    gatewayState.close();
+  });
+
+  it("a partially applied batch still stamps ONE receive event with status/error and the applied count", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gatewayState = netState("gateway-batch-partial");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const good = { scope: ROOM_SCOPE, seq: 1, delivery_seq: 1, cells: [], observations: [] };
+    // Row 2's null cell throws inside receiveFanout AFTER row 1 durably
+    // advanced — the survivorship-bias case the review reproduced.
+    const poison = { scope: ROOM_SCOPE, seq: 2, delivery_seq: 2, cells: [null], observations: [] };
+    await expect(
+      call(gateway, gatewayEnv, "/fanout", { kind: "woo.net.fanout_batch.v1", rows: [good, poison] })
+    ).rejects.toThrow();
+    const stamps = metricLines
+      .filter((line) => line.includes("net_gateway_fanout_applied"))
+      .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]).toMatchObject({ rows: 2, applied: 1, status: "error" });
+    expect(typeof stamps[0]!.ms).toBe("number");
+    expect(String(stamps[0]!.error).length).toBeGreaterThan(0);
+    gatewayState.close();
+  });
+});
 
 describe("CO13 relations over the DO shells", () => {
   it("an empty full closure removes stale presence before suppressing its delayed removal", async () => {

@@ -37,9 +37,12 @@ describe("net Analytics Engine canary report", () => {
     expect(parseNetAeLimits((name) => name === "--max-error-rate" ? "0" : undefined)).toEqual({ maxErrorRate: 0 });
   });
 
-  it("accepts a distributed, error-free envelope with elastic admission", () => {
+  it("accepts a distributed, error-free envelope with elastic admission — including an episodic platform tail under the timeout ceiling (2026-07-22 re-scope)", () => {
     const report: NetAeReport = {
-      summary: [{ samples: 600, errors: 0, rpc_timeouts: 0, wall_p99: 280, queue_p99: 160 }],
+      // wall_p99 2800 is an episode-struck tail: accepted, because the
+      // 500ms bound applies at p95 and p99 is gated by the RPC-timeout
+      // ceiling with zero actual timeouts.
+      summary: [{ samples: 600, errors: 0, rpc_timeouts: 0, wall_p95: 320, wall_p99: 2800, queue_p99: 160 }],
       turns: [
         { host_key: "net-gateway:net-api-0", samples: 300, wall_p99: 700 },
         { host_key: "net-gateway:net-api-1", samples: 300, wall_p99: 310 }
@@ -52,7 +55,7 @@ describe("net Analytics Engine canary report", () => {
 
   it("fails closed on insufficient, concentrated, or divergent evidence", () => {
     const report: NetAeReport = {
-      summary: [{ samples: 20, errors: 4, rpc_timeouts: 2, wall_p99: 1800, queue_p99: 1400 }],
+      summary: [{ samples: 20, errors: 4, rpc_timeouts: 2, wall_p95: 900, wall_p99: 6800, queue_p99: 1400 }],
       turns: [{ host_key: "net-gateway:net-api-0", samples: 20 }],
       authorities: [],
       incidents: [
@@ -66,6 +69,7 @@ describe("net Analytics Engine canary report", () => {
     expect(failures.join("\n")).toContain("only 20 turns");
     expect(failures.join("\n")).toContain("turn error rate");
     expect(failures.join("\n")).toContain("RPC timeout");
+    expect(failures.join("\n")).toContain("wall p95");
     expect(failures.join("\n")).toContain("wall p99");
     expect(failures.join("\n")).toContain("queue p99");
     expect(failures.join("\n")).toContain("only 1 gateway shard");

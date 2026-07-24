@@ -2826,7 +2826,60 @@ export class NetScopeDO {
           // a lane of slow deliveries pins the drain for rows × RPC-timeout
           // after a commit has arrived. Halted rows are untouched (pending,
           // no attempt) and the retry alarm resumes them.
-          () => this.submitsInFlight > 0
+          () => this.submitsInFlight > 0,
+          // Lane-batched /fanout (2026-07-22 bake finding: the tail lives in
+          // gateway /fanout receive processing, one request per row): the
+          // lane's deliverable prefix rides ONE request. The batch body is
+          // spliced from the stored row TEXTs — still zero parse/stringify.
+          // A single row keeps the bare-body wire shape.
+          route === "/fanout"
+            ? async (destination, batch) => {
+                try {
+                  if (batch.length === 1) {
+                    await this.host.rpc(destination, "/fanout", undefined, rawBodies.get(batch[0]!.id));
+                    return;
+                  }
+                  const rows = batch.map((row) => rawBodies.get(row.id)).join(",");
+                  await this.host.rpc(destination, "/fanout", undefined, `{"kind":"woo.net.fanout_batch.v1","rows":[${rows}]}`);
+                } catch (batchErr) {
+                  // Review P1 — rollout compatibility is a CORRECTNESS
+                  // requirement, not a retry concern: Cloudflare routes new
+                  // callers to OLD DO code for seconds-to-minutes during an
+                  // update, and the abandon budget (8 attempts × 250ms
+                  // exponential ≈ 32s) fits inside that window — pure
+                  // retry could permanently abandon rows mid-rollout. On
+                  // ANY multi-row batch failure, fall back to the bare-row
+                  // wire the previous receiver understands, serially and
+                  // in order. Idempotent either way: a pre-parse rejection
+                  // applied nothing, and a mid-batch crash's applied rows
+                  // no-op at the receiver's seq gate. A genuinely down
+                  // destination fails the FIRST bare row (≤1 extra RPC
+                  // before the normal lane-failure path).
+                  if (batch.length === 1) {
+                    deliveryErrors.set(batch[0]!.id, String(batchErr));
+                    throw batchErr;
+                  }
+                  this.metric({
+                    kind: "net_scope_fanout_batch_fallback",
+                    route,
+                    destination,
+                    rows: batch.length,
+                    error: String(batchErr)
+                  });
+                  for (const row of batch) {
+                    try {
+                      await this.host.rpc(destination, "/fanout", undefined, rawBodies.get(row.id));
+                    } catch (rowErr) {
+                      // Prefix-atomic accounting: the whole batch counts as
+                      // failed. Rows already delivered bare redeliver on
+                      // retry and no-op at the seq gate (CO2.5).
+                      for (const failed of batch) deliveryErrors.set(failed.id, String(rowErr));
+                      throw rowErr;
+                    }
+                  }
+                }
+              }
+            : undefined
         );
         const rpcMs = Date.now() - rpcStarted;
         if (drained.yielded) {

@@ -127,6 +127,8 @@ function primaryCount(event: AnalyticsMetric): number {
       return typeof e.presence_scan_rows === "number" ? e.presence_scan_rows : 0;
     case "net_scope_outbox_drain_pass":
       return typeof e.delivered === "number" ? e.delivered : 0;
+    case "net_gateway_fanout_applied":
+      return typeof e.rows === "number" ? e.rows : 0;
     case "net_scope_outbox_abandoned":
     case "net_fanout_gap":
     case "net_rpc":

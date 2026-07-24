@@ -147,10 +147,14 @@ second, through write amplification rather than volume; expressiveness
 holds best, with three named walls.**
 
 **Perf.** Every act adds validation + fold fan-out to a sequenced turn
-on a single-threaded lane (space.md §S9). The NC8 bake failure
-(2026-07-20: hot-room stalls, wall p99 2920ms vs 500ms target, without
-fold machinery) shows hot-room turn cost is already the binding
-constraint. Rules, not hopes: **acts are for coordination-rate facts**
+on a single-threaded lane (space.md §S9). NC8's original 2026-07-20
+bake (hot-room wall p99 2920ms against the then-500ms target, without
+fold machinery) established that hot-room turn cost is the binding
+constraint. Main now batches the durable `/fanout` lane and evaluates
+it under the re-scoped p95 ≤750ms / p99 ≤5s envelope. The first Acts
+canary predates that batching, so its 513/1944/2634ms p50/p95/p99 is
+not an Acts-overhead result; the merged fanout mechanisms must be
+remeasured before attribution. Rules, not hopes: **acts are for coordination-rate facts**
 (~1/s sustained per room; machine-rate signals aggregate at ingress —
 the router's occurrence-ledger, gravity G1, is the pressure valve);
 rollup fan-in makes coordination centers the bottleneck (batching,
