@@ -19,8 +19,12 @@
  * every DO into one world image). Only a deployed canary with guests spread
  * across >=2 real shards exercises it. Pass `--enforce-who` to require
  * conclusive, complete-roster evidence (fails on partial OR inconclusive).
+ * The catalog intentionally caps one roster at 100 actors; larger capacity
+ * runs therefore pass `--skip-who` and use a separate <=100-actor
+ * completeness run.
  */
 
+import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../src/net/client-session-policy";
 import { sessionShardHint } from "../src/net/session-id";
 
 export type CanaryGuest = { actor: string; session: string; elastic: boolean; activeScope: string | null };
@@ -168,6 +172,44 @@ export async function jsonFetch(
   return { response, body, ms };
 }
 
+type JsonFetchResult = Awaited<ReturnType<typeof jsonFetch>>;
+type JsonFetcher = (url: string, init: RequestInit) => Promise<JsonFetchResult>;
+
+/**
+ * Claim one deterministic guest across ambiguous transport failures.
+ *
+ * The claim_id is an idempotency bearer: every attempt must replay the exact
+ * body. Retrying only HTTP 503s is insufficient because a lost reply rejects
+ * `fetch` before any status exists—the precise dropped-reply case this lane is
+ * meant to prove.
+ */
+export async function fetchCanaryGuestClaim(
+  base: string,
+  claimBody: Record<string, unknown>,
+  guestIndex: number,
+  fetcher: JsonFetcher = jsonFetch,
+  retryDelayMs = 250
+): Promise<JsonFetchResult> {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const result = await fetcher(`${base}/net-api/guest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(claimBody)
+      });
+      if (result.response.status !== 503 || attempt === 3) return result;
+    } catch (error) {
+      if (attempt === 3) {
+        throw new Error(`guest ${guestIndex} claim transport failed after ${attempt} attempts: ${String(error)}`, {
+          cause: error
+        });
+      }
+    }
+    if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, attempt * retryDelayMs));
+  }
+  throw new Error(`guest ${guestIndex} claim retry loop exhausted`);
+}
+
 /** Drive one `who_all` turn per guest and summarize roster completeness.
  * `who_all` is a direct self-verb on $player (target = the caller's own
  * actor). The gate remains necessary after retiring connected_players:
@@ -238,6 +280,11 @@ async function main(): Promise<void> {
   canaryFetchTimeoutMs = Math.max(1_000, Number(value("--fetch-timeout-ms", String(DEFAULT_CANARY_FETCH_TIMEOUT_MS))));
   const room = value("--room", "the_chatroom");
   const enforceWho = args.includes("--enforce-who");
+  const skipWho = args.includes("--skip-who");
+  if (enforceWho && skipWho) throw new Error("--enforce-who and --skip-who are mutually exclusive");
+  if (actors > 100 && !skipWho) {
+    throw new Error("--actors >100 exceeds the catalog's bounded who_all listing; pass --skip-who and run a separate <=100 actor --enforce-who lane");
+  }
   const run = `canary-${Date.now().toString(36)}`;
   const guests: CanaryGuest[] = [];
   const outcomes: Outcome[] = [];
@@ -250,20 +297,10 @@ async function main(): Promise<void> {
       // one shard and the gateway derives the same actor/session submit, so a
       // timeout after commit cannot leak a second anonymous identity.
       const claimBody = {
-        ttl_ms: 10 * 60_000,
-        claim_id: `g1.${Date.now().toString(36)}.${(10 * 60_000).toString(36)}.${crypto.randomUUID()}`
+        ttl_ms: CLIENT_SESSION_TTL_DEFAULT_MS,
+        claim_id: `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.${crypto.randomUUID()}`
       };
-      let result: Awaited<ReturnType<typeof jsonFetch>> | null = null;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        result = await jsonFetch(`${base}/net-api/guest`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(claimBody)
-        });
-        if (result.response.status !== 503 || attempt === 3) break;
-        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
-      }
-      if (!result) throw new Error(`guest ${i} did not run`);
+      const result = await fetchCanaryGuestClaim(base, claimBody, i);
       const { response, body } = result;
       if (!response.ok || typeof body.actor !== "string" || typeof body.session !== "string") {
         throw new Error(`guest ${i} failed: ${response.status} ${JSON.stringify(body)}`);
@@ -373,7 +410,7 @@ async function main(): Promise<void> {
     // check now verifies that completeness (a regression gate) rather than
     // documenting the old connected_players partial view; --enforce-who fails
     // the run on any partial or inconclusive result.
-    whoCheck = await runWhoCheck(base, guests, run);
+    if (!skipWho) whoCheck = await runWhoCheck(base, guests, run);
   } finally {
     await Promise.all(guests.map(async (guest) => {
       let last = { status: 0, detail: "close request did not run" };

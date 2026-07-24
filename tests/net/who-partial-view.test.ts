@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  fetchCanaryGuestClaim,
   guestsNeedingEnter,
   jsonFetch,
   summarizeWhoCheck,
@@ -106,5 +107,21 @@ describe("deployed canary request deadline", () => {
 
     await expect(jsonFetch("https://canary.invalid/net-api/turn", { method: "POST" }, 10))
       .rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("replays the same guest claim after a lost reply", async () => {
+    const claim = { ttl_ms: 60_000, claim_id: "stable-claim" };
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new DOMException("reply lost", "TimeoutError"))
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 200 }),
+        body: { actor: "guest_net_retry", session: "s_retry" },
+        ms: 1
+      });
+
+    const result = await fetchCanaryGuestClaim("https://canary.invalid", claim, 17, fetcher, 0);
+    expect(result.body).toMatchObject({ actor: "guest_net_retry", session: "s_retry" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
   });
 });
