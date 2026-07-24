@@ -105,7 +105,7 @@ DOs hibernate after periods of inactivity. WebSocket connections survive hiberna
 
 ### R1.5 Alarm-based scheduling
 
-Suspended tasks (`SUSPEND`, `FORK`, `READ`-with-timeout) are durable on the parking DO via SQLite + a DO alarm set at the earliest resume time. On alarm fire, the DO wakes and resumes all due tasks. See [../semantics/tasks.md §16](../semantics/tasks.md#16-task-lifecycle-and-suspension).
+Pending scheduled turns are durable on the scope DO via SQLite, with a DO alarm armed at the earliest due time. On alarm fire the DO moves a bounded batch of due entries to the planner outbox. See §R7 and [../protocol/coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
 
 ### R1.6 Connection routing
 
@@ -262,13 +262,9 @@ interface ObjectRepository {
   deleteSession(session_id: string): void;
   loadExpiredSessions(now: number): SerializedSession[];
 
-  // Parked tasks (see tasks.md §16) ------------------------------------------
-  saveTask(task: ParkedTaskRecord): void;
-  deleteTask(id: string): void;
-  loadTask(id: string): ParkedTaskRecord | null;
-  loadDueTasks(now: number): ParkedTaskRecord[];
-  loadAwaitingReadTasks(player: ObjRef): ParkedTaskRecord[];   // FIFO order
-  earliestResumeAt(): number | null;
+  // Pending scheduled turns are NOT part of this interface: they are
+  // per-scope durable state owned by the scope sequencer's store, not
+  // host-scoped object storage. See coherence.md §CO16 and §R7.
 
   // Host-scoped counters (atomic read-and-increment) -------------------------
   nextCounter(name: string): number;
@@ -420,7 +416,7 @@ The caller's task is *not* yielded mid-call — it's the same `await` shape as a
 
 ### R6.2 Cross-DO calls may not park (v1 normative)
 
-A cross-DO call that attempts `SUSPEND`, `READ`, or `FORK`-with-delay inside the target verb body raises `E_CROSSDO_PARKING_UNSUPPORTED` and unwinds the cross-DO RPC. The caller's frame surfaces the error in its own `try`/`except` chain (or as a `$error` observation if the call was sequenced).
+There is no cross-DO parking case: no opcode parks a VM stack, so a cross-DO call either returns or fails. Deferred work inside a cross-DO verb body is a `schedule` recorded in the transcript, which commits with the turn and fires later in the scheduling scope.
 
 The rule is enforced on the target side: when the VM detects a parking opcode running under a hydrated cross-DO frame, it raises before persisting any task state. This keeps cross-DO RPCs bounded — a target can't stash a continuation on disk that the caller is waiting for.
 
@@ -434,29 +430,56 @@ A verb that calls `$audience.in(room):tell(msg)` on N players hits N DOs in para
 
 ---
 
-## R7. Alarm-based parked-task resume
+## R7. Alarm-based scheduled-turn delivery
 
-DOs replace the local 250ms scheduler poll with native alarms.
+The scope DO's native alarm is the waker for deferred work. Mechanism and
+invariants are [protocol/coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns);
+this section is the Cloudflare binding.
 
-### R7.1 Scheduling
+### R7.1 Arming
 
-After every operation that adds/removes a parked task (FORK, SUSPEND, READ, deliverInput, runDueTasks), the DO computes `min(resume_at)` over all `state == 'suspended'` tasks and calls `state.storage.setAlarm(min_resume_at)`. If no suspended tasks remain, the alarm is cleared.
+After any operation that adds or removes a pending scheduled entry — a
+committed turn carrying `schedules`/`cancellations`, the operator
+`/net/schedule` route, or an alarm firing that moves a due batch — the DO
+computes the earliest `at_logical_time` over its pending entries and calls
+`state.storage.setAlarm()` with it. With no pending entries the scheduled
+alarm contribution is dropped.
 
-`READ` tasks (state `'awaiting_read'`) without an explicit timeout do **not** schedule alarms — they wake on `deliverInput`, not on time.
+One DO has one alarm, shared with the outbox retry lane. The armed time is
+the minimum across every durable wake source the DO owns; each source
+re-derives its own next-wake from durable state on fire, so a shared alarm
+never loses one source's work to another's.
 
 ### R7.2 Firing
 
-CF invokes `alarm()` on the DO when the scheduled time arrives. The handler:
+CF invokes `alarm()` when the armed time arrives. For the scheduled family
+the handler moves a **bounded batch** of due entries, in firing order,
+atomically from the scheduled row family to `/plan-scheduled` outbox rows,
+then re-arms — immediately if more entries are already due, otherwise at
+the next future entry. The batch bound is what keeps a due burst from
+ballooning a single alarm transaction; the re-arm is what keeps overdue
+rows from spinning it.
 
-1. Loads all tasks where `resume_at <= now AND state == 'suspended'`.
-2. Resumes each (per [tasks.md §16.2](../semantics/tasks.md#162-suspend-across-host-eviction)).
-3. Computes the new `min(resume_at)` and reschedules.
+Delivery from there is the planner gateway's, per CO16.5.
 
-Alarm fire is best-effort timely (sub-second under normal load; can drift under DO contention). Track skew via instrumentation (§R10).
+### R7.3 Timeliness and idempotency
 
-### R7.3 Idempotency
+Alarm fire is best-effort timely: sub-second under normal load, drifting
+under DO contention, and arbitrarily late after a long hibernation. This is
+why CO16.6 specifies fire-once-no-catch-up and hands the verb both `at` and
+`fired_at` — an author must be able to see that a timer is late, and the
+platform will not promise that it is not.
 
-Alarm scheduling is idempotent — `setAlarm(t)` overrides any previous alarm. Concurrent task adds/removes on the same DO compute the new minimum after the mutation; whoever's last wins, which is correct.
+`setAlarm(t)` overrides any previous alarm, so arming is idempotent.
+Concurrent adds and removes compute the new minimum after their own
+mutation; last writer wins, which is correct because the value is derived
+from durable state rather than accumulated.
+
+**Untested and load-bearing:** that alarms armed across multi-day
+boundaries fire reliably, and that a scope's durable state is fully
+reconstructible after hibernation with no in-memory residue. The 365-day
+scheduling horizon rests on both. Neither is reproducible on the workerd
+lane; this is a deploy-only signal.
 
 ---
 
@@ -819,7 +842,7 @@ Every persistent object exposes a direct-callable `:metrics()` returning a rolli
   calls_window_60s: int,
   errors_total: int,
   errors_window_60s: int,
-  parked_tasks: int,
+  pending_scheduled_turns: int,
   storage_bytes: int,                 // from state.storage.sql.databaseSize
   alarms_fired_total: int,
   last_alarm_skew_ms: int,
@@ -1119,7 +1142,7 @@ Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to indexed commit-scope state, marks any legacy `SerializedWorld`
 cache dirty, and the storage transaction upserts only projection rows named by
 the `ApplyResult`: touched objects, sessions, logs, counters, snapshots,
-parked tasks, tombstones, and tool surfaces. The normal accepted path MUST NOT
+scheduled turns, tombstones, and tool surfaces. The normal accepted path MUST NOT
 materialize a full `SerializedWorld`; that export is reserved for explicit
 legacy/export/checkpoint/execution boundaries. This keeps steady-state commit
 storage cost proportional to the turn delta, not to the scope's world size.

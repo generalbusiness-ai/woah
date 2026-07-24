@@ -39,7 +39,7 @@ GATEWAY  — session edge: auth, planning, derived cache (incl. the MCP
    ▼
 SCOPE    — the authority: one sequencer per commit scope; validates,
            commits, owns the cells anchored to it; durable outbox;
-           scheduled-turn alarms and parked-task resumption (CO2.8)
+           scheduled-turn alarms and durable continuations (CO2.8)
    │ routing hints + leased presence projection
 DIRECTORY — routing hints + leased session/presence projection (never authority)
 KV        — epoch-stamped cold-start seeds (read-only fallback)
@@ -286,16 +286,17 @@ row.
 
 ### CO2.8 Durable continuations
 
-Parked tasks (VM `SUSPEND`/`FORK` with serialized frames) and scheduled
-turns are **scope state**. The scope sequencer stores the pending queue
-durably, sets its alarm to the earliest `at_logical_time`, wakes itself,
-and validates a fired turn exactly as a live-submitted one
-(`ScheduledTurnRequest`, VTN18.2 carried as written: `schedules` /
-`cancellations` are typed transcript arrays, included in the
-`post_state_hash` preimage, never fabricated `TranscriptWrite` ops). A
-parked task survives DO eviction and resumes via the scope alarm; this is a
-conformance gate (CO12), not an aspiration — the v2 worker never
-implemented it, so this layer carries the obligation explicitly.
+Deferred work is **scope state**, never host state. There are no parked VM
+stacks: a turn runs to completion or fails, and work that must happen later
+is a pending *scheduled turn* (CO16). The scope sequencer stores the
+pending queue durably, sets its alarm to the earliest `at_logical_time`,
+wakes itself, and validates a fired turn exactly as a live-submitted one
+(`ScheduledTurnRequest` per CO16.2: `schedules` / `cancellations` are typed
+transcript arrays, included in the `post_state_hash` preimage, never
+fabricated `TranscriptWrite` ops). A pending entry survives DO eviction and
+fires via the scope alarm; this is a conformance gate (CO12), not an
+aspiration — the v2 worker never implemented it, so this layer carries the
+obligation explicitly.
 
 ## CO3. The effect transcript
 
@@ -327,8 +328,8 @@ type EffectTranscript = {
   creates?: TranscriptCreate[];
   moves?: TranscriptMove[];
   recycles?: TranscriptRecycle[];
-  schedules?: ScheduledTurnRequest[];      // VTN18.2, carried as written
-  cancellations?: string[];                // schedule ids to cancel
+  schedules?: ScheduledTurnRequest[];      // CO16.2
+  cancellations?: string[];                // schedule ids to cancel; CO16.2
   observations: WooObservation[];
   result?: WooValue;
   error?: WooError;
@@ -345,6 +346,14 @@ from VTN7, including its rules: every mutation record names the VM frame
 whose effective programmer authority performed it (write authority is
 validated per-frame, **never** the union of verb owners in the transcript);
 `complete: false` transcripts are never accepted as durable turns.
+
+`ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
+validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,
+which drop VTN18.2's stored `caller_perms`. Like `creates` and `recycles`,
+`schedules`/`cancellations` are named typed arrays with their own
+validation path — never `TranscriptWrite` entries under a fabricated `op` —
+and both are in the `post_state_hash` preimage, because the pending queue
+is durable scope state.
 
 ## CO4. Commit validation
 
@@ -450,7 +459,7 @@ gate (CO12) enforces it. Every copy is epoch-stamped (CO8).
 
 | # | Copy | Provenance | Freshness bound | Reseed path |
 |---|---|---|---|---|
-| 1 | Scope authority (ScopeDO SQLite; includes the committed sequenced log, parked-task/scheduled queue, and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
+| 1 | Scope authority (ScopeDO SQLite; includes the committed sequenced log, the pending scheduled-turn queue, and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
 | 2 | Gateway cache (GatewayDO SQLite; includes the MCP tool-surface projection, [projection-cache.md PC1](../semantics/projection-cache.md); in-memory views are reads of this copy, not additional copies) | `derived` | stamped `(scope_head, catalog_epoch)` | `E_STALE_EPOCH` → refetch closure from scope |
 | 3 | KV seed | `seed` | stamped epoch; may lag | overwritten on checkpoint; consumers head-check with the scope before trusting |
 | 4 | Browser cache (IDB/localStorage) | `derived` + `echo` overlay | stamped as #2 | epoch mismatch → drop and rehydrate |
@@ -668,7 +677,7 @@ that only runs under `test:full` does not hold the line):
    smoke scenario; divergence is a stop.
 5. **Fault lane**: injected RPC latency (100 ms / 1 s), DO eviction between
    turns, cold-owner timeout, fanout redelivery — scenario stays green;
-   a parked task survives eviction and resumes via the scope alarm.
+   a pending scheduled turn survives eviction and fires via the scope alarm.
 6. **Aged-world lane**: build a world through history (install vN, play,
    upgrade to vN+1, replay), then run the scenario; reseeds appear as
    named CO6/CO8 events, never as failures.
@@ -1148,7 +1157,133 @@ One write path per fact (CO9), concretized:
   Deployment = per-partition seed + KV seed writes. The Phase-5
   fresh-install path (identity import included) is this same pipeline.
 
-## CO16. Scheduled-turn execution
+## CO16. Scheduled turns
+
+> Status: **delivery implemented** (CO16.5); **production, envelope,
+> quotas, and lifecycle specified, not yet implemented** (CO16.2–CO16.4,
+> CO16.6–CO16.9). Design rationale in
+> `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
+> [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
+> where the two differ, this governs.
+
+### CO16.1 The primitive
+
+The substrate offers exactly one deferred-execution primitive:
+
+> Fire verb `V` on object `O` with args `A`, **once**, at wall-clock time
+> `T`, as a committed turn in **this** scope, on behalf of actor `X`.
+
+Not recurrence, not cron expressions, not calendars or timezones. A
+periodic behavior is a verb that re-schedules itself; a calendar rule is
+woocode that computes the next `T`. The substrate has no business knowing
+about weekdays, and a scope that owns its own queue needs no global
+scheduler — which is what keeps this compatible with a world of millions
+of scopes.
+
+**Time is UTC epoch milliseconds.** `ScheduledTurn.at_logical_time` is the
+scope clock denominated in epoch ms, compared against the host clock. The
+field name is historical; it is not a turn counter. Ordering of committed
+turns is the sequenced log's `seq` — that is what "logical time" was
+reaching for, and the log already provides it.
+
+Delivery is at a wall-clock instant; **ordering among turns that fire
+together** is `(at_logical_time ASC, id ASC)`, and each fired turn takes
+its own `seq` in the normal way.
+
+### CO16.2 Schedules are transcript effects
+
+`schedules` and `cancellations` are named, typed arrays on the
+`EffectTranscript` (CO3), parallel to `creates` and `recycles`. They MUST
+NOT be represented as `TranscriptWrite` entries with a fabricated `op`.
+Both are included in the `post_state_hash` preimage: the pending queue is
+durable scope state.
+
+The commit scope applies them **atomically with the turn's writes**. A
+timer armed by a turn that was then rejected does not exist; a turn
+replayed arms the same timer. This is CO9 — one write path per fact — and
+it makes the ordinary acceptance receipt the answer to "did my timer get
+set?".
+
+`POST /net/schedule` remains as a substrate/operator surface for seeding,
+repair, and tests. It is not the path catalog code takes, and a world in
+steady state does not use it.
+
+```ts
+type ScheduledTurnRequest = {
+  kind:            "woo.scheduled_turn_request.v1";
+  id:              string;      // namespaced; see CO16.3
+  scope:           ScopeRef;    // MUST match the committing scope
+  at_logical_time: number;      // UTC epoch ms; MUST be in the future
+  idle_policy:     "while_active" | "always";   // CO16.6
+  call: {
+    actor:  ActorRef;
+    target: ObjRef;
+    verb:   string;
+    args:   WooValue[];
+  };
+};
+```
+
+Validation at commit:
+
+- `scope` MUST match the committing scope. Cross-scope scheduling is not a
+  primitive (CO16.4); waking another scope is an ordinary committed turn
+  submitted by the fired verb.
+- `at_logical_time` MUST be strictly greater than the committing turn's
+  wall-clock input, and within the horizon of CO16.7.
+- `id` MUST lie in the scheduling object's namespace (CO16.3).
+- `id` is an **upsert key**: an existing pending entry with the same id is
+  replaced atomically. This is what makes a self-re-arming chain
+  idempotent.
+- `idle_policy: "always"` requires wizard authority in the arming frame
+  (CO16.6).
+- An `id` appearing in both `schedules` and `cancellations` in one
+  transcript is rejected. Otherwise the two arrays apply atomically.
+- Over any quota in CO16.7 → `E_QUOTA`, rejecting the turn whole. A
+  partially-applied schedule set is exactly the split state CO2.2 forbids.
+
+`cancellations` is a list of ids; cancelling an id that does not exist is a
+no-op, and cancelling outside the caller's namespace is rejected.
+
+### CO16.3 Identity is namespaced to the scheduling object
+
+The stored id is `<scheduling object ref>:<key>`, constructed by the
+engine, never supplied whole by the author. Two forms:
+
+- **Stable key** — `key` as given by the caller. Upserts. This is the form
+  a periodic chain uses to re-arm without accumulating duplicates.
+- **Turn-unique** — `key = hash(turn_id, per_turn_counter)`. Distinct per
+  call within a turn, stable across replay. The form for one-shots.
+
+`cancel_schedule` may name only ids in the calling object's namespace.
+Without this rule any verb in a scope could cancel or silently overwrite
+any other object's timer — a same-scope denial of service with no audit
+signal. A wizard may cancel any id in the scope through an explicit
+privileged path, which is auditable.
+
+### CO16.4 Authority
+
+- **Session-less.** `ScheduledTurn.call` carries actor/target/verb/args and
+  no session, so per CO14's sessions-absent rule the fired turn is an
+  actor-authority DIRECT-route turn.
+- **No stored programmer authority.** The pending entry does NOT capture
+  the arming frame's `progr`. When the turn fires the verb dispatches
+  normally and takes programmer authority from **its own owner**, exactly
+  as on a live call. Capturing `progr` (as VTN18.2 proposed) would be a
+  capability with unbounded lifetime, and it buys nothing.
+- **Permission is checked at delivery**, against live world state, not at
+  arming time. An actor who has been demoted, recycled, or moved out of
+  scope produces an error frame and the entry is dropped. Scheduling
+  therefore grants nothing the actor could not do at the moment of firing,
+  and holds nothing they have since lost.
+- **Attribution is captured at arming** (AU3.2): the `Principal` and the
+  arming turn's trace context ride the durable row so the eventual turn is
+  attributable and joins the originating trace. Attribution never widens
+  authority.
+- `target` may be any object in the scope, not only `this`. The fire-time
+  check is the ordinary one, so this grants nothing a live call would not.
+
+### CO16.5 Delivery — implemented
 
 - The scope remains the durable home and the waker (CO2.8); **a
   registered planner gateway executes**. `/net/subscribe` carries a
@@ -1183,20 +1318,130 @@ One write path per fact (CO9), concretized:
   (the CO15 conventions), each only when the gateway holds no
   high-water for it; anything further rides the standard
   E_MISSING_STATE recovery.
-- **Scheduled turns are session-less**: `ScheduledTurn.call` carries
-  actor/target/verb/args and no session, so per CO14's sessions-absent
-  rule they run as actor-authority DIRECT-route turns. This is the
-  documented posture until VTN18.2's engine-side scheduling lands an
-  authority field.
 - With no registered planner, due turns stay parked with a named metric
   (`net_scope_scheduled_turn_fired`; the non-destructive peek is the
   specified no-planner state). A later planner subscription arms an
   immediate wake, so parked overdue turns dispatch without waiting for
   an unrelated alarm. Dispatches emit
   `net_scope_scheduled_turn_dispatched`.
-- Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
-  remain deferred until the DSL exposes scheduling; `/net/schedule` is
-  the substrate surface until then.
+
+### CO16.6 Delivery envelope
+
+**Minimum interval: 60 seconds.** The scope enforces a minimum interval
+between consecutive deliveries of the same `(target, verb)` pair. A world
+MAY raise the floor through `$server_options`; lowering it is a substrate
+change, not a configuration knob.
+
+The rate follows from what a delivery *is*: a full committed turn — a
+sequencer transaction, a fanout pass, an audit record, a projection fold —
+against an envelope of p95 ≤ 750ms for submits (CO10). **The committed
+plane is not for animation.** A minute is the finest grain at which
+durable, ordered, audited, replayable execution is offered; anything
+faster belongs on the live plane or in the browser. VTN18.10's
+live-vs-committed table is the guidance.
+
+The floor applies at **delivery**, deferring the entry, not at arming. A
+chain that asks for faster than the floor receives the floor rather than an
+error.
+
+**Idle policy.** Each entry declares one:
+
+- **`while_active`** — the scope does not fire it while it has no live
+  subscribers. The entry stays parked; the next accepted turn in the scope
+  re-arms it. Correct for anything whose only purpose is to be observed.
+  The default for periodic chains, and available to ordinary catalog code.
+- **`always`** — fires with nobody watching. Required for deadlines,
+  expiries, and pushes. **Arming one directly requires wizard authority**:
+  a periodic `always` chain is the one shape here that bills a world
+  forever in a scope no one will visit again.
+
+  The wizard rule attaches to arming, not to the shapes built on it.
+  Ordinary user-facing one-shots — "remind me in ten minutes", "close this
+  after 24h" — reach `always` through wizard-owned catalog verbs that arm
+  on the caller's behalf under their own owner's authority, the same
+  pattern any privileged builtin is wrapped in. The effect of the rule is
+  *no unattended timer without going through code a wizard wrote*, not
+  *no reminders*.
+
+**No catch-up.** An overdue entry fires **once**, at its first opportunity.
+Periodic chains skip missed intervals rather than replaying them: a chain
+re-arms only after it fires, so this follows from the upsert semantics. A
+scope evicted for a month must not wake and execute a month of ticks. The
+fired verb receives both the intended and the actual time (CO16.8) and may
+decide for itself what the gap means.
+
+### CO16.7 Quotas
+
+| Bound | Default | Enforced |
+|---|---|---|
+| Pending entries per scope | 1000 | commit validation |
+| Pending entries per object | 32 | commit validation |
+| `schedule` calls per turn | 16 | VM |
+| Minimum interval | 60s (CO16.6) | delivery |
+| Maximum horizon | 365 days | VM and commit validation |
+
+Over-cap raises `E_QUOTA` with the pre-action semantics of
+[failures.md](../semantics/failures.md) — which quota, current vs limit,
+no partial state. These are scope-local caps on a scope-local row family,
+distinct from the per-owner storage accounting of
+[quotas.md](../reference/quotas.md).
+
+The 365-day horizon rests on an untested property: that host alarms set
+across multi-day boundaries fire reliably and that hibernated state is
+fully reconstructible from durable storage alone. See
+[tasks.md §16.2](../semantics/tasks.md#162-deferred-execution).
+
+### CO16.8 Lifecycle
+
+- **Target recycled** → its pending entries are cancelled. Bounded by the
+  per-scope cap, so a scan, not an index.
+- **Target moved out of scope** → the entry fires, the turn cannot resolve
+  the target, error frame, entry dropped. Loud is correct; silently
+  following an object across scopes would be the cross-scope primitive
+  CO16.1 declines to build.
+- **Actor recycled or demoted** → fire-time check fails, error frame, entry
+  dropped (CO16.4).
+- **Verb removed or renamed under a catalog upgrade** → the turn fails
+  loudly at fire time and the entry is dropped. One visible failure per
+  broken timer.
+- **Epoch fence** → **entries survive.** They carry the epoch they were
+  armed under for attribution, but the fired turn is planned against the
+  *current* epoch. Cancelling every pending entry on a fence (as VTN18.6
+  proposed) would stop every timer in a world on the routine operation of
+  upgrading a catalog, silently. A catalog migration that renames a ticking
+  verb must re-arm — the same obligation any migration carries.
+- **Scope retirement (CO17)** → the retiring scope cancels its pending
+  queue and clears its alarm before teardown.
+- **Failure does not retry.** A scheduled turn that errors is not
+  re-delivered; a chain that wants retry re-schedules explicitly. A broken
+  chain therefore stops on its own, which is the desired failure mode.
+
+**Fire-time context.** The fired turn presents `caller = $system` and a
+`scheduled: {id, at, fired_at}` block, so a verb can tell it was woken
+rather than called, and how late it is.
+
+**`tell` is not durable.** A scheduled verb that reports only through
+`tell(actor, ...)` produces nothing at all when the actor is disconnected,
+and the substrate does not detect or warn about this. Scheduled work whose
+output matters MUST land it durably — an act on the log, a note, a message
+object — and may `tell` in addition. Catalog surfaces are responsible for
+making the durable path the default one.
+
+### CO16.9 Observability
+
+- `net_scope_scheduled_turn_fired` — due entry moved to the outbox, or
+  parked with no planner registered.
+- `net_scope_scheduled_turn_dispatched` — planner dispatch.
+- A per-world count of live `always` entries. This is the recurring-cost
+  number; it is the reason CO16.6 gates them.
+- Pending entries are introspectable in-world for the object that armed
+  them. Invisible timers are unmaintainable for authors and worse for
+  operators.
+
+Outbox **abandonment** of a `/plan-scheduled` row is the named divergence
+(CO16.5), and for scheduled turns it means *a deadline silently never
+fired*. It warrants an alert, not only a metric, before a world depends on
+`always` entries.
 
 ## CO17. Scope retirement
 
@@ -1230,6 +1475,12 @@ discipline):
    observation subscribers use to unpin) included. Undeliverable rows
    age out by the existing dead-subscriber pruning; drain completion is
    "no undelivered rows", not "every peer acknowledged".
+
+   The **pending schedule queue** (CO16) is cancelled in this step, not
+   drained: entries not yet due are discarded, and any already moved to a
+   `/plan-scheduled` outbox row drains with the rest. A retiring scope
+   arms no further alarms for scheduled work. Nothing survives to fire
+   into a reclaimed scope.
 3. **Tombstone.** The scope's copy-#3 seed record (`net:seed:<scope>`)
    is replaced with a tombstone `{retired: true, head, catalog_epoch}`.
    The tombstone is the *only* durable trace of the scope after step 4,

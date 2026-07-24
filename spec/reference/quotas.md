@@ -68,9 +68,10 @@ Per-owner state, one row, held by the owner's accounting shard:
 ```
 
 `object_count` maintains from create/recycle deltas the same way bytes do.
-(`parked_tasks` from the old schema is out of scope here: task limits are
-runtime metering under [permissions.md §11](../semantics/permissions.md),
-not storage.)
+(Pending scheduled turns are out of scope here: they are bounded per scope
+and per object as scope-local state under
+[coherence.md §CO16.7](../protocol/coherence.md#co167-quotas), not as owner
+storage.)
 
 ### R5.3 Reconciliation
 

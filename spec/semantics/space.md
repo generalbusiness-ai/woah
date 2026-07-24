@@ -55,7 +55,7 @@ stricter contract and only targets live sessions.
 4. **Resolve the target verb.** Use the standard verb lookup rule on `message.target` ([objects.md §9.1](objects.md#91-lookup): parent chain, then feature lookup where applicable). If not found, the call moves directly to step 8 (apply failure) with `E_VERBNF`.
 5. **Run the behavior.** Execute the verb's bytecode (T0 or full VM) inside the runtime's behavior savepoint. The behavior may read/write properties on objects in the same anchor cluster (atomic), call other verbs (recursive within cluster), await permitted cross-host reads/calls, and emit observations.
 6. **On success:** commit mutations from step 5; observations from step 5 are queued for delivery; the verb return value is retained as the caller-only `result` field on the live applied frame and on the immediate REST response.
-7. **On parked continuation:** if the behavior executes `SUSPEND`, `READ`, or another operation that parks the VM stack, commit the parking record and any mutations before the parking point, then deliver the applied frame for this message. The later wake/input is a new sequenced message (normally a runtime `$resume` frame; see [tasks.md §16.2](tasks.md#162-suspend-across-host-eviction) and [§16.6](tasks.md#166-read-tasks)) with a fresh seq allocated at resume time.
+7. **On deferred work:** a behavior cannot park its VM stack — it runs to completion within the message or it fails. Work that must happen later is arranged with `schedule` ([scheduling.md](scheduling.md)), which records a pending entry as part of this message's committed effect. The later work arrives as its own sequenced message with its own `seq`, so nothing mutates space-anchored state between two frames without a frame of its own.
 8. **On failure (any raised err during step 5):** roll back mutations from step 5; the message remains in the log at its assigned `seq`; an `error` observation is queued describing the failure.
 9. **Deliver `applied` frame.** Push `{op: "applied", id?, space, seq, message, observations, result?, audience_sessions?, observation_session_audiences?}` to the live sessions present in the space (per [v2-turn-network.md §VTN9](../protocol/v2-turn-network.md#vtn9-catch-up-and-applied-frames)). `result` is present only for the originating caller; replay, SSE, MCP broadcast queues, and other observers receive the durable public shape without `result`. Actor-level `subscribers` is a compatibility projection, not the authoritative fan-out key.
 
@@ -84,12 +84,14 @@ The six questions of failure semantics, answered:
 
 Replay reconstructs materialized state by re-applying logged messages in seq order from the most recent snapshot (S7). For replay to converge:
 
-- Call-handler verbs must be deterministic given `(message, target_state, anchor_cluster_state)`.
+- Call-handler verbs must be deterministic given `(message, target_state, anchor_cluster_state, logical_inputs)`.
 - No reads from non-anchored objects.
-- No wall-clock or RNG inside the handler.
+- No *ambient* wall-clock or RNG inside the handler.
 - No cross-host RPC inside the handler.
 
-Verbs that need non-determinism (random colors, server timestamps) live *outside* call-handlers — they can be normal verbs called via direct dispatch, or they can capture the value at call time and pass it in `message.body`.
+Time and randomness are available, but only as **admitted logical inputs**: `now()` and `random()` are recorded when the turn is planned and replayed from the record, so a handler that calls them is still deterministic and a replay sees the same values it saw the first time. This is what lets `schedule` compute a due time inside a committed turn ([scheduling.md §SC3](scheduling.md#sc3-time)). What breaks replay is reading a clock or an entropy source the recorder does not see.
+
+Verbs that need non-determinism the runtime does not admit (an external service result, a fetched price) capture the value outside the call-handler and pass it in `message.body`.
 
 The runtime does not enforce determinism; violations show up as replay divergence. Tooling can help (replay-and-diff against current state) once the implementation exists.
 
@@ -171,7 +173,7 @@ A space's `call` verb runs serially — one call at a time through validate, seq
 
 The host's input gate is held during a call; the runtime's "release on await" mode is *not* used for `$space:call`. Implementations must enforce this; without it, the seq order is meaningless.
 
-Parking a continuation is not "awaiting inside the call." The current message has completed its sequenced apply by writing a durable parked-task record. When the continuation wakes, it re-enters the space as a new sequenced message (`$resume` or the target verb named by a space-targeted `FORK`). The original seq records that the task parked; the later seq records the effect of resuming.
+Deferred work is not "awaiting inside the call." A call that arranges later work completes its sequenced apply now, recording a pending scheduled turn as part of that message's committed effect. When the scheduled turn fires it enters the space as a new sequenced message with its own seq. The original seq records that the work was arranged; the later seq records what it did.
 
 ---
 

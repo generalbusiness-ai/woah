@@ -76,9 +76,11 @@ return value;
 
 try { ... } except err in (E_PERM, E_PROPNF) { ... } finally { ... }
 
-fork(60) { player:tell("a minute later"); }
-suspend(seconds);
-let input = read(player);
+// Deferred execution — one primitive, in the current scope. scheduling.md.
+schedule(this, "chime", [], 600_000);          // in ten minutes
+schedule(this, "tick", [], 60_000, "my_tick"); // stable key: upserts
+cancel_schedule(id);
+fork(600, this, "chime");                      // LambdaMOO spelling; SECONDS
 
 observe(event);
 emit(target, event);

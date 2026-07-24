@@ -7,7 +7,7 @@ status: partial
 
 > Part of the [woo specification](../../SPEC.md). Layer: **semantics**.
 
-The normative semantics for destroying an object via the `recycle(obj)` builtin. LambdaMOO's `recycle()` had subtle load-bearing behavior — child tasks killed, parent bookkeeping cleared, ULID retired — that needs to be specified explicitly so implementations don't diverge.
+The normative semantics for destroying an object via the `recycle(obj)` builtin. LambdaMOO's `recycle()` had subtle load-bearing behavior — pending work cancelled, parent bookkeeping cleared, ULID retired — that needs to be specified explicitly so implementations don't diverge.
 
 **Heritage.** This spec follows LambdaMOO's `bf_recycle` (`objects.c`) closely:
 the verb name (`:recycle`), the handler-then-walk order, the silent fall-through
@@ -28,7 +28,7 @@ deliberate woo changes are flagged inline:
 **Implementation status (2026-05-07).** The host-local path is implemented
 as a single `recycle(obj, opts?)` builtin (replacing the earlier
 `builder_recycle` / `wiz_force_recycle` pair). The builtin does pre-flight
-A1–A4 checks, `:recycle` dispatch (§RC4), parked-task kill (RC3 step 2),
+A1–A4 checks, `:recycle` dispatch (§RC4),
 child grafting (RC3 step 3), contents displacement to `$nowhere`
 (RC3 step 4), parent/location chain bookkeeping (steps 5, 6), lazy
 verb/ancestor cache invalidation on dispatch-time tombstone hits (step 7),
@@ -36,6 +36,10 @@ storage-row deletion (step 8), and ULID tombstoning persisted across hosts
 (step 9). The §RC3a empty-children safety check rides on the builtin as
 the `force` opt; §RC6.1 wizard-only behavior rides as the `force_reserved`
 opt. The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
+RC3 step 2 (scheduled-turn cancellation) is **not** implemented: the
+builtin still kills parked tasks, a mechanism that no longer runs anywhere
+(see [tasks.md](tasks.md)), and it does not yet touch the scope's schedule
+queue. That lands with the scheduling work.
 Status remains `partial` because `$system.recycle_tick_budget` and the
 cross-host steps in §RC3.1 / §RC10 (cluster co-location enforcement when
 the cluster spans hosts, fire-after-commit Directory reconciliation, and
@@ -105,7 +109,7 @@ If any pre-flight check fails, `recycle` raises and `obj` is unchanged.
 
 1. **Fire `:recycle`** on `obj` (see §RC4). Failures are caught and surfaced as a `$recycle_handler_error` observation; they do not abort the recycle. (Catalogs that need cascade work — clear `owner.owned_objects`, remove features, spill room contents to enclosing space, drain cross-cluster contents/children — define `:recycle` and chain with `pass(@args)`, matching LambdaCore's `$root_object`/`$player`/`$room` convention.)
 1a. **Re-verify A4 (post-handler cluster collocation).** A handler may have moved an object into `obj.contents`, reparented a child, or otherwise altered the graph since pre-flight. Re-check that `obj.parent`, `obj.location`, and every member of `obj.children` and `obj.contents` is still in `obj`'s anchor cluster (or is `$nowhere`). If the re-check fails, abort: roll back the handler's intra-cluster mutations and raise `E_CROSS_HOST_WRITE`. The handler's cross-cluster effects are *not* in the rollback scope and may have leaked (§RC3.1); this is a documented risk of writing handlers that touch other clusters.
-2. **Kill parked tasks anchored to `obj`.** Any task in the `task` table with `target == obj`, `parked_on == obj`, or where the suspended frame's `this_ == obj` is removed and abandoned. The task is marked `state: 'killed'` if any consumer is watching for completion. Per [failures.md §F7](failures.md#f7-lifecycle-failures), `E_INTRPT` is delivered to handlers awaiting these tasks.
+2. **Cancel scheduled turns anchored to `obj`.** Every pending entry in the scope's schedule queue whose `call.target == obj`, or whose id lies in `obj`'s namespace (i.e. `obj` armed it), is removed. Nothing is delivered and no handler is notified: a scheduled turn is a durable intention to start work later, not work in progress, so there is nothing to interrupt. The queue is bounded by [CO16.7](../protocol/coherence.md#co167-quotas), so this is a bounded scan and needs no index.
 3. **Walk `children`.** For each child `c` whose `parent == obj`, set `c.parent = obj.parent` (graft up). All children are collocated with `obj` (or `$nowhere`) by A4. `obj.parent` is always non-null because `$system` is forbidden by §RC6.
 4. **Walk `contents`.** For each contained `c` whose `location == obj`, set `c.location = $nowhere`. All contents are collocated with `obj` (or `$nowhere`) by A4. The `:recycle` handler usually drains contents to a more polite destination first, so this catches only objects the handler did not relocate. (`$nowhere` is the universal default-home location — see [bootstrap.md §B2.15](bootstrap.md#b215-nowhere). It is the documented exception to bidirectional containment ([objects.md §4.3](objects.md#43-containment-and-cross-host-invariants)): `$nowhere.contents` is **not maintained**, so this step writes only `c.location` and never RPCs the `$nowhere` host. `$nowhere` is itself unrecyclable per §RC6.)
 5. **Walk parent-side bookkeeping.** Remove `obj` from `obj.parent.children`.
@@ -336,10 +340,10 @@ Recycle destroys the object. **Unanchoring** (changing an object's anchor cluste
 
 The conformance suite ([conformance.md §CF3](../tooling/conformance.md#cf3-required-categories)) will cover:
 
-- Recycle of a leaf object (no children, no contents, no parked tasks).
+- Recycle of a leaf object (no children, no contents, no scheduled turns).
 - Recycle that triggers same-cluster child reparenting (graft up).
 - Recycle that displaces same-cluster contents to `$nowhere`.
-- Recycle that kills parked tasks (`E_INTRPT` delivered to handlers).
+- Recycle that cancels pending scheduled turns targeting or armed by the object; none of them subsequently fire.
 - Recycle of a forbidden object (must raise `E_INVARG`).
 - Recycle of a live actor (must raise `E_PERM`).
 - Recycle blocked by an anchored descendant (must raise `E_NACC`).

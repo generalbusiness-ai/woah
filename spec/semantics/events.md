@@ -80,7 +80,7 @@ Same opcode, same emit shape, two delivery contracts — but the contract is an 
 
 **Receiver discipline.**
 
-- Handlers for live observations should be side-effect-free: no `SET_PROP` on persistent state, no `emit` of would-be-sequenced observations, no `FORK`/`SUSPEND`. Violating this leaks non-replayable mutations into persistent state — the same anti-pattern as a log-handler that mutates behind the log's back.
+- Handlers for live observations should be side-effect-free: no `SET_PROP` on persistent state, no `emit` of would-be-sequenced observations, no `schedule`. Violating this leaks non-replayable mutations into persistent state — the same anti-pattern as a log-handler that mutates behind the log's back.
 - Receivers should not persist live observations. Doing so makes a non-replayable observation durable; reload won't reproduce it.
 
 ### 12.7 Observation audience and direct-message routing

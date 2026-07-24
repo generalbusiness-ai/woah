@@ -7,7 +7,7 @@ status: implemented
 
 > Part of the [woo specification](../../SPEC.md). Layer: **semantics**.
 
-Covers the VM's data structures (frames, tasks, bytecode), the full opcode table with stack effects and yield semantics, tick and memory metering, and the per-host scheduler. Task lifecycle (suspend, fork, read) is in [tasks.md §16](tasks.md).
+Covers the VM's data structures (frames, tasks, bytecode), the full opcode table with stack effects and yield semantics, tick and memory metering, and the per-host scheduler. Task lifecycle is in [tasks.md §16](tasks.md); deferred execution is [scheduling.md](scheduling.md).
 
 ---
 
@@ -35,9 +35,8 @@ type Task = {
   frames: Frame[];             // bottom = entry, top = current
   ticks_remaining: number;
   memory_used: number;
-  state: 'running' | 'suspended' | 'awaiting_read' | 'done';
-  resume_at?: number;          // ms timestamp, when state='suspended'
-  awaiting?: AwaitingInfo;
+  state: 'running' | 'awaiting_rpc' | 'done';
+  awaiting?: AwaitingInfo;     // in-flight cross-host call, held in memory
   origin: ObjRef;              // host where task was created (for return routing)
   actor: ObjRef;               // sticky; the principal that initiated this task
 };
@@ -202,13 +201,12 @@ Cold-path operations (`length`, `slice`, `delete`, `has`, `keys`, type coercions
 
 | Op | Operands | Stack effect | Yield | Description |
 |---|---|---|---|---|
-| `SUSPEND` | — | seconds → | **Y** | Serialize task; schedule resume via the host scheduler. Returns 0 to caller on resume; raises `E_INTRPT` if killed. |
-| `READ` | — | player → input | **Y** | Suspend task awaiting input from given player. |
-| `FORK` | argc | seconds verb_obj verb_name [args...] → task_id | **Y** | Spawn a new task to call `verb_obj:verb_name(args)` after `seconds` delay. |
+| `SCHEDULE` | argc | target verb args at_ms [key] → schedule_id | N | Record a pending scheduled turn in the transcript. Does **not** yield: the current turn continues and the work happens in a later turn. |
+| `CANCEL_SCHEDULE` | — | schedule_id → removed | N | Record a cancellation in the transcript. |
 | `EMIT` | — | target event → | **Y** | Send event. Target may be obj, list of objs, or `$everyone_in(room)`. RPC to remote targets. |
 | `YIELD` | — | — | **Y** | Cooperative scheduler boundary. Inserted at backedges of long loops. |
 
-The forked task starts with a fresh frame for the named verb call. The forking task continues at the next opcode without waiting. Forked task's `progr` = forking verb's `progr`; `player` = forking task's `player` (sticky); `caller` = `#-1`.
+`SCHEDULE` and `CANCEL_SCHEDULE` are *recording* opcodes: they append to the turn's `schedules` / `cancellations` transcript arrays and nothing else. No task is created now, no authority is captured, and nothing has happened until the turn commits. The scheduled turn, when it fires, is a wholly separate task with a fresh budget, `caller = $system`, and programmer authority from the fired verb's own owner. Semantics: [scheduling.md](scheduling.md); mechanism: [coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
 
 #### 8.3.9 Exceptions
 
@@ -224,7 +222,7 @@ Handler frames record the operand stack depth at install; on raise, the stack is
 
 Every opcode dispatch decrements `ticks_remaining` by a per-op weight (default 1; some opcodes cost more). When it reaches zero, the task is aborted with `E_TICKS`.
 
-Initial budget: `100_000` ticks for a foreground task, `30_000` for a forked task. Refilled on `SUSPEND`/`READ` resume to avoid death-by-suspension; **not** refilled on `RAISE`/`TRY` — catching `E_TICKS` does not give the task a fresh budget. The very next opcode dispatch re-fires the error.
+Initial budget: `100_000` ticks for a foreground task, `30_000` for a scheduled one. **Not** refilled on `RAISE`/`TRY` — catching `E_TICKS` does not give the task a fresh budget. The very next opcode dispatch re-fires the error.
 
 Op weights (defaults; tunable per-world):
 
@@ -266,8 +264,7 @@ Tick metering counts opcodes; it does not count time spent waiting on cross-host
 | Task class | Default cap | Notes |
 |---|---|---|
 | Foreground (response to player input) | 10 seconds | The player is waiting. |
-| Forked / scheduled | 60 seconds | No human in the loop. |
-| `SUSPEND` / `READ` | not counted | The clock pauses while parked. |
+| Scheduled | 60 seconds | No human in the loop. |
 
 When the cap expires, the task is aborted with `E_TIMEOUT`. Like ticks and memory, the budget is monotone — catching it does not reset the clock.
 

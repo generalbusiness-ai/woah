@@ -1120,7 +1120,7 @@ changes, and do not require matching `projection_writes` entries.
 
 Projection transfer rows are receiver-profiled. The authority/gateway profile
 uses full materialized rows (`SerializedObject`, `SerializedSession`, log rows,
-snapshots, parked tasks, tombstones, and tool-surface rows). A browser profile
+snapshots, scheduled turns, tombstones, and tool-surface rows). A browser profile
 uses display-only rows:
 
 ```ts
@@ -2690,13 +2690,24 @@ production v2 spec needs decisions on:
 - catalog update sequencing relative to ordinary turns;
 - privacy profile for projection/state transfer to agents.
 
-## VTN18. Scheduled turns (draft/proposed)
+## VTN18. Scheduled turns (superseded)
 
-> Status: **proposed**. This section describes how catalog code arranges for
-> periodic committed turns without a global clock. It extends the `EffectTranscript`
-> from VTN7 with `schedules` and `cancellations` arrays, defines a
-> `ScopeTimeAdvance` control frame for the commit plane, and specifies the
-> logical-time advancement rule precisely. Not yet implemented.
+> Status: **superseded by [coherence.md §CO16](coherence.md#co16-scheduled-turns)**,
+> which governs. Retained as design history. This section was the original
+> proposal; four of its decisions did NOT survive and are corrected in CO16.
+> Do not implement from this section.
+>
+> | This section | Superseded by | Why |
+> |---|---|---|
+> | VTN18.2 `caller_perms` captured in the pending entry | CO16.4 | a stored programmer-authority capability with unbounded lifetime, and unnecessary: the fired verb takes authority from its own owner |
+> | VTN18.3/18.4 logical time as a monotonic turn counter with `delay_ms` added to it | CO16.1 | incoherent, and never implemented. Ordering is the log's `seq`; due-time is UTC epoch ms |
+> | VTN18.5 16ms minimum interval | CO16.6 | each delivery is a full committed turn; the floor is 60s |
+> | VTN18.6 cancel all pending entries on epoch fence | CO16.8 | would silently stop every timer in a world on the routine operation of upgrading a catalog |
+>
+> Also unimplemented and not carried: the `ScopeTimeAdvance` control frame
+> (the scope's own alarm drives delivery — CO16.5 / cloudflare.md §R7) and
+> the `$tick_source` pattern of VTN18.7, whose replacement is the
+> `$scheduling` catalog feature ([semantics/scheduling.md §SC11](../semantics/scheduling.md#sc11-catalog-surface)).
 
 ### VTN18.1 Motivation
 

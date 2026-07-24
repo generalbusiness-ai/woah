@@ -62,7 +62,7 @@ The protocol-level invariants that make cross-host execution sound:
 
 **4. Bytecode versioning on serialized tasks.** Every serialized task carries `vm_version`, and each frame carries the `(definer, verb, version)` triple of its running bytecode. On resume, if the running VM rejects the version, the task raises `E_VERSION` and aborts cleanly — never silently runs against incompatible code.
 
-**5. Mid-task host crash.** A task whose host crashes mid-execution is lost if not yet checkpointed. Tasks in the host's persistent task table (`suspended`, `awaiting_read`) survive the crash; tasks running in memory or awaiting an in-flight RPC do not. Authors of long-running mutations should checkpoint via `suspend(0)` periodically.
+**5. Mid-task host crash.** A task whose host crashes mid-execution is lost: no task state is parked durably mid-turn. The turn simply does not commit, and turn atomicity (CO2.2) means no half-applied state results. There is no author-side checkpointing primitive and none is needed — a long piece of work is a sequence of committed turns, each durable on acceptance, chained with `schedule` ([semantics/scheduling.md](../semantics/scheduling.md)).
 
 **6. Failure-mode summary.**
 
@@ -93,8 +93,8 @@ re-entered by that same request.
 #### 3.5.1 Definitions
 
 - A **behavior turn** is a queued execution of user-visible behavior on a host:
-  direct verb dispatch, sequenced `$space:call` behavior, parked-task resume, or
-  VM continuation resume.
+  direct verb dispatch, sequenced `$space:call` behavior, or a fired
+  scheduled turn.
 - A **synchronous host RPC** is an RPC whose caller cannot complete the current
   behavior turn until the callee returns.
 - A **wait edge** `A -> B` exists while host `A` is awaiting a synchronous RPC
@@ -144,8 +144,8 @@ Examples:
 - Not OK: native behavior calls `directCall()` or `$space:call()` on the same
   host through the external queue, then awaits it. That is `H -> H` and must
   fail with `E_HOST_CYCLE` or use a local dispatch primitive instead.
-- OK: behavior schedules a later message (`FORK`, alarm, or sequenced message)
-  and returns. The later turn is a new request, not a reentrant wait.
+- OK: behavior schedules a later message (`schedule`, alarm, or sequenced
+  message) and returns. The later turn is a new request, not a reentrant wait.
 
 #### 3.5.2.1 Re-entrant chain dispatch
 
@@ -230,7 +230,7 @@ ordinary language primitives:
 - remote property-value writes are awaited host RPCs to the owning object host;
 - property definition, property metadata, and lifecycle writes remain
   `E_CROSS_HOST_WRITE` when they would cross hosts;
-- long-running cross-host coordination is expressed as messages, parked tasks,
+- long-running cross-host coordination is expressed as messages, scheduled turns,
   or sequenced calls, not as callbacks inside an open behavior turn.
 
 Native handlers and host primitives are held to the same rule. They must not

@@ -38,7 +38,7 @@ Every frame has a `progr` field (the verb owner at the time of compilation). Per
 A wizard `progr` bypasses all perm checks except where explicitly restricted.
 
 Dispatch route is not an authority model. Direct calls, sequenced `$space:call`,
-REST/WS ingress, parked-task resumes, and VM `CALL_VERB`/`PASS` choose ordering,
+REST/WS ingress, scheduled-turn dispatch, and VM `CALL_VERB`/`PASS` choose ordering,
 durability, presence, and transport behavior; all object behavior still enters
 the same permission kernel:
 
@@ -74,13 +74,14 @@ Fine-grained per-verb-call capability tokens are not in v1. Wizard-vs-not-wizard
 
 ### 11.7 Storage quotas and accounting
 
-Each object owns durable state (its persistent storage footprint plus any forked/suspended tasks parked on its host). Per-owner caps prevent runaway resource consumption.
+Each object owns durable state — its persistent storage footprint. Per-owner caps prevent runaway resource consumption.
 
 | Quota | Default | Enforcement |
 |---|---|---|
 | Object count per owner | 1000 | At `create()` time, against the owner's `created` list. Real-time. |
 | Storage bytes per owner | 100 MiB | Eventually consistent. |
-| Active parked tasks per owner | 10000 | At `FORK`/`SUSPEND` time, against owner's running counter. Real-time. |
+
+Pending scheduled turns are bounded separately, per scope and per object rather than per owner, because the queue is scope-local state: see [protocol/coherence.md §CO16.7](../protocol/coherence.md#co167-quotas).
 
 Storage accounting is **eventually consistent**: committed writes are charged as per-owner storage deltas delivered asynchronously to a per-owner record, which admission consults. Charging is generic over committed growth — any operation that enlarges durable state is charged, not just `create()` and large `SET_PROP`. A burst write can briefly exceed quota before deltas land and the cached standing refreshes. Strict real-time accounting would require a central allocator and contradict the decentralized minting story ([objects.md §5.5](objects.md#55-id-allocation)).
 
