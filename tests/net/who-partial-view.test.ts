@@ -1,11 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   guestsNeedingEnter,
+  jsonFetch,
   summarizeWhoCheck,
   whoCheckFailsAcceptance,
   type CanaryGuest,
   type WhoRosterInput
 } from "../../scripts/net-canary-load";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // Unit coverage for the pure partial-view summary used by the deployed-canary
 // who_all check (net-cutover layering item 6). The LIVE partial view is a
@@ -90,5 +95,16 @@ describe("deployed canary room setup", () => {
       { actor: "unknown", session: "s_3", elastic: false, activeScope: null }
     ];
     expect(guestsNeedingEnter(guests, "the_chatroom").map((guest) => guest.actor)).toEqual(["elsewhere", "unknown"]);
+  });
+});
+
+describe("deployed canary request deadline", () => {
+  it("turns a lost reply into a bounded rejection so cleanup can continue", async () => {
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    })));
+
+    await expect(jsonFetch("https://canary.invalid/net-api/turn", { method: "POST" }, 10))
+      .rejects.toMatchObject({ name: "TimeoutError" });
   });
 });

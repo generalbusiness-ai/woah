@@ -3389,6 +3389,31 @@ export class NetGatewayDO {
         503
       );
     }
+    // A fresh guest is born present at a FOREIGN room owner. The commit
+    // durably queued the relation deltas, but the accepted response is also
+    // the client's freshness fence: an immediate who/look must see this
+    // session in the room authority's compact roster. Session-open and turn
+    // transitions use the same fence. Omitting it here made a burst of
+    // elastic claims temporarily look like unresolved room contents, which
+    // both returned partial rosters and spent one presentation probe per
+    // guest until the asynchronous outbox caught up.
+    let relationExpediteDegraded = false;
+    if (relateDestinations) {
+      try {
+        await this.expediteForeignRelations(reply, relateDestinations, []);
+      } catch (err) {
+        // Acceptance is already durable and the scope outbox retains the
+        // exact same relation facts. Preserve success, but name the weaker
+        // freshness guarantee just as sessionOpen does.
+        relationExpediteDegraded = true;
+        this.metric({
+          kind: "net_relation_expedite_degraded",
+          scope: reply.scope,
+          status: "error",
+          error: String(err)
+        });
+      }
+    }
     let installDegraded = false;
     try {
       await this.installTouched(this.ensureView(), destination, reply.touched);
@@ -3407,7 +3432,8 @@ export class NetGatewayDO {
       scope: planned.clusterScope,
       active_scope: template.initial_room,
       elastic: true,
-      ...(installDegraded ? { install_degraded: true } : {})
+      ...(installDegraded ? { install_degraded: true } : {}),
+      ...(relationExpediteDegraded ? { relation_expedite_degraded: true } : {})
     });
   }
 

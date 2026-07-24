@@ -52,8 +52,15 @@ export type WhoCheckSummary = {
   min_seen: number;
   max_missing: number;
   partial: boolean;
-  examples: Array<{ actor: string; shard: string | null; seen: number; missing: string[] }>;
+  examples: Array<{ actor: string; shard: string | null; seen: number; missing: string[]; detail?: string }>;
 };
+
+// A canary is an acceptance gate, so a lost edge reply must become evidence,
+// not an indefinitely hung process that also skips session cleanup. Keep this
+// comfortably above the Worker's 5s internal RPC deadline while still bounding
+// the 512-responder roster phase.
+export const DEFAULT_CANARY_FETCH_TIMEOUT_MS = 30_000;
+let canaryFetchTimeoutMs = DEFAULT_CANARY_FETCH_TIMEOUT_MS;
 
 /** Enforcement requires both a conclusive run and a complete roster. */
 export function whoCheckFailsAcceptance(summary: WhoCheckSummary): boolean {
@@ -101,7 +108,15 @@ export function summarizeWhoCheck(
   for (const responder of responders) {
     if (!responder.reachable) {
       unreachable += 1;
-      if (examples.length < 12) examples.push({ actor: responder.actor, shard: responder.shard, seen: -1, missing: ["UNREACHABLE"] });
+      if (examples.length < 12) {
+        examples.push({
+          actor: responder.actor,
+          shard: responder.shard,
+          seen: -1,
+          missing: ["UNREACHABLE"],
+          detail: responder.haystack.slice(0, 500)
+        });
+      }
       continue;
     }
     responderCount += 1;
@@ -133,9 +148,15 @@ function percentile(values: number[], p: number): number {
   return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)] ?? 0;
 }
 
-async function jsonFetch(url: string, init: RequestInit): Promise<{ response: Response; body: Record<string, unknown>; ms: number }> {
+export async function jsonFetch(
+  url: string,
+  init: RequestInit,
+  timeoutMs = canaryFetchTimeoutMs
+): Promise<{ response: Response; body: Record<string, unknown>; ms: number }> {
   const started = performance.now();
-  const response = await fetch(url, init);
+  const deadline = AbortSignal.timeout(timeoutMs);
+  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  const response = await fetch(url, { ...init, signal });
   const ms = Math.round(performance.now() - started);
   const text = await response.text();
   let body: Record<string, unknown>;
@@ -162,28 +183,42 @@ async function runWhoCheck(base: string, guests: CanaryGuest[], run: string): Pr
     return summarizeWhoCheck(guestActors, guestShards, []);
   }
   const responders: WhoRosterInput[] = [];
-  for (const responder of guests) {
-    const { response, body } = await jsonFetch(`${base}/net-api/turn`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer session:${responder.session}` },
-      body: JSON.stringify({
-        target: responder.actor,
-        verb: "who_all",
-        args: [],
-        route: "direct",
-        idempotency_key: `${run}-who-${responder.actor}`
-      })
-    });
-    const reply = body.reply as { status?: unknown } | undefined;
-    const reachable = response.ok && reply?.status === "accepted";
-    responders.push({
-      actor: responder.actor,
-      shard: sessionShardHint(responder.session),
-      reachable,
-      haystack: reachable
-        ? JSON.stringify({ result: body.result ?? null, observations: body.observations ?? [] })
-        : JSON.stringify({ status: response.status, error: body.error ?? reply ?? null })
-    });
+  for (const [index, responder] of guests.entries()) {
+    try {
+      const { response, body } = await jsonFetch(`${base}/net-api/turn`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer session:${responder.session}` },
+        body: JSON.stringify({
+          target: responder.actor,
+          verb: "who_all",
+          args: [],
+          route: "direct",
+          idempotency_key: `${run}-who-${responder.actor}`
+        })
+      });
+      const reply = body.reply as { status?: unknown } | undefined;
+      const reachable = response.ok && reply?.status === "accepted";
+      responders.push({
+        actor: responder.actor,
+        shard: sessionShardHint(responder.session),
+        reachable,
+        haystack: reachable
+          ? JSON.stringify({ result: body.result ?? null, observations: body.observations ?? [] })
+          : JSON.stringify({ status: response.status, error: body.error ?? reply ?? null })
+      });
+    } catch (error) {
+      // A timed-out roster read is an unreachable responder, not a reason to
+      // lose the remaining cross-shard evidence or skip session cleanup.
+      responders.push({
+        actor: responder.actor,
+        shard: sessionShardHint(responder.session),
+        reachable: false,
+        haystack: JSON.stringify({ error: String(error) })
+      });
+    }
+    if ((index + 1) % 64 === 0 || index + 1 === guests.length) {
+      console.error(`canary progress: who_all ${index + 1}/${guests.length}`);
+    }
   }
   return summarizeWhoCheck(guestActors, guestShards, responders);
 }
@@ -200,6 +235,7 @@ async function main(): Promise<void> {
   const rounds = Math.max(1, Number(value("--rounds", "50")));
   const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
   const roundDelayMs = Math.max(0, Number(value("--round-delay-ms", "0")));
+  canaryFetchTimeoutMs = Math.max(1_000, Number(value("--fetch-timeout-ms", String(DEFAULT_CANARY_FETCH_TIMEOUT_MS))));
   const room = value("--room", "the_chatroom");
   const enforceWho = args.includes("--enforce-who");
   const run = `canary-${Date.now().toString(36)}`;
@@ -238,6 +274,9 @@ async function main(): Promise<void> {
         elastic: body.elastic === true,
         activeScope: typeof body.active_scope === "string" ? body.active_scope : null
       });
+      if (guests.length % 64 === 0 || guests.length === actors) {
+        console.error(`canary progress: claimed ${guests.length}/${actors} guests`);
+      }
     }
 
     // Establish co-presence: every guest enters the shared room so its session
@@ -266,6 +305,7 @@ async function main(): Promise<void> {
       }
     }));
     outcomes.push(...enterBatch);
+    console.error(`canary progress: entered ${enterBatch.length}/${guestsNeedingEnter(guests, room).length} guests`);
 
     for (let round = 0; round < rounds; round += 1) {
       const requests = guests.flatMap((guest, actorIndex) =>
@@ -322,6 +362,7 @@ async function main(): Promise<void> {
         }
       }));
       outcomes.push(...batch);
+      console.error(`canary progress: load round ${round + 1}/${rounds} completed (${batch.length} turns)`);
       if (roundDelayMs > 0 && round + 1 < rounds) {
         await new Promise((resolve) => setTimeout(resolve, roundDelayMs));
       }
