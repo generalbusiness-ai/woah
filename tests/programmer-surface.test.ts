@@ -182,6 +182,31 @@ describe("programmer surface (feature-composed)", () => {
     expect((gone as any).error.code).toBe("E_VERBNF");
   });
 
+  it("drops task perms to the actor so wrappers cannot retain $wiz authority (§8.8)", async () => {
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "perms@example.com");
+    const agent = await createAgent(world, human, "permsbot", true);
+
+    // eval runs arbitrary DSL under the task's effective principal. The wrapper
+    // is $wiz-owned, so without the actor drop this would run as $wiz. After the
+    // drop, task_perms() must report the agent, not the wizard.
+    const res = (await world.directCall("ev", agent, agent, "eval", ["task_perms()", {}])) as CallResult;
+    expect(res.op).toBe("result");
+    expect((res as any).result.ok).toBe(true);
+    expect((res as any).result.value).toBe(agent);
+
+    // And a foreign, wizard-owned object cannot be authored by the agent.
+    world.createObject({ id: "foreign_box", name: "Foreign Box", parent: "$thing", owner: "$wiz" });
+    const foreign = (await world.directCall("fw", agent, agent, "install_verb", [
+      "foreign_box",
+      "sneak",
+      "verb :sneak() rxd { return 1; }",
+      {}
+    ])) as CallResult;
+    expect(foreign.op).toBe("error");
+    expect(world.object("foreign_box").verbs.find((v) => v.name === "sneak")).toBeUndefined();
+  });
+
   it("leaves target state unchanged when a verb install hits a stale version (§8.9)", async () => {
     const world = createWorld();
     const { human } = await provisionHuman(world, "stale@example.com");
