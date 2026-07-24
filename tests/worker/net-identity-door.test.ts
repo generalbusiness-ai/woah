@@ -235,6 +235,12 @@ async function buildDoorHarness(options: {
     },
     catalogTailSeqs: () => (scopeStates.get("catalog")!.state.storage.sql
       .exec("SELECT seq FROM net_scope_tail ORDER BY seq") as { toArray(): Array<{ seq: number }> }).toArray(),
+    forgetCloseReceipt: (session: string) => {
+      gwState.state.storage.sql.exec(
+        "DELETE FROM net_gateway_session_close_receipt WHERE session = ?",
+        session
+      );
+    },
     settle: async () => settleStates(states),
     close: async () => closeStates(states)
   };
@@ -737,6 +743,17 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     const closeReplay = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
     expect(closeReplay.status, JSON.stringify(closeReplay.body)).toBe(200);
     expect(closeReplay.body).toEqual({ closed: true, already: "closed" });
+
+    // If authority accepted but BOTH bounded internal submit replies were
+    // lost, the gateway never records that receipt. The expired derived cell
+    // still proves which opaque bearer is closing itself; replay must reach
+    // the idempotent postcondition instead of dying at live-bearer auth.
+    h.forgetCloseReceipt(session);
+    const closeAfterLostInternalReplies = await h.api("DELETE", "/net-api/session", {
+      token: `session:${session}`
+    });
+    expect(closeAfterLostInternalReplies.status, JSON.stringify(closeAfterLostInternalReplies.body)).toBe(200);
+    expect(closeAfterLostInternalReplies.body).toMatchObject({ closed: true });
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     // The first-in-pool-order seat is free again — the next claim gets it.

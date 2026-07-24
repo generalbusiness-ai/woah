@@ -654,6 +654,15 @@ that only runs under `test:full` does not hold the line):
    direct case); a head-changing commit invalidates it. Thus stale cache
    state can cost one repair but cannot bless a stale read, allocate from a
    stale counter, or commit an invalid post-state.
+
+   The substrate session mint/close path MAY advance the same cached cluster
+   base to the exact head returned by its accepted submit. That transcript
+   cannot create objects, so the cached allocation counter is unchanged.
+   A concurrent cluster write is still proved by CO4's bounded retained-head
+   rebase or rejects the optimistic base `stale_head`; on rejection the path
+   fetches and epoch-checks `/head` before retry.
+   This removes a routine close-time RPC without weakening the authority
+   proof.
 4. **Differential gate** (build-time, Plan 002 Phase 2): v2 and `src/net/`
    produce equal committed state and observation streams on the shared
    smoke scenario; divergence is a stop.
@@ -941,6 +950,14 @@ One write path per fact (CO9), concretized:
   - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
     view lineage (CO15; convention pull `cluster:<actor>` on miss) and
     mints through `/net/session-open`'s machinery.
+  - `DELETE /net-api/session` is semantically idempotent although its success
+    invalidates its own bearer. The session-routed gateway retains a bounded
+    accepted-close receipt and checks it before live-bearer authentication.
+    If both bounded internal submit replies were lost after authority
+    accepted, that receipt may be absent; the gateway MAY then use its exact
+    derived session value solely to bind the opaque bearer to the actor and
+    reach the same close postcondition. An expired value grants no other
+    operation. Unknown session ids still fail ordinary authentication.
   - `POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the

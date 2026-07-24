@@ -2288,12 +2288,17 @@ export class NetGatewayDO {
     const destination = request.cluster_destination ?? `scope:${clusterScope}`;
 
     const now = request.issued_at_ms ?? this.host.now();
-    // Phase 5: the session mint stamps request.catalog_epoch; a cluster
-    // scope at another durable epoch would reject every submit, so fail
-    // fast at the head fetch (same rule as the turn path).
-    const liveHead = await this.scopeHead(destination);
-    this.assertTurnEpoch(liveHead, request.catalog_epoch, clusterScope, []);
-    let base = liveHead.head;
+    // Phase 5: the session mint stamps request.catalog_epoch. Reuse this
+    // gateway's exact accepted cluster-head hint when present; it is only an
+    // optimistic base, and /submit still rejects a stale generation/head.
+    // A miss pays /head and preserves the ordinary fail-fast epoch check.
+    let planningHead = this.cachedPlanningHead(clusterScope, request.catalog_epoch);
+    if (planningHead === null) {
+      planningHead = await this.scopeHead(destination);
+      this.rememberPlanningHead(clusterScope, request.catalog_epoch, planningHead);
+    }
+    this.assertTurnEpoch(planningHead, request.catalog_epoch, clusterScope, []);
+    let base = planningHead.head;
     const actorLineage = view.get(cellKey("object_lineage", request.actor))?.value as { name?: unknown } | undefined;
     // AU3.1 rule-4 backfill: an EXCLUSIVE mint is definitionally an
     // identity-door pool claim, and a pool actor with no valid
@@ -2347,9 +2352,20 @@ export class NetGatewayDO {
         withSibling ? { submit: bare, relate_destinations: relateDestinations } : bare
       );
       if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
-      base = (await this.scopeHead(destination)).head;
+      planningHead = await this.scopeHead(destination);
+      this.assertTurnEpoch(planningHead, request.catalog_epoch, clusterScope, []);
+      this.rememberPlanningHead(clusterScope, request.catalog_epoch, planningHead);
+      base = planningHead.head;
     }
     if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
+    // Session commits never allocate objects, so the accepted authority head
+    // can advance the cached base while retaining the allocation counter from
+    // the exact prior /head. A concurrent later write merely causes the normal
+    // stale_head repair; the cache is not an authority certificate.
+    this.rememberPlanningHead(clusterScope, request.catalog_epoch, {
+      ...planningHead,
+      head: reply.head
+    });
     let relationExpediteDegraded = false;
     try {
       await this.expediteForeignRelations(reply, relateDestinations, []);
@@ -2641,14 +2657,32 @@ export class NetGatewayDO {
       // authentication credential. A response-lost retry therefore cannot
       // pass ordinary bearer validation. The gateway that minted/routed the
       // session retains a bounded durable receipt; consume it before the live
-      // bearer gate and return the original semantic success. Unknown random
-      // session ids still take the normal fail-closed auth path below.
+      // bearer gate and return the original semantic success.
+      //
+      // There is one wider dropped-reply window: both bounded internal submit
+      // replies can be lost after authority accepted, so this gateway never
+      // gets to write its receipt. Its derived session cell still binds the
+      // opaque bearer to an actor even though the value is now expired. Let
+      // that exact bearer reach the idempotent close path, which proves the
+      // already-released postcondition and writes the missing receipt. This
+      // grants no use of an expired session beyond destroying itself. Unknown
+      // random session ids still take the normal fail-closed auth path below.
       if (request.method === "DELETE" && url.pathname === "/net-api/session" && credential.kind === "session") {
         const closedActor = this.closedSessionActor(credential.session);
         if (closedActor) {
           auditActor = closedActor;
           this.enforceClientRate(closedActor, url.pathname);
           return json({ closed: true, already: "closed" });
+        }
+        const value = this.ensureView().get(sessionCellKey(credential.session))?.value as {
+          id?: unknown;
+          actor?: unknown;
+        } | undefined;
+        if (value?.id === credential.session && typeof value.actor === "string") {
+          auditActor = value.actor;
+          this.enforceClientRate(value.actor, url.pathname);
+          const identity = await this.catalogIdentity();
+          return await this.clientSessionClose(value.actor, credential.session, identity.epoch);
         }
       }
       const identity = await this.catalogIdentity();

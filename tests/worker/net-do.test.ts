@@ -936,10 +936,17 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     await call(cluster.instance, scopeEnv, "/seed", { scope: "cluster:#actor", catalog_epoch: EPOCH, cells: seedCells() });
 
     const gatewayState = netState("gateway-sessions");
+    let clusterHeadCalls = 0;
+    const countedCluster = {
+      fetch: async (request: Request): Promise<Response> => {
+        if (new URL(request.url).pathname.endsWith("/head")) clusterHeadCalls += 1;
+        return cluster.instance.fetch(request);
+      }
+    };
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
       NET_RESOLVE: (destination) => {
-        if (destination === "scope:cluster:#actor") return cluster.instance;
+        if (destination === "scope:cluster:#actor") return countedCluster;
         throw new Error(`unexpected destination ${destination}`);
       }
     };
@@ -954,6 +961,19 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(opened.reply.status, JSON.stringify(opened.reply)).toBe("accepted");
     expect(opened.scope).toBe("cluster:#actor");
     expect(opened.value).toMatchObject({ id: "s-open-1", actor: "#actor" });
+    expect(clusterHeadCalls).toBe(1);
+
+    // The accepted mint returned the cluster's exact new head. A second
+    // session substrate commit on this gateway reuses it and therefore pays
+    // no routine /head RPC; /submit remains the authority check.
+    const openedAgain = await call<{ reply: CommitReply }>(
+      gateway,
+      gatewayEnv,
+      "/session-open",
+      { session: "s-open-2", actor: "#actor", ttl_ms: 60_000, catalog_epoch: EPOCH, cluster_destination: "scope:cluster:#actor" }
+    );
+    expect(openedAgain.reply.status, JSON.stringify(openedAgain.reply)).toBe("accepted");
+    expect(clusterHeadCalls).toBe(1);
 
     // The accepted cell is authoritative at the cluster…
     const closure = await call<{ cells: Array<{ key: string; value: unknown }> }>(
@@ -1010,6 +1030,19 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
       stamp: { scope_head: "x", catalog_epoch: EPOCH }
     });
     expect(sequencedReply.status, JSON.stringify(sequencedReply)).toBe("accepted");
+
+    // A write from another gateway advances authority after the retained
+    // hint. The scope, not the cache, proves that base through its bounded
+    // retained tail and safely rebases this readless session commit without
+    // adding a /head round trip.
+    const repaired = await call<{ reply: CommitReply }>(
+      gateway,
+      gatewayEnv,
+      "/session-open",
+      { session: "s-open-3", actor: "#actor", ttl_ms: 60_000, catalog_epoch: EPOCH, cluster_destination: "scope:cluster:#actor" }
+    );
+    expect(repaired.reply.status, JSON.stringify(repaired.reply)).toBe("accepted");
+    expect(clusterHeadCalls).toBe(1);
 
     // Phase 5: a zero/negative TTL can no longer even CONSTRUCT a mint —
     // the no-expiry guard refuses at the library boundary, through the
