@@ -1,7 +1,8 @@
 # Programmer environment and MCP remediation plan
 
 Date: 2026-07-23
-Status: design note for review; not normative and not implemented
+Status: design note; revised same day after a code-verified review. Not
+normative and not implemented.
 
 ## 1. Decision
 
@@ -126,6 +127,19 @@ feature page. Within the feature chain, programmer overrides of `inspect` and
 `search` win over their builder definitions exactly as they do for legacy
 `$programmer` descendants.
 
+Parent-chain-wins cuts both ways. Any verb on the actor-kind ancestry
+(`$player`, `$actor`, `$agent`, `$human`, `$guest`) whose name collides with a
+surface verb silently disables that tool for feature-composed programmers
+while legacy `$programmer` descendants keep it — silent behavioral divergence
+between the two promotion paths. Today the name sets are disjoint (`$player`
+defines `look_self`, `inventory`, `home`, `who_all`, `ways`,
+`examine_detailed`, `tell`, `help`; none collide with the surface's `look`,
+`inspect`, `search`, `create`, `eval`, ...), so this is a constraint to
+enforce, not a bug to fix. A guard script in the `guard:*` family must
+enumerate verb-name collisions between the surface chain and every actor-kind
+ancestry chain and fail the build on overlap, so a future `$player:search`
+cannot quietly retire a programmer tool.
+
 Creating `$builder_tools` and `$programmer_tools` copies would make the naming
 more literal but would force duplicated implementations or a new delegation
 layer. Gateway projection from flags would be worse: it would make generic
@@ -160,10 +174,22 @@ later primitive one missed check away from escalation. After the surface check,
 `set_task_perms(actor)` makes substrate permission checks enforce the same
 principal the wrapper claims to represent.
 
-The native helpers that currently accept a `surfaceClass` must recognize a
-surface resolved through an attached feature as well as ancestry. That check
-must remain generic over the supplied definer/feature chain; core must not gain
-`$programmer` or `$builder` special cases.
+There must be exactly one surface-membership predicate, and everything routes
+through it. Define a generic check — working name `has_surface(actor,
+surface)` — that is true when `surface` is on the actor's parent chain or is
+reachable through the actor's attached feature chain, using the same FT2
+resolution order the dispatcher uses. It is generic over the supplied class;
+core does not name `$programmer` or `$builder`. All of the following are
+rewritten to call it and nothing else:
+
+- every woocode wrapper guard that today reads `isa(actor, $programmer)` or
+  `isa(actor, $builder)` (roughly 35 verbs across the two classes);
+- the native `assertProgrammerActor` / `surfaceClass` helpers behind
+  `builder_create_object`, `programmer_install_verb`, and their siblings.
+
+Per-wrapper hand-rolled feature walks in DSL are forbidden: one missed or
+divergent reimplementation is an authorization bug, and the guard set is too
+large to audit piecewise.
 
 ### 4.3 Attachment is not self-service
 
@@ -179,6 +205,40 @@ normal operation that changes surface, flag, quota counter, and audit
 observation together. Provisioning may reattach a deliberately removed surface
 only through an explicit promote/repair operation; session startup must not
 silently reverse the owner's removal.
+
+### 4.4 Core learns the surface from catalog data, not by name
+
+The AP6 provisioning verbs are native. If they attached `$programmer` by
+name, generic core would gain knowledge of a bundled catalog — the same
+layering defect §4.2 forbids in the check path. The plan must not prohibit
+catalog names in one native path while requiring them in another.
+
+Resolution: the prog catalog's seed_hook publishes the surface reference as
+catalog data — a `$system.programmer_surface` property whose value is the
+surface object (`$programmer`). The native create/promote/demote operations
+read that property and attach whatever it names. When the property is absent
+or unset, provisioning sets the flag and quota only, and reports plainly that
+no authoring surface is installed. Core never names `$builder`, `$programmer`,
+or the prog catalog.
+
+This rule also retires an existing violation the original draft missed:
+`runWizProgrammerParentMigration` in `src/core/local-catalogs.ts` branches on
+the catalog name `"prog"` and reparents `$wiz` under `$programmer` — the
+exact reparent-as-promotion pattern this plan eliminates, applied to the most
+privileged actor in the system. The remediation:
+
+- retire `runWizProgrammerParentMigration`; the prog seed_hook instead
+  attaches `$programmer` to `$wiz` as a feature, the same shape every other
+  actor uses;
+- `$wiz` keeps its own kind ancestry (`$wiz` under `$player`); wizard and
+  programmer authority continue to come from its flags, never from surface
+  ancestry;
+- an idempotent bootstrap local-boot migration repairs already-installed
+  worlds: reparent `$wiz` back under `$player` and attach the feature,
+  recorded in `$system.applied_migrations` like any other cold-init repair.
+
+After Phase B, a grep-able guard holds: no file under `src/core` names
+`$builder`, `$programmer`, or the prog catalog.
 
 ## 5. Provisioning and migration
 
@@ -209,6 +269,20 @@ demote_agent_from_programmer(actor):
   invalidate authoring discovery
   commit all or none
 ```
+
+"Commit all or none" names a mechanism, and the mechanism has a
+precondition. The current native handlers are sequential `setProp` calls with
+no rollback; atomicity comes only from the single-turn effect transcript,
+which commits within one authoritative scope. The transition touches state on
+two objects: the flag and feature list on the agent, the quota counter on the
+`$account`. All-or-none is therefore available only when the agent, its
+account record, and the audit observation commit in the same authoritative
+scope. Co-residency is an explicit precondition of these operations:
+provisioning places the agent in the owning human's authority cluster, and
+promote/demote assert co-residency before mutating — refusing with a
+distinct error rather than proceeding across scopes. A cross-scope
+promote/demote protocol is a deliberate deferral (§12); until it exists, the
+operations refuse rather than partially commit.
 
 Demotion removes the programmer surface. It does not remove a separately
 granted `$builder` feature. If the only builder access came through
@@ -316,17 +390,28 @@ The remediation is not complete unless adversarial tests prove:
 9. Version conflict, compile failure, runtime failure, and editor-save failure
    leave target state unchanged.
 10. Promotion and demotion are atomic across feature, flag, quota, audit, and
-    Net cells.
+    Net cells, committing in one authoritative scope; when the agent and its
+    account record are not co-resident, the operation refuses without
+    mutating anything.
 11. Demotion invalidates live discovery and authoritative calls, including a
     call submitted from stale metadata.
 12. A cold gateway cannot resurrect a removed authoring feature.
+13. No verb name collides between the surface chain and any actor-kind
+    ancestry chain; the collision guard fails the build on overlap, so a
+    feature-composed programmer and a legacy `$programmer` descendant resolve
+    the same tool set.
+14. No file under `src/core` names `$builder`, `$programmer`, or the prog
+    catalog; the surface object reaches native code only as data
+    (`$system.programmer_surface` or an explicit argument).
 
 ## 9. Fit-for-purpose proof
 
 One workerd scenario should use a fresh account and agent, not a hand-edited
 fixture:
 
-1. Provision `agent_42` with programmer authority and an API key.
+1. Provision `agent_42` with programmer authority and an API key; assert the
+   agent object, its account quota record, and its feature attachment
+   committed together in one authoritative scope.
 2. Authenticate a Net MCP session and assert its actor remains an `$agent`.
 3. List tools and find the builder/programmer surface on `agent_42`.
 4. Create an owned fertile base and a child object.
@@ -351,7 +436,12 @@ operational proof, not the first correctness test.
 ### Phase A — make the contract explicit
 
 - Amend identity/provisioning: kind stays in ancestry; authoring surface is a
-  feature; promotion/demotion mutate both atomically.
+  feature; promotion/demotion mutate both atomically, with agent/account
+  co-residency as a stated precondition (§5.1) and refusal as the cross-scope
+  behavior.
+- Specify the single surface predicate (`has_surface`, §4.2) and the
+  catalog-data indirection (`$system.programmer_surface`, §4.4) so the
+  implementation cannot choose per-wrapper walks or core-named classes.
 - Amend features: explicitly permit a persistent class object to serve as a
   feature and document the dual-use pattern.
 - Amend permissions: public authoring wrappers reduce task permissions to the
@@ -359,18 +449,25 @@ operational proof, not the first correctness test.
 - Amend MCP: add the provisioned-programmer acceptance case; retain generic
   feature discovery.
 - Align the prog catalog design and user docs; remove reparenting as the
-  canonical promotion instruction.
+  canonical promotion instruction, including `$wiz`'s (§4.4).
 
 Exit: the spec makes the implementation choice unavoidable.
 
 ### Phase B — compose the surface
 
-- Make prog wrapper guards accept actor-self invocation resolved through the
-  attached surface.
-- Extend the generic substrate surface assertion to feature-chain resolution.
+- Implement `has_surface` and rewrite every wrapper guard and the native
+  `assertProgrammerActor`/`surfaceClass` helpers to call it — no per-wrapper
+  feature walks.
 - Drop effective permissions to the actor in all public builder/programmer
-  wrappers, including chat commands and editor entry.
-- Update AP6 create/promote/demote to attach/remove `$programmer` atomically.
+  wrappers, including chat commands and editor entry. Today only
+  `set_property_info` calls `set_task_perms(actor)`; the change touches every
+  other wrapper, so scope Phase B accordingly.
+- Update AP6 create/promote/demote to attach/remove the surface named by
+  `$system.programmer_surface` atomically, asserting co-residency first.
+- Retire `runWizProgrammerParentMigration`; attach `$programmer` to `$wiz`
+  via the prog seed_hook and ship the local-boot repair migration (§4.4).
+- Add the surface/ancestry verb-name collision guard and the
+  core-names-no-catalog guard (§8.13, §8.14).
 - Add in-memory adversarial and rollback tests.
 
 Exit: a feature-composed `$agent` completes the authoring loop without
@@ -393,7 +490,10 @@ Exit: the workerd scenario in §9 is green and repeatable.
   design. The gateway must route a presented random key to an exact
   authoritative record without global enumeration; use a self-routing opaque
   shard hint or a hash-sharded credential directory. Actor/block cluster state
-  remains authoritative, and lookup rows are derived.
+  remains authoritative, and lookup rows are derived. Migration of existing
+  keys must account for the identity export path's wins-on-collision merge of
+  `$system.api_keys`, so a rotation or revocation during cutover cannot be
+  resurrected by a later merge of the old map.
 - Complete the live catalog epoch-transition/migration pipeline before using
   it to update deployed prog actors.
 - Provide the explicit resource grant and quota path for programmer-authored
@@ -409,7 +509,9 @@ programmer agents without editing global maps or bypassing Net authority.
 - Update human docs to show feature-based promotion and the same editor
   contracts.
 - Mark `trace` honestly as unavailable or implement it; do not list it as a
-  usable v1 tool while it always returns `E_NOT_IMPLEMENTED`.
+  usable v1 tool while it always returns `E_NOT_IMPLEMENTED`. If it stays
+  unimplemented, remove it from the `$programmer:look` tools listing too, not
+  only from the docs.
 - Bake create/edit/call/reconnect/demote under two concurrent programmer
   sessions and record latency, envelope size, and repair behavior.
 
@@ -422,8 +524,10 @@ The programmer environment is not ready to claim until:
 - a fresh programmer agent completes §9 on workerd;
 - no step reparents the actor out of `$agent`;
 - all authoring state is attributed to the agent;
-- promotion/demotion atomicity and stale-call refusal are adversarially tested;
-- the MCP gateway remains catalog-agnostic;
+- promotion/demotion atomicity and stale-call refusal are adversarially
+  tested, including the cross-scope refusal path;
+- the MCP gateway and `src/core` are both catalog-agnostic: the guards of
+  §8.13/§8.14 pass and `runWizProgrammerParentMigration` is gone;
 - cold recovery preserves both tools and authored objects;
 - authoring searches and lists are bounded;
 - API-key issuance/revocation no longer depends on one global mutable map;
@@ -437,6 +541,8 @@ The programmer environment is not ready to claim until:
 These are useful but do not block the first fit-for-purpose MCP loop:
 
 - source-span tracing across the next N calls;
+- a cross-scope promote/demote protocol (until then the operations refuse
+  when agent and account are not co-resident, per §5.1);
 - real-time shared text buffers;
 - arbitrary cross-host object editing;
 - repository browsing or execution inside Woo;
