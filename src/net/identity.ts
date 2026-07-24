@@ -265,6 +265,10 @@ export async function importIdentity(
 ): Promise<{ actors: number; api_keys: number; unattributed: string[] }> {
   const exportedIds = new Set(identity.actors.map((actor) => actor.id));
   const dangling: string[] = [];
+  // Carried feature refs that did not resolve in the fresh install; dropped
+  // (not fatal) so cutover is never blocked by a non-reinstallable custom
+  // feature, but surfaced so an operator can see a capability was not carried.
+  const droppedFeatures: string[] = [];
 
   // §8: imported actors REHOME to the catalog-defined start location —
   // the same `$system.guest_initial_room` convention that places fresh
@@ -347,6 +351,23 @@ export async function importIdentity(
       }
     }
     for (const [name, value] of Object.entries(actor.props)) {
+      if (name === "features" && Array.isArray(value)) {
+        // A carried feature ref must resolve in the freshly installed world.
+        // Bundled surface classes (e.g. $programmer) reinstall and resolve; a
+        // custom/live feature absent from the fresh install is dropped rather
+        // than imported as a dangling capability (it rehomes to defaults, like
+        // any uncarried world state). Catalogs are installed before this import.
+        const resolved = value.filter((ref) => typeof ref === "string" && world.objects.has(ref));
+        if (resolved.length !== value.length) {
+          for (const ref of value) {
+            if (typeof ref !== "string" || !world.objects.has(ref)) {
+              droppedFeatures.push(`${actor.id}: feature ${String(ref)} does not resolve in the fresh install`);
+            }
+          }
+        }
+        world.setProp(actor.id, name, resolved as never);
+        continue;
+      }
       world.setProp(actor.id, name, value as never);
     }
   }
@@ -433,6 +454,9 @@ export async function importIdentity(
   }
   if (dangling.length > 0) {
     throw new Error(`identity import verification failed (${dangling.length} dangling refs):\n  ${dangling.join("\n  ")}`);
+  }
+  if (droppedFeatures.length > 0) {
+    console.warn(`identity import dropped ${droppedFeatures.length} non-reinstallable feature ref(s):\n  ${droppedFeatures.join("\n  ")}`);
   }
   return { actors: identity.actors.length, api_keys: Object.keys(identity.api_keys).length, unattributed };
 }

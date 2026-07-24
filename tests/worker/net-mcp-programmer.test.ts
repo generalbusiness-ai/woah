@@ -46,20 +46,23 @@ type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
 describe("Net MCP programmer surface (fake-DO lane)", () => {
   it("exposes a feature-composed agent's authoring tools over Net MCP and authors through the turn path", async () => {
-    // Two carried actors with apikeys (the proven net-mcp auth pattern), one
-    // with the programmer surface composed on. The surface is a feature on any
-    // $actor descendant, so this exercises the same feature-chain resolution a
-    // programmer $agent uses; the create_agent provisioning path itself is
+    // Two $wiz-owned $agents with apikeys, one with the programmer surface
+    // composed on. Real $agent auth exercises the owner-chain eligibility check
+    // (owner read from object_lineage). The create_agent provisioning path is
     // covered in tests/programmer-surface.test.ts. The identity export now
-    // carries the `features` surface, so the actor arrives feature-composed.
+    // carries the `features` surface, so the agent arrives feature-composed.
+    const progAgent = "prog_agent";
+    const plainAgent = "plain_agent";
     const old = createWorld();
-    const progAgent = old.auth("guest:mcp-prog").actor;
-    const plainAgent = old.auth("guest:mcp-plain").actor;
+    old.createObject({ id: progAgent, parent: "$agent", owner: "$wiz", name: "ProgBot" });
+    old.createObject({ id: plainAgent, parent: "$agent", owner: "$wiz", name: "PlainBot" });
     old.ensureApiKey("$wiz", progAgent, "prog-key", "prog-secret", "prog");
     old.ensureApiKey("$wiz", plainAgent, "plain-key", "plain-secret", "plain");
     old.setObjectFlags("$wiz", progAgent, { programmer: true }); // flag + surface
 
-    // The surface is composed as a feature, never by reparenting.
+    // §8.1: kind stays $agent; the surface is composed as a feature, never by
+    // reparenting.
+    expect(old.isDescendantOf(progAgent, "$agent")).toBe(true);
     expect(old.isDescendantOf(progAgent, "$programmer")).toBe(false);
     expect(old.actorHasSurface(progAgent, "$programmer")).toBe(true);
     expect(old.actorHasSurface(plainAgent, "$programmer")).toBe(false);

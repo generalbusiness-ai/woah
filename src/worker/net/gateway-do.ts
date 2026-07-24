@@ -3225,8 +3225,16 @@ export class NetGatewayDO {
       const cell = this.ensureView().get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
       return cell && "value" in cell ? cell.value : undefined;
     };
-    const lineage = (object: string): { parent?: string | null } | undefined =>
-      this.ensureView().get(cellKey("object_lineage", object))?.value as { parent?: string | null } | undefined;
+    const lineage = (object: string): { parent?: string | null; owner?: string | null } | undefined =>
+      this.ensureView().get(cellKey("object_lineage", object))?.value as { parent?: string | null; owner?: string | null } | undefined;
+    // Ownership is serialized into the object_lineage cell (src/net/bridge.ts),
+    // not a property_cell — a `property_cell:<obj>:owner` is never emitted, so
+    // owner MUST be read from lineage. Reading it via `prop(obj, "owner")` would
+    // always resolve nothing and refuse every non-$wiz-owned agent.
+    const ownerOf = (object: string): string | undefined => {
+      const value = lineage(object)?.owner;
+      return typeof value === "string" ? value : undefined;
+    };
     const reachesClass = (object: string, cls: string): boolean => {
       let current: string | null | undefined = object;
       const guard = new Set<string>();
@@ -3258,7 +3266,7 @@ export class NetGatewayDO {
       // $agent: recurse up the owner chain (core's rule) — a deactivated
       // owner disqualifies its agents. $wiz-owned agents authenticate.
       if (reachesClass(current, "$agent")) {
-        const owner = prop(current, "owner");
+        const owner = ownerOf(current);
         if (owner === "$wiz") return;
         if (typeof owner !== "string" || owner.length === 0) refuse({ actor: current, reason_detail: "agent_owner_unresolved" });
         await this.warmScopes(

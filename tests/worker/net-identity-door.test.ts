@@ -482,10 +482,11 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     old.setProp(human, "deactivated_at", Date.now() as never);
     old.ensureApiKey("$wiz", human, "v3-human-key", "v3-human-secret", "deactivated actor");
     // An AGENT owned by a deactivated owner (the reviewer's "apikey for a
-    // deactivated agent" — here via the owner chain).
-    const owner = old.auth("guest:v3-owner").actor;
-    old.setProp(owner, "deactivated_at", Date.now() as never);
-    const agent = old.createObject({ id: "agent_v3", parent: "$agent", owner, name: "agent" }).id;
+    // deactivated agent" — here via the owner chain). The owner is the carried,
+    // deactivated human above (the production shape: agents are owned by the
+    // $human that provisioned them, whose deactivated state carries with the
+    // identity export). The owner-chain check reads owner from object_lineage.
+    const agent = old.createObject({ id: "agent_v3", parent: "$agent", owner: human, name: "agent" }).id;
     old.ensureApiKey("$wiz", agent, "v3-agent-key", "v3-agent-secret", "agent of deactivated owner");
     const identity = exportIdentity(old.exportWorld());
 

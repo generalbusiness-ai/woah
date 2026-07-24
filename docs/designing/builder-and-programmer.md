@@ -19,19 +19,29 @@ agent_42.features = [$programmer]   (surface composed on)
 ```
 
 Promote an actor by attaching the surface — its kind never changes. The
-normal path is the provisioning verb, which attaches the surface, sets
-the `programmer` flag, and consumes quota together:
+normal path is a provisioning verb on the owning `$human`, which attaches
+the surface, sets the `programmer` flag, and consumes quota together:
 
 ```
-woo_call("<your-human>", "promote_agent_to_programmer", ["<agent>"])
+$human:promote_agent_to_programmer(<agent>)
 ```
 
 or provision it programmer-ready in one step with
-`create_agent(name, purpose, true)`. Do **not** reparent an actor into
-`$programmer`: that would strip the ancestry that records what kind of
-principal it is (`$agent`, `$human`). Demote with
-`demote_agent_from_programmer(<agent>)`, which removes the surface,
+`$human:create_agent(name, purpose, true)`. Do **not** reparent an actor
+into `$programmer`: that would strip the ancestry that records what kind
+of principal it is (`$agent`, `$human`). Demote with
+`$human:demote_agent_from_programmer(<agent>)`, which removes the surface,
 clears the flag, and frees the quota slot.
+
+> **Surface note.** These provisioning verbs are native account-management
+> operations, not woocode tools. They run on the in-world/account path
+> (in-memory and local-SQLite deployments, and the account surface). They
+> are **not** yet reachable through the Net MCP tool surface — the Net MCP
+> gateway advertises only bytecode-backed, `tool_exposed` verb pages, and a
+> supported cross-scope promote/demote path over Net (with the agent and its
+> account co-resident in one authority scope) is still to be built. Over Net,
+> provision the agent programmer-ready at creation, or manage promotion
+> through the account surface, rather than `woo_call`-ing these verbs.
 
 ## Why two classes
 

@@ -390,6 +390,19 @@ protocol is deferred; until it exists the co-resident case is the
 supported one. `create_agent` provisions the agent in the calling human's
 scope, so it is co-resident by construction.
 
+> **Net status (not yet supported).** On the Net (Cloudflare) profile there
+> is not yet a supported live promote/demote path, for two reasons. (1) These
+> verbs are native, and the Net MCP gateway advertises only bytecode-backed
+> `tool_exposed` pages, so they are not reachable through the MCP tool
+> surface. (2) An imported/provisioned agent self-clusters while its account
+> is not anchored into that same cluster, so the co-resident precondition
+> above is not actually constructed and the transition would refuse. Building
+> the Net path therefore requires both an account-surface (or bytecode)
+> provisioning entry point AND an authority anchor that co-locates an agent
+> with its account. Until then, provision agents programmer-ready at
+> `create_agent` time, and drive promote/demote on the in-memory / local
+> SQLite profiles or the account surface.
+
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,
 existing flags survive — agents keep `programmer = true` until

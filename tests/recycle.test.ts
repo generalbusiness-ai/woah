@@ -17,11 +17,11 @@ describe("recycle", () => {
   function wizActor(world: ReturnType<typeof createWorld>) {
     const session = world.auth("guest:wiz-recycle");
     const actor = session.actor;
-    const obj = world.object(actor);
-    obj.owner = actor;
-    obj.flags.wizard = true;
-    obj.flags.programmer = true;
-    world.chparentAuthoredObject("$wiz", actor, "$wiz");
+    world.object(actor).owner = actor;
+    // Grant authority through the supported API so the authoring surface is
+    // composed onto the actor — a wizard resolves builder/programmer verbs via
+    // the surface feature, not via $wiz ancestry (which instances don't inherit).
+    world.setObjectFlags("$wiz", actor, { wizard: true, programmer: true });
     return { session, actor };
   }
 

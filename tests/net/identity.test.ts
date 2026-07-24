@@ -94,6 +94,25 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
   });
 
+  it("drops a carried feature ref that does not reinstall, keeping resolvable ones", async () => {
+    const { world, actor } = oldWorld();
+    // A custom feature (world furniture, not carried) alongside the bundled
+    // programmer surface. Attach both directly.
+    world.createObject({ id: "custom_feature", name: "Custom", parent: "$thing", owner: "$wiz" });
+    world.setObjectFlags("$wiz", actor, { programmer: true }); // composes $programmer
+    world.setProp(actor, "features", [...(world.getProp(actor, "features") as string[]), "custom_feature"]);
+    expect(world.getProp(actor, "features")).toEqual(["$programmer", "custom_feature"]);
+
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+
+    // $programmer reinstalled and resolves; custom_feature (not carried) is
+    // dropped rather than left dangling.
+    expect(plan.world.objects.has("custom_feature")).toBe(false);
+    expect(plan.world.getProp(actor, "features")).toEqual(["$programmer"]);
+    expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
+  });
+
   it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
     // The reviewer's repro shape: the primary is z_human, but an agent
     // whose id sorts FIRST is also bound — a rebuild-from-first-sorted

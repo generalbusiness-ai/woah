@@ -3660,11 +3660,13 @@ export class WooWorld {
     private attachProgrammerSurface(actor: ObjRef): void {
       const surface = this.programmerSurface();
       if (!surface || !this.canCarryFeatures(actor)) return;
+      // Bounded collision check FIRST — before the already-present short-circuit
+      // — so a surface a bypass (generic add_feature) attached to a shadowing
+      // kind is still caught on the next reconcile, not silently accepted. This
+      // choke point covers createAgent, promote, and wizard set_object_flags.
+      this.assertSurfaceComposable(actor, surface);
       const features = this.featureList(actor);
       if (features.includes(surface)) return;
-      // Bounded collision check covers any live/custom actor class reaching this
-      // choke point (createAgent, promote, wizard set_object_flags).
-      this.assertSurfaceComposable(actor, surface);
       this.setProp(actor, "features", [...features, surface]);
       this.bumpFeaturesVersion(actor);
     }
@@ -3746,10 +3748,14 @@ export class WooWorld {
      * touched, and quota before a promote transition, so a refusal happens with
      * nothing mutated rather than half-applied across a host boundary.
      */
-    private async setProgrammerAgentState(actor: ObjRef, account: ObjRef, programmer: boolean, auditAction: string): Promise<void> {
+    private async setProgrammerAgentState(caller: ObjRef, actor: ObjRef, account: ObjRef, programmer: boolean, auditAction: string): Promise<void> {
       const currently = this.object(actor).flags.programmer === true;
       const transition = currently !== programmer;
-      if (programmer) this.assertSurfaceComposable(actor, this.programmerSurface() ?? actor);
+      const surface = this.programmerSurface();
+      // Preflight composability before any mutation: a promote onto a kind that
+      // shadows a surface verb refuses with nothing changed, and a surface that
+      // a bypass attached to such a kind is caught here too.
+      if (programmer && surface) this.assertSurfaceComposable(actor, surface);
       if (transition) {
         if (programmer) this.assertProgrammerAgentQuota(account);
         // The transition writes the account counter; refuse across a host
@@ -3760,10 +3766,18 @@ export class WooWorld {
         const delta = programmer ? 1 : -1;
         const next = Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + delta);
         this.setProp(account, "programmer_agent_count", next);
-        this.recordWizardAction(actor, auditAction, { actor, account, programmer });
+        // The caller (the human/wizard) is the acting principal; the agent is
+        // the subject (§8.10 audit attribution).
+        this.recordWizardAction(caller, auditAction, { target: actor, account, programmer });
       }
       // Surface reconciliation is unconditional so partial legacy state heals.
+      // A repair without a flag transition is itself auditable.
+      const hadSurface = surface ? this.featureList(actor).includes(surface) : false;
       this.reconcileProgrammerSurface(actor, programmer);
+      const hasSurface = surface ? this.featureList(actor).includes(surface) : false;
+      if (!transition && hadSurface !== hasSurface) {
+        this.recordWizardAction(caller, "programmer_surface_repaired", { target: actor, attached: hasSurface });
+      }
     }
 
     private rotateAgentKey(human: ObjRef, agent: ObjRef, force: boolean): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
@@ -6444,9 +6458,11 @@ export class WooWorld {
       if (id && this.objects.has(id)) ids.add(id);
     };
     const actorObj = this.object(actor);
-    if (scope === "all") {
-      for (const id of this.objects.keys()) add(id);
-    } else if (scope === "owned") {
+    // No "all" scope: a global object enumeration is forbidden on Net
+    // (spec/semantics/distribution.md) and on any host it would return only the
+    // misleading local closure. "owned" is bounded to the actor's own objects
+    // (plan §7). An unrecognized scope (including "all") is rejected below.
+    if (scope === "owned") {
       for (const obj of this.objects.values()) if (obj.owner === actor) add(obj.id);
     } else {
       add(actor);
@@ -9687,10 +9703,19 @@ export class WooWorld {
     return this.objects.get(actor)?.flags.wizard === true;
   }
 
-  recordWizardAction(actor: ObjRef, action: string, details: Record<string, WooValue>): void {
+  recordWizardAction(principal: ObjRef, action: string, details: Record<string, WooValue>): void {
     const raw = this.propOrNull("$system", "wizard_actions");
     const actions = Array.isArray(raw) ? raw : [];
-    this.setProp("$system", "wizard_actions", [...actions, { ts: Date.now(), actor, action, ...details }]);
+    // `actor` is the acting principal and `action`/`ts` are structural — a
+    // details key must never clobber them. A details.actor (the subject some
+    // callers pass) is preserved as `target` instead, matching the audit
+    // convention that separates principal (`actor`) from subject (`target`).
+    const { actor: subject, ...rest } = details;
+    const entry: Record<string, WooValue> = { ...rest, ts: Date.now(), actor: principal, action };
+    if (typeof subject === "string" && subject !== principal && entry.target === undefined) {
+      entry.target = subject;
+    }
+    this.setProp("$system", "wizard_actions", [...actions, entry]);
   }
 
   /**
@@ -9712,23 +9737,39 @@ export class WooWorld {
     const allowed = new Set(["wizard", "programmer", "fertile"]);
     const obj = this.object(target);
     const before: Record<string, boolean> = { ...obj.flags };
+    // Pass 1 — validate every flag and compute the intended changes WITHOUT
+    // mutating, so a later failure (a non-composable surface) cannot leave a
+    // partially-applied flag set.
     const changes: Record<string, { from: boolean; to: boolean }> = {};
     for (const [key, raw] of Object.entries(flags)) {
       if (!allowed.has(key)) continue;
       if (typeof raw !== "boolean") throw wooError("E_TYPE", `flag ${key} must be boolean`, { key, value: raw as WooValue });
       const prev = Boolean(before[key]);
       if (prev === raw) continue;
-      (obj.flags as Record<string, boolean>)[key] = raw;
       changes[key] = { from: prev, to: raw };
     }
     if (Object.keys(changes).length === 0) return { ...obj.flags };
-    // The programmer flag and the authoring surface travel together. A raw
-    // flag flip here (the auth.md §A11 backup-wizard path, or a wizard directly
-    // granting programmer) reconciles the surface too, so this path can never
-    // leave a flag-without-surface or surface-without-flag inconsistency for
-    // has_surface to disagree with. No quota accounting: set_object_flags is the
-    // deliberate quota-bypassing wizard primitive.
-    if (changes.programmer) this.reconcileProgrammerSurface(target, changes.programmer.to);
+    // The authoring surface must resolve on any actor that can author — a
+    // programmer OR a wizard (a wizard bypasses the surface CHECK but still
+    // needs the verbs to RESOLVE on itself). Preflight composability before
+    // touching anything if either flag is going true, so a shadowing kind
+    // refuses with the flag left false.
+    const willAuthor = (changes.programmer?.to ?? (before.programmer === true)) || (changes.wizard?.to ?? (before.wizard === true));
+    if (willAuthor && (changes.programmer?.to === true || changes.wizard?.to === true)) {
+      const surface = this.programmerSurface();
+      if (surface && this.canCarryFeatures(target)) this.assertSurfaceComposable(target, surface);
+    }
+    // Pass 2 — apply. The programmer/wizard flags and the authoring surface
+    // travel together, so a flag flip reconciles the surface too and this path
+    // can never leave an author-capable actor without a resolvable surface, nor
+    // a surface stranded on a non-authoring actor. No quota accounting:
+    // set_object_flags is the deliberate quota-bypassing wizard primitive.
+    for (const [key, change] of Object.entries(changes)) {
+      (obj.flags as Record<string, boolean>)[key] = change.to;
+    }
+    if (changes.programmer || changes.wizard) {
+      this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
+    }
     this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
     this.markObjectDirty(target);
     return { ...obj.flags };
@@ -9788,6 +9829,14 @@ export class WooWorld {
     const wizard = this.isWizard(actor);
     if (!wizard && consumerOwner !== actor) throw wooError("E_PERM", `${actor} cannot add features to ${consumer}`);
     if (!wizard && !(await this.canFeatureBeAttachedBy(feature, actor))) throw wooError("E_PERM", `${feature} cannot be attached by ${actor}`);
+    // The programmer surface must not be composed onto a kind that shadows its
+    // verbs, even through this generic path — otherwise a wizard could attach it
+    // to a colliding kind here and then set the flag, landing a half-working
+    // surface that promote would accept.
+    const surface = this.programmerSurface();
+    if (surface && (feature === surface || this.inheritsFrom(feature, surface))) {
+      this.assertSurfaceComposable(consumer, surface);
+    }
     const features = this.featureList(consumer);
     if (features.includes(feature)) {
       observations?.push({ type: "feature_already_added", source: consumer, feature });
@@ -10981,26 +11030,26 @@ export class WooWorld {
         // Strip programmer state through the shared transition first: it clears
         // the flag, removes the surface, decrements the quota, and refuses
         // cross-host before any of that — idempotent if already non-programmer.
-        await this.setProgrammerAgentState(agent, account, false, "agent_demoted_from_programmer");
+        await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         const key = this.propOrNull(agent, "api_key_id");
         if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
         this.setProp(agent, "deactivated_at", Date.now());
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        this.recordWizardAction(ctx.actor, "agent_revoked", { actor: agent, reason: typeof args[1] === "string" ? args[1] : null });
+        this.recordWizardAction(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
         return true;
       });
       this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        await this.setProgrammerAgentState(agent, account, true, "agent_promoted_to_programmer");
+        await this.setProgrammerAgentState(ctx.actor, agent, account, true, "agent_promoted_to_programmer");
         return true;
       });
       this.nativeHandlers.set("human_demote_agent_from_programmer", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        await this.setProgrammerAgentState(agent, account, false, "agent_demoted_from_programmer");
+        await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         return true;
       });
       this.nativeHandlers.set("human_rotate_agent_key", (ctx, args) => {

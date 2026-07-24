@@ -245,9 +245,27 @@ describe("programmer surface (feature-composed)", () => {
     expect(up.op).toBe("result");
     expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+
+    // §6: the repair is audited, with the human as principal and the agent as
+    // subject (never the agent as its own acting principal).
+    const audit = world.propOrNull("$system", "wizard_actions") as Array<Record<string, unknown>>;
+    const repair = audit.find((a) => a.action === "programmer_surface_repaired");
+    expect(repair, JSON.stringify(audit.slice(-3))).toMatchObject({ actor: human, target: agent, attached: true });
+
     // And the repaired agent can now author.
     const created = (await world.directCall("mk", agent, agent, "create", ["$thing", { name: "Rep" }])) as CallResult;
     expect(created.op).toBe("result");
+  });
+
+  it("attributes a promote audit to the human principal, not the agent", async () => {
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "attrib@example.com");
+    const agent = await createAgent(world, human, "attribbot", false);
+    await world.directCall("up", human, human, "promote_agent_to_programmer", [agent]);
+    const audit = world.propOrNull("$system", "wizard_actions") as Array<Record<string, unknown>>;
+    const promote = audit.find((a) => a.action === "agent_promoted_to_programmer");
+    expect(promote).toMatchObject({ actor: human, target: agent });
+    expect(promote?.actor).not.toBe(agent);
   });
 
   it("removes a stranded surface when a raw flag-clear left the feature behind", async () => {
@@ -276,14 +294,32 @@ describe("programmer surface (feature-composed)", () => {
     expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
   });
 
-  it("refuses to compose the surface onto a kind that shadows a surface verb", async () => {
+  it("refuses to compose the surface onto a kind that shadows a surface verb, leaving the flag false", async () => {
     const world = createWorld();
     // $block (isa $actor) defines its own set_property and look, which the
     // builder surface also defines. Composing the surface would silently shadow
-    // them, so attachment must refuse.
+    // them, so attachment must refuse — and set_object_flags must not have
+    // half-applied the flag before the refusal.
     world.createObject({ id: "test_block", name: "Test Block", parent: "$block", owner: "$wiz" });
     expect(() => world.setObjectFlags("$wiz", "test_block", { programmer: true })).toThrow(/shadows surface verb/);
     expect(world.actorHasSurface("test_block", "$programmer")).toBe(false);
+    expect(world.object("test_block").flags.programmer ?? false).toBe(false);
+  });
+
+  it("closes the add_feature bypass: the generic attach refuses the surface for a shadowing kind, and a bypassed surface is caught on flag-set", async () => {
+    const world = createWorld();
+    world.createObject({ id: "bypass_block", name: "Bypass Block", parent: "$block", owner: "$wiz" });
+    // The generic addFeature path (even with wizard authority) must refuse the
+    // programmer surface onto a shadowing kind — it is not a bypass around the
+    // composability check.
+    await expect((world as any).addFeature("bypass_block", "$programmer", "$wiz")).rejects.toMatchObject({ code: "E_INVARG" });
+    expect(world.actorHasSurface("bypass_block", "$programmer")).toBe(false);
+
+    // Even if a raw write plants the surface, setting the programmer flag
+    // re-validates composability and refuses, leaving the flag false.
+    world.setProp("bypass_block", "features", ["$programmer"]);
+    expect(() => world.setObjectFlags("$wiz", "bypass_block", { programmer: true })).toThrow(/shadows surface verb/);
+    expect(world.object("bypass_block").flags.programmer ?? false).toBe(false);
   });
 
   it("promote leaves flag, surface, quota, and audit unchanged when quota is exhausted (§8.10 atomicity)", async () => {
