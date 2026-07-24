@@ -3225,18 +3225,24 @@ export class WooWorld {
   createApiKey(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to create api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     return this.createApiKeyRecord(actor, target, label, "create_api_key");
   }
 
-  /** Dev/ops helper: ensure a caller-specified apikey exists with exactly the
-   * provided id+secret and target. Intended for localdev bootstrap code that
-   * already owns the secret; ordinary user-facing minting should use
-   * createApiKey/createApiKeyForOwner so secrets remain one-time generated. */
+  /**
+   * Compatibility-image constructor for tests and pre-Net donor worlds.
+   *
+   * This deliberately synthesizes the historical global registry so identity
+   * carry and old-key authentication remain testable. It is not a live-world
+   * issuance path: catalogs use createApiKey/createApiKeyForOwner, while Net
+   * operator bootstrap uses the internal-signed credential ensure route.
+   *
+   * @deprecated New credentials must use an actor-owned issuance path.
+   */
   ensureApiKey(actor: ObjRef, target: ObjRef, id: string, secret: string, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number; created: boolean } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to ensure api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     if (!id || id.includes(":")) throw wooError("E_INVARG", "apikey id must be non-empty and must not contain ':'", { id });
     if (!secret) throw wooError("E_INVARG", "apikey secret must be non-empty");
 
@@ -3277,25 +3283,46 @@ export class WooWorld {
    * can be configured by their creator without wizard escalation. */
   createApiKeyForOwner(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
       throw wooError("E_PERM", "owner-mint requires the calling actor to own the target", { actor, target });
     }
     return this.createApiKeyRecord(actor, target, label, "create_api_key_for_owner");
   }
 
-  private createApiKeyRecord(_actor: ObjRef, target: ObjRef, label: string | null, _auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
+  private createApiKeyRecord(actor: ObjRef, target: ObjRef, label: string | null, auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     const authorityRoot = this.apiKeyAuthorityRoot(target);
+    // n1 ids have one intentionally narrow routing grammar: catalog seed
+    // roots route to `catalog`; concrete actor roots route to their cluster.
+    // Refuse every other anchor shape instead of reproducing CO15's full
+    // class classifier in core. In particular, an actor anchored under a
+    // room must not mint an id that falsely names `cluster:<room>`.
+    if (!authorityRoot.startsWith("$") && !this.isActorDescendant(authorityRoot)) {
+      throw wooError(
+        "E_LINEAGE",
+        "apikey authority root must be catalog identity or an $actor descendant",
+        { actor: target, authority_root: authorityRoot }
+      );
+    }
     const id = routedApiKeyId(authorityRoot, target, randomHex(16));
     const secret = randomHex(32);
     const salt = randomHex(16);
     const hash = hashSource(`${salt}:${secret}`);
     const created_at = Date.now();
     const map = { ...this.apiKeyMap(target) };
-    map[id] = { hash, salt, actor: target, label: label ?? null, created_at } as WooValue;
-    // The actor cluster is the authority and the accepted turn is the durable
-    // issuance audit. Writing `$system.wizard_actions` here would reintroduce
-    // the catalog mutation that Net correctly refuses for ordinary turns.
+    map[id] = {
+      hash,
+      salt,
+      actor: target,
+      label: label ?? null,
+      created_at,
+      created_by: actor,
+      created_via: auditAction
+    } as WooValue;
+    // The actor-owned record (including created_at) is the durable issuance
+    // audit in every runtime profile; Net additionally retains the accepted
+    // transcript. Writing `$system.wizard_actions` here would reintroduce the
+    // catalog mutation that Net correctly refuses for ordinary turns.
     this.setProp(target, "api_keys", map as WooValue);
     return { id, secret, actor: target, label, created_at };
   }
@@ -3331,14 +3358,22 @@ export class WooWorld {
     if (!isWizard && !isOwner) {
       throw wooError("E_PERM", "revoke requires wizard authority or ownership of the bound actor", { actor, key_id: id });
     }
-    return this.revokeApiKeyRecord(actor, id, map, r, targetActor, routed?.actor ?? null);
+    return this.revokeApiKeyRecord(actor, id, map, r, targetActor, routed?.actor ?? null, true);
   }
 
-  private revokeApiKeyRecord(actor: ObjRef, id: string, map: Record<string, WooValue>, record: Record<string, WooValue>, targetActor: ObjRef, recordOwner: ObjRef | null = null): { revoked: boolean; closedSessions: Session[] } {
+  private revokeApiKeyRecord(
+    actor: ObjRef,
+    id: string,
+    map: Record<string, WooValue>,
+    record: Record<string, WooValue>,
+    targetActor: ObjRef,
+    recordOwner: ObjRef | null,
+    closeSessions: boolean
+  ): { revoked: boolean; closedSessions: Session[] } {
     if (record.revoked_at != null) return { revoked: false, closedSessions: [] }; // already revoked — caller can disambiguate via listApiKeys
-    const updated = { ...record, revoked_at: Date.now() };
+    const updated = { ...record, revoked_at: Date.now(), revoked_by: actor };
     this.setProp(recordOwner ?? "$system", "api_keys", { ...map, [id]: updated as WooValue });
-    const closedSessions = this.closeSessionsForApiKey(id);
+    const closedSessions = closeSessions ? this.closeSessionsForApiKey(id) : [];
     if (recordOwner) {
       // The actor-owned write and authenticated transcript are the durable
       // audit record. Do not append `$system.wizard_actions`: that catalog
@@ -3383,18 +3418,17 @@ export class WooWorld {
   /** Owner-scoped: list apikeys for actors the caller owns. Useful for
    * `$block:list_apikeys` so a block's owner can audit "is my plug
    * connected and which key did it use?" without wizard authority. */
-  listApiKeysForOwner(actor: ObjRef, target: ObjRef | null = null): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
-    if (target && this.objects.has(target)) {
-      if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
-        throw wooError("E_PERM", "apikey listing requires wizard authority or ownership of the bound actor", { actor, target });
-      }
-      return this.collectApiKeyMetadata(this.apiKeyMap(target));
+  listApiKeysForOwner(actor: ObjRef, target: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
+    if (!this.objects.has(target)) {
+      throw wooError("E_OBJNF", `apikey listing target not found: ${target}`, target);
     }
-    if (this.canBypassPerms(actor)) return this.collectApiKeyMetadata(this.legacyApiKeyMap());
-    return this.collectApiKeyMetadata().filter((entry) => {
-      if (!entry.actor || !this.objects.has(entry.actor)) return false;
-      return this.object(entry.actor).owner === actor;
-    });
+    if (!this.isActorDescendant(target)) {
+      throw wooError("E_TYPE", `apikey listing target must be an $actor descendant: ${target}`, target);
+    }
+    if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
+      throw wooError("E_PERM", "apikey listing requires wizard authority or ownership of the bound actor", { actor, target });
+    }
+    return this.collectApiKeyMetadata(this.apiKeyMap(target));
   }
 
   private collectApiKeyMetadata(map: Record<string, WooValue> = this.legacyApiKeyMap()): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
@@ -3426,6 +3460,12 @@ export class WooWorld {
     return raw && typeof raw === "object" && !Array.isArray(raw)
       ? raw as Record<string, WooValue>
       : {};
+  }
+
+  /** One semantic predicate for credential APIs; callers should not repeat
+   * the seed-class identity that the layering guard deliberately budgets. */
+  private isActorDescendant(object: ObjRef): boolean {
+    return this.inheritsFrom(object, "$actor");
   }
 
   /** Immutable anchor root encoded into new public key ids. The same walk
@@ -3803,24 +3843,33 @@ export class WooWorld {
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(human, oldKey, force);
       const key = this.createApiKeyForOwner(human, agent, String(this.propOrNull(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
-      this.recordWizardAction(human, "api_key_rotated", { actor: agent, key_id: key.id, force });
+      // The old/new actor-owned records are the cross-profile audit. Net's
+      // accepted transcript adds caller attribution without a catalog write.
       return key;
     }
 
     private revokeApiKeyRecordById(actor: ObjRef, id: string, closeSessions: boolean): boolean {
-      const raw = this.propOrNull("$system", "api_keys");
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-      const map = raw as Record<string, WooValue>;
+      const routed = parseRoutedApiKeyId(id);
+      if (
+        routed &&
+        (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)
+      ) return false;
+      const recordOwner = routed?.actor ?? null;
+      const map = recordOwner ? this.apiKeyMap(recordOwner) : this.legacyApiKeyMap();
       const rec = map[id];
       if (!rec || typeof rec !== "object" || Array.isArray(rec)) return false;
       const r = rec as Record<string, WooValue>;
       if (r.revoked_at != null) return false;
       const targetActor = String(r.actor ?? "");
-      const updated = { ...r, revoked_at: Date.now() };
-      this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
-      if (closeSessions) this.closeSessionsForApiKey(id);
-      this.recordWizardAction(actor, "api_key_revoked", { key_id: id, actor: targetActor });
-      return true;
+      return this.revokeApiKeyRecord(
+        actor,
+        id,
+        map,
+        r,
+        targetActor,
+        recordOwner,
+        closeSessions
+      ).revoked;
     }
 
     private findHermesAgent(human: ObjRef, profileId: string): ObjRef | null {
@@ -10872,16 +10921,10 @@ export class WooWorld {
     this.nativeHandlers.set("list_api_keys", (ctx) => {
       return this.listApiKeys(ctx.actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("list_api_keys_for_owner", (ctx) => {
-      // A credential-bearing catalog wrapper calls this native on the system
-      // object; `caller` is the wrapper object and therefore supplies the
-      // exact bounded principal whose private key map should be read. A
-      // direct system call retains legacy-map compatibility.
-      const target =
-        ctx.caller !== "#-1" &&
-        this.objects.has(ctx.caller)
-          ? ctx.caller
-          : null;
+    this.nativeHandlers.set("list_api_keys_for_owner", (ctx, args) => {
+      // The bounded authority is an explicit contract argument. Frame
+      // topology (`caller`) is not an access-control input.
+      const target = assertObj(args[0]);
       return this.listApiKeysForOwner(ctx.actor, target) as unknown as WooValue;
     });
     this.nativeHandlers.set("provision_actor", (ctx, args) => {
@@ -10898,7 +10941,6 @@ export class WooWorld {
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(ctx.actor, oldKey, args[1] === true);
       const key = this.createApiKey(ctx.actor, agent, String(this.propOrNull(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
-      this.recordWizardAction(ctx.actor, "api_key_rotated", { actor: agent, key_id: key.id, force: args[1] === true });
       return { api_key: `apikey:${key.id}:${key.secret}`, id: key.id, actor: agent, created_at: key.created_at } as unknown as WooValue;
     });
     this.nativeHandlers.set("deactivate_actor", (ctx, args) => {

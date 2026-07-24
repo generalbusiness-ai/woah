@@ -934,18 +934,21 @@ One write path per fact (CO9), concretized:
   authenticates the client credential itself: `authorization: Bearer
   apikey:<id>:<secret>` (or `x-woo-api-key`). For an `n1_` id, the public
   routing hint names the actor's immutable anchor scope and actor. The gateway
-  asks that authority for exactly one indexed `api_key_lookup` row and the
-  current mutation-complete head; it does not transfer the scope or trust an
-  asynchronously fanned-out copy as a revocation fence. The relation is a
-  cache: its one writer is transcript derivation at the actor authority, and
-  bounded relation rebuild must reproduce it from the actor-owned `api_keys`
-  cell. Historical ids fall back to the carried, read-only catalog identity
+  asks that authority for exactly one row in its authority-private verifier
+  index and the current mutation-complete head. The index is derived from the
+  actor-owned `api_keys` cell, rebuildable from it, and never appears in CO13
+  relations, closure transfer, fanout, gateway mirrors, or public relation
+  reads. The gateway may cache an authority receipt for
+  `NET_CREDENTIAL_TTL_MS` (default 1000ms, hard maximum 30s; zero means exact per request);
+  therefore revocation fences future API-key and bearer-session use within
+  that explicit bound. The cache is fixed-size and includes negative results.
+  Authority unavailability is retryable 503 `E_RPC_TIMEOUT`, including the
+  MCP GET carrier; it must not collapse to 401 unknown/revoked or 404 missing
+  session. Historical ids fall back to the carried, read-only catalog identity
   cell `property_cell:$system:api_keys`. Both paths use core's exact salt/hash
   scheme reimplemented in `src/worker/net/client-auth.ts` (never an engine
-  import); refusals are named 401 `E_NOSESSION` verdicts. A session minted
-  from an API key stores only that public id and re-checks it on bearer-only
-  requests, so revocation also fences already-minted HTTP, MCP, and WebSocket
-  sessions without persisting the secret.
+  import). A session minted from an API key stores only that public id and
+  rechecks it on bearer-only requests without persisting the secret.
   **Rate limits (wire.md's inbound rule, applied per authenticated
   actor):** every `/net-api` operation — REST request or WS turn frame —
   draws from one token bucket of 50 ops/s sustained, burst 100; the

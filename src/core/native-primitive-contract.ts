@@ -253,10 +253,10 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     version: 1,
     transcript: "tracked",
     deterministic: true,
-    reads: ["calling actor api_keys or legacy $system.api_keys", "actor ownership"],
+    reads: ["explicit target actor api_keys", "target actor existence and ancestry", "actor ownership"],
     writes: [],
     emits: [],
-    note: "Bounded actor-authority listing is read-only and returns redacted metadata only; a direct system call retains historical-registry compatibility."
+    note: "Bounded actor-authority listing is read-only and returns redacted metadata only; the target is an explicit argument, never inferred from the caller frame."
   },
   revoke_api_key: {
     kind: "woo.native_primitive_contract.shadow.v1",

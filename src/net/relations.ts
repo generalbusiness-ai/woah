@@ -14,7 +14,6 @@
  * acquires a second writer (CO13).
  */
 import { cellKey, type Cell, type CellStore } from "./cells";
-import { parseRoutedApiKeyId } from "../core/api-key-id";
 import { ORDERED_EDGE_PROP, ORDERED_EDGE_RELATION, readOrderedEdge } from "./ordered-edges";
 import type { ApplyResult, EffectTranscript } from "./transcript";
 
@@ -41,10 +40,6 @@ export type RelationDelta = {
  * choose their own presence property names; this relation name is substrate
  * vocabulary shared by scopes, gateways, and session lifecycle code. */
 export const SESSION_PRESENCE_RELATION = "session_presence";
-/** Actor-authority projection used by the authentication edge. The member is
- * the public key id; the body is the stored salted-hash record. */
-export const API_KEY_LOOKUP_RELATION = "api_key_lookup";
-export const ACTOR_API_KEYS_PROPERTY = "api_keys";
 
 /** Select observations addressed to relation owners changed by one foreign
  * delivery. The synchronous freshness fence and the durable outbox must send
@@ -106,8 +101,7 @@ export function deriveRelationDeltas(
   },
   homeScope: string,
   scopeOf?: (object: string) => string,
-  post?: Pick<CellStore, "get">,
-  priorRelations?: Iterable<RelationRow>
+  post?: Pick<CellStore, "get">
 ): DerivedRelationDeltas {
   const deltas = new Map<string, RelationDelta>();
   const orderedEdgeWriters = new Set(
@@ -227,44 +221,6 @@ export function deriveRelationDeltas(
         transcript.session,
         presenceBody(transcript.call.actor, transcript.session)
       );
-    }
-  }
-
-  // A principal's API-key map is the authority; this indexed relation is the
-  // one derived lookup a cold gateway can read after routing from the public
-  // id. Compare against the scope's prior rows so revocation/removal produces
-  // exact deletes without needing the transcript to carry old values.
-  if (post) {
-    const changedActors = new Set(
-      transcript.writes
-        .filter((write) =>
-          write.cell.kind === "prop" &&
-          write.cell.name === ACTOR_API_KEYS_PROPERTY &&
-          write.cell.object !== "$system"
-        )
-        .map((write) => write.cell.object)
-    );
-    const existing = [...(priorRelations ?? [])];
-    for (const actor of changedActors) {
-      const payload = post.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY))?.value as
-        | { value?: unknown }
-        | undefined;
-      const map =
-        payload?.value && typeof payload.value === "object" && !Array.isArray(payload.value)
-          ? payload.value as Record<string, unknown>
-          : {};
-      const desired = new Set<string>();
-      for (const [id, record] of Object.entries(map)) {
-        const routed = parseRoutedApiKeyId(id);
-        if (!routed || routed.actor !== actor || !record || typeof record !== "object" || Array.isArray(record)) continue;
-        desired.add(id);
-        put("add", API_KEY_LOOKUP_RELATION, actor, id, record);
-      }
-      for (const row of existing) {
-        if (row.relation === API_KEY_LOOKUP_RELATION && row.owner === actor && !desired.has(row.member)) {
-          put("remove", API_KEY_LOOKUP_RELATION, actor, row.member, row.body);
-        }
-      }
     }
   }
 
@@ -391,37 +347,6 @@ export function rebuildContentsRelation(cells: Iterable<Cell>, memberScope?: str
       ...(memberScope ? { member_scope: memberScope } : {})
     };
     rows.set(relationKey("contents", location, cell.object), row);
-  }
-  return rows;
-}
-
-/** Rebuild the complete actor-owned credential lookup family from authority
- * property cells. This is bounded by one scope's cells and never consults the
- * historical global registry. */
-export function rebuildApiKeyLookupRelation(cells: Iterable<Cell>): Map<string, RelationRow> {
-  const rows = new Map<string, RelationRow>();
-  for (const cell of cells) {
-    if (
-      cell.kind !== "property_cell" ||
-      cell.object === "$system" ||
-      cell.name !== ACTOR_API_KEYS_PROPERTY
-    ) continue;
-    const payload = cell.value as { value?: unknown } | undefined;
-    const map =
-      payload?.value && typeof payload.value === "object" && !Array.isArray(payload.value)
-        ? payload.value as Record<string, unknown>
-        : {};
-    for (const [id, record] of Object.entries(map)) {
-      const routed = parseRoutedApiKeyId(id);
-      if (!routed || routed.actor !== cell.object || !record || typeof record !== "object" || Array.isArray(record)) continue;
-      const row: RelationRow = {
-        relation: API_KEY_LOOKUP_RELATION,
-        owner: cell.object,
-        member: id,
-        body: record
-      };
-      rows.set(relationKey(row.relation, row.owner, row.member), row);
-    }
   }
   return rows;
 }

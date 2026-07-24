@@ -3,7 +3,6 @@
 // application at the sequencer, foreign application, and bounded rebuild.
 import { describe, expect, it } from "vitest";
 import {
-  API_KEY_LOOKUP_RELATION,
   applyRelationDeltas,
   deriveRelationDeltas,
   observationsForRelationOwners,
@@ -46,7 +45,7 @@ function transcript(partial: Partial<EffectTranscript>): EffectTranscript {
 const NO_WRITES = { projectionWrites: [] as never[] };
 
 describe("deriveRelationDeltas (CO13)", () => {
-  it("derives actor-owned API-key lookups and exact removals from the authority map", () => {
+  it("never derives actor-owned API-key verifiers into transferable relation state", () => {
     const actor = "agent_alpha";
     const id = routedApiKeyId(actor, actor, "0123456789abcdef0123456789abcdef");
     const record = {
@@ -67,11 +66,8 @@ describe("deriveRelationDeltas (CO13)", () => {
     const changed = transcript({
       writes: [{ cell: { kind: "prop", object: actor, name: "api_keys" }, value: { [id]: record }, op: "set", writer: WRITER }]
     });
-    const added = deriveRelationDeltas(changed, NO_WRITES, `cluster:${actor}`, undefined, post, []);
-    expect(added.local).toContainEqual({
-      op: "add",
-      row: { relation: API_KEY_LOOKUP_RELATION, owner: actor, member: id, body: record }
-    });
+    const added = deriveRelationDeltas(changed, NO_WRITES, `cluster:${actor}`, undefined, post);
+    expect(added.local).toEqual([]);
 
     post.commit({
       kind: "property_cell",
@@ -80,18 +76,8 @@ describe("deriveRelationDeltas (CO13)", () => {
       value: { value: {} },
       stamp: { scope_head: "2:key", catalog_epoch: EPOCH }
     });
-    const removed = deriveRelationDeltas(
-      changed,
-      NO_WRITES,
-      `cluster:${actor}`,
-      undefined,
-      post,
-      [{ relation: API_KEY_LOOKUP_RELATION, owner: actor, member: id, body: record }]
-    );
-    expect(removed.local).toContainEqual({
-      op: "remove",
-      row: { relation: API_KEY_LOOKUP_RELATION, owner: actor, member: id, body: record }
-    });
+    const removed = deriveRelationDeltas(changed, NO_WRITES, `cluster:${actor}`, undefined, post);
+    expect(removed.local).toEqual([]);
   });
 
   it("moves derive remove-at-source and add-at-destination contents deltas", () => {
@@ -340,7 +326,7 @@ describe("sequencer relation application (durable, one transaction)", () => {
     expect(store.readRelations().length).toBe(3);
   });
 
-  it("rebuildRelations reproduces every actor-owned API-key lookup", () => {
+  it("rebuildRelations reproduces the authority-private verifier index without a relation row", () => {
     const actor = "agent_rebuild";
     const id = routedApiKeyId(actor, actor, "abcdefabcdefabcdefabcdefabcdefab");
     const record = {
@@ -357,19 +343,12 @@ describe("sequencer relation application (durable, one transaction)", () => {
       { kind: "property_cell", object: actor, name: "api_keys", value: { value: { [id]: record } } }
     ]);
     seq.rebuildRelations();
-    expect(seq.relations().get(relationKey(API_KEY_LOOKUP_RELATION, actor, id))).toEqual({
-      relation: API_KEY_LOOKUP_RELATION,
-      owner: actor,
-      member: id,
-      body: record
-    });
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(seq.relations().size).toBe(0);
+    expect(store.readApiKeyVerifiers()).toEqual([{ actor, id, record }]);
     const rehydrated = new ScopeSequencer(`cluster:${actor}`, EPOCH, { durable: store });
-    expect(rehydrated.relations().get(relationKey(API_KEY_LOOKUP_RELATION, actor, id))).toEqual({
-      relation: API_KEY_LOOKUP_RELATION,
-      owner: actor,
-      member: id,
-      body: record
-    });
+    expect(rehydrated.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(rehydrated.relations().size).toBe(0);
   });
 
   it("operator credential ensure is atomic, idempotent, and collision-safe", () => {
@@ -390,7 +369,8 @@ describe("sequencer relation application (durable, one transaction)", () => {
     expect(first.status).toBe("applied");
     expect(first.head.seq).toBe(1);
     expect(first.cell.value).toMatchObject({ value: { [id]: record } });
-    expect(seq.relations().get(relationKey(API_KEY_LOOKUP_RELATION, actor, id))).toMatchObject({ body: record });
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(seq.relations().size).toBe(0);
 
     const replay = seq.operatorEnsureCredential(actor, id, record);
     expect(replay.status).toBe("empty");
@@ -401,7 +381,7 @@ describe("sequencer relation application (durable, one transaction)", () => {
     expect(() => seq.operatorEnsureCredential(actor, id, { ...record, secret: "must-never-persist" }))
       .toThrow(/record or routing hint is invalid/);
     expect(seq.head()).toEqual(first.head);
-    expect(seq.relations().get(relationKey(API_KEY_LOOKUP_RELATION, actor, id))).toMatchObject({ body: record });
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
   });
 
   it("rebuildRelations drops candidates owned by another scope (multi-scope: no second copy of a foreign row family)", () => {

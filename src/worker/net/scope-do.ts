@@ -108,7 +108,6 @@ import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import {
-  API_KEY_LOOKUP_RELATION,
   observationsForRelationOwners,
   relationKey,
   roomRosterRows,
@@ -116,6 +115,7 @@ import {
   type RelationDelta,
   type RelationRow
 } from "../../net/relations";
+import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
@@ -278,6 +278,11 @@ export class SqliteScopeStore implements ScopeStore {
     this.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_net_scope_scheduled_due ON net_scope_scheduled (due_at)");
     // Sixth row family (CO13): derived relation rows this scope owns.
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Authority-private credential index. These rows are not CO13 relations:
+    // no closure transfer, subscriber fanout, or gateway mirror can see them.
+    this.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_api_key_verifier (key TEXT PRIMARY KEY, body TEXT NOT NULL)"
+    );
     // Seventh row family (sequenced-log.md SL1/SL4): the committed
     // sequenced log, keyed by (SEMANTIC space id, space-log seq). Appended
     // inside the accept transaction; paged on demand off the primary key —
@@ -456,6 +461,24 @@ export class SqliteScopeStore implements ScopeStore {
 
   deleteRelation(key: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_relation WHERE key = ?", key);
+  }
+
+  readApiKeyVerifiers(): ApiKeyVerifierRow[] {
+    return sqlRows<{ body: string }>(
+      this.storage.sql.exec("SELECT body FROM net_scope_api_key_verifier")
+    ).map((row) => JSON.parse(row.body) as ApiKeyVerifierRow);
+  }
+
+  writeApiKeyVerifier(key: string, row: ApiKeyVerifierRow): void {
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_api_key_verifier (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+      key,
+      JSON.stringify(row)
+    );
+  }
+
+  deleteApiKeyVerifier(key: string): void {
+    this.storage.sql.exec("DELETE FROM net_scope_api_key_verifier WHERE key = ?", key);
   }
 
   appendLogEntry(entry: ReplayLogEntry): void {
@@ -1257,13 +1280,13 @@ export class NetScopeDO {
             scope: seq.scope
           });
         }
-        const row = seq.relations().get(relationKey(API_KEY_LOOKUP_RELATION, body.actor, body.id));
+        const record = seq.apiKeyVerifier(body.actor, body.id);
         return json({
           scope: seq.scope,
           head: seq.head(),
           actor: body.actor,
           id: body.id,
-          record: row?.body ?? null
+          record
         });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
@@ -1346,32 +1369,12 @@ export class NetScopeDO {
         }
         const seq = this.ensureSequencer();
         const ensured = this.discardSeqOnThrow(() => this.store.transaction(() => {
-          const result = seq.operatorEnsureCredential(
+          return seq.operatorEnsureCredential(
             body.actor as string,
             body.id as string,
             body.record as Record<string, unknown>
           );
-          if (result.status === "applied") {
-            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
-              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
-            );
-            const fanout: FanoutBody = {
-              scope: seq.scope,
-              seq: result.head.seq,
-              head_hash: result.head.hash,
-              head_generation: result.head.generation,
-              cells: [result.cell],
-              observations: [],
-              relations: [{ op: "add", row: result.relation }]
-            };
-            const text = JSON.stringify(fanout);
-            for (const { destination, delivery_seq } of subscribers) {
-              this.persistFanoutRow(destination, delivery_seq, fanout, text);
-            }
-          }
-          return result;
         }));
-        this.armOutboxRetryAlarm();
         return json({
           ok: true,
           scope: seq.scope,

@@ -3970,11 +3970,117 @@ describe("local catalogs", () => {
         expect(key.id).toMatch(/^n1_/);
         expect(world.propOrNull("$system", "api_keys")).toEqual(legacyBefore);
         expect(world.propOrNull(blockId, "api_keys")).toMatchObject({
-          [key.id]: expect.objectContaining({ actor: blockId, hash: expect.any(String), salt: expect.any(String) })
+          [key.id]: expect.objectContaining({
+            actor: blockId,
+            hash: expect.any(String),
+            salt: expect.any(String),
+            created_by: owner,
+            created_via: "create_api_key_for_owner"
+          })
         });
         const sess = world.auth(`apikey:${key.id}:${key.secret}`);
         expect(sess.actor).toBe(blockId);
       });
+    });
+
+    it("refuses a routed key when the actor's anchor root is room-classed", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      const owner = world.auth("guest:block-room-anchor-owner").actor;
+      world.createObject({ id: "obj_key_room", name: "Key Room", parent: "$space", owner });
+      world.createObject({
+        id: "obj_room_anchored_block",
+        name: "Misanchored Block",
+        parent: "$block",
+        owner,
+        anchor: "obj_key_room",
+        location: "obj_key_room"
+      });
+
+      const minted = await world.directCall(
+        "mint-room-anchored-key",
+        owner,
+        "obj_room_anchored_block",
+        "mint_apikey",
+        ["must-refuse"]
+      );
+      expect(minted.op).toBe("error");
+      if (minted.op === "error") expect(minted.error.code).toBe("E_LINEAGE");
+      expect(world.propOrNull("obj_room_anchored_block", "api_keys")).toEqual({});
+    });
+
+    it("both wizard and owner rotation revoke actor-owned old keys before minting replacements", async () => {
+      const world = createWorld();
+
+      world.createObject({
+        id: "agent_wizard_rotate",
+        name: "Wizard Rotate",
+        parent: "$agent",
+        owner: "$wiz",
+        location: "$nowhere"
+      });
+      const wizardOld = world.createApiKey("$wiz", "agent_wizard_rotate", "old wizard key");
+      world.setProp("agent_wizard_rotate", "api_key_id", wizardOld.id);
+      const wizardOldSession = world.auth(`apikey:${wizardOld.id}:${wizardOld.secret}`);
+      const wizardRotated = await world.directCall(
+        "wizard-rotate-routed",
+        "$wiz",
+        "$system",
+        "rotate_api_key",
+        ["agent_wizard_rotate", true]
+      );
+      expect(wizardRotated.op).toBe("result");
+      if (wizardRotated.op !== "result") return;
+      const wizardNew = wizardRotated.result as { id: string; api_key: string };
+      expect(wizardNew.id).toMatch(/^n1_/);
+      expect(wizardNew.id).not.toBe(wizardOld.id);
+      const wizardMap = world.propOrNull("agent_wizard_rotate", "api_keys") as Record<string, Record<string, unknown>>;
+      expect(wizardMap[wizardOld.id]?.revoked_at).toEqual(expect.any(Number));
+      expect(wizardMap[wizardOld.id]?.revoked_by).toBe("$wiz");
+      expect(() => world.auth(`apikey:${wizardOld.id}:${wizardOld.secret}`)).toThrow(/not found or revoked/);
+      expect(() => world.auth(`session:${wizardOldSession.id}`)).toThrow(/expired or unknown/);
+      expect(world.auth(wizardNew.api_key).actor).toBe("agent_wizard_rotate");
+
+      world.createObject({
+        id: "human_owner_rotate",
+        name: "Human Owner",
+        parent: "$human",
+        owner: "$wiz",
+        location: "$nowhere"
+      });
+      world.createObject({
+        id: "account_owner_rotate",
+        name: "Owner Account",
+        parent: "$account",
+        owner: "$wiz"
+      });
+      world.setProp("human_owner_rotate", "account", "account_owner_rotate");
+      world.createObject({
+        id: "agent_owner_rotate",
+        name: "Owner Rotate",
+        parent: "$agent",
+        owner: "human_owner_rotate",
+        location: "$nowhere"
+      });
+      const ownerOld = world.createApiKeyForOwner("human_owner_rotate", "agent_owner_rotate", "old owner key");
+      world.setProp("agent_owner_rotate", "api_key_id", ownerOld.id);
+      const ownerOldSession = world.auth(`apikey:${ownerOld.id}:${ownerOld.secret}`);
+      const ownerRotated = await world.directCall(
+        "owner-rotate-routed",
+        "human_owner_rotate",
+        "human_owner_rotate",
+        "rotate_agent_key",
+        ["agent_owner_rotate", true]
+      );
+      expect(ownerRotated.op).toBe("result");
+      if (ownerRotated.op !== "result") return;
+      const ownerResult = ownerRotated.result as { api_key: string };
+      const ownerMap = world.propOrNull("agent_owner_rotate", "api_keys") as Record<string, Record<string, unknown>>;
+      expect(ownerMap[ownerOld.id]?.revoked_at).toEqual(expect.any(Number));
+      expect(ownerMap[ownerOld.id]?.revoked_by).toBe("human_owner_rotate");
+      expect(() => world.auth(`apikey:${ownerOld.id}:${ownerOld.secret}`)).toThrow(/not found or revoked/);
+      expect(() => world.auth(`session:${ownerOldSession.id}`)).toThrow(/expired or unknown/);
+      expect(world.auth(ownerResult.api_key).actor).toBe("agent_owner_rotate");
     });
 
     it("$dispenser_block: order → next_pending → deliver flows end-to-end", async () => {

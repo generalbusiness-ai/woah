@@ -1,13 +1,13 @@
 /**
  * Client authentication for the /net-api surface (Plan 002 Phase 4
- * item 2; coherence.md CO14 "credential authentication against identity
- * cells in the catalog scope closure").
+ * item 2; coherence.md CO14).
  *
- * The token is the existing woo apikey credential (`apikey:<id>:<secret>`),
- * verified against the catalog identity cell
- * `property_cell:$system:api_keys`. The salt/hash scheme is EXACTLY the
- * one core auth uses (src/core/world.ts authApiKey), reimplemented
- * narrowly here because the net layer must never import world.ts:
+ * The token is the existing woo apikey credential (`apikey:<id>:<secret>`).
+ * Historical ids verify against `property_cell:$system:api_keys`; self-
+ * routing ids verify one record from the actor authority's private index.
+ * The salt/hash scheme is EXACTLY the one core auth uses
+ * (src/core/world.ts authApiKey), reimplemented narrowly here because the
+ * net layer must never import world.ts:
  *
  *   stored record: { hash, salt, actor, label, created_at, revoked_at? }
  *   verification:  constantTimeEqual(hashSource(`${salt}:${secret}`), hash)
@@ -134,7 +134,7 @@ export function verifyApiKeyCredential(map: unknown, credential: ClientCredentia
   return verifyApiKeyRecord(record, credential);
 }
 
-/** Verify one exact actor-owned lookup row. Keeping the record-level helper
+/** Verify one exact actor-owned private-index record. Keeping this helper
  * beside the legacy-map wrapper guarantees both authorities use identical
  * refusal ordering and constant-time hash comparison. */
 export function verifyApiKeyRecord(record: unknown, credential: ClientCredential): { actor: string } {

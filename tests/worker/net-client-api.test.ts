@@ -100,7 +100,7 @@ type TurnBody = {
   replayed?: boolean;
 };
 
-async function buildHarness() {
+async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   // ---- Engine-real fixture: a room, a room-anchored box with a bump
   // verb (returns + observes), the actor placed in the room, and an
   // apikey minted into $system.api_keys via the same wizard path
@@ -133,7 +133,7 @@ async function buildHarness() {
     world,
     "capi_agent",
     "list_apikeys",
-    "verb :list_apikeys() rxd { return $system:list_api_keys_for_owner(); }",
+    "verb :list_apikeys() rxd { return $system:list_api_keys_for_owner(this); }",
     null
   ).ok).toBe(true);
   expect(installVerb(
@@ -248,6 +248,9 @@ async function buildHarness() {
     WOO_INTERNAL_SECRET: SECRET,
     NET_RESOLVE: resolve,
     NET_AUDIT_SHARDS: "1",
+    // Security regressions in this fixture normally require an exact read.
+    // Cache behavior has its own test below.
+    NET_CREDENTIAL_TTL_MS: options.credentialTtlMs ?? "0",
     METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
   };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
@@ -264,6 +267,7 @@ async function buildHarness() {
     metricPoints,
     auditDO,
     scopeEnv,
+    gatewayEnv,
     ensureCredential: async (target: string, id: string, record: Record<string, unknown>) => {
       const scope = `cluster:${target}`;
       const instance = scopeDOs.get(scope);
@@ -319,6 +323,80 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     }
   });
 
+  it("bounds verifier RPCs with an expiring cache and names authority outages on REST and MCP", async () => {
+    const h = await buildHarness({ credentialTtlMs: "60000" });
+    try {
+      const id = routedApiKeyId(h.actor, h.actor, "23232323232323232323232323232323");
+      const secret = "cached-actor-owned-secret";
+      const salt = "6".repeat(32);
+      const record = {
+        hash: hashSource(`${salt}:${secret}`),
+        salt,
+        actor: h.actor,
+        label: "cache-proof",
+        created_at: 5
+      };
+      const ensured = await h.ensureCredential(h.actor, id, record);
+      expect(ensured.status, await ensured.clone().text()).toBe(200);
+
+      type RpcHost = {
+        rpc(destination: string, route: string, body?: unknown): Promise<unknown>;
+      };
+      const host = (h.gateway as unknown as { host: RpcHost }).host;
+      const originalRpc = host.rpc.bind(host);
+      const routes: string[] = [];
+      host.rpc = async (destination, route, body) => {
+        routes.push(route);
+        return originalRpc(destination, route, body);
+      };
+      const token = `apikey:${id}:${secret}`;
+      const first = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      const afterFirst = routes.filter((route) => route === "/credential-record").length;
+      expect(afterFirst).toBe(1);
+
+      const cached = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(cached.status, JSON.stringify(cached.body)).toBe(200);
+      expect(routes.filter((route) => route === "/credential-record")).toHaveLength(afterFirst);
+
+      h.gatewayEnv.NET_CREDENTIAL_TTL_MS = "1";
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const expired = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(expired.status, JSON.stringify(expired.body)).toBe(200);
+      expect(routes.filter((route) => route === "/credential-record")).toHaveLength(afterFirst + 1);
+
+      host.rpc = async (destination, route, body) => {
+        if (route === "/credential-record") throw new Error("authority unavailable");
+        return originalRpc(destination, route, body);
+      };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const unavailable = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(unavailable.status).toBe(503);
+      expect(unavailable.body).toMatchObject({
+        error: {
+          code: "E_RPC_TIMEOUT",
+          detail: { reason: "credential_authority_unavailable", retryable: true }
+        }
+      });
+
+      const mcp = await h.gateway.fetch(new Request("https://do/net-api/mcp", {
+        headers: {
+          accept: "text/event-stream",
+          "mcp-session-id": String(first.body.session)
+        }
+      }));
+      expect(mcp.status).toBe(503);
+      expect(await mcp.json()).toMatchObject({
+        error: {
+          code: "E_RPC_TIMEOUT",
+          detail: { reason: "credential_authority_unavailable", retryable: true }
+        }
+      });
+    } finally {
+      h.close();
+    }
+  });
+
   it("commits ordinary owner minting at the target actor authority and authenticates the returned key", async () => {
     const h = await buildHarness();
     try {
@@ -360,6 +438,22 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       });
       expect(plugSession.status, JSON.stringify(plugSession.body)).toBe(200);
       expect(plugSession.body).toMatchObject({ actor: "capi_agent" });
+
+      // Verifiers are an authority-private index, not a CO13 relation. Even
+      // the bound actor cannot enumerate hash/salt records through the public
+      // sibling read surface.
+      const leakedRelation = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/relation?relation=api_key_lookup&owner=capi_agent&session=${encodeURIComponent(String(plugSession.body.session))}`,
+        { token: `session:${String(plugSession.body.session)}` }
+      );
+      expect(leakedRelation.status, JSON.stringify(leakedRelation.body)).toBe(200);
+      expect(leakedRelation.body).toEqual({
+        relation: "api_key_lookup",
+        owner: "capi_agent",
+        members: []
+      });
 
       const listed = await clientFetch(h.gateway, "POST", "/net-api/turn", {
         token: ownerToken,

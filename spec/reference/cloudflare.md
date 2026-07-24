@@ -1409,9 +1409,10 @@ The production entry also exposes one internal-signed credential bootstrap
 operation: `POST /net-operator/credentials/ensure`. It accepts an actor,
 authority scope, versioned self-routing key id, and verifier record
 (`hash`, `salt`, actor, label, creation time)—never the replayable secret.
-The actor scope stores that record and derives the lookup relation. Exact
-replay is success, while disagreement at an existing id is a collision
-refusal. This is an operator recovery/provisioning surface, not a client API:
+The actor scope stores that record and derives an authority-private verifier
+index. The index is never a transferable/fanned-out relation and has no public
+read surface. Exact replay is success, while disagreement at an existing id is
+a collision refusal. This is an operator recovery/provisioning surface, not a client API:
 the edge verifies `WOO_INTERNAL_SECRET`, strips the inbound signature, and
 freshly signs the authority hop. Secrets must not enter logs, metrics, command
 arguments, or repository files. Operator tooling generates the secret
@@ -1449,6 +1450,7 @@ Net turn-path `[vars]`:
 |---|---|---|
 | `NET_API_GATEWAY_SHARDS` | `"8"` | Gateway DO fan-out width. `NET_GATEWAY_SELF` is a test/legacy override that MUST be absent when >1 shard. |
 | `NET_RPC_TIMEOUT_MS` | `"5000"` | Deadline on every coherence RPC and hot-scope queue wait → `E_RPC_TIMEOUT` (HTTP 503, retryable). A submit timeout is ambiguous, so the gateway performs one CO2.5-preserving same-key replay before surfacing it. |
+| `NET_CREDENTIAL_TTL_MS` | `"1000"` | Maximum age of an actor-authority API-key verifier cached by a gateway. `0` forces an exact authority RPC per check; values above 30,000ms are clamped to that hard revocation-staleness ceiling. |
 | `NET_TURN_QUEUE_WAIT_MS` | `"1500"` | Per-scope serializer queue deadline. |
 | `NET_TURN_SCOPE_CONCURRENCY` | `"12"` | Bounded per-scope lanes per gateway shard. |
 | `WOO_AE_DATASET` | `"woo_v1_prod"` | Selects the AE dataset (§R10.1); the net acceptance canary sets `"woo_v1_net_canary"` so its evidence never mixes with prod's. Also a **deployed-environment marker**: when set, un-metered dev-only surfaces such as `/net-smoke` are hard-refused (`src/worker/net-only-index.ts`, `src/worker/net/workerd-host.ts`). |

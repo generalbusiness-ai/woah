@@ -115,7 +115,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `features` | list<obj> | `[]` | Feature objects contributing verbs to this actor. See [features.md](features.md). |
 | `features_version` | int | 0 | Monotonic counter incremented on feature-list changes; used for verb-lookup cache invalidation. |
 | `focus_list` | list<obj> | `[]` | Actor-scoped list of focused objects/spaces for MCP tool discovery and agent attention. |
-| `api_keys` | map | `{}` | Owner-private authoritative API-key records bound to this actor. Net derives the indexed `api_key_lookup` relation from this cell; cleartext secrets are returned once and never stored. |
+| `api_keys` | map | `{}` | Owner-private authoritative API-key records bound to this actor. Its owning Net scope derives an authority-private O(1) verifier index that never transfers, fans out, or appears in public relation reads; cleartext secrets are returned once and never stored. |
 
 An active Net world installed before `api_keys` joined the universal seed must
 install `prop:$actor:api_keys` through the signed bootstrap-definition repair

@@ -185,6 +185,9 @@ export type NetGatewayEnv = NetBindingsEnv & {
   NET_TURN_QUEUE_WAIT_MS?: string;
   /** Bounded concurrent planning/submission lanes per scope on this shard. */
   NET_TURN_SCOPE_CONCURRENCY?: string;
+  /** Maximum staleness of one authority-verified API-key record. Zero forces
+   * an exact RPC per request. Default: 1000ms; hard-capped at 30s. */
+  NET_CREDENTIAL_TTL_MS?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -2946,13 +2949,13 @@ export class NetGatewayDO {
     return { map, epoch: cell.stamp.catalog_epoch };
   }
 
-  /** Resolve a new self-routing credential from the actor authority's derived
-   * lookup row. Authentication is an exact authority read on every presented
-   * long-lived key: fanout keeps ordinary gateway projections warm, but its
-   * delivery is asynchronous and therefore cannot be the revocation fence.
-   * The authority endpoint performs one indexed row lookup and returns the
-   * current mutation-complete head—no actor scan or whole-scope transfer.
-   * Historical ids retain the carried catalog-map compatibility path. */
+  /** Resolve a self-routing credential from the actor authority's private
+   * verifier index. A small bounded cache amortizes the cross-DO hop; unlike
+   * fanout it has an explicit revocation-staleness ceiling and stores no
+   * enumerable relation state. The authority endpoint performs one indexed
+   * lookup and returns the current mutation-complete head—no actor scan or
+   * whole-scope transfer. Historical ids retain the carried catalog-map
+   * compatibility path. */
   private async verifyClientApiKey(
     legacyMap: unknown,
     credential: ReturnType<typeof parseClientCredential>
@@ -2972,23 +2975,54 @@ export class NetGatewayDO {
     return verified;
   }
 
-  /** Exact O(1) verifier read and receipt-shape validation shared by initial
-   * API-key authentication and session-bearer revocation checks. */
+  /** Bounded O(1) verifier cache shared by initial authentication and
+   * session-bearer revocation checks. Negative rows are cached too, so random
+   * routed ids cannot amplify into unbounded authority traffic. */
+  private readonly routedApiKeyCache = new Map<string, { checkedAt: number; record: unknown }>();
+
+  private credentialTtlMs(): number {
+    const raw = Number(this.env.NET_CREDENTIAL_TTL_MS);
+    return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 30_000) : 1_000;
+  }
+
+  /** Exact O(1) verifier read and receipt-shape validation. Transport
+   * failures are availability errors, never "unknown credential": callers
+   * may retry without mistaking a dead authority for revocation. */
   private async routedApiKeyAuthorityRecord(
     scope: string,
     actor: string,
     id: string
   ): Promise<{ record: unknown }> {
-    const answer = (await this.host.rpc(`scope:${scope}`, "/credential-record", {
-      actor,
-      id
-    })) as {
+    const cacheKey = `${scope}\0${actor}\0${id}`;
+    const now = this.host.now();
+    const ttl = this.credentialTtlMs();
+    const cached = this.routedApiKeyCache.get(cacheKey);
+    if (cached && ttl > 0 && now >= cached.checkedAt && now - cached.checkedAt <= ttl) {
+      // Refresh insertion order so the fixed-size map is LRU, not FIFO.
+      this.routedApiKeyCache.delete(cacheKey);
+      this.routedApiKeyCache.set(cacheKey, cached);
+      return { record: cached.record };
+    }
+    let answer: {
       scope?: unknown;
       actor?: unknown;
       id?: unknown;
       head?: unknown;
       record?: unknown;
     };
+    try {
+      answer = (await this.host.rpc(`scope:${scope}`, "/credential-record", {
+        actor,
+        id
+      })) as typeof answer;
+    } catch {
+      throw new ClientAuthError(
+        "apikey authority is temporarily unavailable",
+        { reason: "credential_authority_unavailable", retryable: true, scope },
+        "E_RPC_TIMEOUT",
+        503
+      );
+    }
     if (
       answer.scope !== scope ||
       answer.actor !== actor ||
@@ -2999,6 +3033,13 @@ export class NetGatewayDO {
         reason: "malformed_authority_receipt"
       });
     }
+    this.routedApiKeyCache.delete(cacheKey);
+    while (this.routedApiKeyCache.size >= 1_024) {
+      const oldest = this.routedApiKeyCache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.routedApiKeyCache.delete(oldest);
+    }
+    this.routedApiKeyCache.set(cacheKey, { checkedAt: now, record: answer.record });
     return { record: answer.record };
   }
 
@@ -4363,7 +4404,17 @@ export class NetGatewayDO {
     try {
       actor = await this.mcpSessionActor(session);
     } catch (error) {
-      return json({ error: { code: "E_NOSESSION", message: error instanceof Error ? error.message : String(error) } }, 404);
+      const auth = error instanceof ClientAuthError ? error : null;
+      return json(
+        {
+          error: {
+            code: auth?.code ?? "E_NOSESSION",
+            message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+            ...(auth ? { detail: auth.detail } : {})
+          }
+        },
+        auth?.code === "E_NOSESSION" ? 404 : (auth?.status ?? 404)
+      );
     }
     this.enforceClientRate(actor, "/net-api/mcp");
     const state = this.mcpSessionState(session, actor, true);
@@ -4510,10 +4561,15 @@ export class NetGatewayDO {
     try {
       actor = await this.mcpSessionActor(session);
     } catch (error) {
+      const auth = error instanceof ClientAuthError ? error : null;
       return json({
         jsonrpc: "2.0",
         id,
-        error: { code: -32000, message: error instanceof Error ? error.message : String(error) }
+        error: {
+          code: -32000,
+          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
+        }
       }, 200);
     }
     this.mcpSessionState(session, actor, true);
@@ -4601,10 +4657,15 @@ export class NetGatewayDO {
     try {
       actor = await this.mcpSessionActor(session);
     } catch (error) {
+      const auth = error instanceof ClientAuthError ? error : null;
       return json({
         jsonrpc: "2.0",
         id,
-        error: { code: -32000, message: error instanceof Error ? error.message : String(error) }
+        error: {
+          code: -32000,
+          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
+        }
       }, 200);
     }
     this.mcpSessionState(session, actor, true);

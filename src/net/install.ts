@@ -33,12 +33,7 @@ import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
 import { materializeCustomerAttributions } from "./identity";
 import { CATALOG_SCOPE, classifierFromLineage, partitionCells, type AnchorLineage } from "./topology";
-import {
-  ACTOR_API_KEYS_PROPERTY,
-  API_KEY_LOOKUP_RELATION,
-  type RelationRow
-} from "./relations";
-import { parseRoutedApiKeyId } from "../core/api-key-id";
+import type { RelationRow } from "./relations";
 
 /**
  * The activation barrier (cutover state machine — spec/operations/
@@ -219,9 +214,9 @@ export function deriveScopeAttributions(
 /** Derive the install-time relation families from the complete world image and
  * route each row by its OWNER's CO15 scope. This is intentionally a whole-
  * install operation: doing it inside individual scope seeds loses cross-scope
- * facts such as `the_pinboard` living on `the_deck`. Actor-owned credential
- * rows are co-located with their authority and make an imported actor map
- * immediately authenticatable without a post-install scan. */
+ * facts such as `the_pinboard` living on `the_deck`. Actor-owned credentials
+ * are indexed privately by each ScopeSequencer from its seeded cells; they
+ * deliberately never enter this transferable relation family. */
 export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<string, RelationRow[]> {
   const lineage = new Map<string, AnchorLineage>();
   for (const cell of cells) {
@@ -243,29 +238,6 @@ export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<s
       });
       out.set(scope, rows);
       continue;
-    }
-    if (
-      cell.kind === "property_cell" &&
-      cell.object !== "$system" &&
-      cell.name === ACTOR_API_KEYS_PROPERTY
-    ) {
-      const value = (cell.value as { value?: unknown } | undefined)?.value;
-      const map = value && typeof value === "object" && !Array.isArray(value)
-        ? value as Record<string, unknown>
-        : {};
-      const scope = classifier.scopeOf(cell.object);
-      const rows = out.get(scope) ?? [];
-      for (const [id, record] of Object.entries(map)) {
-        const routed = parseRoutedApiKeyId(id);
-        if (!routed || routed.actor !== cell.object || !record || typeof record !== "object" || Array.isArray(record)) continue;
-        rows.push({
-          relation: API_KEY_LOOKUP_RELATION,
-          owner: cell.object,
-          member: id,
-          body: record
-        });
-      }
-      out.set(scope, rows);
     }
   }
   for (const rows of out.values()) {
