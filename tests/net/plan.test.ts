@@ -229,6 +229,36 @@ describe("compact room-roster planning", () => {
     ]));
     expect(warmSubmitBytes(roomRosterPlan)).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     expect(roomRosterPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
+
+    // `look_at` must render the names already carried by the compact owner
+    // projection. Re-dereferencing each row's actor id would restore one
+    // foreign-cluster proof per occupant and turn an O(1)-RPC room read into
+    // an unbounded cross-authority fan-out.
+    const lookPlan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-chat-look-30",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: room,
+        verb: "look",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-chat-look-30",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+    expect(lookPlan.transcript.error).toBeUndefined();
+    expect(
+      String(lookPlan.transcript.observations.find((observation) => observation.type === "looked")?.text ?? "")
+    ).toContain("Guest 29");
+    expect(lookPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
   });
 
   it.each([

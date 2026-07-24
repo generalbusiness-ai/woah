@@ -4746,6 +4746,12 @@ describe("local catalogs", () => {
       const witness = world.auth("guest:look-at-present-other").actor;
       world.setProp(looker, "name", "Looker McLook");
       world.setProp(witness, "name", "Witness McSee");
+      // This is the non-Net in-memory lane, so there is no accepted rename
+      // transcript to refresh session_presence. Keep its object labels aligned
+      // with the properties changed directly above; the Net rename relation
+      // derivation has separate coverage.
+      world.object(looker).name = "Looker McLook";
+      world.object(witness).name = "Witness McSee";
       const enterLooker = await world.directCall("enter-looker", looker, "the_chatroom", "enter", []);
       const enterWitness = await world.directCall("enter-witness", witness, "the_chatroom", "enter", []);
       expect(enterLooker.op).toBe("result");
