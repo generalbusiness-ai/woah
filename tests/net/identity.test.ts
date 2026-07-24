@@ -142,6 +142,34 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect(scopeOf(agent)).toBe(`cluster:${human}`);
   });
 
+  it("the real provisioning path anchors the account and agents to the human authority root", async () => {
+    const world = createWorld();
+    const start = await world.beginSignup("family@example.com", "password123");
+    const verify = world.verifySignup(start.verification_token);
+    const human = verify.actor as string;
+    const account = world.propOrNull(human, "account") as string;
+    world.setProp(account, "programmer_grant_quota", 10);
+    // Signup recorded the authority root and anchored the account to it.
+    expect(world.propOrNull(account, "authority_root")).toBe(human);
+    expect(world.object(account).anchor).toBe(human);
+
+    // create_agent anchors the new agent to the same root.
+    const prov = (await world.directCall("prov", human, human, "create_agent", ["FamilyBot", "", true])) as {
+      op: string; result: { actor_id: string };
+    };
+    const agent = prov.result.actor_id;
+    expect(world.object(agent).anchor).toBe(human);
+
+    // The whole family carries into cluster:<human>.
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    const scopeOf = (id: string): string | undefined =>
+      [...plan.partitions.entries()].find(([, cells]) => cells.some((c) => c.object === id))?.[0];
+    expect(scopeOf(human)).toBe(`cluster:${human}`);
+    expect(scopeOf(account)).toBe(`cluster:${human}`);
+    expect(scopeOf(agent)).toBe(`cluster:${human}`);
+  });
+
   it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
     // The reviewer's repro shape: the primary is z_human, but an agent
     // whose id sorts FIRST is also bound — a rebuild-from-first-sorted

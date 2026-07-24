@@ -90,7 +90,8 @@ const IDENTITY_PROPS = [
   "actors",
   "last_seen_at",
   "features",
-  "features_version"
+  "features_version",
+  "authority_root"
 ] as const;
 
 export type IdentityActorExport = {

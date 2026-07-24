@@ -3514,6 +3514,20 @@ export class WooWorld {
     private bindHumanToAccount(actor: ObjRef, account: ObjRef, now: number): void {
       this.setProp(account, "email_verified_at", now);
       this.setProp(account, "primary_actor", actor);
+      // Authority root (the single-human supported lifecycle case): the account,
+      // its human, and the human's owned agents share ONE authority scope so a
+      // promote/demote turn commits atomically without a catalog write. Record
+      // the primary human as the stable root and anchor the account to it. This
+      // runs once (first binding wins) while the account is still in-memory and
+      // never yet carried/partitioned, so it is a provisioning-time placement,
+      // not a scope migration. A multi-human account keeps its original root —
+      // the explicit field stops later code from splitting agents by their
+      // immediate co-owner. Owned agents anchor to this root at provisioning.
+      if (this.propOrNull(account, "authority_root") == null) {
+        this.setProp(account, "authority_root", actor);
+        this.object(account).anchor = actor;
+        this.markObjectDirty(account);
+      }
       const actors = this.accountActors(account);
       if (!actors.includes(actor)) this.setProp(account, "actors", [...actors, actor]);
       this.setProp(actor, "account", account);
@@ -3557,6 +3571,19 @@ export class WooWorld {
       return id;
     }
 
+    /**
+     * The authority root an owned actor anchors to: the primary human recorded
+     * on the owner's account (the single-human supported case), falling back to
+     * the owner itself when the account or root is unset. Keeps every agent of
+     * one human in that human's authority cluster.
+     */
+    private authorityRootOf(human: ObjRef): ObjRef | null {
+      const account = this.propOrNull(human, "account");
+      if (typeof account !== "string" || !this.objects.has(account)) return human;
+      const root = this.propOrNull(account, "authority_root");
+      return typeof root === "string" && this.objects.has(root) ? root : human;
+    }
+
     private provisionActorInternal(classRef: ObjRef, owner: ObjRef, attrs: Record<string, WooValue>, caller: ObjRef): { actor: ObjRef } {
       if (!this.objects.has(classRef)) throw wooError("E_OBJNF", `class not found: ${classRef}`, classRef);
       if (!this.inheritsFrom(classRef, "$actor")) throw wooError("E_TYPE", `class must descend from $actor: ${classRef}`, classRef);
@@ -3564,7 +3591,15 @@ export class WooWorld {
       const prefix = classRef === "$human" ? "human" : classRef === "$agent" ? "agent" : "actor";
       const id = this.createProvisionedObjectId(prefix);
       const name = typeof attrs.name === "string" && attrs.name ? attrs.name : id;
-      this.createObject({ id, name, parent: classRef, owner, location: "$nowhere" });
+      // Anchor an agent to its owning human's authority root so it co-locates
+      // with the account + human in one cluster (the supported lifecycle). Set
+      // at creation because anchors are never patched. Only when the owner is a
+      // real $human root: a $wiz-owned agent has no human authority family, and
+      // anchoring to $wiz would classify it to the catalog scope.
+      const anchor = classRef === "$agent" && this.inheritsFrom(owner, "$human")
+        ? (this.authorityRootOf(owner) ?? owner)
+        : null;
+      this.createObject({ id, name, parent: classRef, owner, location: "$nowhere", anchor });
       this.setProp(id, "name", name);
       if (typeof attrs.description === "string") this.setProp(id, "description", attrs.description);
       if (classRef === "$human" && typeof attrs.account === "string") this.setProp(id, "account", attrs.account);
