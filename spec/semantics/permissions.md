@@ -60,6 +60,16 @@ permissions to a different object; non-wizard frames may only set them to their
 current value. Generic wizard-owned setters on a universal ancestor are not safe
 public capabilities.
 
+The prog catalog's builder/programmer authoring wrappers are the canonical
+application of this rule. They are installed `$wiz`-owned (so they run with
+`progr = $wiz`), and after their surface/flag guard — verifying `actor` carries
+the authoring surface (`has_surface`) and, for programmer operations, the
+`programmer` flag — every public wrapper calls `set_task_perms(actor)` before
+any caller-controlled work. Substrate primitives the wrapper then invokes
+(create, verb/property install, editor save, `eval`) enforce the actor's own
+ownership and permissions, so a wrapper cannot retain `$wiz` authority past its
+guard.
+
 ### 11.5 Cross-host trust
 
 When a task calls between persistent hosts within the same deployment, the receiver trusts the call envelope's `progr`. The deployment boundary is the trust boundary.

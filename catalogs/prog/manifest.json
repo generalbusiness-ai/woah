@@ -13,7 +13,7 @@
     {
       "local_name": "$builder",
       "parent": "$player",
-      "description": "Builder player class. Actors inheriting from `$builder` expose object creation, reparenting, recycling, data-property setting, and structure-oriented inspection/search as their own MCP tools. Builder class membership is the authoring surface, not programmer authority: these verbs cannot install code, change executable behavior, or adjust source/perms metadata. Engine builtins check the invoking actor and object policy, not the wrapper verb owner.",
+      "description": "Builder player class. Actors that carry `$builder` (through ancestry or as an attached feature) expose object creation, reparenting, recycling, data-property setting, and structure-oriented inspection/search as their own MCP tools. Builder class membership is the authoring surface, not programmer authority: these verbs cannot install code, change executable behavior, or adjust source/perms metadata. Engine builtins check the invoking actor and object policy, not the wrapper verb owner.",
       "properties": [
         {
           "name": "api_version",
@@ -269,7 +269,7 @@
     {
       "local_name": "$programmer",
       "parent": "$builder",
-      "description": "Programmer player class. Actors inheriting from `$programmer` expose source-aware inspection, verb resolution, source listing, source search, verb install with dry-run diagnostics, metadata-only verb edits, property-definition metadata, and traces as their own MCP tools. Programmer class membership exposes the interface; the programmer or wizard flag remains the hard authority check. The surface is source-level; bytecode and VM internals are deliberately absent.",
+      "description": "Programmer player class. Actors that carry `$programmer` (through ancestry or as an attached feature) expose source-aware inspection, verb resolution, source listing, source search, verb install with dry-run diagnostics, metadata-only verb edits, property-definition metadata, and traces as their own MCP tools. Programmer class membership exposes the interface; the programmer or wizard flag remains the hard authority check. The surface is source-level; bytecode and VM internals are deliberately absent.",
       "properties": [
         {
           "name": "api_version",

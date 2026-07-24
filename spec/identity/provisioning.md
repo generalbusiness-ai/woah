@@ -104,6 +104,23 @@ hierarchy retained for kind (matching how `$guest` is a class even
 when "guest" could have been just a flag — the pool allocator needs
 to mint a specific kind).
 
+**Authoring surface via feature, not ancestry.** The builder/programmer
+authoring *verbs* live on the prog catalog's `$builder`/`$programmer`
+classes, but an actor gains them without leaving its kind: the surface
+class is attached as a [feature](../semantics/features.md), and the
+dispatcher resolves it through the actor's feature chain. Kind stays in
+the actor's own ancestry (`agent_42 isa $agent`), capability stays in the
+flag, and the visible surface is a third, independent axis. The single
+predicate `has_surface(actor, class)` — true when `class` is on the
+actor's parent chain (legacy `$programmer`/`$builder` descendants) or is
+reachable through an attached feature — decides surface membership for
+both the DSL wrapper guards and the substrate authoring helpers, so the
+two promotion shapes resolve identically. An actor must never be
+reparented out of its kind class to gain an authoring surface; that
+destroys the ancestry that records what kind of principal it is. This
+includes `$wiz`: it keeps `$wiz isa $player` and carries the programmer
+surface as a feature like any other actor.
+
 Capability defaults additionally follow attached features
 ([features.md](../semantics/features.md)) and team memberships
 ([teams.md](teams.md)). The `wizard` and `programmer` flags are the
@@ -351,6 +368,27 @@ expected slot without per-account wizard work.
 strip programmer from their own agents. Demoting decrements the
 `account.programmer_agent_count` counter and frees a slot for
 `promote`/`create_agent` to consume.
+
+**Surface attach/remove is part of the transition.** `create_agent`
+(with `programmer = true`), `promote_agent_to_programmer`, and
+`demote_agent_from_programmer` mutate three pieces of state together: the
+`programmer` flag on the agent, the attached authoring surface (AP4), and
+the `account.programmer_agent_count`. The surface class is read from
+`$system.programmer_surface`, a reference the prog catalog publishes as
+catalog data; core never names the surface class. When that property is
+unpublished (prog not installed), provisioning sets the flag and quota
+only and the actor simply has no authoring surface. `revoke_agent` also
+removes the surface when it clears the flag.
+
+The transition is atomic — all three commit in one authoritative turn or
+none do. Because the flag/surface live on the agent and the counter lives
+on the `$account`, `promote`/`demote`/`revoke` first assert the agent and
+its account are co-resident in one authority scope; when they are not,
+the operation refuses with `E_CROSS_HOST_WRITE` rather than half-applying
+the transition across a host boundary. A cross-scope promote/demote
+protocol is deferred; until it exists the co-resident case is the
+supported one. `create_agent` provisions the agent in the calling human's
+scope, so it is co-resident by construction.
 
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,
