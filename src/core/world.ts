@@ -741,8 +741,9 @@ export class WooWorld {
     // net planning always installs an explicit snapshot (including []).
     const now = this.logicalNow("room_roster.now");
     const roomName = this.objects.get(room)?.name ?? room;
-    return this.activeActorsIn(room)
-      .filter((actor) => this.objects.has(actor) && this.actorIsRosterVisibleIn(actor, room))
+    const roster = this.activeActorRosterStateIn(room, now);
+    return roster.actors
+      .filter((actor) => roster.visibleActors.has(actor))
       .map((actor) => {
         const stats = this.playerSessionStats(actor, now);
         const presence = stats.connected
@@ -763,19 +764,30 @@ export class WooWorld {
       });
   }
 
-  /** Local-runtime counterpart of Net's roomRosterRows filter. An actor is
-   * socially visible when any live session in the room is visible. Actors
-   * known only through a legacy projection remain visible for compatibility;
-   * complete local session state is authoritative whenever it exists. */
-  private actorIsRosterVisibleIn(actor: ObjRef, room: ObjRef): boolean {
-    const now = Date.now();
-    let hasLiveSession = false;
+  /** Compute local active membership and social visibility in the same session
+   * pass. Hidden service sessions remain active delivery carriers, while any
+   * visible sibling session keeps the actor's deduplicated roster row visible. */
+  private activeActorRosterStateIn(space: ObjRef, now: number): { actors: ObjRef[]; visibleActors: Set<ObjRef> } {
+    const actors = new Set<ObjRef>();
+    const visibleActors = new Set<ObjRef>();
     for (const session of this.sessions.values()) {
-      if (session.actor !== actor || session.activeScope !== room || this.sessionExpired(session, now)) continue;
-      hasLiveSession = true;
-      if (session.rosterVisible !== false) return true;
+      if (session.activeScope !== space || this.sessionExpired(session, now)) continue;
+      if (!this.objects.has(session.actor)) continue;
+      actors.add(session.actor);
+      if (session.rosterVisible !== false) visibleActors.add(session.actor);
     }
-    return !hasLiveSession;
+    const projected = this.presenceSessionsIn(space);
+    if (projected) {
+      const room = this.objects.get(space);
+      for (const [sessionId, actor] of projected) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
+        if (!this.objects.has(actor) || !room?.contents.has(actor)) continue;
+        actors.add(actor);
+        if (session.rosterVisible !== false) visibleActors.add(actor);
+      }
+    }
+    return { actors: Array.from(actors).sort(), visibleActors };
   }
 
   /** Apply a planned session transition to the transient owner snapshot so
@@ -11666,25 +11678,7 @@ export class WooWorld {
   }
 
   activeActorsIn(space: ObjRef): ObjRef[] {
-    const actors = new Set<ObjRef>();
-    const now = Date.now();
-    for (const session of this.sessions.values()) {
-      if (session.activeScope !== space) continue;
-      if (this.sessionExpired(session, now)) continue;
-      if (!this.objects.has(session.actor)) continue;
-      actors.add(session.actor);
-    }
-    const projected = this.presenceSessionsIn(space);
-    if (projected) {
-      const room = this.objects.get(space);
-      for (const [sessionId, actor] of projected) {
-        const session = this.sessions.get(sessionId);
-        if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
-        if (!this.objects.has(actor) || !room?.contents.has(actor)) continue;
-        actors.add(actor);
-      }
-    }
-    return Array.from(actors).sort();
+    return this.activeActorRosterStateIn(space, Date.now()).actors;
   }
 
   async visibleContentsForActor(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {

@@ -127,7 +127,10 @@ means “the otherwise-selected audience minus these actors.” For an already
 explicit observation the runtime folds the exclusion into the exact positive
 enumeration; for a presence observation it carries the parallel negative set.
 The latter is the appropriate shape for public room output whose named
-recipient receives a separate private rendering.
+recipient receives a separate private rendering. These internal audience
+fields affect live delivery only; sequenced `applied` frames use their
+committed frame audience and ignore both `_audience_exclude` and
+`_audience_override`.
 
 **How the audience is computed.** For each observation:
 
