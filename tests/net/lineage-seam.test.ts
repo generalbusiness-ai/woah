@@ -11,9 +11,16 @@ import { installVerb } from "../../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../../src/core/bootstrap";
 import { effectTranscriptFromRecordedTurn } from "../../src/core/effect-transcript";
 import { InMemoryTurnRecorder } from "../../src/core/turn-recorder";
-import { cellsFromSerialized } from "../../src/net/bridge";
+import { cellsFromSerialized, storeCells, type ShadowTurnCall } from "../../src/net/bridge";
 import { CellStore, cellKey, cellVersion, makeCell, type EpochStamp } from "../../src/net/cells";
+import { planTurn } from "../../src/net/plan";
+import type { ScopeClassifier } from "../../src/net/route";
+import { ScopeSequencer } from "../../src/net/scope";
 import { applyTranscript } from "../../src/net/transcript";
+
+const CONCURRENCY_SCOPE = "seam-scope";
+// Phase-2 fixed assignment: one shared scope owns everything (differential idiom).
+const oneScope: ScopeClassifier = { scopeOf: () => CONCURRENCY_SCOPE, isShared: (s) => s === CONCURRENCY_SCOPE };
 
 const STAMP: EpochStamp = { scope_head: "seam-head", catalog_epoch: "seam-epoch" };
 
@@ -109,6 +116,9 @@ describe("lineage-mutation seam: recorder, apply, and parity", () => {
     expect(hasWrite("prop", agent, "features"), "features write").toBe(true);
     expect(hasWrite("prop", agent, "features_version"), "features_version write").toBe(true);
     expect(hasWrite("prop", account, "programmer_agent_count"), "account count write").toBe(true);
+    // The seam records a READ of the prior lineage version — the CAS basis that
+    // makes a concurrent lineage change reject the stale plan (gate 2).
+    expect(transcript.reads.some((r) => r.cell.kind === "lifecycle" && r.cell.object === agent), "lineage read recorded").toBe(true);
 
     const applied = applyTranscript(authorityFrom(serialized), transcript, STAMP);
     // Post-state parity: the applied object_lineage cell content-addresses
@@ -224,5 +234,69 @@ describe("lineage-mutation seam: recorder, apply, and parity", () => {
     // ...but the turn is INCOMPLETE: the native is uncontracted.
     expect(transcript.complete).toBe(false);
     expect(transcript.incompleteReasons.some((r) => r.includes("set_object_flags"))).toBe(true);
+  });
+
+  it("gate 2: two concurrent lineage mutations serialize — the stale one rejects, replans, and both survive", async () => {
+    const { serialized, human, agent } = await seededGenesis();
+    // Install a rename verb on the agent so turn B is an INDEPENDENT lineage
+    // (name) mutation racing turn A's promote (flag) mutation on the same cell.
+    const base = createWorldFromSerialized(structuredClone(serialized), { persist: false });
+    const installed = installVerb(base, agent, "relabel", `verb :relabel(name) rxd { set_object_name(this, name); return this.name; }`, null);
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+    const genesisWorld = base.exportWorld();
+
+    const seq = new ScopeSequencer(CONCURRENCY_SCOPE, "seam-epoch");
+    seq.seed(cellsFromSerialized(genesisWorld));
+    const view = new CellStore("derived");
+    for (const cell of storeCells(seq.store)) view.install(cell);
+    const refreshView = (touched: string[]): void => {
+      for (const key of touched) {
+        const cell = seq.store.get(key);
+        if (cell) view.install(cell);
+        else view.delete(key);
+      }
+    };
+
+    const planAt = (id: string, target: string, verb: string, args: unknown[]) =>
+      planTurn({
+        call: { kind: "woo.turn_call.shadow.v1", id, route: "direct", scope: CONCURRENCY_SCOPE, session: null, actor: human, target, verb, args } as ShadowTurnCall,
+        view,
+        planningScope: CONCURRENCY_SCOPE,
+        classifier: oneScope,
+        base: seq.head(),
+        idempotencyKey: id,
+        stamp: seq.stamp()
+      });
+
+    // Both plan against the SAME base head (concurrent): A promotes, B renames.
+    const planA = await planAt("concurrent-promote", human, "promote_agent_to_programmer", [agent]);
+    const planB = await planAt("concurrent-rename", agent, "relabel", ["Renamed"]);
+
+    // B commits first, advancing the head and bumping the agent lineage version.
+    const replyB = seq.submit(planB.submit);
+    expect(replyB.status, JSON.stringify(replyB)).toBe("accepted");
+    if (replyB.status !== "accepted") return;
+    refreshView(replyB.touched);
+
+    // A's submit was planned at the now-stale head with a stale lineage read.
+    // The scope rejects it — a concurrency guard fired (stale_head or the
+    // lineage read-version CAS), never a silent double-apply.
+    const staleReplyA = seq.submit(planA.submit);
+    expect(staleReplyA.status).toBe("rejected");
+    if (staleReplyA.status !== "rejected") return;
+    expect(["stale_head", "read_version_mismatch"]).toContain(staleReplyA.reason);
+
+    // Replan A against the refreshed view + current head: it now reads the
+    // renamed agent, flips the flag on top, and converges.
+    const replanA = await planAt("concurrent-promote-2", human, "promote_agent_to_programmer", [agent]);
+    const replyA = seq.submit(replanA.submit);
+    expect(replyA.status, JSON.stringify(replyA)).toBe("accepted");
+    if (replyA.status !== "accepted") return;
+    refreshView(replyA.touched);
+
+    // Both mutations survive: the agent is renamed AND a programmer.
+    const lineage = seq.store.get(cellKey("object_lineage", agent))?.value as { name?: string; flags?: Record<string, boolean> };
+    expect(lineage?.name, "rename survived the concurrent promote").toBe("Renamed");
+    expect(lineage?.flags?.programmer, "promote applied on top of the rename").toBe(true);
   });
 });
