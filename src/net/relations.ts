@@ -275,9 +275,19 @@ export function roomRosterRows(
     if (row.relation !== SESSION_PRESENCE_RELATION || row.owner !== room) continue;
     const body = row.body as SessionPresenceBody | undefined;
     if (!body || typeof body.actor !== "string") continue;
-    const session = body.session as { actor?: unknown; started?: unknown; expiresAt?: unknown; activeScope?: unknown } | undefined;
+    const session = body.session as {
+      actor?: unknown;
+      started?: unknown;
+      expiresAt?: unknown;
+      activeScope?: unknown;
+      rosterVisible?: unknown;
+    } | undefined;
     if (!session || session.actor !== body.actor || session.activeScope !== room) continue;
     if (typeof session.expiresAt === "number" && session.expiresAt <= now) continue;
+    // Authorization presence and social visibility are deliberately
+    // independent. Hidden API-key service sessions retain this relation row
+    // for reads/fanout but never become a public actor-level roster row.
+    if (session.rosterVisible === false) continue;
     const started = typeof session.started === "number" ? session.started : now;
     const prior = byActor.get(body.actor);
     byActor.set(body.actor, {

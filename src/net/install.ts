@@ -211,10 +211,12 @@ export function deriveScopeAttributions(
   return attributions;
 }
 
-/** Derive the install-time `contents` family from the complete world image and
+/** Derive the install-time relation families from the complete world image and
  * route each row by its OWNER's CO15 scope. This is intentionally a whole-
  * install operation: doing it inside individual scope seeds loses cross-scope
- * facts such as `the_pinboard` living on `the_deck`. */
+ * facts such as `the_pinboard` living on `the_deck`. Actor-owned credentials
+ * are indexed privately by each ScopeSequencer from its seeded cells; they
+ * deliberately never enter this transferable relation family. */
 export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<string, RelationRow[]> {
   const lineage = new Map<string, AnchorLineage>();
   for (const cell of cells) {
@@ -223,20 +225,24 @@ export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<s
   const classifier = classifierFromLineage((object) => lineage.get(object) ?? null);
   const out = new Map<string, RelationRow[]>();
   for (const cell of cells) {
-    if (cell.kind !== "object_live") continue;
-    const location = (cell.value as { location?: unknown } | null)?.location;
-    if (typeof location !== "string" || !location || location === "$nowhere") continue;
-    const scope = classifier.scopeOf(location);
-    const rows = out.get(scope) ?? [];
-    rows.push({
-      relation: "contents",
-      owner: location,
-      member: cell.object,
-      member_scope: classifier.scopeOf(cell.object)
-    });
-    out.set(scope, rows);
+    if (cell.kind === "object_live") {
+      const location = (cell.value as { location?: unknown } | null)?.location;
+      if (typeof location !== "string" || !location || location === "$nowhere") continue;
+      const scope = classifier.scopeOf(location);
+      const rows = out.get(scope) ?? [];
+      rows.push({
+        relation: "contents",
+        owner: location,
+        member: cell.object,
+        member_scope: classifier.scopeOf(cell.object)
+      });
+      out.set(scope, rows);
+      continue;
+    }
   }
-  for (const rows of out.values()) rows.sort((a, b) => `${a.owner}\0${a.member}`.localeCompare(`${b.owner}\0${b.member}`));
+  for (const rows of out.values()) {
+    rows.sort((a, b) => `${a.relation}\0${a.owner}\0${a.member}`.localeCompare(`${b.relation}\0${b.owner}\0${b.member}`));
+  }
   return out;
 }
 

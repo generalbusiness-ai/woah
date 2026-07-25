@@ -157,6 +157,39 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
     expect(seq.head().seq).toBe(1);
   });
 
+  it("stores hidden-roster policy without suppressing authority presence", () => {
+    const seq = sessionSequencer("cluster:#actor");
+    const { submit, value } = mintSessionSubmit({
+      session: "s-hidden",
+      actor: "#actor",
+      ttl_ms: 60_000,
+      now: NOW,
+      base: seq.head(),
+      epoch: EPOCH,
+      clusterScope: "cluster:#actor",
+      activeScope: "room:r1",
+      rosterVisible: false
+    });
+
+    expect(value).toMatchObject({
+      actor: "#actor",
+      activeScope: "room:r1",
+      rosterVisible: false
+    });
+    expect(submit.transcript.sessionScopeTransition).toMatchObject({
+      actor: "#actor",
+      session: "s-hidden",
+      rosterVisible: false,
+      from: null,
+      to: "room:r1"
+    });
+    expect(seq.submit(submit).status).toBe("accepted");
+    expect(seq.store.get(sessionCellKey("s-hidden"))?.value).toMatchObject({
+      activeScope: "room:r1",
+      rosterVisible: false
+    });
+  });
+
   it("stampGuestCustomerOf rides the exclusive mint commit with the AU3.1 rule-4 shape (aged-world pool backfill)", () => {
     // The exclusive mint requires the occupancy witness (an empty pool
     // seat: no live sessions bind the actor).
@@ -243,9 +276,15 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
       base: seq.head(),
       epoch: EPOCH,
       clusterScope: "cluster:#actor",
+      rosterVisible: false,
       closing: { priorActiveScope: "room:r1", ephemeralActor: true }
     });
     expect(submit.transcript.sessionClose).toBe(true);
+    expect(submit.transcript.sessionScopeTransition).toMatchObject({
+      rosterVisible: false,
+      from: "room:r1",
+      to: null
+    });
     expect(value.expiresAt).toBeLessThan(NOW);
     expect(value.ephemeralActor).toBe(true);
     expect(value.retireFromScope).toBe("room:r1");

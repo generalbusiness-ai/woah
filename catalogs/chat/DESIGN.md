@@ -68,7 +68,13 @@ shape in woocode while making planning cost one room-authority read.
 `$room:live_audience(observation?)` is the separate delivery answer; it
 delegates to the substrate's observation audience rules and returns live
 subscribed session ids. Render/API code should use `room_roster()`, not
-`subscribers`, for presentation.
+`subscribers`, for presentation. Conversely, delivery code must not construct
+an audience from `room_roster()`: API-key appliances may be socially hidden but
+remain live recipients. `:say_to` stays in presence-delivery mode and supplies
+only `_audience_exclude: [recipient]` when the named player will receive the
+private rendering. Each gateway therefore applies the compact exclusion to its
+own raw session-presence slice instead of trusting a planner's incomplete actor
+enumeration.
 
 **Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a tasks catalog's `:claim`, `:transition_intent`); chat traffic flows past it.
 
@@ -169,7 +175,7 @@ Inside each verb body: `this` = the consumer space (the room being talked in), `
 
 ```woo
 declare_event $conversational "said"    { source: obj, actor: obj, text: str };
-declare_event $conversational "said_to" { source: obj, actor: obj, to: obj, text: str, _audience_override?: list<obj> };
+declare_event $conversational "said_to" { source: obj, actor: obj, to: obj, text: str, _audience_exclude?: list<obj> };
 declare_event $conversational "said_as" { source: obj, actor: obj, style: str, text: str };
 declare_event $conversational "emoted"  { source: obj, actor: obj, text: str };
 declare_event $conversational "posed"   { source: obj, actor: obj, text: str };

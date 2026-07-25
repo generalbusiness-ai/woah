@@ -110,6 +110,7 @@ describe("runHoroscopeTick", () => {
     expect(aiCall0.max_tokens).toBe(200);
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
+    expect(calls[0].body).toEqual({ roster_visible: false });
     expect(calls[1].url).toContain("/net-api/cell?");
     expect(calls[1].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
     expect(calls[2].url).toBe("https://woo.example/net-api/turn");

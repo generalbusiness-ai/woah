@@ -223,10 +223,20 @@ On each fire it:
    sum / mode per `fields[name].agg`).
 5. Calls `:set_properties({current, daily, timeseries, last_pushed_at, config_state})`
    in a single bundle.
-6. Disconnects.
+6. Closes its hidden-roster Net session in a `finally` path.
 
 Failure paths set `last_error` and skip the data write; `:look` surfaces
-the freshness state for operators.
+the durable plug state for operators. The plug's session retains ordinary
+authorization presence while a tick runs, but `roster_visible:false` keeps
+the appliance out of `who` and presence UI. `:look` does not infer health
+from that ephemeral session: it derives `healthy`, `stale`, `pending`,
+`error`, or `never` from `last_pushed_at`, `last_error`, and `config_state`.
+When an imported/seeded current reading predates `last_pushed_at`, its
+`observed_at` is fallback evidence of a successful update; a displayed reading
+without either timestamp does not also print the contradictory “no successful
+update yet” sentence. The manifest's 7,200,000 ms threshold is deliberately
+coupled to `plug/wrangler.toml`'s hourly cron: one missed run plus one run of
+grace. A cadence change MUST update both values and their tests.
 
 ### Free-tier budget
 

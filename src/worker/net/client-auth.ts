@@ -1,23 +1,23 @@
 /**
  * Client authentication for the /net-api surface (Plan 002 Phase 4
- * item 2; coherence.md CO14 "credential authentication against identity
- * cells in the catalog scope closure").
+ * item 2; coherence.md CO14).
  *
- * The token is the existing woo apikey credential (`apikey:<id>:<secret>`),
- * verified against the catalog identity cell
- * `property_cell:$system:api_keys`. The salt/hash scheme is EXACTLY the
- * one core auth uses (src/core/world.ts authApiKey), reimplemented
- * narrowly here because the net layer must never import world.ts:
+ * The token is the existing woo apikey credential (`apikey:<id>:<secret>`).
+ * Historical ids verify against `property_cell:$system:api_keys`; self-
+ * routing ids verify one record from the actor authority's private index.
+ * The salt/hash scheme is EXACTLY the one core auth uses
+ * (src/core/world.ts authApiKey), reimplemented narrowly here because the
+ * net layer must never import world.ts:
  *
  *   stored record: { hash, salt, actor, label, created_at, revoked_at? }
  *   verification:  constantTimeEqual(hashSource(`${salt}:${secret}`), hash)
  *
- * Core checks deliberately NOT mirrored (documented, not implied): actor
- * existence and deactivation are engine-state checks with no cell-level
- * equivalent at the gateway; an unresolvable actor surfaces downstream as
- * E_MISSING_STATE when the session open tries to classify it, never as a
- * silent accept. last_seen_at touch (a world write) is likewise a core
- * concern — the net path records liveness through session cells instead.
+ * The record helper only verifies the credential bytes. Before session mint,
+ * the gateway separately resolves the actor's authority cells and mirrors
+ * core's deactivation checks for the actor, human account, and recursive
+ * agent-owner chain. An unresolvable owner fails closed. `last_seen_at` touch
+ * remains a world-write concern; Net records bounded liveness through its
+ * session cells and audit instead.
  *
  * Every failure is a ClientAuthError: the caller maps it to HTTP 401 with
  * {error:{code:"E_NOSESSION", ...}} — the same named-refusal vocabulary
@@ -131,6 +131,16 @@ export function verifyApiKeyCredential(map: unknown, credential: ClientCredentia
     map && typeof map === "object" && !Array.isArray(map)
       ? (map as Record<string, unknown>)[credential.id]
       : undefined;
+  return verifyApiKeyRecord(record, credential);
+}
+
+/** Verify one exact actor-owned private-index record. Keeping this helper
+ * beside the legacy-map wrapper guarantees both authorities use identical
+ * refusal ordering and constant-time hash comparison. */
+export function verifyApiKeyRecord(record: unknown, credential: ClientCredential): { actor: string } {
+  if (credential.kind !== "apikey") {
+    throw new ClientAuthError("credential is not an apikey", { reason: "unsupported_token_class" });
+  }
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     throw new ClientAuthError("apikey not found or revoked", { reason: "unknown_or_revoked" });
   }

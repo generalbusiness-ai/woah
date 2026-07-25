@@ -110,17 +110,25 @@ The block exposes apikey ops as verbs so the owner can manage credentials
 without `$system` access:
 
 - `:mint_apikey(label?)` — calls `$system:create_api_key_for_owner(this, label)`.
-  Owner or wizard. The secret is in the result and is shown ONCE.
+  Owner or wizard. The actor's anchor cluster stores the hashed record and
+  derives a private verifier index; the secret is in the result and is shown
+  ONCE. Blocks with a non-actor anchor root refuse issuance because their id
+  could not truthfully route to the CO15 authority.
 - `:revoke_apikey(id)` — calls `$system:revoke_api_key(id)`. Owner of
-  the bound actor or wizard. Marks `revoked_at` (record kept for audit)
-  and closes any in-memory sessions minted from the key.
-- `:list_apikeys()` — calls `$system:list_api_keys_for_owner()` and
-  filters to keys bound to this block. Returns
-  `{id, label, created_at, last_seen_at, revoked_at}` records.
+  the bound actor or wizard. Marks the actor-owned record's `revoked_at`
+  (record kept for audit), closes in-memory sessions minted from the key, and
+  makes Net reject both future authentication and bearer-only use of sessions
+  minted from it. Historical global-map keys require operator
+  rotation/revocation.
+- `:list_apikeys()` — calls `$system:list_api_keys_for_owner(this)`. Returns
+  `{id, label, created_at, last_seen_at, revoked_at}` records. Net records
+  connection liveness through sessions/audit, so `last_seen_at` may remain
+  null for a Net-authenticated key.
 
 The minted credential used by plugs is the full token string
 `apikey:<id>:<secret>`. The id is part of the credential, not just
-metadata; `apikey:<secret>` is not the documented token form. Operators
+metadata; its versioned routing fields are public and are not authentication
+material. `apikey:<secret>` is not the documented token form. Operators
 should validate the full token before storing it in Worker secrets:
 
 ```bash

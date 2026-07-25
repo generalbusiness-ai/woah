@@ -26,7 +26,22 @@
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
-import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "./relations";
+import {
+  applyRelationDeltas,
+  deriveRelationDeltas,
+  rebuildContentsRelation,
+  relationKey,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow
+} from "./relations";
+import {
+  ACTOR_API_KEYS_PROPERTY,
+  apiKeyVerifierKey,
+  apiKeyVerifierRowsForActor,
+  rebuildApiKeyVerifierIndex,
+  type ApiKeyVerifierRow
+} from "./api-key-index";
 import {
   ORDERED_EDGE_RELATION,
   orderedChildrenForContainer,
@@ -46,6 +61,7 @@ import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
 
 export type ScopeHead = {
   seq: number;
@@ -61,6 +77,13 @@ export type OperatorDefinitionRepair = {
   head: ScopeHead;
   cells: Cell[];
   removed: string[];
+};
+
+export type OperatorCredentialEnsure = {
+  status: "applied" | "empty";
+  head: ScopeHead;
+  cell: Cell;
+  verifier: ApiKeyVerifierRow;
 };
 
 /** CO7/CO10 envelope byte ceilings. Enforced by the gateway on the ACTUAL
@@ -271,6 +294,9 @@ export class ScopeSequencer {
   private attribution: ScopeAttribution | null = null;
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relationRows = new Map<string, RelationRow>();
+  /** Private O(1) authentication index derived from actor api_keys cells.
+   * This is not relation state and has no transfer/fanout/public surface. */
+  private readonly apiKeyVerifiers = new Map<string, ApiKeyVerifierRow>();
   /** CO13 ordered-edge relation buckets, maintained in (rank, child) order
    * when rows change. Relation rows are keyed by member, so the reverse map
    * lets an overwrite/reparent remove the old bucket entry before adding the
@@ -335,6 +361,9 @@ export class ScopeSequencer {
       // delegate). The in-memory map serves only durable-less
       // sequencers.
       for (const row of durable.readRelations()) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
+      for (const row of durable.readApiKeyVerifiers()) {
+        this.apiKeyVerifiers.set(apiKeyVerifierKey(row.actor, row.id), row);
+      }
       this.syncOrderedRelationIndex(this.relationRows.keys());
     }
   }
@@ -424,6 +453,11 @@ export class ScopeSequencer {
     for (const cell of cells) {
       seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
     }
+    // Seed carries the complete authority cell image, so rebuild the private
+    // verifier index directly from it. The index never rides the public
+    // `relations` argument.
+    this.apiKeyVerifiers.clear();
+    for (const [key, row] of rebuildApiKeyVerifierIndex(seeded)) this.apiKeyVerifiers.set(key, row);
     // A present relation field is the COMPLETE initial family and replaces a
     // partial first attempt. Legacy seed callers omitted the field entirely;
     // omission must preserve their already-seeded rows, not silently mean an
@@ -443,6 +477,10 @@ export class ScopeSequencer {
           for (const row of durable.readRelations()) durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
           for (const [key, row] of this.relationRows) durable.writeRelation(key, row);
         }
+        for (const row of durable.readApiKeyVerifiers()) {
+          durable.deleteApiKeyVerifier(apiKeyVerifierKey(row.actor, row.id));
+        }
+        for (const [key, row] of this.apiKeyVerifiers) durable.writeApiKeyVerifier(key, row);
         // Meta is written on seed too, so a seeded-but-never-committed
         // scope still hydrates with its head and epoch.
         durable.writeMeta(this.metaRow());
@@ -543,6 +581,130 @@ export class ScopeSequencer {
       });
     }
     return { status: "applied", head: this.headState, cells: committed, removed };
+  }
+
+  /** Internal-signed bootstrap of one actor-owned API-key verifier.
+   *
+   * The operator generates the id, secret, and salt locally and sends only the
+   * non-replayable verifier record here. Exact replay is empty success;
+   * disagreement at an existing id is a collision. The actor cell, private
+   * verifier index, head, and recovery tail advance in one transaction.
+   */
+  operatorEnsureCredential(
+    actor: string,
+    id: string,
+    record: Record<string, unknown>
+  ): OperatorCredentialEnsure {
+    const routed = parseRoutedApiKeyId(id);
+    const routedScope = routedApiKeyScope(id);
+    const recordKeys = Object.keys(record).sort();
+    const closedRecord =
+      recordKeys.length === 5 &&
+      recordKeys.every((key) => ["actor", "created_at", "hash", "label", "salt"].includes(key));
+    if (
+      !routed ||
+      routed.actor !== actor ||
+      routedScope !== this.scope ||
+      !closedRecord ||
+      record.actor !== actor ||
+      typeof record.hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(record.hash) ||
+      typeof record.salt !== "string" ||
+      !/^[0-9a-f]{32}$/.test(record.salt) ||
+      !Number.isSafeInteger(record.created_at) ||
+      Number(record.created_at) < 0 ||
+      (record.label !== null &&
+        (typeof record.label !== "string" || new TextEncoder().encode(record.label).byteLength > 256))
+    ) {
+      throw netError("E_INVARG", "credential ensure record or routing hint is invalid", {
+        actor,
+        id,
+        scope: this.scope
+      });
+    }
+    if (!this.store.has(cellKey("object_lineage", actor))) {
+      throw netError("E_MISSING_STATE", "credential actor is not authoritative at this scope", {
+        actor,
+        scope: this.scope
+      });
+    }
+    if (this.options.scopeOf && this.options.scopeOf(actor) !== this.scope) {
+      throw netError("E_INVARG", "credential actor belongs to a different authority scope", {
+        actor,
+        scope: this.scope,
+        actual: this.options.scopeOf(actor)
+      });
+    }
+
+    const key = cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY);
+    const priorCell = this.store.get(key);
+    const priorPayload =
+      priorCell?.value && typeof priorCell.value === "object" && !Array.isArray(priorCell.value)
+        ? priorCell.value as { value?: unknown; def?: unknown }
+        : {};
+    const priorMap =
+      priorPayload.value && typeof priorPayload.value === "object" && !Array.isArray(priorPayload.value)
+        ? priorPayload.value as Record<string, unknown>
+        : {};
+    const existing = priorMap[id];
+    if (existing !== undefined && cellVersion(existing) !== cellVersion(record)) {
+      throw netError("E_INVARG", "credential id is already bound to a different verifier", {
+        actor,
+        id
+      });
+    }
+    const verifier: ApiKeyVerifierRow = { actor, id, record };
+    const verifierId = apiKeyVerifierKey(actor, id);
+    const existingVerifier = this.apiKeyVerifiers.get(verifierId);
+    if (existing !== undefined && existingVerifier && cellVersion(existingVerifier) === cellVersion(verifier)) {
+      if (!priorCell) throw netError("E_MISSING_STATE", "credential record exists without its authority cell", { actor, id });
+      return { status: "empty", head: this.headState, cell: priorCell, verifier };
+    }
+
+    const marker = `operator_credential_ensure:${cellVersion({ actor, id, record })}`;
+    const priorHead = this.headState;
+    const nextHead: ScopeHead = {
+      seq: priorHead.seq + 1,
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker]),
+      generation: (priorHead.generation ?? priorHead.seq) + 1
+    };
+    const nextStamp: EpochStamp = {
+      scope_head: `${nextHead.seq}:${nextHead.hash}`,
+      catalog_epoch: this.catalogEpoch
+    };
+    const cell = this.store.commit({
+      kind: "property_cell",
+      object: actor,
+      name: ACTOR_API_KEYS_PROPERTY,
+      value: {
+        ...("def" in priorPayload ? { def: priorPayload.def } : {}),
+        value: { ...priorMap, [id]: record }
+      },
+      stamp: nextStamp
+    });
+    this.apiKeyVerifiers.set(verifierId, verifier);
+    this.headState = nextHead;
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: [cell.key],
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        durable.writeCell(cell);
+        durable.writeApiKeyVerifier(verifierId, verifier);
+        durable.writeMeta(this.metaRow());
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
+    return { status: "applied", head: this.headState, cell, verifier };
   }
 
   /**
@@ -992,11 +1154,36 @@ export class ScopeSequencer {
       this.memoryLogRows.set(logEntry.space, rows);
     }
 
+    // Re-index actor-owned verifier maps inside the authority transaction.
+    // This state is intentionally absent from CommitReply: it is neither a
+    // public relation delta nor gateway fanout material.
+    const changedVerifierKeys = new Set<string>();
+    const credentialActors = new Set(
+      submit.transcript.writes
+        .filter((write) =>
+          write.cell.kind === "prop" &&
+          write.cell.name === ACTOR_API_KEYS_PROPERTY &&
+          write.cell.object !== "$system"
+        )
+        .map((write) => write.cell.object)
+    );
+    for (const actor of credentialActors) {
+      if (this.options.scopeOf && this.options.scopeOf(actor) !== this.scope) continue;
+      const cell = applied.post.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY));
+      for (const key of this.replaceApiKeyVerifiersForActor(actor, cell?.value)) changedVerifierKeys.add(key);
+    }
+
     // CO13: derive relation deltas from the accepted transcript — the
     // single write path for contents/presence rows. Local rows apply here
     // (durably, in the same transaction below); foreign rows ride the
     // reply for the shell's /net/relate delivery.
-    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf, applied.post);
+    const derived = deriveRelationDeltas(
+      submit.transcript,
+      applied,
+      this.scope,
+      this.options.scopeOf,
+      applied.post
+    );
     const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
     this.syncOrderedRelationIndex(changedRelationKeys);
     const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
@@ -1038,6 +1225,11 @@ export class ScopeSequencer {
           const row = this.relationRows.get(key);
           if (row) durable.writeRelation(key, row);
           else durable.deleteRelation(key);
+        }
+        for (const key of changedVerifierKeys) {
+          const row = this.apiKeyVerifiers.get(key);
+          if (row) durable.writeApiKeyVerifier(key, row);
+          else durable.deleteApiKeyVerifier(key);
         }
       });
     }
@@ -1189,6 +1381,25 @@ export class ScopeSequencer {
       appliedKeys.push(key);
     }
     appliedKeys.sort();
+    const changedVerifierKeys = new Set<string>();
+    const credentialActors = new Set<string>();
+    for (const cell of accepted) {
+      if (
+        cell.kind === "property_cell" &&
+        cell.name === ACTOR_API_KEYS_PROPERTY &&
+        cell.object !== "$system"
+      ) credentialActors.add(cell.object);
+    }
+    const credentialSuffix = `:${ACTOR_API_KEYS_PROPERTY}`;
+    for (const key of acceptedRemovals) {
+      if (!key.startsWith("property_cell:") || !key.endsWith(credentialSuffix)) continue;
+      const actor = key.slice("property_cell:".length, -credentialSuffix.length);
+      if (actor && actor !== "$system") credentialActors.add(actor);
+    }
+    for (const actor of credentialActors) {
+      const cell = this.store.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY));
+      for (const key of this.replaceApiKeyVerifiersForActor(actor, cell?.value)) changedVerifierKeys.add(key);
+    }
     this.headState = nextHead;
     const tailEntry: TailEntry = {
       seq: nextHead.seq,
@@ -1215,6 +1426,11 @@ export class ScopeSequencer {
         durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        for (const key of changedVerifierKeys) {
+          const row = this.apiKeyVerifiers.get(key);
+          if (row) durable.writeApiKeyVerifier(key, row);
+          else durable.deleteApiKeyVerifier(key);
+        }
       });
     }
     return { status: "applied", head: this.headState, applied: appliedKeys, conflicts };
@@ -1224,6 +1440,30 @@ export class ScopeSequencer {
    * shell's /net/relate application and for roster queries. */
   relations(): ReadonlyMap<string, RelationRow> {
     return this.relationRows;
+  }
+
+  /** Exact authority-private lookup used only by the signed credential
+   * endpoint. Returning the record, rather than the index row, keeps actor/id
+   * routing metadata out of the verifier shape. */
+  apiKeyVerifier(actor: string, id: string): Record<string, unknown> | null {
+    return this.apiKeyVerifiers.get(apiKeyVerifierKey(actor, id))?.record ?? null;
+  }
+
+  private replaceApiKeyVerifiersForActor(actor: string, value: unknown): string[] {
+    const desired = apiKeyVerifierRowsForActor(actor, value);
+    const changed = new Set<string>();
+    for (const [key, row] of [...this.apiKeyVerifiers]) {
+      if (row.actor !== actor || desired.has(key)) continue;
+      this.apiKeyVerifiers.delete(key);
+      changed.add(key);
+    }
+    for (const [key, row] of desired) {
+      const existing = this.apiKeyVerifiers.get(key);
+      if (existing && cellVersion(existing) === cellVersion(row)) continue;
+      this.apiKeyVerifiers.set(key, row);
+      changed.add(key);
+    }
+    return [...changed].sort();
   }
 
   /** Owner-complete ordering for exactly one `(container, parent)` bucket.
@@ -1598,8 +1838,9 @@ export class ScopeSequencer {
     return lo;
   }
 
-  /** CO13 bounded repair: recompute the locally knowable contents relation
-   * from authority live cells. Presence and ordered-edge rows are preserved:
+  /** CO13 bounded repair: recompute locally knowable contents relations and
+   * the separate authority-private credential index from authority cells.
+   * Presence and ordered-edge rows are preserved:
    * their defining cells may live at foreign immutable anchors, so they repair
    * only through their single transcript-derivation + `/net/relate` path.
    * Replaces contents rows in memory and durably.
@@ -1611,8 +1852,9 @@ export class ScopeSequencer {
    * scope's row family — the CO9 dual-write this module exists to
    * prevent. Single-scope contents rebuilds keep everything. */
   rebuildRelations(): void {
+    const cells = [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c));
     const rebuilt = rebuildContentsRelation(
-      [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)),
+      cells,
       this.scope
     );
     if (this.options.scopeOf) {
@@ -1624,13 +1866,21 @@ export class ScopeSequencer {
       if (row.relation === "contents" && !rebuilt.has(key)) this.relationRows.delete(key);
     }
     for (const [key, row] of rebuilt) this.relationRows.set(key, row);
+    this.apiKeyVerifiers.clear();
+    for (const [key, row] of rebuildApiKeyVerifierIndex(cells)) this.apiKeyVerifiers.set(key, row);
     const durable = this.options.durable;
     if (durable) {
       durable.transaction(() => {
         for (const row of durable.readRelations()) {
-          if (row.relation === "contents") durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          if (row.relation === "contents") {
+            durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          }
         }
         for (const [key, row] of rebuilt) durable.writeRelation(key, row);
+        for (const row of durable.readApiKeyVerifiers()) {
+          durable.deleteApiKeyVerifier(apiKeyVerifierKey(row.actor, row.id));
+        }
+        for (const [key, row] of this.apiKeyVerifiers) durable.writeApiKeyVerifier(key, row);
       });
     }
   }

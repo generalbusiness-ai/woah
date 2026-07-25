@@ -17,6 +17,7 @@
  * room-sized; CA12.1 cell-keyed splitting is the deferred scale lever).
  */
 import type { ScopeAttribution } from "./attribution";
+import type { ApiKeyVerifierRow } from "./api-key-index";
 import type { Cell } from "./cells";
 import type { RelationRow } from "./relations";
 import type { ReplayLogEntry } from "./replay-pages";
@@ -96,6 +97,13 @@ export interface ScopeStore {
   writeRelation(key: string, row: RelationRow): void;
   deleteRelation(key: string): void;
 
+  /** Authority-private credential index. Unlike relation rows, these records
+   * never transfer or fan out; the owning Scope DO serves exact internal-
+   * signed lookups only. */
+  readApiKeyVerifiers(): ApiKeyVerifierRow[];
+  writeApiKeyVerifier(key: string, row: ApiKeyVerifierRow): void;
+  deleteApiKeyVerifier(key: string): void;
+
   /** Seventh row family (sequenced-log.md SL1/SL4): the committed sequenced
    * log this authority owns — one row per accepted SEQUENCED transcript,
    * keyed by (SEMANTIC space id, space-log seq). This is the durable log
@@ -123,6 +131,7 @@ export class InMemoryScopeStore implements ScopeStore {
   private tail: TailEntry[] = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relations = new Map<string, RelationRow>();
+  private readonly apiKeyVerifiers = new Map<string, ApiKeyVerifierRow>();
   /** Committed sequenced-log rows: space → (seq → entry). */
   private readonly logRows = new Map<string, Map<number, ReplayLogEntry>>();
 
@@ -223,6 +232,18 @@ export class InMemoryScopeStore implements ScopeStore {
 
   deleteRelation(key: string): void {
     this.relations.delete(key);
+  }
+
+  readApiKeyVerifiers(): ApiKeyVerifierRow[] {
+    return [...this.apiKeyVerifiers.values()].map((row) => structuredClone(row));
+  }
+
+  writeApiKeyVerifier(key: string, row: ApiKeyVerifierRow): void {
+    this.apiKeyVerifiers.set(key, structuredClone(row));
+  }
+
+  deleteApiKeyVerifier(key: string): void {
+    this.apiKeyVerifiers.delete(key);
   }
 
   appendLogEntry(entry: ReplayLogEntry): void {

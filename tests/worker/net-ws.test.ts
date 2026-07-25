@@ -238,6 +238,25 @@ async function buildHarness(
   if (!speakVerb) throw new Error("speak verb missing after install");
   speakVerb.direct_callable = true;
   expect(speakVerb.direct_callable).toBe(true);
+  const speakExceptSubmitter = installVerb(
+    world,
+    "ws_wave_box",
+    "speak_except_submitter",
+    `verb :speak_except_submitter(text) rxd {
+      /* The submitter sees the call result; peers use the same cross-shard
+       * presence-minus transport shape as chat:say_to. */
+      observe({ type: "spoke", actor: actor, text: text, _audience_exclude: [actor] });
+      return true;
+    }`,
+    null
+  );
+  expect(speakExceptSubmitter.ok).toBe(true);
+  const speakExceptSubmitterVerb = world.object("ws_wave_box").verbs.find(
+    (verb) => verb.name === "speak_except_submitter"
+  );
+  if (!speakExceptSubmitterVerb) throw new Error("speak_except_submitter verb missing after install");
+  speakExceptSubmitterVerb.direct_callable = true;
+  expect(speakExceptSubmitterVerb.direct_callable).toBe(true);
   // A third room for the "present elsewhere" push case: a session that
   // transitioned HERE must receive nothing from an annex-scope fanout.
   world.createObject({ id: "ws_side", name: "WS Side Room", parent: "$space", owner: actor });
@@ -374,18 +393,18 @@ async function buildHarness(
     }
   };
 
-  const mint = async (): Promise<string> => {
+  const mint = async (rosterVisible = true): Promise<string> => {
     const minted = await clientFetch(gateway, "POST", "/net-api/session", {
       token: `apikey:${KEY_ID}:${KEY_SECRET}`,
-      body: { ttl_ms: 600_000 }
+      body: { ttl_ms: 600_000, ...(rosterVisible ? {} : { roster_visible: false }) }
     });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     return minted.body.session as string;
   };
-  const mintOther = async (): Promise<string> => {
+  const mintOther = async (rosterVisible = true): Promise<string> => {
     const minted = await clientFetch(gateway, "POST", "/net-api/session", {
       token: "apikey:ws-key-2:ws-secret-2",
-      body: { ttl_ms: 600_000 }
+      body: { ttl_ms: 600_000, ...(rosterVisible ? {} : { roster_visible: false }) }
     });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     return minted.body.session as string;
@@ -739,6 +758,72 @@ describe("gateway self-subscribe (H1)", () => {
 });
 
 describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () => {
+  it("delivers presence-mode room speech to a socially hidden service session", async () => {
+    const h = await buildHarness();
+    const humanToken = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const serviceToken = "apikey:ws-key-2:ws-secret-2";
+    await h.subscribe(h.annexScope);
+    const human = await h.mint();
+    const service = await h.mintOther(false);
+    const enter = async (token: string, session: string, key: string): Promise<void> => {
+      const response = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "ws_annex", verb: "welcome", session, idempotency_key: key }
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    };
+    await enter(humanToken, human, "hidden-speech-human-enter");
+    await enter(serviceToken, service, "hidden-speech-service-enter");
+    await h.settle();
+
+    // Social presentation omits the service actor even though its raw
+    // session_presence row remains the delivery carrier.
+    const roster = await clientFetch(
+      h.gateway,
+      "GET",
+      `/net-api/relation?session=${human}&relation=session_presence&owner=ws_annex`,
+      { token: humanToken }
+    );
+    expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+    expect((roster.body.members as Array<{ member: string }>).map((row) => row.member)).toEqual([h.actor]);
+
+    const humanUpgrade = await upgrade(h, human);
+    expect(humanUpgrade.status).toBe(101);
+    const humanSocket = humanUpgrade.server as FakeWebSocket;
+    const serviceTicket = await mintTicket(h, service, serviceToken);
+    const serviceUpgrade = await upgrade(h, service, { ticket: serviceTicket });
+    expect(serviceUpgrade.status).toBe(101);
+    const serviceSocket = serviceUpgrade.server as FakeWebSocket;
+    await h.gateway.webSocketMessage(
+      humanSocket as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "hidden-speech",
+        route: "direct",
+        target: "ws_wave_box",
+        verb: "speak_except_submitter",
+        args: ["service-visible"],
+        idempotency_key: "hidden-speech"
+      })
+    );
+    await h.settle();
+
+    const speechResult = frames(humanSocket).find(
+      (frame) => frame.type === "turn_result" && frame.id === "hidden-speech"
+    );
+    expect(speechResult?.status, JSON.stringify(speechResult)).toBe(200);
+    expect(speechResult?.observations).toEqual([
+      expect.objectContaining({ type: "spoke", text: "service-visible" })
+    ]);
+    expect(frames(serviceSocket).filter((frame) => frame.type === "live_observations")).toEqual([
+      expect.objectContaining({
+        scope: h.annexScope,
+        observations: [expect.objectContaining({ type: "spoke", text: "service-visible" })]
+      })
+    ]);
+    h.close();
+  });
+
   it("relays a validated effect-free direct observation without minting a scope sequence", async () => {
     const h = await buildHarness();
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;

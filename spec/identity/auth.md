@@ -56,7 +56,7 @@ Extending [identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline):
 
 - **`session:<session_id>`** — unchanged from identity.md. A live-session resume token.
 
-- **`apikey:<id>:<secret>`** — long-lived programmatic credential for service/agent accounts. See A8.
+- **`apikey:<id>:<secret>`** — long-lived programmatic credential for service/agent accounts. The id is public routing metadata, not a secret; only the final secret component authenticates. See A8.
 
 - **`recovery:<token>`** — single-use, narrow-scope token from a recovery flow. Lands the user in a session that can change credentials and nothing else.
 
@@ -141,6 +141,49 @@ contract.
   For `$wiz`-owned infra agents (bundled plugs, deployment-bound
   identities) there is no `$account`; the key is bound to the agent
   directly and its lifecycle follows the deployment.
+- **Authority and lookup (implemented).** A newly minted key record lives in
+  the bound actor's own `api_keys` property, at that actor's immutable anchor
+  cluster. The record contains the salted secret hash and metadata; cleartext
+  never persists. Its id has the versioned self-routing form
+  `n1_<authority-root-hex>_<actor-hex>_<random-hex>`. The two encoded object
+  references are public routing hints, not credentials. They let any cold
+  gateway name the one bounded authority scope and actor without enumeration.
+  Issuance is permitted only when the anchor root is catalog identity or an
+  `$actor` descendant—the two cases the id grammar can route without copying
+  CO15's classifier. Other anchor shapes refuse `E_LINEAGE`.
+
+  The committing scope derives an authority-private O(1) verifier index from
+  the actor property. This index is not a relation: it never enters closure
+  transfer, subscriber fanout, gateway mirrors, or the public relation API.
+  Authentication asks that exact authority for one indexed record and its
+  current mutation-complete head. A gateway may cache that result for at most
+  `NET_CREDENTIAL_TTL_MS` (default 1000ms, hard maximum 30s; zero disables
+  the cache), which is the explicit revocation-staleness ceiling. Authority
+  transport failure is a retryable 503 `E_RPC_TIMEOUT`, never an
+  unknown/revoked credential verdict. Private-index rebuild from the actor
+  property must reproduce the complete verifier family.
+- The historical `$system.api_keys` map is read-only compatibility for carried
+  keys. New issuance, rotation, revocation, and liveness metadata must not
+  write it. An old key remains usable until rotated or revoked through the
+  migration/operator path; importing an old identity image must never
+  overwrite a newer actor-owned record or resurrect a revocation. The core
+  `ensureApiKey` helper exists only to construct pre-Net compatibility images
+  in tests and install rehearsals; it is not an installed-world issuance path.
+- Credential inspection is likewise bounded: an owner may list one actor's
+  redacted records by passing that actor explicitly, while the wizard-only
+  global listing is a compatibility view of the historical registry. Runtime
+  code must not infer the target from call-frame topology or enumerate actor
+  authorities to synthesize a new global key list.
+- Owner issuance and revocation are ordinary actor-cluster turns and therefore
+  commit the key record, private index, turn audit, and returned result
+  atomically. The actor-owned record's creation/revocation timestamps are the
+  durable cross-profile audit and include `created_by`/`created_via` or
+  `revoked_by` attribution; Net additionally retains the accepted transcript.
+  Deployment bootstrap may instead use the internal-signed
+  operator ensure route. Operator tooling generates and durably stores the id
+  and secret locally first; the route accepts only the derived salted verifier,
+  is idempotent for the exact same actor/id/verifier tuple, rejects collisions,
+  and never receives or returns the replayable secret.
 - API keys are scoped (`read-only`, `bot:<purpose>`, etc.).
 - Revocable independently of bearer tokens.
 - May have IP / origin restrictions.
@@ -151,7 +194,9 @@ kind-vs-capability split: class via `$agent`, authoring privilege via
 the `programmer` flag (subject to its own quota — see
 [provisioning.md AP6](provisioning.md#ap6-self-service-agent-provisioning-in-world)).
 
-Audit: API key issuance is logged; usage is logged at session-start (not per-call, to keep the volume bounded).
+Audit: API key issuance and revocation are authority commits; usage is logged
+at session-start (not per-call, to keep the volume bounded). Logs and metrics
+may carry the key id but must never carry the secret or full token.
 
 ---
 

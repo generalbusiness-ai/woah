@@ -34,6 +34,8 @@ import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
+import { routedApiKeyId } from "../../src/core/api-key-id";
+import { hashSource } from "../../src/core/source-hash";
 
 const SECRET = "net-client-api-test-secret";
 const EPOCH = "cat-net-capi-1";
@@ -98,7 +100,7 @@ type TurnBody = {
   replayed?: boolean;
 };
 
-async function buildHarness() {
+async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   // ---- Engine-real fixture: a room, a room-anchored box with a bump
   // verb (returns + observes), the actor placed in the room, and an
   // apikey minted into $system.api_keys via the same wizard path
@@ -109,6 +111,38 @@ async function buildHarness() {
   const actor = session.actor;
   world.createObject({ id: "capi_room", name: "Client Room", parent: "$space", owner: actor });
   world.createObject({ id: "capi_box", name: "Client Box", parent: "$thing", owner: actor, anchor: "capi_room", location: "capi_room" });
+  // A block-shaped external principal with its own immutable authority
+  // cluster. Its verb is the exact $block:mint_apikey delegation, kept here
+  // as a small fixture so this lane proves the native/Net boundary without
+  // installing a bundled catalog through a second mechanism.
+  world.createObject({
+    id: "capi_agent",
+    name: "Client Agent",
+    parent: "$agent",
+    owner: actor,
+    location: actor
+  });
+  expect(installVerb(
+    world,
+    "capi_agent",
+    "mint_apikey",
+    "verb :mint_apikey(label) rx { return $system:create_api_key_for_owner(this, label); }",
+    null
+  ).ok).toBe(true);
+  expect(installVerb(
+    world,
+    "capi_agent",
+    "list_apikeys",
+    "verb :list_apikeys() rxd { return $system:list_api_keys_for_owner(this); }",
+    null
+  ).ok).toBe(true);
+  expect(installVerb(
+    world,
+    "capi_agent",
+    "revoke_apikey",
+    "verb :revoke_apikey(id) rx { return $system:revoke_api_key(id); }",
+    null
+  ).ok).toBe(true);
   world.defineProperty("capi_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
   const installed = installVerb(
     world,
@@ -193,7 +227,7 @@ async function buildHarness() {
     const req = new Request(`https://do${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     return instance.fetch(await signInternalRequest(scopeEnv, req));
   };
-  for (const scope of [roomScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
+  for (const scope of [roomScope, clusterScope, "cluster:capi_agent", CATALOG_SCOPE, `cluster:${other}`]) {
     const st = netState(`scope-${scope}`);
     const instance = new NetScopeDO(st.state, scopeEnv);
     const seeded = await signedTo(instance, "/net/seed", {
@@ -214,6 +248,9 @@ async function buildHarness() {
     WOO_INTERNAL_SECRET: SECRET,
     NET_RESOLVE: resolve,
     NET_AUDIT_SHARDS: "1",
+    // Security regressions in this fixture normally require an exact read.
+    // Cache behavior has its own test below.
+    NET_CREDENTIAL_TTL_MS: options.credentialTtlMs ?? "0",
     METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
   };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
@@ -221,10 +258,306 @@ async function buildHarness() {
   states.push(gatewayState);
 
   states.push(auditState);
-  return { gateway, actor, other, roomScope, resolvedDestinations, metricPoints, auditDO, scopeEnv, close: () => states.forEach((st) => st.close()) };
+  return {
+    gateway,
+    actor,
+    other,
+    roomScope,
+    resolvedDestinations,
+    metricPoints,
+    auditDO,
+    scopeEnv,
+    gatewayEnv,
+    ensureCredential: async (target: string, id: string, record: Record<string, unknown>) => {
+      const scope = `cluster:${target}`;
+      const instance = scopeDOs.get(scope);
+      if (!instance) throw new Error(`missing credential authority ${scope}`);
+      return signedTo(instance, "/net/ensure-credential", { actor: target, id, record });
+    },
+    close: () => states.forEach((st) => st.close())
+  };
 }
 
 describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
+  it("authenticates a cold gateway from one actor-owned lookup and preserves legacy compatibility", async () => {
+    const h = await buildHarness();
+    try {
+      const id = routedApiKeyId(h.actor, h.actor, "22222222222222222222222222222222");
+      const secret = "actor-owned-secret";
+      const salt = "5".repeat(32);
+      const record = {
+        hash: hashSource(`${salt}:${secret}`),
+        salt,
+        actor: h.actor,
+        label: "actor-owned",
+        created_at: 4
+      };
+      const ensured = await h.ensureCredential(h.actor, id, record);
+      expect(ensured.status, await ensured.clone().text()).toBe(200);
+      expect(await ensured.json()).toMatchObject({ ok: true, status: "applied", actor: h.actor, id });
+
+      const opened = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${id}:${secret}`,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(opened.status).toBe(200);
+      expect(opened.body).toMatchObject({ actor: h.actor, session: expect.any(String) });
+      expect(h.resolvedDestinations).toContain(`scope:cluster:${h.actor}`);
+
+      const wrong = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${id}:wrong`,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(wrong.status).toBe(401);
+      expect(wrong.body).toMatchObject({ error: { code: "E_NOSESSION" } });
+
+      // The carried global-map key remains readable during rotation.
+      const legacy = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(legacy.status).toBe(200);
+      expect(legacy.body).toMatchObject({ actor: h.actor });
+    } finally {
+      h.close();
+    }
+  });
+
+  it("keeps API-key service sessions authoritative but out of the public room roster", async () => {
+    const h = await buildHarness();
+    try {
+      const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+      const invalid = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token,
+        body: { roster_visible: "no" }
+      });
+      expect(invalid.status).toBe(400);
+      expect(invalid.body).toMatchObject({ error: { code: "E_INVARG" } });
+
+      const opened = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token,
+        body: { ttl_ms: 60_000, roster_visible: false }
+      });
+      expect(opened.status, JSON.stringify(opened.body)).toBe(200);
+      expect(opened.body).toMatchObject({
+        actor: h.actor,
+        active_scope: "capi_room",
+        roster_visible: false
+      });
+
+      // The session remains a valid room-scoped authority anchor, while its
+      // client-safe actor projection is empty because the sole live session
+      // is hidden. The lower-level transcript test pins the raw presence row.
+      const roster = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/relation?session=${encodeURIComponent(String(opened.body.session))}&relation=session_presence&owner=capi_room`,
+        { token }
+      );
+      expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+      expect(roster.body).toEqual({
+        relation: "session_presence",
+        owner: "capi_room",
+        members: []
+      });
+
+      const own = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/cell?session=${encodeURIComponent(String(opened.body.session))}&key=${encodeURIComponent(`object_live:${h.actor}`)}`,
+        { token }
+      );
+      expect(own.status, JSON.stringify(own.body)).toBe(200);
+    } finally {
+      h.close();
+    }
+  });
+
+  it("bounds verifier RPCs with an expiring cache and names authority outages on REST and MCP", async () => {
+    const h = await buildHarness({ credentialTtlMs: "60000" });
+    try {
+      const id = routedApiKeyId(h.actor, h.actor, "23232323232323232323232323232323");
+      const secret = "cached-actor-owned-secret";
+      const salt = "6".repeat(32);
+      const record = {
+        hash: hashSource(`${salt}:${secret}`),
+        salt,
+        actor: h.actor,
+        label: "cache-proof",
+        created_at: 5
+      };
+      const ensured = await h.ensureCredential(h.actor, id, record);
+      expect(ensured.status, await ensured.clone().text()).toBe(200);
+
+      type RpcHost = {
+        rpc(destination: string, route: string, body?: unknown): Promise<unknown>;
+      };
+      const host = (h.gateway as unknown as { host: RpcHost }).host;
+      const originalRpc = host.rpc.bind(host);
+      const routes: string[] = [];
+      host.rpc = async (destination, route, body) => {
+        routes.push(route);
+        return originalRpc(destination, route, body);
+      };
+      const token = `apikey:${id}:${secret}`;
+      const first = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      const afterFirst = routes.filter((route) => route === "/credential-record").length;
+      expect(afterFirst).toBe(1);
+
+      const cached = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(cached.status, JSON.stringify(cached.body)).toBe(200);
+      expect(routes.filter((route) => route === "/credential-record")).toHaveLength(afterFirst);
+
+      h.gatewayEnv.NET_CREDENTIAL_TTL_MS = "1";
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const expired = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(expired.status, JSON.stringify(expired.body)).toBe(200);
+      expect(routes.filter((route) => route === "/credential-record")).toHaveLength(afterFirst + 1);
+
+      host.rpc = async (destination, route, body) => {
+        if (route === "/credential-record") throw new Error("authority unavailable");
+        return originalRpc(destination, route, body);
+      };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const unavailable = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: {} });
+      expect(unavailable.status).toBe(503);
+      expect(unavailable.body).toMatchObject({
+        error: {
+          code: "E_RPC_TIMEOUT",
+          detail: { reason: "credential_authority_unavailable", retryable: true }
+        }
+      });
+
+      const mcp = await h.gateway.fetch(new Request("https://do/net-api/mcp", {
+        headers: {
+          accept: "text/event-stream",
+          "mcp-session-id": String(first.body.session)
+        }
+      }));
+      expect(mcp.status).toBe(503);
+      expect(await mcp.json()).toMatchObject({
+        error: {
+          code: "E_RPC_TIMEOUT",
+          detail: { reason: "credential_authority_unavailable", retryable: true }
+        }
+      });
+    } finally {
+      h.close();
+    }
+  });
+
+  it("commits ordinary owner minting at the target actor authority and authenticates the returned key", async () => {
+    const h = await buildHarness();
+    try {
+      const ownerToken = `apikey:${KEY_ID}:${KEY_SECRET}`;
+      const ownerSession = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: ownerToken,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(ownerSession.status, JSON.stringify(ownerSession.body)).toBe(200);
+
+      const minted = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: ownerToken,
+        body: {
+          target: "capi_agent",
+          verb: "mint_apikey",
+          args: ["external-plug"],
+          session: ownerSession.body.session,
+          idempotency_key: "capi-owner-mint"
+        }
+      });
+      expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+      const result = minted.body.result as {
+        id?: unknown;
+        secret?: unknown;
+        actor?: unknown;
+        label?: unknown;
+      };
+      expect(result).toMatchObject({
+        id: expect.stringMatching(/^n1_/),
+        secret: expect.any(String),
+        actor: "capi_agent",
+        label: "external-plug"
+      });
+      expect((minted.body.reply as CommitReply).scope).toBe("cluster:capi_agent");
+
+      const plugSession = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${String(result.id)}:${String(result.secret)}`,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(plugSession.status, JSON.stringify(plugSession.body)).toBe(200);
+      expect(plugSession.body).toMatchObject({ actor: "capi_agent" });
+
+      // Verifiers are an authority-private index, not a CO13 relation. Even
+      // the bound actor cannot enumerate hash/salt records through the public
+      // sibling read surface.
+      const leakedRelation = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/relation?relation=api_key_lookup&owner=capi_agent&session=${encodeURIComponent(String(plugSession.body.session))}`,
+        { token: `session:${String(plugSession.body.session)}` }
+      );
+      expect(leakedRelation.status, JSON.stringify(leakedRelation.body)).toBe(200);
+      expect(leakedRelation.body).toEqual({
+        relation: "api_key_lookup",
+        owner: "capi_agent",
+        members: []
+      });
+
+      const listed = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: ownerToken,
+        body: {
+          target: "capi_agent",
+          verb: "list_apikeys",
+          session: ownerSession.body.session
+        }
+      });
+      expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+      expect(listed.body.result).toEqual([
+        expect.objectContaining({
+          id: result.id,
+          actor: "capi_agent",
+          label: "external-plug"
+        })
+      ]);
+      expect(JSON.stringify(listed.body.result)).not.toContain(String(result.secret));
+
+      const revoked = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: ownerToken,
+        body: {
+          target: "capi_agent",
+          verb: "revoke_apikey",
+          args: [result.id],
+          session: ownerSession.body.session
+        }
+      });
+      expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
+      expect(revoked.body.result).toBe(true);
+
+      const refused = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${String(result.id)}:${String(result.secret)}`,
+        body: { ttl_ms: 60_000 }
+      });
+      expect(refused.status).toBe(401);
+      expect(refused.body).toMatchObject({ error: { code: "E_NOSESSION" } });
+
+      // Revocation also fences the already-minted bearer. The session stores
+      // only the public key id, then rechecks the exact authority row; no
+      // replayable secret is copied into session state.
+      const refusedBearer = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: `session:${String(plugSession.body.session)}`,
+        body: { target: "capi_agent", verb: "list_apikeys" }
+      });
+      expect(refusedBearer.status).toBe(401);
+      expect(refusedBearer.body).toMatchObject({
+        error: { code: "E_NOSESSION", detail: { reason: "session_apikey_revoked" } }
+      });
+    } finally {
+      h.close();
+    }
+  });
+
   it("an unseeded namespace refuses with the named E_NOT_INSTALLED verdict, not a 500 (cutover item D)", async () => {
     // The pre-install condition every fresh deploy sits in: the catalog
     // scope DO exists but holds NO durable state. An authenticated

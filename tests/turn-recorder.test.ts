@@ -3,7 +3,13 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
 import { installCatalogManifest } from "../src/core/catalog-installer";
-import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld, type EffectTranscript } from "../src/core/effect-transcript";
+import {
+  effectTranscriptFromRecordedTurn,
+  sessionScopePresenceDeltas,
+  transcriptTouchedStateHash,
+  validateTranscriptAgainstSerializedWorld,
+  type EffectTranscript
+} from "../src/core/effect-transcript";
 import { remoteBridgeEffectName } from "../src/core/remote-bridge-transcript-policy";
 import { transcriptTouchedObjectIds } from "../src/core/shadow-commit-scope";
 import { shadowCommitReceipt } from "../src/core/turn-commit";
@@ -367,6 +373,145 @@ describe("turn recorder", () => {
     });
   });
 
+  it("keeps hidden service sessions out of every catalog-declared social presence projection", () => {
+    const projections = () => [
+      { name: "actor_roster", def: { kind: "presence" as const, key: "actor" as const } },
+      {
+        name: "session_roster",
+        def: {
+          kind: "presence" as const,
+          key: "session" as const,
+          sessionField: "sid",
+          actorField: "who"
+        }
+      }
+    ];
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "cluster:service",
+      seq: 1,
+      session: "service-session",
+      call: { actor: "service", target: "service", verb: "session_mint", args: [] },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "hidden-social-projection",
+      sessionScopeTransition: {
+        session: "service-session",
+        actor: "service",
+        rosterVisible: false,
+        from: null,
+        to: "room"
+      }
+    } satisfies EffectTranscript;
+
+    expect(sessionScopePresenceDeltas(projections, transcript)).toEqual([]);
+    expect(sessionScopePresenceDeltas(projections, {
+      ...transcript,
+      sessionScopeTransition: {
+        session: "service-session",
+        actor: "service",
+        rosterVisible: false,
+        from: "room",
+        to: null
+      }
+    })).toEqual([]);
+
+    // Omission is the compact visible form and still derives both declared
+    // shapes, so this regression cannot "fix" privacy by disabling the
+    // facility globally.
+    expect(sessionScopePresenceDeltas(projections, {
+      ...transcript,
+      sessionScopeTransition: {
+        session: "human-session",
+        actor: "human",
+        from: null,
+        to: "room"
+      }
+    })).toEqual([
+      expect.objectContaining({ property: "actor_roster", op: "add", actor: "human" }),
+      expect.objectContaining({ property: "session_roster", op: "add", session: "human-session" })
+    ]);
+  });
+
+  it("checks session roster visibility against readable session authority", () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-roster-authority");
+    session.activeScope = "the_chatroom";
+    session.rosterVisible = false;
+    const before = world.exportWorld();
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "cluster:service",
+      seq: 1,
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "move", args: [] },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "roster-authority",
+      sessionScopeTransition: {
+        session: session.id,
+        actor: session.actor,
+        rosterVisible: false,
+        from: "the_chatroom",
+        to: "the_deck"
+      }
+    } satisfies EffectTranscript;
+
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({
+      ok: true,
+      errors: [],
+      mismatchedReadCells: []
+    });
+
+    const { rosterVisible: _rosterVisible, ...transitionWithoutPolicy } = transcript.sessionScopeTransition;
+    const missingHiddenPolicy: EffectTranscript = {
+      ...transcript,
+      sessionScopeTransition: transitionWithoutPolicy
+    };
+    expect(validateTranscriptAgainstSerializedWorld(before, missingHiddenPolicy).errors).toContain(
+      "session scope transition rosterVisible mismatch: transition=default actual=false"
+    );
+
+    const visibleBefore = structuredClone(before);
+    delete visibleBefore.sessions.find((row) => row.id === session.id)?.rosterVisible;
+    expect(validateTranscriptAgainstSerializedWorld(visibleBefore, transcript).errors).toContain(
+      "session scope transition rosterVisible mismatch: transition=false actual=default"
+    );
+
+    // A mint has no authoritative pre-state row to compare. Its false policy is
+    // still structurally checked and becomes authority with the accepted row.
+    const mintBefore = structuredClone(before);
+    mintBefore.sessions = mintBefore.sessions.filter((row) => row.id !== session.id);
+    const mintTranscript: EffectTranscript = {
+      ...transcript,
+      sessionScopeTransition: {
+        ...transcript.sessionScopeTransition,
+        from: null
+      }
+    };
+    expect(validateTranscriptAgainstSerializedWorld(mintBefore, mintTranscript)).toEqual({
+      ok: true,
+      errors: [],
+      mismatchedReadCells: []
+    });
+  });
+
   it("keeps Tier 1 look and describe verbs in bytecode transcripts", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-tier1");
@@ -554,7 +699,7 @@ describe("turn recorder", () => {
           handler: "create_api_key",
           transcript: "tracked",
           deterministic: true,
-          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+          writes: expect.arrayContaining(["target actor api_keys"])
         })
       })
     }));
@@ -593,7 +738,7 @@ describe("turn recorder", () => {
           transcript: "tracked",
           deterministic: true,
           reads: expect.arrayContaining(["target actor ownership"]),
-          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+          writes: expect.arrayContaining(["target actor api_keys"])
         })
       })
     }));

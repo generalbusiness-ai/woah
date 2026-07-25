@@ -11,6 +11,7 @@ import {
   roomRosterRows,
   type RelationRow
 } from "../../src/net/relations";
+import { routedApiKeyId } from "../../src/core/api-key-id";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
@@ -44,6 +45,41 @@ function transcript(partial: Partial<EffectTranscript>): EffectTranscript {
 const NO_WRITES = { projectionWrites: [] as never[] };
 
 describe("deriveRelationDeltas (CO13)", () => {
+  it("never derives actor-owned API-key verifiers into transferable relation state", () => {
+    const actor = "agent_alpha";
+    const id = routedApiKeyId(actor, actor, "0123456789abcdef0123456789abcdef");
+    const record = {
+      hash: "a".repeat(64),
+      salt: "b".repeat(32),
+      actor,
+      label: "test",
+      created_at: 1
+    };
+    const post = new CellStore("authority");
+    post.commit({
+      kind: "property_cell",
+      object: actor,
+      name: "api_keys",
+      value: { value: { [id]: record } },
+      stamp: { scope_head: "1:key", catalog_epoch: EPOCH }
+    });
+    const changed = transcript({
+      writes: [{ cell: { kind: "prop", object: actor, name: "api_keys" }, value: { [id]: record }, op: "set", writer: WRITER }]
+    });
+    const added = deriveRelationDeltas(changed, NO_WRITES, `cluster:${actor}`, undefined, post);
+    expect(added.local).toEqual([]);
+
+    post.commit({
+      kind: "property_cell",
+      object: actor,
+      name: "api_keys",
+      value: { value: {} },
+      stamp: { scope_head: "2:key", catalog_epoch: EPOCH }
+    });
+    const removed = deriveRelationDeltas(changed, NO_WRITES, `cluster:${actor}`, undefined, post);
+    expect(removed.local).toEqual([]);
+  });
+
   it("moves derive remove-at-source and add-at-destination contents deltas", () => {
     const t = transcript({ moves: [{ object: "#alice", from: "room:hall", to: "room:den" }] });
     const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");
@@ -290,6 +326,64 @@ describe("sequencer relation application (durable, one transaction)", () => {
     expect(store.readRelations().length).toBe(3);
   });
 
+  it("rebuildRelations reproduces the authority-private verifier index without a relation row", () => {
+    const actor = "agent_rebuild";
+    const id = routedApiKeyId(actor, actor, "abcdefabcdefabcdefabcdefabcdefab");
+    const record = {
+      hash: "c".repeat(64),
+      salt: "d".repeat(32),
+      actor,
+      label: null,
+      created_at: 2
+    };
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(`cluster:${actor}`, EPOCH, { durable: store });
+    seq.seed([
+      { kind: "object_lineage", object: actor, value: { parent: "$agent", anchor: null } },
+      { kind: "property_cell", object: actor, name: "api_keys", value: { value: { [id]: record } } }
+    ]);
+    seq.rebuildRelations();
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(seq.relations().size).toBe(0);
+    expect(store.readApiKeyVerifiers()).toEqual([{ actor, id, record }]);
+    const rehydrated = new ScopeSequencer(`cluster:${actor}`, EPOCH, { durable: store });
+    expect(rehydrated.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(rehydrated.relations().size).toBe(0);
+  });
+
+  it("operator credential ensure is atomic, idempotent, and collision-safe", () => {
+    const actor = "agent_operator";
+    const id = routedApiKeyId(actor, actor, "11111111111111111111111111111111");
+    const record = {
+      hash: "2".repeat(64),
+      salt: "3".repeat(32),
+      actor,
+      label: "weather",
+      created_at: 3
+    };
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(`cluster:${actor}`, EPOCH, { durable: store });
+    seq.seed([{ kind: "object_lineage", object: actor, value: { parent: "$agent", anchor: null } }]);
+
+    const first = seq.operatorEnsureCredential(actor, id, record);
+    expect(first.status).toBe("applied");
+    expect(first.head.seq).toBe(1);
+    expect(first.cell.value).toMatchObject({ value: { [id]: record } });
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
+    expect(seq.relations().size).toBe(0);
+
+    const replay = seq.operatorEnsureCredential(actor, id, record);
+    expect(replay.status).toBe("empty");
+    expect(replay.head).toEqual(first.head);
+
+    expect(() => seq.operatorEnsureCredential(actor, id, { ...record, hash: "4".repeat(64) }))
+      .toThrow(/already bound to a different verifier/);
+    expect(() => seq.operatorEnsureCredential(actor, id, { ...record, secret: "must-never-persist" }))
+      .toThrow(/record or routing hint is invalid/);
+    expect(seq.head()).toEqual(first.head);
+    expect(seq.apiKeyVerifier(actor, id)).toEqual(record);
+  });
+
   it("rebuildRelations drops candidates owned by another scope (multi-scope: no second copy of a foreign row family)", () => {
     // A cluster scope holds the actor's live cell, whose LOCATION is a
     // foreign room. Its rebuild must not mint the room's contents row —
@@ -324,7 +418,7 @@ describe("primitives", () => {
     expect(observationsForRelationOwners(observations, deltas)).toEqual(observations.slice(0, 2));
   });
 
-  it("reduces live presence to one row per actor and excludes expired residue", () => {
+  it("reduces live presence to one row per actor and excludes expired or roster-hidden residue", () => {
     const now = 100_000;
     const relations: RelationRow[] = [];
     for (let index = 0; index < 30; index += 1) {
@@ -350,10 +444,63 @@ describe("primitives", () => {
         }
       });
     }
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "service-only",
+      body: {
+        actor: "weather-service",
+        name: "Weather",
+        session: {
+          id: "service-only",
+          actor: "weather-service",
+          started: 90_000,
+          expiresAt: 200_000,
+          activeScope: "room:x",
+          rosterVisible: false
+        }
+      }
+    });
+    // One hidden session must not hide the actor when another live session
+    // explicitly participates in the social roster.
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "mixed-hidden",
+      body: {
+        actor: "mixed-actor",
+        session: {
+          id: "mixed-hidden",
+          actor: "mixed-actor",
+          started: 89_000,
+          expiresAt: 200_000,
+          activeScope: "room:x",
+          rosterVisible: false
+        }
+      }
+    });
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "mixed-visible",
+      body: {
+        actor: "mixed-actor",
+        name: "Mixed Actor",
+        session: {
+          id: "mixed-visible",
+          actor: "mixed-actor",
+          started: 91_000,
+          expiresAt: 200_000,
+          activeScope: "room:x"
+        }
+      }
+    });
     const roster = roomRosterRows(relations, "room:x", "Room X", now);
-    expect(roster).toHaveLength(30);
+    expect(roster).toHaveLength(31);
     expect(roster[0]).toMatchObject({ player: "actor-0", name: "Actor 0", location_name: "Room X" });
     expect(roster.some((row) => row.player.startsWith("stale-"))).toBe(false);
+    expect(roster.some((row) => row.player === "weather-service")).toBe(false);
+    expect(roster.find((row) => row.player === "mixed-actor")).toMatchObject({ name: "Mixed Actor" });
   });
 
   it("applyRelationDeltas reports changed keys and skips no-op removes", () => {

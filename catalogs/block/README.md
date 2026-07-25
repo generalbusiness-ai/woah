@@ -57,12 +57,13 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 | `:moveto(target)` | wizard | Block is anchored; non-wizard raises `E_PERM`. |
 | `:acceptable(object)` | rxd | Always false (nothing enters a block). |
 | `:mint_apikey(label?)` | owner/wizard | Mints an apikey bound to this block's actor. |
-| `:revoke_apikey(id)` | owner/wizard | Revokes a key (closes any sessions minted from it). |
+| `:revoke_apikey(id)` | owner/wizard | Revokes a key and fences sessions minted from it. |
 | `:list_apikeys()` | rxd | Returns the apikey records for this block. |
 
 After minting, store the returned credential as the full token string:
 `apikey:<id>:<secret>`. The id is part of the credential, not just
-metadata; `apikey:<secret>` is not the documented token form. Validate
+metadata; new ids contain public routing hints but no secret.
+`apikey:<secret>` is not the documented token form. Validate
 the full token before putting it into a plug's secret store:
 
 ```bash

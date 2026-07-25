@@ -941,11 +941,23 @@ One write path per fact (CO9), concretized:
   reads, metrics, tickets, and WebSocket upgrades return to that same DO.
   No internal signing rides this path — the gateway
   authenticates the client credential itself: `authorization: Bearer
-  apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
-  catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
-  from the catalog scope), with core's exact salt/hash scheme
-  reimplemented in `src/worker/net/client-auth.ts` (never an engine
-  import); refusals are named 401 `E_NOSESSION` verdicts.
+  apikey:<id>:<secret>` (or `x-woo-api-key`). For an `n1_` id, the public
+  routing hint names the actor's immutable anchor scope and actor. The gateway
+  asks that authority for exactly one row in its authority-private verifier
+  index and the current mutation-complete head. The index is derived from the
+  actor-owned `api_keys` cell, rebuildable from it, and never appears in CO13
+  relations, closure transfer, fanout, gateway mirrors, or public relation
+  reads. The gateway may cache an authority receipt for
+  `NET_CREDENTIAL_TTL_MS` (default 1000ms, hard maximum 30s; zero means exact per request);
+  therefore revocation fences future API-key and bearer-session use within
+  that explicit bound. The cache is fixed-size and includes negative results.
+  Authority unavailability is retryable 503 `E_RPC_TIMEOUT`, including the
+  MCP GET carrier; it must not collapse to 401 unknown/revoked or 404 missing
+  session. Historical ids fall back to the carried, read-only catalog identity
+  cell `property_cell:$system:api_keys`. Both paths use core's exact salt/hash
+  scheme reimplemented in `src/worker/net/client-auth.ts` (never an engine
+  import). A session minted from an API key stores only that public id and
+  rechecks it on bearer-only requests without persisting the secret.
   **Rate limits (wire.md's inbound rule, applied per authenticated
   actor):** every `/net-api` operation — REST request or WS turn frame —
   draws from one token bucket of 50 ops/s sustained, burst 100; the
@@ -956,9 +968,28 @@ One write path per fact (CO9), concretized:
   instead of stranding). Buckets are per-gateway-isolate memory
   (bounded, idle-evicted); eviction degrades to permitting one fresh
   burst, never to blocking a legitimate client.
-  - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
-    view lineage (CO15; convention pull `cluster:<actor>` on miss) and
-    mints through `/net/session-open`'s machinery.
+  - `POST /net-api/session {ttl_ms?, roster_visible?}` derives the actor's
+    cluster from view lineage (CO15; convention pull `cluster:<actor>` on
+    miss) and mints through `/net/session-open`'s machinery.
+    `roster_visible:false` is accepted only when the request authenticated
+    with an API key; otherwise it refuses HTTP 403 `E_PERM` with
+    `detail.reason:"roster_visibility_requires_apikey"`. It does **not**
+    suppress substrate session presence: the session still has `activeScope`,
+    produces the owner-sequenced `session_presence` row, remains eligible for
+    live observation fanout, and satisfies presence-scoped authorization.
+    Catalog delivery code MUST likewise use presence-mode delivery or
+    `live_audience`, never derive its transport audience from the social
+    roster. A planner's `active_actors` result is a useful local view, not a
+    complete distributed delivery membership proof.
+    The flag suppresses the actor from every actor/session-level social
+    projection: the compact `room_roster` consumed by `who` and presence UI,
+    and catalog properties declared with `presence_projection`. The choice is
+    stored in the session authority cell and carried by each accepted
+    `sessionScopeTransition`, so every materializer derives the same public
+    state. An actor with multiple sessions remains in `room_roster` when any
+    live session is roster-visible. Omission defaults to `true`; a non-boolean
+    value refuses HTTP 400 `E_INVARG`. A successful mint reply includes the
+    resolved `roster_visible` boolean for both API-key and human doors.
   - `DELETE /net-api/session` is semantically idempotent although its success
     invalidates its own bearer. The session-routed gateway retains a bounded
     accepted-close receipt and checks it before live-bearer authentication.
@@ -967,6 +998,10 @@ One write path per fact (CO9), concretized:
     derived session value solely to bind the opaque bearer to the actor and
     reach the same close postcondition. An expired value grants no other
     operation. Unknown session ids still fail ordinary authentication.
+    Scheduled/disconnected plugs SHOULD request `roster_visible:false` and
+    close the session in a `finally` path. Hidden-roster mode is not session
+    garbage collection: failure to close still leaves authority state,
+    subscriptions, and expiry work behind.
   - `POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the

@@ -31,10 +31,14 @@ export function compactNetLiveAudience(audience: DirectLiveAudience): LiveAudien
     };
   }
   const perObservation = audience.observationAudiences ?? [];
+  const perObservationExclusions = audience.observationAudienceExclusions ?? [];
   return {
     observationAudienceModes: modes,
     observationAudiences: modes.map((mode, index) =>
       mode === "explicit" ? (perObservation[index] ?? []) : []
+    ),
+    observationAudienceExclusions: modes.map((mode, index) =>
+      mode === "presence" ? (perObservationExclusions[index] ?? []) : []
     )
   };
 }

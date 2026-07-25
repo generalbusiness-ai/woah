@@ -70,6 +70,9 @@ export type TranscriptSessionScopeTransition = {
    * lineage. Presence owners use it for roster projection without importing
    * the actor's authority cells into every room turn. */
   actorName?: string;
+  /** Immutable service-session presentation policy, copied from the
+   * authoritative session row. False suppresses social projections only. */
+  rosterVisible?: false;
   from: ObjRef | null;
   to: ObjRef | null;
 };
@@ -231,7 +234,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           session: event.session,
           actor: event.actor,
           from: sessionScopeTransition ? sessionScopeTransition.from : event.from,
-          to: event.to
+          to: event.to,
+          ...((sessionScopeTransition?.rosterVisible === false || event.rosterVisible === false)
+            ? { rosterVisible: false as const }
+            : {})
         };
         break;
       case "projection_write":
@@ -389,8 +395,9 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
   // write authority (it is routing/presence state, not a CA3 authoritative
   // write), but NOT trust-exempt — check it structurally. It must name this
   // turn's session and actor, and (when the session's pre-state is readable on
-  // this host) its `from` must agree with the authoritative pre-state scope so a
-  // stale transition cannot silently rewrite presence.
+  // this host) its `from` and roster policy must agree with the authoritative
+  // pre-state session so a stale or crafted transition cannot silently rewrite
+  // either delivery placement or social presence.
   const transition = transcript.sessionScopeTransition;
   if (transition) {
     if (!transcript.session) {
@@ -401,9 +408,22 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     if (transition.actor !== transcript.call.actor) {
       errors.push(`session scope transition actor mismatch: transition=${transition.actor} call=${transcript.call.actor}`);
     }
-    const priorScope = readerSessionActiveScope(reader, transition.session);
-    if (priorScope !== undefined && (priorScope ?? null) !== (transition.from ?? null)) {
-      errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
+    if (transition.rosterVisible !== undefined && transition.rosterVisible !== false) {
+      errors.push("session scope transition rosterVisible must be false when present");
+    }
+    const priorSession = readerSessionAuthority(reader, transition.session);
+    if (priorSession) {
+      const priorScope = priorSession.activeScope ?? priorSession.currentLocation ?? null;
+      if (priorScope !== (transition.from ?? null)) {
+        errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
+      }
+      const transitionRosterVisible = transition.rosterVisible === false;
+      const authoritativeRosterVisible = priorSession.rosterVisible === false;
+      if (transitionRosterVisible !== authoritativeRosterVisible) {
+        errors.push(
+          `session scope transition rosterVisible mismatch: transition=${transitionRosterVisible ? "false" : "default"} actual=${authoritativeRosterVisible ? "false" : "default"}`
+        );
+      }
     }
   }
 
@@ -519,6 +539,11 @@ export function sessionScopePresenceDeltas(
 ): PresenceProjectionRowDelta[] {
   const transition = transcript.sessionScopeTransition;
   if (!transition || !transition.session || !transition.actor) return [];
+  // Hidden-roster is immutable for the session lifetime. Such a session never
+  // contributes to catalog social projections, so neither movement nor close
+  // may add OR remove a row (the latter could erase a visible sibling session's
+  // actor-keyed row).
+  if (transition.rosterVisible === false) return [];
   const { session, actor, from, to } = transition;
   if (from === to) return [];
   const deltas: PresenceProjectionRowDelta[] = [];
@@ -774,14 +799,12 @@ function serializedObject(reader: TranscriptCellReader, object: ObjRef): Seriali
   return reader.objectById.get(object);
 }
 
-// The session's active scope in the reader's pre-state, or undefined when the
-// session row is not present on this host (so the caller skips the check rather
-// than treating "absent" as null). Used to validate a session-scope transition's
-// `from` against authoritative pre-state where it is locally knowable.
-function readerSessionActiveScope(reader: TranscriptCellReader, sessionId: string): ObjRef | null | undefined {
-  const session = reader.serialized.sessions.find((row) => row.id === sessionId);
-  if (!session) return undefined;
-  return session.activeScope ?? session.currentLocation ?? null;
+// The authoritative session row in the reader's pre-state, or undefined when
+// this host does not carry it. Keeping the row intact lets every transition
+// field be checked against one authority lookup; absence remains distinct from
+// an authoritative null active scope for newly minted sessions.
+function readerSessionAuthority(reader: TranscriptCellReader, sessionId: string): SerializedWorld["sessions"][number] | undefined {
+  return reader.serialized.sessions.find((row) => row.id === sessionId);
 }
 
 function serializedVerb(reader: TranscriptCellReader, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {

@@ -5,10 +5,11 @@
  * decision 1).
  *
  * The cutover reinstalls the world from catalogs; the ONE thing carried
- * over is identity: the `$system.api_keys` map verbatim (salted hashes —
- * plugs and agents keep authenticating) and the reachable identity actor
- * graph with PRESERVED object ids (apikey records point at actor objects
- * by id; preserving ids means no ref rewriting anywhere). Bearer tokens
+ * over is identity: the historical `$system.api_keys` compatibility map,
+ * actor-owned `api_keys` authorities, and the reachable identity actor graph,
+ * including agent-owner chains, with PRESERVED object ids (apikey records
+ * point at actor objects by id; preserving ids means no ref rewriting
+ * anywhere). Bearer tokens
  * are dropped by design (60-minute TTL; humans re-login by password).
  *
  * Export is a pure walk over a SerializedWorld (no live world needed —
@@ -58,7 +59,7 @@ export function materializeCustomerAttributions(world: WooWorld): string[] {
   return unattributed;
 }
 
-/** The §8 closed allow-list of identity properties, plus three deliberate
+/** The §8 closed allow-list of identity properties, plus deliberate
  * additions surfaced here rather than silently made:
  * - `email`: account lookup for password login is BY email
  *   (`world.findAccountByEmail`) — a carried account without it could
@@ -70,7 +71,10 @@ export function materializeCustomerAttributions(world: WooWorld): string[] {
  *   point — rebuilt-from-bindings guesses wrong for multi-actor
  *   accounts, so the original mapping carries (export filters it to
  *   exported actors; import verifies resolution). `actors` carries too,
- *   filtered the same way. */
+ *   filtered the same way;
+ * - `api_keys`: the actor is now the credential authority. Import merges
+ *   this map monotonically so an aged carry cannot overwrite a newer
+ *   revocation in the destination. */
 const IDENTITY_PROPS = [
   "name",
   "account",
@@ -82,13 +86,14 @@ const IDENTITY_PROPS = [
   "deactivated_at",
   "primary_actor",
   "actors",
-  "last_seen_at"
+  "last_seen_at",
+  "api_keys"
 ] as const;
 
 export type IdentityActorExport = {
   /** Original object id — imports re-create with the SAME id. */
   id: string;
-  /** Parent CLASS id (e.g. "$agent", "$account"), resolved against the
+  /** Parent CLASS id (for example, the agent class or "$account"), resolved against the
    * freshly installed catalogs at import. */
   parent: string;
   name: string;
@@ -139,17 +144,22 @@ function chainReaches(objects: Map<string, SerializedObject>, id: string, cls: s
   return false;
 }
 
+function isSerializedActor(objects: Map<string, SerializedObject>, id: string): boolean {
+  return chainReaches(objects, id, "$actor");
+}
+
 function propsOf(obj: SerializedObject): Map<string, unknown> {
   return new Map(obj.properties as Array<[string, unknown]>);
 }
 
 /**
  * Export the identity graph from a serialized v2 world image: the
- * api_keys map verbatim, every `$account` instance, and every `$actor`
- * descendant referenced by an apikey record or carrying an account
- * binding. Nothing else — inventories, locations, and world furniture
- * are deliberately not carried; imported actors rehome to the catalog
- * start location (§8).
+ * api_keys map verbatim, every `$account` instance, every acting-principal
+ * descendant referenced by either credential authority or carrying an
+ * account binding, and the transitive agent-owner chain needed to preserve
+ * that actor's authentication verdict. Nothing else — inventories, locations,
+ * and world furniture are deliberately not carried; imported actors
+ * rehome to the catalog start location (§8).
  */
 export function exportIdentity(serialized: SerializedWorld): IdentityExport {
   const objects = new Map<string, SerializedObject>(serialized.objects.map((obj) => [obj.id, obj]));
@@ -169,13 +179,37 @@ export function exportIdentity(serialized: SerializedWorld): IdentityExport {
   // Every $actor descendant an apikey record references.
   for (const record of Object.values(apiKeys)) {
     const actor = (record as { actor?: unknown } | null)?.actor;
-    if (typeof actor === "string" && chainReaches(objects, actor, "$actor")) wanted.add(actor);
+    if (typeof actor === "string" && isSerializedActor(objects, actor)) wanted.add(actor);
+  }
+  // An actor-owned verifier map is itself a root in the identity inventory.
+  // It must not depend on a legacy registry or account binding to be carried.
+  for (const obj of serialized.objects) {
+    if (!isSerializedActor(objects, obj.id) || obj.id === "$actor") continue;
+    const owned = propsOf(obj).get("api_keys");
+    if (owned && typeof owned === "object" && !Array.isArray(owned) && Object.keys(owned).length > 0) {
+      wanted.add(obj.id);
+    }
   }
   // Every $actor descendant carrying an account binding.
   for (const obj of serialized.objects) {
-    if (!chainReaches(objects, obj.id, "$actor") || obj.id === "$actor") continue;
+    if (!isSerializedActor(objects, obj.id) || obj.id === "$actor") continue;
     const account = propsOf(obj).get("account");
     if (typeof account === "string" && account.length > 0) wanted.add(obj.id);
+  }
+  // An agent's eligibility is recursive through object ownership. Carry the
+  // full actor-owner chain even when an owner has neither an API key nor an
+  // account binding of its own. Without this closure a same-id stock guest
+  // can be adopted at import with fresh flags/properties, silently
+  // reactivating every carried agent below a deactivated owner.
+  const pendingOwners = [...wanted];
+  while (pendingOwners.length > 0) {
+    const id = pendingOwners.pop()!;
+    const obj = objects.get(id);
+    if (!obj || !chainReaches(objects, id, "$agent")) continue;
+    const owner = objects.get(obj.owner);
+    if (!owner || !chainReaches(objects, owner.id, "$actor") || wanted.has(owner.id)) continue;
+    wanted.add(owner.id);
+    pendingOwners.push(owner.id);
   }
 
   const actors: IdentityActorExport[] = [];
@@ -339,6 +373,21 @@ export async function importIdentity(
       }
     }
     for (const [name, value] of Object.entries(actor.props)) {
+      if (name === "api_keys") {
+        const carried =
+          value && typeof value === "object" && !Array.isArray(value)
+            ? value as Record<string, unknown>
+            : {};
+        const currentRaw = world.propOrNull(actor.id, "api_keys");
+        const current =
+          currentRaw && typeof currentRaw === "object" && !Array.isArray(currentRaw)
+            ? currentRaw as Record<string, unknown>
+            : {};
+        // Existing wins: retrying an older export cannot resurrect a record
+        // that this destination has since revoked or otherwise advanced.
+        world.setProp(actor.id, "api_keys", { ...carried, ...current } as never);
+        continue;
+      }
       world.setProp(actor.id, name, value as never);
     }
   }
@@ -409,6 +458,16 @@ export async function importIdentity(
     const actor = (record as { actor?: unknown } | null)?.actor;
     if (typeof actor !== "string" || !liveChainReaches(world, actor, "$actor")) {
       dangling.push(`api_keys[${keyId}]: actor ${String(actor)} is not a live $actor descendant`);
+    }
+  }
+  for (const actor of identity.actors) {
+    const owned = actor.props.api_keys;
+    if (!owned || typeof owned !== "object" || Array.isArray(owned)) continue;
+    for (const [keyId, record] of Object.entries(owned as Record<string, unknown>)) {
+      const bound = (record as { actor?: unknown } | null)?.actor;
+      if (bound !== actor.id) {
+        dangling.push(`${actor.id}.api_keys[${keyId}]: actor ${String(bound)} does not match its authority`);
+      }
     }
   }
   for (const actor of identity.actors) {

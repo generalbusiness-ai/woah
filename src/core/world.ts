@@ -41,6 +41,7 @@ import {
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
+import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
   createV2TurnEffects,
   type TurnEffects,
@@ -740,30 +741,63 @@ export class WooWorld {
     // net planning always installs an explicit snapshot (including []).
     const now = this.logicalNow("room_roster.now");
     const roomName = this.objects.get(room)?.name ?? room;
-    return this.activeActorsIn(room).filter((actor) => this.objects.has(actor)).map((actor) => {
-      const stats = this.playerSessionStats(actor, now);
-      const presence = stats.connected
-        ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"
-        : "sleeping";
-      return {
-        player: actor,
-        name: this.objects.get(actor)?.name ?? actor,
-        connected: stats.connected,
-        connected_at: stats.connectedAt,
-        connected_seconds: stats.connectedSeconds,
-        idle_seconds: stats.idleSeconds,
-        last_login_at: stats.lastLoginAt,
-        location: room,
-        location_name: roomName,
-        presence
-      } as unknown as WooValue;
-    });
+    const roster = this.activeActorRosterStateIn(room, now);
+    return roster.actors
+      .filter((actor) => roster.visibleActors.has(actor))
+      .map((actor) => {
+        const stats = this.playerSessionStats(actor, now);
+        const presence = stats.connected
+          ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"
+          : "sleeping";
+        return {
+          player: actor,
+          name: this.objects.get(actor)?.name ?? actor,
+          connected: stats.connected,
+          connected_at: stats.connectedAt,
+          connected_seconds: stats.connectedSeconds,
+          idle_seconds: stats.idleSeconds,
+          last_login_at: stats.lastLoginAt,
+          location: room,
+          location_name: roomName,
+          presence
+        } as unknown as WooValue;
+      });
+  }
+
+  /** Compute local active membership and social visibility in the same session
+   * pass. Hidden service sessions remain active delivery carriers, while any
+   * visible sibling session keeps the actor's deduplicated roster row visible. */
+  private activeActorRosterStateIn(space: ObjRef, now: number): { actors: ObjRef[]; visibleActors: Set<ObjRef> } {
+    const actors = new Set<ObjRef>();
+    const visibleActors = new Set<ObjRef>();
+    for (const session of this.sessions.values()) {
+      if (session.activeScope !== space || this.sessionExpired(session, now)) continue;
+      if (!this.objects.has(session.actor)) continue;
+      actors.add(session.actor);
+      if (session.rosterVisible !== false) visibleActors.add(session.actor);
+    }
+    const projected = this.presenceSessionsIn(space);
+    if (projected) {
+      const room = this.objects.get(space);
+      for (const [sessionId, actor] of projected) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
+        if (!this.objects.has(actor) || !room?.contents.has(actor)) continue;
+        actors.add(actor);
+        if (session.rosterVisible !== false) visibleActors.add(actor);
+      }
+    }
+    return { actors: Array.from(actors).sort(), visibleActors };
   }
 
   /** Apply a planned session transition to the transient owner snapshot so
    * move results describe post-turn presence. This mutates planning-only data;
    * the accepted relation remains the sole durable write path. */
   private applyTransientRoomRosterTransition(session: Session, from: ObjRef | null, to: ObjRef): void {
+    // Hidden service sessions never contribute to the social projection. Do
+    // not even remove the actor: a separate visible session may be the reason
+    // the deduplicated actor row exists.
+    if (session.rosterVisible === false) return;
     if (from) {
       const source = this.roomRosterProjections.get(from);
       if (source) {
@@ -3161,10 +3195,14 @@ export class WooWorld {
     const id = payload.slice(0, colon);
     const secret = payload.slice(colon + 1);
     if (!id || !secret) throw wooError("E_NOSESSION", "apikey token must be apikey:<id>:<secret>");
-    const keys = this.propOrNull("$system", "api_keys");
-    const record = keys && typeof keys === "object" && !Array.isArray(keys)
-      ? (keys as Record<string, WooValue>)[id]
-      : null;
+    const routed = parseRoutedApiKeyId(id);
+    if (routed && (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)) {
+      throw wooError("E_NOSESSION", "apikey not found or revoked");
+    }
+    const keys = routed
+      ? this.apiKeyMap(routed.actor)
+      : this.legacyApiKeyMap();
+    const record = keys[id];
     if (!record || typeof record !== "object" || Array.isArray(record)) throw wooError("E_NOSESSION", "apikey not found or revoked");
     const r = record as Record<string, WooValue>;
     const salt = String(r.salt ?? "");
@@ -3181,7 +3219,7 @@ export class WooWorld {
       // Record liveness so :look on a block can render "plug last seen Ns ago"
       // without needing extra state. last_seen_at is per-key, not per-session;
       // a key with N concurrent sessions still gets one timestamp.
-      this.touchApiKeyLastSeen(id);
+      this.touchApiKeyLastSeen(id, routed?.actor ?? null);
       if (this.objects.has(actor) && this.inheritsFrom(actor, "$agent")) this.setProp(actor, "last_seen_at", Date.now());
       return this.createSessionForActor(actor, "apikey", id);
     }
@@ -3220,18 +3258,24 @@ export class WooWorld {
   createApiKey(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to create api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     return this.createApiKeyRecord(actor, target, label, "create_api_key");
   }
 
-  /** Dev/ops helper: ensure a caller-specified apikey exists with exactly the
-   * provided id+secret and target. Intended for localdev bootstrap code that
-   * already owns the secret; ordinary user-facing minting should use
-   * createApiKey/createApiKeyForOwner so secrets remain one-time generated. */
+  /**
+   * Compatibility-image constructor for tests and pre-Net donor worlds.
+   *
+   * This deliberately synthesizes the historical global registry so identity
+   * carry and old-key authentication remain testable. It is not a live-world
+   * issuance path: catalogs use createApiKey/createApiKeyForOwner, while Net
+   * operator bootstrap uses the internal-signed credential ensure route.
+   *
+   * @deprecated New credentials must use an actor-owned issuance path.
+   */
   ensureApiKey(actor: ObjRef, target: ObjRef, id: string, secret: string, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number; created: boolean } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to ensure api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     if (!id || id.includes(":")) throw wooError("E_INVARG", "apikey id must be non-empty and must not contain ':'", { id });
     if (!secret) throw wooError("E_INVARG", "apikey secret must be non-empty");
 
@@ -3272,7 +3316,7 @@ export class WooWorld {
    * can be configured by their creator without wizard escalation. */
   createApiKeyForOwner(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
       throw wooError("E_PERM", "owner-mint requires the calling actor to own the target", { actor, target });
     }
@@ -3280,27 +3324,48 @@ export class WooWorld {
   }
 
   private createApiKeyRecord(actor: ObjRef, target: ObjRef, label: string | null, auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
-    const id = randomHex(16);
+    const authorityRoot = this.apiKeyAuthorityRoot(target);
+    // n1 ids have one intentionally narrow routing grammar: catalog seed
+    // roots route to `catalog`; concrete actor roots route to their cluster.
+    // Refuse every other anchor shape instead of reproducing CO15's full
+    // class classifier in core. In particular, an actor anchored under a
+    // room must not mint an id that falsely names `cluster:<room>`.
+    if (!authorityRoot.startsWith("$") && !this.isActorDescendant(authorityRoot)) {
+      throw wooError(
+        "E_LINEAGE",
+        "apikey authority root must be catalog identity or an $actor descendant",
+        { actor: target, authority_root: authorityRoot }
+      );
+    }
+    const id = routedApiKeyId(authorityRoot, target, randomHex(16));
     const secret = randomHex(32);
     const salt = randomHex(16);
     const hash = hashSource(`${salt}:${secret}`);
     const created_at = Date.now();
-    const raw = this.propOrNull("$system", "api_keys");
-    const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
-    map[id] = { hash, salt, actor: target, label: label ?? null, created_at } as WooValue;
-    this.setProp("$system", "api_keys", map as WooValue);
-    this.recordWizardAction(actor, auditAction, { actor: target, key_id: id, label: label ?? null });
+    const map = { ...this.apiKeyMap(target) };
+    map[id] = {
+      hash,
+      salt,
+      actor: target,
+      label: label ?? null,
+      created_at,
+      created_by: actor,
+      created_via: auditAction
+    } as WooValue;
+    // The actor-owned record (including created_at) is the durable issuance
+    // audit in every runtime profile; Net additionally retains the accepted
+    // transcript. Writing `$system.wizard_actions` here would reintroduce the
+    // catalog mutation that Net correctly refuses for ordinary turns.
+    this.setProp(target, "api_keys", map as WooValue);
     return { id, secret, actor: target, label, created_at };
   }
 
-  private touchApiKeyLastSeen(id: string): void {
-    const raw = this.propOrNull("$system", "api_keys");
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
-    const map = raw as Record<string, WooValue>;
+  private touchApiKeyLastSeen(id: string, actor: ObjRef | null): void {
+    const map = actor ? this.apiKeyMap(actor) : this.legacyApiKeyMap();
     const rec = map[id];
     if (!rec || typeof rec !== "object" || Array.isArray(rec)) return;
     const updated = { ...(rec as Record<string, WooValue>), last_seen_at: Date.now() };
-    this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
+    this.setProp(actor ?? "$system", "api_keys", { ...map, [id]: updated as WooValue });
   }
 
   /** Mark an apikey revoked and tear down any sessions minted from it.
@@ -3312,9 +3377,11 @@ export class WooWorld {
   }
 
   private revokeApiKeyWithClosedSessions(actor: ObjRef, id: string): { revoked: boolean; closedSessions: Session[] } {
-    const raw = this.propOrNull("$system", "api_keys");
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { revoked: false, closedSessions: [] };
-    const map = raw as Record<string, WooValue>;
+    const routed = parseRoutedApiKeyId(id);
+    if (routed && (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)) {
+      return { revoked: false, closedSessions: [] };
+    }
+    const map = routed ? this.apiKeyMap(routed.actor) : this.legacyApiKeyMap();
     const rec = map[id];
     if (!rec || typeof rec !== "object" || Array.isArray(rec)) return { revoked: false, closedSessions: [] };
     const r = rec as Record<string, WooValue>;
@@ -3324,15 +3391,32 @@ export class WooWorld {
     if (!isWizard && !isOwner) {
       throw wooError("E_PERM", "revoke requires wizard authority or ownership of the bound actor", { actor, key_id: id });
     }
-    return this.revokeApiKeyRecord(actor, id, map, r, targetActor);
+    return this.revokeApiKeyRecord(actor, id, map, r, targetActor, routed?.actor ?? null, true);
   }
 
-  private revokeApiKeyRecord(actor: ObjRef, id: string, map: Record<string, WooValue>, record: Record<string, WooValue>, targetActor: ObjRef): { revoked: boolean; closedSessions: Session[] } {
+  private revokeApiKeyRecord(
+    actor: ObjRef,
+    id: string,
+    map: Record<string, WooValue>,
+    record: Record<string, WooValue>,
+    targetActor: ObjRef,
+    recordOwner: ObjRef | null,
+    closeSessions: boolean
+  ): { revoked: boolean; closedSessions: Session[] } {
     if (record.revoked_at != null) return { revoked: false, closedSessions: [] }; // already revoked — caller can disambiguate via listApiKeys
-    const updated = { ...record, revoked_at: Date.now() };
-    this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
-    const closedSessions = this.closeSessionsForApiKey(id);
-    this.recordWizardAction(actor, "revoke_api_key", { key_id: id, actor: targetActor });
+    const updated = { ...record, revoked_at: Date.now(), revoked_by: actor };
+    this.setProp(recordOwner ?? "$system", "api_keys", { ...map, [id]: updated as WooValue });
+    const closedSessions = closeSessions ? this.closeSessionsForApiKey(id) : [];
+    if (recordOwner) {
+      // The actor-owned write and authenticated transcript are the durable
+      // audit record. Do not append `$system.wizard_actions`: that catalog
+      // mutation is exactly what the Net-safe path must avoid.
+    } else {
+      // Compatibility keys remain catalog-owned until rotated. This path is
+      // retained for in-memory/SQLite and the signed migration lane; an
+      // ordinary Net turn still refuses the catalog write.
+      this.recordWizardAction(actor, "revoke_api_key", { key_id: id, actor: targetActor });
+    }
     return { revoked: true, closedSessions };
   }
 
@@ -3357,7 +3441,8 @@ export class WooWorld {
     return matches;
   }
 
-  /** Wizard-only: list every apikey record's metadata. */
+  /** Wizard-only compatibility view of the historical global registry.
+   * Actor-owned authorities are deliberately not globally enumerable. */
   listApiKeys(actor: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to list api keys", { actor });
     return this.collectApiKeyMetadata();
@@ -3366,19 +3451,22 @@ export class WooWorld {
   /** Owner-scoped: list apikeys for actors the caller owns. Useful for
    * `$block:list_apikeys` so a block's owner can audit "is my plug
    * connected and which key did it use?" without wizard authority. */
-  listApiKeysForOwner(actor: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
-    if (this.canBypassPerms(actor)) return this.collectApiKeyMetadata();
-    return this.collectApiKeyMetadata().filter((entry) => {
-      if (!entry.actor || !this.objects.has(entry.actor)) return false;
-      return this.object(entry.actor).owner === actor;
-    });
+  listApiKeysForOwner(actor: ObjRef, target: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
+    if (!this.objects.has(target)) {
+      throw wooError("E_OBJNF", `apikey listing target not found: ${target}`, target);
+    }
+    if (!this.isActorDescendant(target)) {
+      throw wooError("E_TYPE", `apikey listing target must be an $actor descendant: ${target}`, target);
+    }
+    if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
+      throw wooError("E_PERM", "apikey listing requires wizard authority or ownership of the bound actor", { actor, target });
+    }
+    return this.collectApiKeyMetadata(this.apiKeyMap(target));
   }
 
-  private collectApiKeyMetadata(): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
-    const raw = this.propOrNull("$system", "api_keys");
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  private collectApiKeyMetadata(map: Record<string, WooValue> = this.legacyApiKeyMap()): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
     const out: Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> = [];
-    for (const [id, rec] of Object.entries(raw as Record<string, WooValue>)) {
+    for (const [id, rec] of Object.entries(map)) {
       if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
       const r = rec as Record<string, WooValue>;
       out.push({
@@ -3391,6 +3479,42 @@ export class WooWorld {
       });
     }
     return out;
+  }
+
+  private legacyApiKeyMap(): Record<string, WooValue> {
+    const raw = this.propOrNull("$system", "api_keys");
+    return raw && typeof raw === "object" && !Array.isArray(raw)
+      ? raw as Record<string, WooValue>
+      : {};
+  }
+
+  private apiKeyMap(actor: ObjRef): Record<string, WooValue> {
+    const raw = this.propOrNull(actor, "api_keys");
+    return raw && typeof raw === "object" && !Array.isArray(raw)
+      ? raw as Record<string, WooValue>
+      : {};
+  }
+
+  /** One semantic predicate for credential APIs; callers should not repeat
+   * the seed-class identity that the layering guard deliberately budgets. */
+  private isActorDescendant(object: ObjRef): boolean {
+    return this.inheritsFrom(object, "$actor");
+  }
+
+  /** Immutable anchor root encoded into new public key ids. The same walk
+   * defines Net's actor cluster, so a gateway can route before it has any
+   * actor cells. */
+  private apiKeyAuthorityRoot(actor: ObjRef): ObjRef {
+    let root = actor;
+    const seen = new Set<ObjRef>();
+    while (this.objects.has(root)) {
+      if (seen.has(root)) throw wooError("E_LINEAGE", "apikey authority anchor cycles", { actor, root });
+      seen.add(root);
+      const anchor = this.object(root).anchor;
+      if (!anchor) return root;
+      root = anchor;
+    }
+    throw wooError("E_LINEAGE", "apikey authority anchor leaves the object graph", { actor, root });
   }
 
   async beginSignup(emailInput: string, password: string, options: { inviteCode?: string | null; signupMethod?: string } = {}): Promise<SignupStartResult> {
@@ -3752,24 +3876,33 @@ export class WooWorld {
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(human, oldKey, force);
       const key = this.createApiKeyForOwner(human, agent, String(this.propOrNull(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
-      this.recordWizardAction(human, "api_key_rotated", { actor: agent, key_id: key.id, force });
+      // The old/new actor-owned records are the cross-profile audit. Net's
+      // accepted transcript adds caller attribution without a catalog write.
       return key;
     }
 
     private revokeApiKeyRecordById(actor: ObjRef, id: string, closeSessions: boolean): boolean {
-      const raw = this.propOrNull("$system", "api_keys");
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-      const map = raw as Record<string, WooValue>;
+      const routed = parseRoutedApiKeyId(id);
+      if (
+        routed &&
+        (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)
+      ) return false;
+      const recordOwner = routed?.actor ?? null;
+      const map = recordOwner ? this.apiKeyMap(recordOwner) : this.legacyApiKeyMap();
       const rec = map[id];
       if (!rec || typeof rec !== "object" || Array.isArray(rec)) return false;
       const r = rec as Record<string, WooValue>;
       if (r.revoked_at != null) return false;
       const targetActor = String(r.actor ?? "");
-      const updated = { ...r, revoked_at: Date.now() };
-      this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
-      if (closeSessions) this.closeSessionsForApiKey(id);
-      this.recordWizardAction(actor, "api_key_revoked", { key_id: id, actor: targetActor });
-      return true;
+      return this.revokeApiKeyRecord(
+        actor,
+        id,
+        map,
+        r,
+        targetActor,
+        recordOwner,
+        closeSessions
+      ).revoked;
     }
 
     private findHermesAgent(human: ObjRef, profileId: string): ObjRef | null {
@@ -4587,6 +4720,7 @@ export class WooWorld {
       observationAudiences: liveAudiences.observationAudiences,
       audienceSessions: liveAudiences.audienceSessions,
       observationSessionAudiences: liveAudiences.observationSessionAudiences,
+      observationAudienceExclusions: liveAudiences.observationAudienceExclusions,
       observationAudienceModes: liveAudiences.observationAudienceModes
     };
   }
@@ -6201,7 +6335,14 @@ export class WooWorld {
         // session-row materialization follow editor movement, not just physical
         // room movement (see movetoActorChecked).
         if (session.activeScope !== destination) {
-          this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: session.activeScope ?? null, to: destination });
+          this.recordTurnEvent({
+            kind: "session_scope",
+            session: session.id,
+            actor,
+            from: session.activeScope ?? null,
+            to: destination,
+            ...(session.rosterVisible === false ? { rosterVisible: false } : {})
+          });
         }
         this.setSessionActiveScope(session, destination);
         this.persistSession(session);
@@ -6626,7 +6767,14 @@ export class WooWorld {
       // physical containment. The accepted transcript carries this so every
       // materializer can repair the live presence projections + session row.
       if (oldLocation !== targetRef) {
-        this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: oldLocation ?? null, to: targetRef });
+        this.recordTurnEvent({
+          kind: "session_scope",
+          session: session.id,
+          actor,
+          from: oldLocation ?? null,
+          to: targetRef,
+          ...(session.rosterVisible === false ? { rosterVisible: false } : {})
+        });
       }
       this.setSessionActiveScope(session, targetRef);
       if (derivesPresenceFromTranscript) {
@@ -8745,7 +8893,8 @@ export class WooWorld {
         lastDetachAt: session.lastDetachAt,
         tokenClass: session.tokenClass,
         activeScope: session.activeScope,
-        ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
+        ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {}),
+        ...(session.rosterVisible === false ? { rosterVisible: false } : {})
       };
     }
 
@@ -9326,7 +9475,7 @@ export class WooWorld {
   }
 
   private hydrateSession(
-    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; activeScope?: ObjRef | null; active_scope?: ObjRef | null; currentLocation?: ObjRef | null; apikeyId?: string },
+    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; activeScope?: ObjRef | null; active_scope?: ObjRef | null; currentLocation?: ObjRef | null; apikeyId?: string; rosterVisible?: false },
     now: number
   ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
@@ -9353,7 +9502,8 @@ export class WooWorld {
       // rather than restoring some old timestamp from `started`. Otherwise
       // every freshly-rehydrated DO would show huge idle for everyone.
       lastInputAt: now,
-      ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
+      ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {}),
+      ...(session.rosterVisible === false ? { rosterVisible: false } : {})
     };
   }
 
@@ -9871,9 +10021,11 @@ export class WooWorld {
     const sessions = new Set<string>();
     const observationAudiences: ObjRef[][] = [];
     const observationSessionAudiences: string[][] = [];
+    const observationAudienceExclusions: ObjRef[][] = [];
     const observationAudienceModes: DirectLiveAudience["observationAudienceModes"] = [];
     for (const observation of observations) {
       observationAudienceModes.push(this.observationHasExplicitAudience(observation) ? "explicit" : "presence");
+      observationAudienceExclusions.push(this.observationAudienceExclusions(observation));
       const present = this.observationAudienceActors(audience, observation) ?? [];
       const presentSessions = await this.observationAudienceSessions(audience, observation) ?? [];
       observationAudiences.push(present);
@@ -9881,14 +10033,25 @@ export class WooWorld {
       for (const actor of present) actors.add(actor);
       for (const session of presentSessions) sessions.add(session);
       delete (observation as Record<string, unknown>)._audience_override;
+      delete (observation as Record<string, unknown>)._audience_exclude;
     }
     return {
       audienceActors: actors.size > 0 ? Array.from(actors) : undefined,
       observationAudiences: observations.length > 0 ? observationAudiences : undefined,
       audienceSessions: sessions.size > 0 ? Array.from(sessions) : undefined,
       observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined,
+      observationAudienceExclusions: observations.length > 0 ? observationAudienceExclusions : undefined,
       observationAudienceModes: observations.length > 0 ? observationAudienceModes : undefined
     };
+  }
+
+  /** Internal catalog routing hint: retain presence-mode delivery, but omit
+   * these actors. Positive presence membership is intentionally resolved at
+   * each gateway; a compact negative set remains valid across sparse shards. */
+  private observationAudienceExclusions(observation: Observation): ObjRef[] {
+    const raw = (observation as Record<string, unknown>)._audience_exclude;
+    if (!Array.isArray(raw)) return [];
+    return Array.from(new Set(raw.filter((item): item is ObjRef => typeof item === "string")));
   }
 
   /** Whether an observation names recipients independently of the audience
@@ -9917,26 +10080,29 @@ export class WooWorld {
   }
 
   private observationAudienceActors(fallbackAudience: ObjRef | null, observation: Observation): ObjRef[] | undefined {
+    const exclusions = new Set(this.observationAudienceExclusions(observation));
+    const withoutExclusions = (actors: ObjRef[] | undefined): ObjRef[] | undefined =>
+      actors?.filter((actor) => !exclusions.has(actor));
     // Per-observation audience override. Used when the source is a remote
     // $space whose subscriber list this host can't read locally — the caller
     // pre-fetches subscribers cross-host and stamps them here. The field is
     // stripped from the observation by directLiveAudiences before broadcast.
     const override = (observation as Record<string, unknown>)._audience_override;
     if (Array.isArray(override)) {
-      return override.filter((item): item is ObjRef => typeof item === "string");
+      return withoutExclusions(override.filter((item): item is ObjRef => typeof item === "string"));
     }
     if ((observation.type === "looked" || observation.type === "who") && typeof observation.to === "string") {
-      return [observation.to];
+      return withoutExclusions([observation.to]);
     }
     if (typeof observation.target === "string") {
-      if (this.objects.has(observation.target) && this.inheritsFrom(observation.target, "$actor")) return [observation.target];
-      if (!this.objects.has(observation.target)) return [observation.target];
+      if (this.objects.has(observation.target) && this.inheritsFrom(observation.target, "$actor")) return withoutExclusions([observation.target]);
+      if (!this.objects.has(observation.target)) return withoutExclusions([observation.target]);
     }
     const directed = directedRecipients(observation);
     if (directed.to) {
       const actors = [directed.to];
       if (directed.from) actors.push(directed.from);
-      return actors;
+      return withoutExclusions(actors);
     }
     const source = typeof observation.source === "string" && this.objects.has(observation.source) && this.inheritsFrom(observation.source, "$space")
       ? observation.source
@@ -9946,9 +10112,9 @@ export class WooWorld {
     const present = this.liveAudienceActors(audience);
     if (!present) return undefined;
     if ((observation.type === "entered" || observation.type === "left" || observation.type === "taken" || observation.type === "dropped") && typeof observation.actor === "string") {
-      return present.filter((actor) => actor !== observation.actor);
+      return withoutExclusions(present.filter((actor) => actor !== observation.actor));
     }
-    return present;
+    return withoutExclusions(present);
   }
 
   private async observationAudienceSessions(fallbackAudience: ObjRef | null, observation: Observation): Promise<string[] | undefined> {
@@ -10821,8 +10987,11 @@ export class WooWorld {
     this.nativeHandlers.set("list_api_keys", (ctx) => {
       return this.listApiKeys(ctx.actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("list_api_keys_for_owner", (ctx) => {
-      return this.listApiKeysForOwner(ctx.actor) as unknown as WooValue;
+    this.nativeHandlers.set("list_api_keys_for_owner", (ctx, args) => {
+      // The bounded authority is an explicit contract argument. Frame
+      // topology (`caller`) is not an access-control input.
+      const target = assertObj(args[0]);
+      return this.listApiKeysForOwner(ctx.actor, target) as unknown as WooValue;
     });
     this.nativeHandlers.set("provision_actor", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to provision actors", { actor: ctx.actor });
@@ -10838,7 +11007,6 @@ export class WooWorld {
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(ctx.actor, oldKey, args[1] === true);
       const key = this.createApiKey(ctx.actor, agent, String(this.propOrNull(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
-      this.recordWizardAction(ctx.actor, "api_key_rotated", { actor: agent, key_id: key.id, force: args[1] === true });
       return { api_key: `apikey:${key.id}:${key.secret}`, id: key.id, actor: agent, created_at: key.created_at } as unknown as WooValue;
     });
     this.nativeHandlers.set("deactivate_actor", (ctx, args) => {
@@ -11510,25 +11678,7 @@ export class WooWorld {
   }
 
   activeActorsIn(space: ObjRef): ObjRef[] {
-    const actors = new Set<ObjRef>();
-    const now = Date.now();
-    for (const session of this.sessions.values()) {
-      if (session.activeScope !== space) continue;
-      if (this.sessionExpired(session, now)) continue;
-      if (!this.objects.has(session.actor)) continue;
-      actors.add(session.actor);
-    }
-    const projected = this.presenceSessionsIn(space);
-    if (projected) {
-      const room = this.objects.get(space);
-      for (const [sessionId, actor] of projected) {
-        const session = this.sessions.get(sessionId);
-        if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
-        if (!this.objects.has(actor) || !room?.contents.has(actor)) continue;
-        actors.add(actor);
-      }
-    }
-    return Array.from(actors).sort();
+    return this.activeActorRosterStateIn(space, Date.now()).actors;
   }
 
   async visibleContentsForActor(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {
