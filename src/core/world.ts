@@ -2154,7 +2154,11 @@ export class WooWorld {
     // ScopedObjectSummary) and the inherited "name" property (woocode
     // `this.name`). Different consumers read different surfaces.
     const obj = this.object(objRef);
-    obj.name = name;
+    // `name` lives in the object_lineage cell (and, separately, the inherited
+    // "name" property below). Route the lineage-field change through the seam
+    // so a Net @rename records the lineage write, not only the property write —
+    // otherwise the two name surfaces diverge over Net.
+    this.mutateLineage(objRef, () => { obj.name = name; });
     obj.modified = Date.now();
     this.persistObject(objRef);
     this.setProp(objRef, "name", name);
@@ -7275,7 +7279,10 @@ export class WooWorld {
   private chparentLocal(objRef: ObjRef, parentRef: ObjRef): void {
     const obj = this.object(objRef);
     if (obj.parent && this.objects.has(obj.parent)) this.object(obj.parent).children.delete(objRef);
-    obj.parent = parentRef;
+    // `parent` lives in the object_lineage cell. Route it through the seam so a
+    // runtime @chparent records the lineage write over Net. Off-turn callers
+    // (bootstrap, host-scoped migrations) no-op the recorder — see mutateLineage.
+    this.mutateLineage(objRef, () => { obj.parent = parentRef; });
     this.object(parentRef).children.add(objRef);
     obj.modified = Date.now();
     this.persistObject(objRef);
