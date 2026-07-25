@@ -1187,62 +1187,6 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       harness.cleanup();
     }
   });
-
-  it("resumes delayed FORK work through a new sequenced frame", async () => {
-    const harness = make();
-    try {
-      const world = harness.world;
-      installForkFixture(world);
-      const session = world.auth("guest:conf-fork");
-      const scheduled = await callInDubspace(world, session.id, "fork", message(session.actor, "delay_1", "conf_schedule_mark", ["later"]));
-      expect(scheduled.op).toBe("applied");
-      expect(world.parkedTasks.size).toBe(1);
-      expect(world.propOrNull("delay_1", "conf_forked")).toBeNull();
-
-      const ran = await world.runDueTasks(Date.now() + 1);
-      expect(ran).toHaveLength(1);
-      expect(ran[0].frame?.op).toBe("applied");
-      if (ran[0].frame?.op === "applied") {
-        expect(ran[0].frame.seq).toBe(2);
-        expect(ran[0].frame.message.verb).toBe("conf_mark");
-        expect(ran[0].frame.observations[0].type).toBe("conf_fork_ran");
-      }
-      expect(world.getProp("delay_1", "conf_forked")).toBe("later");
-      expect(world.replay("the_dubspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["conf_schedule_mark", "conf_mark"]);
-    } finally {
-      harness.cleanup();
-    }
-  });
-
-  it("persists READ parking across restart and resumes through a sequenced input frame", async () => {
-    const harness = make();
-    try {
-      let world = harness.world;
-      installReadFixture(world);
-      const session = world.auth("guest:conf-read");
-      const waiting = await callInDubspace(world, session.id, "read", message(session.actor, "delay_1", "conf_read_then_mark", []));
-      expect(waiting.op).toBe("applied");
-      expect(world.parkedTasks.size).toBe(1);
-
-      world = harness.restart();
-      expect(world.parkedTasks.size).toBe(1);
-      const ran = await world.deliverInput(session.actor, "typed text");
-      expect(ran?.frame?.op).toBe("applied");
-      if (ran?.frame?.op === "applied") {
-        expect(ran.frame.seq).toBe(2);
-        expect(ran.frame.message.verb).toBe("$resume");
-        expect(ran.frame.message.body?.kind).toBe("vm_read");
-        expect(ran.frame.message.body?.input).toBe("typed text");
-        expect(ran.frame.observations.map((obs) => obs.type)).toContain("conf_read_resumed");
-      }
-      expect(world.getProp("delay_1", "conf_read_value")).toBe("typed text");
-      expect(world.replay("the_dubspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["conf_read_then_mark", "$resume"]);
-      expect(world.parkedTasks.size).toBe(0);
-    } finally {
-      harness.cleanup();
-    }
-  });
-
   it("compiles and installs source with optimistic version checks", async () => {
     const harness = make();
     try {

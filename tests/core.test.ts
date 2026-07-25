@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { bundledCatalogAliases, installLocalCatalogs } from "../src/core/local-catalogs";
-import type { ParkedTaskRecord, SerializedWorld } from "../src/core/repository";
+import type { SerializedWorld } from "../src/core/repository";
 import type { CallContext, WooWorld } from "../src/core/world";
 import { freezeTinyBytecode, type MetricEvent, type ObjRef, type TinyBytecode, type WooValue } from "../src/core/types";
 import {
@@ -968,18 +968,6 @@ describe("woo core", () => {
   it("exports host-scoped worlds for routed cluster hosts", async () => {
     const world = createWorld();
     world.auth("guest:host-scope");
-    const parked: ParkedTaskRecord = {
-      id: "ptask_12",
-      parked_on: "the_pinboard",
-      state: "suspended",
-      resume_at: Date.now() + 1000,
-      awaiting_player: null,
-      correlation_id: null,
-      serialized: { kind: "test", space: "the_pinboard", target: "the_pinboard" },
-      created: Date.now(),
-      origin: "the_pinboard"
-    };
-    world.parkedTasks.set(parked.id, parked);
     const scoped = world.exportHostScopedWorld("the_pinboard");
     const ids = scoped.objects.map((obj) => obj.id);
 
@@ -990,7 +978,6 @@ describe("woo core", () => {
     expect(ids).toContain("the_dubspace");
     expect(scoped.sessions).toEqual([]);
     expect(scoped.logs.every(([space]) => space === "the_pinboard")).toBe(true);
-    expect(scoped.parkedTaskCounter).toBe(13);
 
     const cluster = createWorldFromSerialized(scoped, { persist: false });
     const clusterSession = cluster.auth("guest:host-scope");
@@ -1600,17 +1587,6 @@ describe("woo core", () => {
       state: { nested: { marker: "before" } },
       hash: "isolation"
     };
-    const task: ParkedTaskRecord = {
-      id: "isolation_task",
-      parked_on: "$nowhere",
-      state: "suspended",
-      resume_at: null,
-      awaiting_player: null,
-      correlation_id: null,
-      serialized: { nested: { marker: "before" } },
-      created: 1,
-      origin: "$nowhere"
-    };
     root.propertyDefs.push(defaultDef);
     root.properties.push(propertyEntry);
     root.propertyVersions.push(["isolation_value", 7]);
@@ -1619,7 +1595,6 @@ describe("woo core", () => {
     root.eventSchemas.push(["isolation_event", eventSchema]);
     serialized.logs.push(["$nowhere", [logEntry]]);
     serialized.snapshots.push(snapshot);
-    serialized.parkedTasks.push(task);
 
     const reloaded = createWorldFromSerialized(serialized, { persist: false });
 
@@ -1637,7 +1612,6 @@ describe("woo core", () => {
     setNestedMarker(logEntry.observations[0].payload, "after-input");
     setNestedMarker(logEntry.error!.value!, "after-input");
     setNestedMarker(snapshot.state, "after-input");
-    setNestedMarker(task.serialized, "after-input");
 
     const exported = reloaded.exportWorld();
     const importedRoot = exported.objects.find((obj) => obj.id === "$root");
@@ -1659,7 +1633,6 @@ describe("woo core", () => {
     expect(nestedMarker(exported.logs.find(([space]) => space === "$nowhere")![1][0].observations[0].payload)).toBe("before");
     expect(nestedMarker(exported.logs.find(([space]) => space === "$nowhere")![1][0].error!.value!)).toBe("before");
     expect(nestedMarker(exported.snapshots.find((item) => item.hash === "isolation")!.state)).toBe("before");
-    expect(nestedMarker(exported.parkedTasks.find((item) => item.id === "isolation_task")!.serialized)).toBe("before");
 
     const liveRoot = reloaded.object("$root");
     const liveVerb = liveRoot.verbs.find((item) => item.name === "isolate_import");
@@ -1687,7 +1660,6 @@ describe("woo core", () => {
     setNestedMarker(liveLog.observations[0].payload, "after-world");
     setNestedMarker(liveLog.error!.value!, "after-world");
     setNestedMarker(reloaded.snapshots.find((item) => item.hash === "isolation")!.state, "after-world");
-    setNestedMarker(reloaded.parkedTasks.get("isolation_task")!.serialized, "after-world");
 
     expect(root.flags.programmer).toBe(false);
     expect(nestedMarker(defaultDef.defaultValue)).toBe("after-input");
@@ -1703,7 +1675,6 @@ describe("woo core", () => {
     expect(nestedMarker(logEntry.observations[0].payload)).toBe("after-input");
     expect(nestedMarker(logEntry.error!.value!)).toBe("after-input");
     expect(nestedMarker(snapshot.state)).toBe("after-input");
-    expect(nestedMarker(task.serialized)).toBe("after-input");
   });
 
   it("deep-freezes bytecode so a shared copy cannot be mutated in place", () => {
@@ -1954,18 +1925,6 @@ describe("woo core", () => {
       verb: "set_control"
     });
   });
-
-  it("runDueTasks short-circuits with no metrics when no task is due", async () => {
-    const world = createWorld();
-    const metrics: MetricEvent[] = [];
-    world.setMetricsHook((event) => metrics.push(event));
-
-    const ran = await world.runDueTasks();
-    expect(ran).toEqual([]);
-    const noise = metrics.filter((event) => event.kind.startsWith("host_task_") && (event as { label?: string }).label === "runDueTasks");
-    expect(noise).toEqual([]);
-  });
-
   it("resumes a live session token", async () => {
     const world = createWorld();
     const first = world.auth("guest:resume");

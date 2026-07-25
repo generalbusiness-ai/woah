@@ -95,7 +95,7 @@ describe("metrics-sink", () => {
   describe("analyticsSampleRate", () => {
     it("returns 10 for the high-volume storage kinds", () => {
       const sdw: MetricEvent = { kind: "storage_direct_write", what: "property", ms: 0, rows: 3 };
-      const flush: MetricEvent = { kind: "storage_flush", objects: 0, properties: 0, sessions: 0, deleted_sessions: 0, tasks: 0, deleted_tasks: 0, counters: false, ms: 0 };
+      const flush: MetricEvent = { kind: "storage_flush", objects: 0, properties: 0, sessions: 0, deleted_sessions: 0, counters: false, ms: 0 };
       expect(analyticsSampleRate(sdw)).toBe(10);
       expect(analyticsSampleRate(flush)).toBe(10);
     });

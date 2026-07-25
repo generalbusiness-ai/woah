@@ -142,30 +142,12 @@ CREATE TABLE ancestor_chain (
   PRIMARY KEY (object_id, position)
 );
 
--- DEPRECATED, pending removal. VM activation stacks are no longer parked
--- durably: a turn runs to completion or fails (coherence.md CO2.8), and
--- deferred work is a pending scheduled turn owned by the scope sequencer's
--- store (coherence.md CO16), not host-scoped object storage. Nothing writes
--- these rows on the net stack and nothing reads them anywhere: the resume
--- driver went away with the pre-net worker. The table and its repository
--- methods are deleted in phase 1 of the scheduling work; a world carrying
--- rows here can drop them without loss, because none of them would ever
--- have fired.
-CREATE TABLE task (
-  id              TEXT PRIMARY KEY,
-  parked_on       TEXT NOT NULL,
-  state           TEXT NOT NULL,
-  resume_at       INTEGER,
-  awaiting_player TEXT,
-  correlation_id  TEXT,
-  serialized      BLOB NOT NULL,
-  created         INTEGER NOT NULL,
-  origin          TEXT NOT NULL
-);
-
-CREATE INDEX task_parked_on ON task(parked_on);
-
-CREATE INDEX task_resume_at ON task(resume_at) WHERE state = 'suspended';
+-- No task table. VM activation stacks are never parked durably: a turn runs
+-- to completion or fails (coherence.md CO2.8), and deferred work is a pending
+-- scheduled turn owned by the scope sequencer's store (coherence.md CO16),
+-- not host-scoped object storage. Worlds created before 2026-07-25 may still
+-- carry an empty `task` table and a `parkedTaskCounter` meta row; both are
+-- inert, unread, and ignored on load.
 
 -- Sequenced messages accepted by a hosted $space.
 -- A DO may host more than one $space (anchored cluster); rows are scoped per space.
@@ -373,7 +355,6 @@ CREATE TABLE v2_commit_scope_meta (
   idempotency_window_ms  INTEGER NOT NULL,
   version                INTEGER NOT NULL DEFAULT 1,
   object_counter         INTEGER NOT NULL DEFAULT 1,
-  parked_task_counter    INTEGER NOT NULL DEFAULT 1,   -- DEPRECATED, see the task table note
   session_counter        INTEGER NOT NULL DEFAULT 1,
   updated_at             INTEGER NOT NULL
 );
@@ -406,7 +387,7 @@ CREATE TABLE v2_commit_scope_snapshot (
   PRIMARY KEY (space, seq)
 );
 
--- DEPRECATED, pending removal with the task table above.
+-- DEPRECATED. Never written; retained only so older stored shapes parse.
 CREATE TABLE v2_commit_scope_task (
   id          TEXT PRIMARY KEY,
   body        TEXT NOT NULL, -- JSON ParkedTaskRecord

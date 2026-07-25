@@ -31,7 +31,6 @@ const IMPURE_OPCODES: ReadonlySet<string> = new Set([
   "SET_PROP", "SET_PROP_INFO",
   "DEFINE_PROP", "UNDEFINE_PROP",
   "OBSERVE", "EMIT",
-  "FORK", "SUSPEND", "READ"
 ]);
 
 // Static purity classification for a bytecode verb. Returns:
@@ -543,7 +542,6 @@ function verifyOpcodeShape(bytecode: TinyBytecode, pc: number, item: TinyOp): vo
     case "MAKE_LIST":
     case "STR_CONCAT":
     case "STR_INTERP":
-    case "FORK":
       expectNonNegativeInteger(pc, item[1], `${op} operand`);
       break;
     case "BUILTIN":
@@ -723,13 +721,6 @@ function stackEffect(pc: number, item: TinyOp): StackEffect {
     }
     case "OBSERVE":
       return { requires: 1, delta: -1 };
-    case "FORK": {
-      const argc = expectNonNegativeInteger(pc, item[1], "FORK argc");
-      return { requires: argc + 3, delta: -argc - 2 };
-    }
-    case "SUSPEND":
-    case "READ":
-      return { requires: 1, delta: 0 };
     default:
       throw compileErrorAt(pc, `unknown opcode ${op}`);
   }
@@ -741,11 +732,11 @@ function opcodeArity(op: string): number {
     "POP", "DUP", "SWAP", "ADD", "SUB", "MUL", "DIV", "MOD", "NEG", "NOT", "EQ", "NEQ", "LT", "LE", "GT", "GE", "IN",
     "FOR_MAP_INIT", "FOR_END", "GET_PROP", "SET_PROP", "HAS_PROP", "DEFINE_PROP", "UNDEFINE_PROP", "PROP_INFO", "SET_PROP_INFO",
     "RETURN", "RAISE", "FAIL", "LIST_GET", "LIST_SET", "LIST_APPEND", "MAP_GET", "MAP_SET", "INDEX_GET", "INDEX_SET", "SPLAT",
-    "OBSERVE", "EMIT", "YIELD", "SUSPEND", "READ", "TRY_POP"
+    "OBSERVE", "EMIT", "YIELD", "TRY_POP"
   ].includes(op)) return 0;
   if ([
     "PUSH_LIT", "PUSH_INT", "PUSH_LOCAL", "POP_LOCAL", "PUSH_ARG", "JUMP", "JUMP_IF_TRUE", "JUMP_IF_FALSE", "JUMP_IF_TRUE_KEEP", "JUMP_IF_FALSE_KEEP",
-    "FOR_LIST_INIT", "FOR_RANGE_INIT", "CALL_VERB", "PASS", "MAKE_MAP", "MAKE_LIST", "STR_CONCAT", "STR_INTERP", "FORK"
+    "FOR_LIST_INIT", "FOR_RANGE_INIT", "CALL_VERB", "PASS", "MAKE_MAP", "MAKE_LIST", "STR_CONCAT", "STR_INTERP"
   ].includes(op)) return 1;
   if (["FOR_LIST_NEXT", "FOR_RANGE_NEXT", "BUILTIN", "TRY_PUSH"].includes(op)) return 2;
   if (op === "FOR_MAP_NEXT") return 3;
@@ -867,9 +858,6 @@ const VALID_OPS = new Set([
   "OBSERVE",
   "EMIT",
   "YIELD",
-  "SUSPEND",
-  "READ",
-  "FORK",
   "TRY_PUSH",
   "TRY_POP",
   "FAIL"

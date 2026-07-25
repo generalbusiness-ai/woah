@@ -437,11 +437,6 @@ function projectionWriteShapeError(write: RecordedProjectionWrite): string | nul
       return write.row.space_id === write.key.space && write.row.seq === write.key.seq
         ? null
         : `projection_write snapshots key mismatch ${write.key.space}@${write.key.seq}`;
-    case "parked_tasks":
-      if (write.op === "delete") return write.bytes === 0 ? null : "projection_write parked_tasks delete must have zero bytes";
-      return write.row.id === write.key
-        ? null
-        : `projection_write parked_tasks key mismatch ${write.key}`;
     case "tombstones":
       if (write.op === "delete") return write.bytes === 0 ? null : "projection_write tombstones delete must have zero bytes";
       return write.row.id === write.key

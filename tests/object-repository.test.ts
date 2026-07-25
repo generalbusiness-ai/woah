@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ObjectRepository, ParkedTaskRecord, SerializedObject } from "../src/core/repository";
+import type { ObjectRepository, SerializedObject } from "../src/core/repository";
 import type { ErrorValue, Message, VerbDef, WooValue } from "../src/core/types";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
@@ -64,21 +64,6 @@ function nativeVerb(name: string): VerbDef {
 
 function msg(actor: string, target: string, verb: string, args: WooValue[] = []): Message {
   return { actor, target, verb, args };
-}
-
-function task(id: string, overrides: Partial<ParkedTaskRecord> = {}): ParkedTaskRecord {
-  return {
-    id,
-    parked_on: "space",
-    state: "suspended",
-    resume_at: 100,
-    awaiting_player: null,
-    correlation_id: null,
-    serialized: { kind: "test" },
-    created: 1,
-    origin: "space",
-    ...overrides
-  };
 }
 
 describe.each(backends)("ObjectRepository contract: $name", ({ make }) => {
@@ -203,7 +188,7 @@ describe.each(backends)("ObjectRepository contract: $name", ({ make }) => {
     }
   });
 
-  it("persists sessions, tasks, snapshots, counters, and meta records", async () => {
+  it("persists sessions, snapshots, counters, and meta records", async () => {
     const { repo, cleanup } = make();
     try {
       repo.saveObject(object("space"));
@@ -211,14 +196,6 @@ describe.each(backends)("ObjectRepository contract: $name", ({ make }) => {
       repo.saveSession({ id: "s2", actor: "$actor", started: 1, expiresAt: 500, lastDetachAt: null, tokenClass: "guest" });
       expect(repo.loadSession("s1")?.actor).toBe("$actor");
       expect(repo.loadExpiredSessions(100).map((session) => session.id)).toEqual(["s1"]);
-
-      repo.saveTask(task("t1", { resume_at: 10 }));
-      repo.saveTask(task("t2", { state: "awaiting_read", resume_at: null, awaiting_player: "$actor", created: 2 }));
-      expect(repo.earliestResumeAt()).toBe(10);
-      expect(repo.loadDueTasks(20).map((item) => item.id)).toEqual(["t1"]);
-      expect(repo.loadAwaitingReadTasks("$actor").map((item) => item.id)).toEqual(["t2"]);
-      repo.deleteTask("t1");
-      expect(repo.loadTask("t1")).toBeNull();
 
       repo.saveSpaceSnapshot({ space_id: "space", seq: 1, ts: 1, state: { ok: true }, hash: "h1" });
       expect(repo.loadLatestSnapshot("space")?.hash).toBe("h1");

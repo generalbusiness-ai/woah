@@ -157,6 +157,9 @@ describe("PlanningWorld admission gate", () => {
 
 describe("PlanningWorld admission gate — buildPlanningWorld enforcement", () => {
   function world(objects: SerializedObject[]): SerializedWorld {
+    // parkedTaskCounter/parkedTasks are legacy keys from the deleted
+    // parked-task model. Kept here deliberately: they exercise the
+    // load-path tolerance that lets pre-existing dumps still import.
     return { version: 1, objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1, objects, sessions: [], logs: [], snapshots: [], parkedTasks: [], tombstones: [] };
   }
 

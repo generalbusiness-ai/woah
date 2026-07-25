@@ -1,5 +1,4 @@
 import type {
-  ParkedTaskRecord,
   SerializedObject,
   SerializedSession,
   SpaceSnapshotRecord
@@ -11,7 +10,6 @@ export type SqlRow = Record<string, unknown>;
 export const SQL_DELETE_TABLES = [
   "world_meta",
   "tombstone",
-  "task",
   "space_snapshot",
   "space_message",
   "session",
@@ -115,19 +113,6 @@ export const SQL_SCHEMA_STATEMENTS = [
     hash TEXT NOT NULL,
     PRIMARY KEY (space_id, seq)
   )`,
-  `CREATE TABLE IF NOT EXISTS task (
-    id TEXT PRIMARY KEY,
-    parked_on TEXT NOT NULL,
-    state TEXT NOT NULL,
-    resume_at INTEGER,
-    awaiting_player TEXT,
-    correlation_id TEXT,
-    serialized TEXT NOT NULL,
-    created INTEGER NOT NULL,
-    origin TEXT NOT NULL
-  )`,
-  "CREATE INDEX IF NOT EXISTS task_parked_on ON task(parked_on)",
-  "CREATE INDEX IF NOT EXISTS task_resume_at ON task(resume_at) WHERE state = 'suspended'",
   `CREATE TABLE IF NOT EXISTS session (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -281,20 +266,6 @@ export function snapshotFromSqlRow(row: SqlRow): SpaceSnapshotRecord {
     ts: Number(row.ts),
     state: parseSqlValue(row.state),
     hash: String(row.hash)
-  };
-}
-
-export function taskFromSqlRow(row: SqlRow): ParkedTaskRecord {
-  return {
-    id: String(row.id),
-    parked_on: String(row.parked_on),
-    state: row.state as ParkedTaskRecord["state"],
-    resume_at: row.resume_at === null || row.resume_at === undefined ? null : Number(row.resume_at),
-    awaiting_player: row.awaiting_player === null || row.awaiting_player === undefined ? null : String(row.awaiting_player),
-    correlation_id: row.correlation_id === null || row.correlation_id === undefined ? null : String(row.correlation_id),
-    serialized: parseSqlValue(row.serialized),
-    created: Number(row.created),
-    origin: String(row.origin)
   };
 }
 

@@ -24,8 +24,8 @@ for mechanism.
 > in the gateway's *planning* world and the effect transcript has no field
 > to carry a parked task, so the row died at the transcript boundary in any
 > case. Woocode could call `fork()`; nothing happened; no error was
-> raised. No catalog had used it. The machinery is deleted and the
-> capability is replaced by scheduled turns.
+> raised. No catalog had used it. The machinery was deleted on 2026-07-25
+> and the capability is replaced by scheduled turns.
 
 ---
 

@@ -37,9 +37,10 @@ storage-row deletion (step 8), and ULID tombstoning persisted across hosts
 the `force` opt; §RC6.1 wizard-only behavior rides as the `force_reserved`
 opt. The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
 RC3 step 2 (scheduled-turn cancellation) is **not** implemented: the
-builtin still kills parked tasks, a mechanism that no longer runs anywhere
-(see [tasks.md](tasks.md)), and it does not yet touch the scope's schedule
-queue. That lands with the scheduling work.
+parked-task kill it used to perform is deleted along with the mechanism
+(see [tasks.md](tasks.md)), and nothing yet touches the scope's schedule
+queue — there is no queue producer to cancel from. That lands with the
+scheduling work.
 Status remains `partial` because `$system.recycle_tick_budget` and the
 cross-host steps in §RC3.1 / §RC10 (cluster co-location enforcement when
 the cluster spans hosts, fire-after-commit Directory reconciliation, and

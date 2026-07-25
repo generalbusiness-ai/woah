@@ -11,7 +11,7 @@ export type RecordedCell =
   | { kind: "lifecycle"; object: ObjRef };
 
 export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace" | "delete";
-export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "parked_tasks" | "tombstones" | "counters" }>;
+export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "tombstones" | "counters" }>;
 
 // Authority is captured at the VM-frame boundary so commit validation can
 // authorize each mutation against the exact `progr` that performed it.

@@ -159,7 +159,6 @@ export type SerializedFromCellsOptions = {
    * (Phase-3 wiring) or fresh ids would collide with existing ones. */
   objectCounter?: number;
   sessionCounter?: number;
-  parkedTaskCounter?: number;
 };
 
 /**
@@ -301,13 +300,11 @@ export function serializedFromCells(
   return {
     version: 1,
     objectCounter: opts.objectCounter ?? 0,
-    parkedTaskCounter: opts.parkedTaskCounter ?? 0,
     sessionCounter: opts.sessionCounter ?? 0,
     objects,
     sessions: sessions.sort((a, b) => a.id.localeCompare(b.id)),
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: [...tombstones].sort()
   };
 }

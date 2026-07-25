@@ -96,48 +96,28 @@ describe("turn recorder", () => {
     expect(rankCapabilityAdsForTurn([ad, cheaper], turnKey).map((item) => item.node)).toEqual(["node-b", "node-a"]);
   });
 
-  it("records parked-task projection writes at the mutation site", async () => {
+  // The parked-task model this test used to exercise is deleted
+  // (spec/semantics/tasks.md). What matters now is that the DSL names it
+  // compiled to fail LOUDLY: the whole reason for deleting the machinery is
+  // that `fork()` used to compile, return a task id, and then do nothing at
+  // all. A silent no-op is exactly what must not come back.
+  it("refuses fork/suspend/read at compile time with an actionable message", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-projection");
     const actor = session.actor;
     world.createObject({ id: "scheduler", name: "Scheduler", parent: "$thing", owner: actor });
-    expect(installVerb(
-      world,
-      "scheduler",
-      "noop",
-      "verb :noop() rxd { return 0; }",
-      null
-    ).ok).toBe(true);
-    expect(installVerb(
-      world,
-      "scheduler",
-      "queue",
-      "verb :queue() rxd { return fork(60, this, \"noop\", []); }",
-      null
-    ).ok).toBe(true);
-    const recorder = new InMemoryTurnRecorder();
-    world.setTurnRecorder(recorder);
 
-    const result = await world.directCall("queue-task", actor, "scheduler", "queue", []);
+    const forked = installVerb(world, "scheduler", "queue", "verb :queue() rxd { return fork(60, this, \"noop\", []); }", null);
+    expect(forked.ok).toBe(false);
+    expect(JSON.stringify(forked)).toMatch(/schedule/);
 
-    expect(result.op).toBe("result");
-    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
-    expect(transcript.projectionWrites).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        table: "counters",
-        key: "parkedTaskCounter",
-        op: "upsert"
-      }),
-      expect.objectContaining({
-        table: "parked_tasks",
-        op: "upsert",
-        row: expect.objectContaining({
-          parked_on: "scheduler",
-          state: "suspended",
-          origin: "scheduler"
-        })
-      })
-    ]));
+    const suspended = installVerb(world, "scheduler", "wait", "verb :wait() rxd { suspend(60); return 0; }", null);
+    expect(suspended.ok).toBe(false);
+    expect(JSON.stringify(suspended)).toMatch(/schedule/);
+
+    const reader = installVerb(world, "scheduler", "ask", "verb :ask() rxd { return read(player); }", null);
+    expect(reader.ok).toBe(false);
+    expect(JSON.stringify(reader)).toMatch(/schedule/);
   });
 
   it("promotes a successful tombstone write to a typed recycle effect", async () => {

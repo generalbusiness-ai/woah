@@ -1139,26 +1139,23 @@ class Codegen {
       this.emit("PUSH_LIT", this.literal(null));
       return;
     }
-    if (name === "suspend") {
-      if (expr.args.length !== 1) throw new CompileError("E_COMPILE", "suspend expects seconds", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.emit("SUSPEND");
-      return;
-    }
-    if (name === "read") {
-      if (expr.args.length !== 1) throw new CompileError("E_COMPILE", "read expects player", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.emit("READ");
-      return;
+    // Phase 1 (scheduled events): the parked-task model these compiled to is
+    // deleted. `fork` returns in phase 3 as sugar over `schedule`; `suspend`
+    // and `read` have no replacement. Reserved here so an author who reaches
+    // for them gets told what happened instead of "unknown builtin".
+    if (name === "suspend" || name === "read") {
+      throw new CompileError(
+        "E_COMPILE",
+        `${name}() no longer exists: a verb runs to completion within its turn. To do work later, use schedule() (spec/semantics/scheduling.md)`,
+        expr.span
+      );
     }
     if (name === "fork") {
-      if (expr.args.length < 3) throw new CompileError("E_COMPILE", "fork expects delay, target, verb, and optional args", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.compileExpr(expr.args[1]);
-      this.compileExpr(expr.args[2]);
-      for (const arg of expr.args.slice(3)) this.compileExpr(arg);
-      this.emit("FORK", expr.args.length - 3);
-      return;
+      throw new CompileError(
+        "E_COMPILE",
+        "fork() is not available yet: the parked-task model it compiled to is removed and the schedule() replacement is not built. See spec/semantics/scheduling.md",
+        expr.span
+      );
     }
     if (!BUILTINS.has(name)) throw new CompileError("E_COMPILE", `unknown builtin: ${name}`, expr.span);
     for (const arg of expr.args) this.compileExpr(arg);
