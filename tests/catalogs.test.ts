@@ -4499,7 +4499,8 @@ describe("local catalogs", () => {
           title: "Temperature in Mountain View CA: 72°F",
           last_updated: "May 6, 2026, 9:01 AM PDT",
           last_updated_text: "May 6, 2026, 9:01 AM PDT",
-          description: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT."
+          plug_status: { state: "stale" },
+          description: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update is older than two hours."
         });
       }
       const roomLook = await world.directCall("blocks-room-look", "$wiz", "the_chatroom", "look", []);
@@ -4518,7 +4519,7 @@ describe("local catalogs", () => {
         expect(lookWeatherCommand.observations.find((obs) => obs.type === "looked")).toMatchObject({
           room: "the_chatroom",
           target: "the_weather",
-          text: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT."
+          text: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update is older than two hours."
         });
       }
       // Horoscope machine: located on the deck, default rate limit + persona.
@@ -5223,6 +5224,9 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "timezone")).toBe("Pacific");
       expect(world.getProp(blockId, "last_error")).toBeNull();
       expect(world.getProp(blockId, "config_state")).toMatchObject({ status: "pending", place: "Mountain View CA", timezone: "Pacific" });
+      const pendingStatus = await world.directCall("weather-pending-status", "$wiz", blockId, "plug_status", []);
+      expect(pendingStatus.op).toBe("result");
+      if (pendingStatus.op === "result") expect(pendingStatus.result).toMatchObject({ state: "pending" });
 
       const unitsDenied = await world.directCall("weather-stranger-set-units", stranger, blockId, "set_units", ["imperial"]);
       expect(unitsDenied.op).toBe("error");
@@ -5235,16 +5239,29 @@ describe("local catalogs", () => {
       const townLook = await world.directCall("weather-town-state-look", "$wiz", blockId, "look_self", []);
       expect(townLook.op).toBe("result");
       if (townLook.op === "result") {
-        const description = String((townLook.result as Record<string, unknown>).description);
-        expect(description).toBe("The weather panel shows that the temperature in Mountain View, CA was 58.62°F at May 6, 2026, 9:01 AM PDT.");
+        const result = townLook.result as Record<string, unknown>;
+        expect(result.plug_status).toMatchObject({ state: "never", age_ms: null });
+        expect(String(result.description)).toBe("The weather panel shows that the temperature in Mountain View, CA was 58.62°F at May 6, 2026, 9:01 AM PDT. Weather plug status: no successful update yet.");
       }
 
       world.setProp(blockId, "place", "94043");
+      world.setProp(blockId, "last_pushed_at", Date.now());
       const zipLook = await world.directCall("weather-zip-look", "$wiz", blockId, "look_self", []);
       expect(zipLook.op).toBe("result");
       if (zipLook.op === "result") {
-        const description = String((zipLook.result as Record<string, unknown>).description);
-        expect(description).toBe("The weather panel shows that the temperature in 94043 was 58.62°F at May 6, 2026, 9:01 AM PDT.");
+        const result = zipLook.result as Record<string, unknown>;
+        expect(result.plug_status).toMatchObject({ state: "healthy" });
+        expect(String(result.description)).toBe("The weather panel shows that the temperature in 94043 was 58.62°F at May 6, 2026, 9:01 AM PDT. Weather plug status: healthy.");
+      }
+
+      world.setProp(blockId, "last_pushed_at", Date.now() - 7_200_001);
+      const staleStatus = await world.directCall("weather-stale-status", "$wiz", blockId, "plug_status", []);
+      expect(staleStatus.op).toBe("result");
+      if (staleStatus.op === "result") {
+        expect(staleStatus.result).toMatchObject({
+          state: "stale",
+          message: "Weather plug status: stale; the last successful update is older than two hours."
+        });
       }
 
       world.setProp(blockId, "config_state", {
@@ -5260,6 +5277,7 @@ describe("local catalogs", () => {
       if (errorLook.op === "result") {
         const result = errorLook.result as Record<string, unknown>;
         expect(result.title).toBe("Weather for 94043: error");
+        expect(result.plug_status).toMatchObject({ state: "error" });
         expect(String(result.description)).toBe("Weather status: error for 94043. tomorrow.io could not fetch weather for \"94043\" - set place to a town name or zip code it recognizes. Last successful reading: 58.62°F at May 6, 2026, 9:01 AM PDT.");
       }
     });

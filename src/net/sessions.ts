@@ -45,6 +45,9 @@ import { applyTranscript, type EffectTranscript, type TranscriptWrite } from "./
  * header shape rule). Task-vocabulary mapping: created_at → `started`,
  * expires_at → `expiresAt`, scope → `activeScope`. */
 export type SessionCellValue = SerializedSession & {
+  /** False keeps authorization presence intact while excluding this session
+   * from actor-level social roster projections. Omission means visible. */
+  rosterVisible?: false;
   /** The actor was provisioned only for this anonymous session. Once no live
    * session remains, the owner reaper retires its physical room placement. */
   ephemeralActor?: boolean;
@@ -116,6 +119,10 @@ export type MintSessionInput = {
    * the public id in the session cell lets bearer-only transports (MCP and
    * browser sessions) re-check revocation without retaining the secret. */
   apikeyId?: string;
+  /** API-key service sessions may retain authorization presence without
+   * presenting their actor as a social room occupant. Only false is stored;
+   * omission is the compact/default visible form. */
+  rosterVisible?: boolean;
   /** Identity-door guest claim: stamp the transcript exclusiveMint so
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
@@ -189,6 +196,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     expiresAt: input.closing ? input.now + 250 : input.now + input.ttl_ms,
     activeScope: input.closing ? null : (input.activeScope ?? null),
     ...(!input.closing && input.apikeyId ? { apikeyId: input.apikeyId } : {}),
+    ...(!input.closing && input.rosterVisible === false ? { rosterVisible: false as const } : {}),
     ...(input.closing?.ephemeralActor
       ? {
           ephemeralActor: true,

@@ -15,7 +15,9 @@ Cron-triggered every minute. Each tick:
    (apikey-class sessions are valid for 24h; the plug re-authenticates
    only when the cached session is within 1h of expiry, or when the
    isolate cold-started). Otherwise POSTs to `/net-api/session` with the
-   actor-bound apikey for the block. The `tick_ok` log line carries
+   actor-bound apikey for the block and `roster_visible:false`: the service
+   session keeps Net authorization/fanout presence without appearing in the
+   social room roster. The `tick_ok` log line carries
    `auth: "warm" | "cold"` so the cache hit rate is greppable from
    `wrangler tail`.
 2. Reads the block's exact `system_prompt` cell through a short in-isolate TTL cache

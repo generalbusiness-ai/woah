@@ -959,9 +959,19 @@ One write path per fact (CO9), concretized:
   instead of stranding). Buckets are per-gateway-isolate memory
   (bounded, idle-evicted); eviction degrades to permitting one fresh
   burst, never to blocking a legitimate client.
-  - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
-    view lineage (CO15; convention pull `cluster:<actor>` on miss) and
-    mints through `/net/session-open`'s machinery.
+  - `POST /net-api/session {ttl_ms?, roster_visible?}` derives the actor's
+    cluster from view lineage (CO15; convention pull `cluster:<actor>` on
+    miss) and mints through `/net/session-open`'s machinery.
+    `roster_visible:false` is accepted only when the request authenticated
+    with an API key. It does **not** suppress session presence: the session
+    still has `activeScope`, produces the owner-sequenced
+    `session_presence` row, receives room fanout, and satisfies
+    presence-scoped authorization. It suppresses only the actor-level social
+    roster projection consumed by `who` and presence UI. The choice is stored
+    in the session authority cell, so every gateway derives the same public
+    roster and an actor with multiple sessions remains visible when any live
+    session is roster-visible. Omission defaults to `true`; a non-boolean
+    value refuses HTTP 400 `E_INVARG`.
   - `DELETE /net-api/session` is semantically idempotent although its success
     invalidates its own bearer. The session-routed gateway retains a bounded
     accepted-close receipt and checks it before live-bearer authentication.
@@ -970,6 +980,10 @@ One write path per fact (CO9), concretized:
     derived session value solely to bind the opaque bearer to the actor and
     reach the same close postcondition. An expired value grants no other
     operation. Unknown session ids still fail ordinary authentication.
+    Scheduled/disconnected plugs SHOULD request `roster_visible:false` and
+    close the session in a `finally` path. Hidden-roster mode is not session
+    garbage collection: failure to close still leaves authority state,
+    subscriptions, and expiry work behind.
   - `POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the

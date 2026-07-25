@@ -17,7 +17,11 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): {
     const call: Call = { url, method, body };
     calls.push(call);
     const handler = handlers[i++];
-    const reply: Reply = handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
+    const reply: Reply = handler
+      ? handler(call)
+      : method === "DELETE" && url.endsWith("/net-api/session")
+        ? { status: 200, body: { closed: true } }
+        : { status: 404, body: { error: { code: "E_NOMATCH" } } };
     const headers = new Headers(reply.headers ?? {});
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(reply.body), { status: reply.status, headers });

@@ -223,10 +223,16 @@ On each fire it:
    sum / mode per `fields[name].agg`).
 5. Calls `:set_properties({current, daily, timeseries, last_pushed_at, config_state})`
    in a single bundle.
-6. Disconnects.
+6. Closes its hidden-roster Net session in a `finally` path.
 
 Failure paths set `last_error` and skip the data write; `:look` surfaces
-the freshness state for operators.
+the durable plug state for operators. The plug's session retains ordinary
+authorization presence while a tick runs, but `roster_visible:false` keeps
+the appliance out of `who` and presence UI. `:look` does not infer health
+from that ephemeral session: it derives `healthy`, `stale`, `pending`,
+`error`, or `never` from `last_pushed_at`, `last_error`, and `config_state`.
+At the hourly cadence, a successful reading becomes `stale` after two hours:
+one missed run plus one run of grace.
 
 ### Free-tier budget
 

@@ -364,6 +364,9 @@ type SessionOpenRequest = {
    * enters session state; bearer-only follow-up requests use this id to
    * re-check the key's current authority record. */
   apikey_id?: string;
+  /** False suppresses only the public/social roster row. The session remains
+   * present for authorization and fanout. */
+  roster_visible?: boolean;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -2364,6 +2367,7 @@ export class NetGatewayDO {
       clusterScope,
       ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
       ...(request.apikey_id ? { apikeyId: request.apikey_id } : {}),
+      ...(request.roster_visible === false ? { rosterVisible: false } : {}),
       ...(request.exclusive ? { exclusive: true } : {}),
       ...(stampGuestCustomerOf ? { stampGuestCustomerOf: true } : {}),
       ...(request.closing ? { closing: request.closing } : {})
@@ -3189,6 +3193,8 @@ export class NetGatewayDO {
   private static readonly DUMMY_PASSWORD_HASH = `pbkdf2-sha256:600000:${"0".repeat(32)}:${"0".repeat(64)}`;
 
   private async clientLogin(body: Record<string, unknown>): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, false);
+    if (rosterRefusal) return rosterRefusal;
     const rawEmail = String(body.email ?? "");
     const password = String(body.password ?? "");
     // V3 finding 7: strict BYTE limits BEFORE the email becomes a
@@ -3280,6 +3286,8 @@ export class NetGatewayDO {
    * first session in one commit at that actor's cluster owner.
    */
   private async clientGuest(body: Record<string, unknown>): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, false);
+    if (rosterRefusal) return rosterRefusal;
     // One shared pre-auth bucket: guest claims are session mints.
     this.enforceClientRate("guest:door", "/net-api/session");
     const ttlMs = clampClientTtl(body.ttl_ms);
@@ -3827,6 +3835,10 @@ export class NetGatewayDO {
       apiKeyId?: string;
     } = {}
   ): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, Boolean(options.apiKeyId));
+    if (rosterRefusal) return rosterRefusal;
+    const requestedRosterVisibility = body.roster_visible;
+    const rosterVisible = requestedRosterVisibility !== false;
     // The mint needs the actor's lineage (cluster-scope derivation) in
     // view; the CO15 `cluster:<actor>` convention names the pull
     // destination without needing lineage first (the planScheduled
@@ -3861,6 +3873,7 @@ export class NetGatewayDO {
       catalog_epoch: epoch,
       active_scope: bornAt,
       ...(options.apiKeyId ? { apikey_id: options.apiKeyId } : {}),
+      ...(!rosterVisible ? { roster_visible: false } : {}),
       ...(options.issuedAt !== undefined ? { issued_at_ms: options.issuedAt } : {}),
       ...(options.exclusive ? { exclusive: true } : {})
     });
@@ -3898,9 +3911,42 @@ export class NetGatewayDO {
       // present. Exposing the routing fact also keeps canaries from creating
       // artificial same-room transition storms.
       active_scope: bornAt,
+      roster_visible: rosterVisible,
       ...(opened.install_degraded ? { install_degraded: true } : {}),
       ...(opened.relation_expedite_degraded ? { relation_expedite_degraded: true } : {})
     });
+  }
+
+  /** Validate the roster policy before login derivation, guest allocation,
+   * or authority writes. Human door sessions cannot hide themselves; only
+   * an already-authenticated API-key service principal may opt out. */
+  private validateRosterVisibility(body: Record<string, unknown>, allowHidden: boolean): Response | null {
+    const requested = body.roster_visible;
+    if (requested !== undefined && typeof requested !== "boolean") {
+      return json(
+        {
+          error: {
+            code: "E_INVARG",
+            message: "roster_visible must be boolean",
+            detail: { roster_visible: requested }
+          }
+        },
+        400
+      );
+    }
+    if (requested === false && !allowHidden) {
+      return json(
+        {
+          error: {
+            code: "E_PERM",
+            message: "hidden-roster sessions require API-key authentication",
+            detail: { reason: "roster_visibility_requires_apikey" }
+          }
+        },
+        403
+      );
+    }
+    return null;
   }
 
   /** POST /net-api/turn — see the clientApi header. */

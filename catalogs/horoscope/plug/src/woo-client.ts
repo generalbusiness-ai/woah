@@ -39,7 +39,9 @@ export class WooClient {
 
   async authenticate(token: string): Promise<WooSession> {
     this.token = token;
-    const body = await this.requestJson("POST", "/net-api/session", {});
+    // This scheduled appliance needs presence for Net authority and fanout,
+    // but its deliberately cached service session is not a social occupant.
+    const body = await this.requestJson("POST", "/net-api/session", { roster_visible: false });
     this.session = {
       actor: String(body.actor),
       session: String(body.session),

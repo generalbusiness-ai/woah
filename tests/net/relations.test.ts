@@ -418,7 +418,7 @@ describe("primitives", () => {
     expect(observationsForRelationOwners(observations, deltas)).toEqual(observations.slice(0, 2));
   });
 
-  it("reduces live presence to one row per actor and excludes expired residue", () => {
+  it("reduces live presence to one row per actor and excludes expired or roster-hidden residue", () => {
     const now = 100_000;
     const relations: RelationRow[] = [];
     for (let index = 0; index < 30; index += 1) {
@@ -444,10 +444,63 @@ describe("primitives", () => {
         }
       });
     }
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "service-only",
+      body: {
+        actor: "weather-service",
+        name: "Weather",
+        session: {
+          id: "service-only",
+          actor: "weather-service",
+          started: 90_000,
+          expiresAt: 200_000,
+          activeScope: "room:x",
+          rosterVisible: false
+        }
+      }
+    });
+    // One hidden session must not hide the actor when another live session
+    // explicitly participates in the social roster.
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "mixed-hidden",
+      body: {
+        actor: "mixed-actor",
+        session: {
+          id: "mixed-hidden",
+          actor: "mixed-actor",
+          started: 89_000,
+          expiresAt: 200_000,
+          activeScope: "room:x",
+          rosterVisible: false
+        }
+      }
+    });
+    relations.push({
+      relation: "session_presence",
+      owner: "room:x",
+      member: "mixed-visible",
+      body: {
+        actor: "mixed-actor",
+        name: "Mixed Actor",
+        session: {
+          id: "mixed-visible",
+          actor: "mixed-actor",
+          started: 91_000,
+          expiresAt: 200_000,
+          activeScope: "room:x"
+        }
+      }
+    });
     const roster = roomRosterRows(relations, "room:x", "Room X", now);
-    expect(roster).toHaveLength(30);
+    expect(roster).toHaveLength(31);
     expect(roster[0]).toMatchObject({ player: "actor-0", name: "Actor 0", location_name: "Room X" });
     expect(roster.some((row) => row.player.startsWith("stale-"))).toBe(false);
+    expect(roster.some((row) => row.player === "weather-service")).toBe(false);
+    expect(roster.find((row) => row.player === "mixed-actor")).toMatchObject({ name: "Mixed Actor" });
   });
 
   it("applyRelationDeltas reports changed keys and skips no-op removes", () => {
