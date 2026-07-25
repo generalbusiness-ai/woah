@@ -24,6 +24,15 @@
  *   here with `nextAlarmAt()`; the Host alarm wiring lands in step 5.
  */
 import { CellStore, type Cell, type EpochStamp } from "./cells";
+import {
+  SCHEDULE_MAX_ENTRY_BYTES,
+  SCHEDULE_MAX_HORIZON_MS,
+  SCHEDULE_MAX_PER_OBJECT,
+  SCHEDULE_MAX_PER_SCOPE,
+  SCHEDULE_MAX_PER_TURN,
+  SCHEDULE_MAX_SCOPE_BYTES,
+  SCHEDULE_MIN_LEAD_MS
+} from "../core/scheduling";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
 import {
@@ -160,20 +169,20 @@ export type RejectReason =
   | "schedule_unauthorized" // CO16.2 — schedule/cancel effect failed provenance, namespace, authority, or quota; terminal
   | "post_state_mismatch"; // step 10
 
-/** CO16.6/CO16.7 — the scheduling envelope, enforced at commit. The VM
- * clamps a short delay before recording; the scope re-checks because it does
- * not trust the planner with its own rules. */
-export const SCHEDULE_MIN_LEAD_MS = 60_000;
-export const SCHEDULE_MAX_HORIZON_MS = 365 * 24 * 60 * 60 * 1000;
-export const SCHEDULE_MAX_PER_SCOPE = 1000;
-export const SCHEDULE_MAX_PER_OBJECT = 32;
-export const SCHEDULE_MAX_PER_TURN = 16;
-export const SCHEDULE_MAX_ENTRY_BYTES = 8 * 1024;
-export const SCHEDULE_MAX_SCOPE_BYTES = 2 * 1024 * 1024;
+/** CO16.6/CO16.7 — the scheduling envelope. Defined in core (both ends
+ * enforce it and the dependency runs core → net); re-exported here so
+ * net-layer consumers and tests keep one import site. */
+export {
+  SCHEDULE_MIN_LEAD_MS,
+  SCHEDULE_MAX_HORIZON_MS,
+  SCHEDULE_MAX_PER_SCOPE,
+  SCHEDULE_MAX_PER_OBJECT,
+  SCHEDULE_MAX_PER_TURN,
+  SCHEDULE_MAX_ENTRY_BYTES,
+  SCHEDULE_MAX_SCOPE_BYTES
+} from "../core/scheduling";
 
-/** Serialized size of a pending row, measured over what the scope stores.
- * Counts bound durable bytes; the byte caps are what actually bound storage,
- * since ids, verb names and args are author-supplied (CO16.7). */
+/** Serialized size of a pending row, measured over what the scope stores. */
 export function scheduledTurnBytes(turn: ScheduledTurn): number {
   return JSON.stringify(turn).length;
 }

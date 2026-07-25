@@ -53,6 +53,7 @@ export const BUILTIN_NAMES = [
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
+  "schedule", "schedule_at", "cancel_schedule",
   // builder_create_object and builder_chparent stay native: both bypass
   // the substrate's programmer-flag check in assertCanCreateObject so
   // builder-class actors (no programmer flag) can build. Moving them
@@ -856,6 +857,29 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return Math.round(numeric(builtinArgs[0], "round argument"));
       case "abs":
         return Math.abs(numeric(builtinArgs[0], "abs argument"));
+      case "schedule":
+      case "schedule_at": {
+        // schedule(target, verb, args, delay_ms|at_ms, opts?)
+        const [target, verbName, verbArgs, when, opts] = builtinArgs;
+        const at = name === "schedule"
+          ? frame.ctx.world.logicalNow("schedule.base") + numeric(when, "delay_ms")
+          : numeric(when, "at_ms");
+        const options = opts === undefined || opts === null ? {} : assertMap(opts);
+        const key = options.key === undefined || options.key === null ? undefined : assertString(options.key);
+        const idlePolicy = options.idle_policy === undefined || options.idle_policy === null
+          ? undefined
+          : (assertString(options.idle_policy) as "while_active" | "always");
+        return frame.ctx.world.recordScheduleRequest(
+          frame.ctx,
+          assertObj(target),
+          assertString(verbName),
+          Array.isArray(verbArgs) ? (verbArgs as WooValue[]) : [],
+          at,
+          { ...(key !== undefined ? { key } : {}), ...(idlePolicy !== undefined ? { idlePolicy } : {}) }
+        );
+      }
+      case "cancel_schedule":
+        return frame.ctx.world.recordScheduleCancellation(frame.ctx, assertString(builtinArgs[0]));
       case "now":
         return frame.ctx.world.logicalNow("now");
       case "create": {

@@ -41,6 +41,7 @@ import {
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
+import { SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
 import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
   createV2TurnEffects,
@@ -612,6 +613,9 @@ export class WooWorld {
   // See spec/protocol/v2-turn-network.md §VTN10.1.
   private shadowExecutionGuardActive = false;
   private currentTurnWriter: RecordedWriteAuthority | null = null;
+  /** Schedules armed by the turn in progress: the CO16.7 per-turn budget and
+   * the derivation of turn-unique schedule ids. */
+  private turnScheduleCount = 0;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
   // CA11.2 occupancy-transition: per-cell provenance for the ephemeral planning
   // world this WooWorld was built from. Only the sparse gateway planning path
@@ -1143,8 +1147,12 @@ export class WooWorld {
     const previous = this.activeTurnRecorder;
     const previousWriter = this.currentTurnWriter;
     const active = recorder.startTurn(turn);
+    const previousScheduleCount = this.turnScheduleCount;
     this.activeTurnRecorder = active;
     this.currentTurnWriter = null;
+    // Per-turn schedule budget and the turn-unique id counter both reset
+    // here, so a nested recorded turn cannot inherit either (CO16.7).
+    this.turnScheduleCount = 0;
     try {
       const result = await fn(active);
       active.event({ kind: "turn_finish", ok: true, result: result as WooValue });
@@ -1155,6 +1163,7 @@ export class WooWorld {
     } finally {
       this.activeTurnRecorder = previous;
       this.currentTurnWriter = previousWriter;
+      this.turnScheduleCount = previousScheduleCount;
     }
   }
 
@@ -1192,6 +1201,94 @@ export class WooWorld {
       // sessionWriter precedent for engine-folded writes).
       writer: { progr: actor, thisObj: spaceRef, verb: "call", definer: spaceRef, caller: "#-1", callerPerms: actor }
     });
+  }
+
+  /**
+   * CO16 / scheduling.md — arm a scheduled turn. The whole effect is one
+   * recorded transcript entry: nothing is written now, no task is created,
+   * and nothing has happened at all until the turn commits.
+   *
+   * The delivery time is derived from `logicalNow()`, the same recorded and
+   * replayed logical input `now()` returns, so the planner and the committing
+   * scope compute the same instant and a replay reproduces it.
+   */
+  recordScheduleRequest(
+    ctx: CallContext,
+    target: ObjRef,
+    verbName: string,
+    args: WooValue[],
+    atMs: number,
+    opts: { key?: string; idlePolicy?: "while_active" | "always" } = {}
+  ): string {
+    assertObj(target);
+    if (!Number.isFinite(atMs)) throw wooError("E_TYPE", "schedule time must be numeric", atMs);
+    const idlePolicy = opts.idlePolicy ?? "while_active";
+    if (idlePolicy !== "while_active" && idlePolicy !== "always") {
+      throw wooError("E_INVARG", `unknown idle_policy ${String(idlePolicy)}`, idlePolicy);
+    }
+    // CO16.6: `always` is the shape that runs unattended and bills a world
+    // forever. Refused here for a useful author-facing error; the scope
+    // re-checks against provenance because it does not trust the planner.
+    if (idlePolicy === "always" && !this.isWizard(ctx.progr)) {
+      throw wooError("E_PERM", "arming an idle_policy \"always\" schedule requires wizard authority", { progr: ctx.progr });
+    }
+    if (this.turnScheduleCount >= SCHEDULE_MAX_PER_TURN) {
+      throw wooError("E_QUOTA", `a turn may arm at most ${SCHEDULE_MAX_PER_TURN} schedules`, {
+        quota: "schedules_per_turn",
+        current: this.turnScheduleCount,
+        limit: SCHEDULE_MAX_PER_TURN
+      });
+    }
+
+    const now = this.logicalNow("schedule.now");
+    // The floor CLAMPS rather than failing (SC3): a v1 author's `fork(1, ...)`
+    // reflex becomes a minute, not an error. The horizon does fail — a time a
+    // year out is a mistake, not a rounding.
+    const at = Math.max(atMs, now + SCHEDULE_MIN_LEAD_MS);
+    if (at > now + SCHEDULE_MAX_HORIZON_MS) {
+      throw wooError("E_QUOTA", `schedule is beyond the ${SCHEDULE_MAX_HORIZON_MS}ms horizon`, {
+        quota: "schedule_horizon",
+        current: at - now,
+        limit: SCHEDULE_MAX_HORIZON_MS
+      });
+    }
+
+    // CO16.3: the namespace half is the arming object and is built HERE, never
+    // supplied by the author — that is the entire defence against one verb
+    // upserting over or cancelling another object's timer.
+    const key = opts.key ?? `t${hashSource(`${ctx.space}:${ctx.seq}:${this.turnScheduleCount}`).slice(0, 12)}`;
+    const id = `${ctx.thisObj}:${key}`;
+    this.turnScheduleCount += 1;
+
+    this.recordTurnEvent({
+      kind: "schedule",
+      request: {
+        id,
+        at,
+        idlePolicy,
+        call: {
+          actor: ctx.actor,
+          target,
+          verb: verbName,
+          args: cloneValue(args as WooValue) as WooValue[]
+        }
+      }
+    });
+    return id;
+  }
+
+  /** CO16.3 — record a cancellation. Returns nothing: the pending queue is
+   * scope state the planner does not hold, so any "did it exist" answer
+   * computed here could be falsified before the turn commits. */
+  recordScheduleCancellation(ctx: CallContext, scheduleId: string): null {
+    assertString(scheduleId);
+    const separator = scheduleId.lastIndexOf(":");
+    const namespace = separator < 0 ? "" : scheduleId.slice(0, separator);
+    if (namespace !== ctx.thisObj && !this.isWizard(ctx.progr)) {
+      throw wooError("E_PERM", `cannot cancel schedule ${scheduleId} outside ${ctx.thisObj}`, { id: scheduleId, this: ctx.thisObj });
+    }
+    this.recordTurnEvent({ kind: "cancel_schedule", id: scheduleId });
+    return null;
   }
 
   // Called by the VM whenever execution changes frames. The recorder annotates

@@ -141,6 +141,7 @@ const BUILTINS = new Set([
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
+  "schedule", "schedule_at", "cancel_schedule",
   "describe_object", "present_actors", "active_actors", "session_metadata", "room_roster", "ordered_children", "ordered_neighbors",
   "visible_contents", "obvious_verbs", "remote_describe",
   // builder_create_object and builder_chparent stay native. The other
@@ -1150,12 +1151,23 @@ class Codegen {
         expr.span
       );
     }
+    // `fork` is the LambdaMOO spelling, kept as sugar over schedule()
+    // (scheduling.md SC9). Three things are load-bearing and deliberate:
+    // it takes SECONDS where schedule takes milliseconds; the 60s lead time
+    // still clamps, so a v1 author's `fork(1, ...)` fires a minute later; and
+    // there is no block form, because a scheduled entry carries values in a
+    // durable row and cannot capture the forking frame's locals.
     if (name === "fork") {
-      throw new CompileError(
-        "E_COMPILE",
-        "fork() is not available yet: the parked-task model it compiled to is removed and the schedule() replacement is not built. See spec/semantics/scheduling.md",
-        expr.span
-      );
+      if (expr.args.length < 3) throw new CompileError("E_COMPILE", "fork expects delay_seconds, target, verb, and optional args", expr.span);
+      this.compileExpr(expr.args[1]);                       // target
+      this.compileExpr(expr.args[2]);                       // verb
+      for (const arg of expr.args.slice(3)) this.compileExpr(arg);
+      this.emit("MAKE_LIST", expr.args.length - 3);         // args list
+      this.compileExpr(expr.args[0]);                       // delay (seconds)
+      this.emit("PUSH_INT", 1000);
+      this.emit("MUL");                                     // → milliseconds
+      this.emit("BUILTIN", "schedule", 4);
+      return;
     }
     if (!BUILTINS.has(name)) throw new CompileError("E_COMPILE", `unknown builtin: ${name}`, expr.span);
     for (const arg of expr.args) this.compileExpr(arg);

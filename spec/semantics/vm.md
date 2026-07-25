@@ -1,6 +1,6 @@
 ---
 date: 2026-07-25
-status: partial — implemented except the SCHEDULE / CANCEL_SCHEDULE opcodes (§8.3.8), which are specified and not yet built
+status: partial — implemented; deferred execution is builtins (`schedule` / `schedule_at` / `cancel_schedule`), not opcodes — see §8.3.8
 ---
 
 # Bytecode and VM
@@ -201,14 +201,12 @@ Cold-path operations (`length`, `slice`, `delete`, `has`, `keys`, type coercions
 
 | Op | Operands | Stack effect | Yield | Description |
 |---|---|---|---|---|
-| `SCHEDULE`&nbsp;※ | argc | target verb args at_ms [opts] → schedule_id | N | Record a pending scheduled turn in the transcript. Does **not** yield: the current turn continues and the work happens in a later turn. |
-| `CANCEL_SCHEDULE`&nbsp;※ | — | schedule_id → null | N | Record a cancellation in the transcript. Returns nothing: see [scheduling.md §SC2](scheduling.md#sc2-signatures). |
 | `EMIT` | — | target event → | **Y** | Send event. Target may be obj, list of objs, or `$everyone_in(room)`. RPC to remote targets. |
 | `YIELD` | — | — | **Y** | Cooperative scheduler boundary. Inserted at backedges of long loops. |
 
-※ **Not yet implemented.** Both are specified and neither is built; no world runs them today. They replace the `FORK` / `SUSPEND` / `READ` opcodes, which were implemented but did nothing at runtime — nothing resumed a parked task — and which were deleted from both this specification and the runtime on 2026-07-25. The DSL keeps `fork` / `suspend` / `read` as reserved names that fail at compile time with a pointer to `schedule`, so the silent no-op cannot return.
+Deferred execution is **not** an opcode. `schedule`, `schedule_at` and `cancel_schedule` are ordinary `BUILTIN` calls, because they need no stack discipline the builtin path lacks and no yield. They replace the `FORK` / `SUSPEND` / `READ` opcodes, which were implemented but did nothing at runtime — nothing resumed a parked task — and which were deleted from both this specification and the runtime on 2026-07-25. `suspend` and `read` remain reserved DSL names that fail at compile time pointing at `schedule`, so the silent no-op cannot return; `fork` compiles to a `schedule` call (scheduling.md §SC9).
 
-`SCHEDULE` and `CANCEL_SCHEDULE` are *recording* opcodes: they append to the turn's `schedules` / `cancellations` transcript arrays and nothing else. No task is created now and nothing has happened until the turn commits. The *arming frame's* authority IS recorded — `armed_by`, the same `RecordedWriteAuthority` a write carries — because the scope must prove the namespace and the wizard check itself rather than trusting the planner; it is validated at commit and discarded, and never rides into the fired turn. The scheduled turn, when it fires, is a wholly separate task with a fresh budget, `caller = $system`, and programmer authority from the fired verb's own owner. Semantics: [scheduling.md](scheduling.md); mechanism: [coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
+The schedule builtins are *recording* operations: they append to the turn's `schedules` / `cancellations` transcript arrays and nothing else. No task is created now and nothing has happened until the turn commits. The *arming frame's* authority IS recorded — `armed_by`, the same `RecordedWriteAuthority` a write carries — because the scope must prove the namespace and the wizard check itself rather than trusting the planner; it is validated at commit and discarded, and never rides into the fired turn. The scheduled turn, when it fires, is a wholly separate task with a fresh budget, `caller = $system`, and programmer authority from the fired verb's own owner. Semantics: [scheduling.md](scheduling.md); mechanism: [coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
 
 #### 8.3.9 Exceptions
 

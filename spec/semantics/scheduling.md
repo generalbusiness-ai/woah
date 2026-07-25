@@ -1,6 +1,6 @@
 ---
-date: 2026-07-24
-status: draft — specified, not yet implemented
+date: 2026-07-25
+status: partial — SC2/SC3/SC4/SC9/SC10 implemented (builtins, clamping, namespaced ids, fork sugar, errors); SC5's fire-time context, SC7's idle-policy delivery filter, and SC11's catalog surface are specified and not yet built
 ---
 
 # Scheduling
@@ -255,7 +255,8 @@ Three things to know:
    durable row and captures nothing. Pass what the verb needs as `args`.
 
 `suspend()` and `read()` have no equivalent and are not part of the
-language. See [tasks.md §16](tasks.md).
+language: both fail at compile time with a pointer here. See
+[tasks.md §16](tasks.md).
 
 ## SC10. Errors
 

@@ -864,6 +864,9 @@ const VALID_OPS = new Set([
 ]);
 
 const VALID_BUILTINS = new Set([
+  "schedule",
+  "schedule_at",
+  "cancel_schedule",
   "event_schema",
   "length",
   "keys",
