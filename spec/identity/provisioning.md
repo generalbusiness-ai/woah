@@ -400,18 +400,22 @@ protocol is deferred; until it exists the co-resident case is the
 supported one. `create_agent` provisions the agent in the calling human's
 scope, so it is co-resident by construction.
 
-> **Net status (not yet supported).** On the Net (Cloudflare) profile there
-> is not yet a supported live promote/demote path, for two reasons. (1) These
-> verbs are native, and the Net MCP gateway advertises only bytecode-backed
-> `tool_exposed` pages, so they are not reachable through the MCP tool
-> surface. (2) An imported/provisioned agent self-clusters while its account
-> is not anchored into that same cluster, so the co-resident precondition
-> above is not actually constructed and the transition would refuse. Building
-> the Net path therefore requires both an account-surface (or bytecode)
-> provisioning entry point AND an authority anchor that co-locates an agent
-> with its account. Until then, provision agents programmer-ready at
-> `create_agent` time, and drive promote/demote on the in-memory / local
-> SQLite profiles or the account surface.
+> **Net status (supported via the turn doorway).** On the Net (Cloudflare)
+> profile a live promote/demote path IS supported over `/net-api/turn`. The
+> co-resident precondition is constructed: `create_agent` anchors a human-owned
+> agent to the human authority root, so the account, its human, and its owned
+> agents share one cluster, and the transition commits atomically there. The
+> programmer flag commits through the `object_lineage` lineage seam and the
+> verbs are tracked native primitives (a transcript-complete turn); the
+> committing scope's audit record IS the provisioning audit, so no `$system`
+> catalog cell is written. Legacy families provisioned before anchoring are
+> co-located by the local-boot repair migration
+> (`2026-07-25-authority-family-colocation`) on in-memory / local-SQLite
+> profiles; a Net world receives correct placement from install/cutover
+> (identity carries the anchor). These verbs remain NATIVE, so the Net MCP
+> gateway — which advertises only bytecode-backed `tool_exposed` pages — does
+> not surface them as MCP tools; drive them through `/net-api/turn` (or the
+> account surface), not `tools/call`.
 
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,
