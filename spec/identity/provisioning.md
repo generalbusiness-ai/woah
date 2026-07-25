@@ -408,14 +408,33 @@ scope, so it is co-resident by construction.
 > programmer flag commits through the `object_lineage` lineage seam and the
 > verbs are tracked native primitives (a transcript-complete turn); the
 > committing scope's audit record IS the provisioning audit, so no `$system`
-> catalog cell is written. Legacy families provisioned before anchoring are
-> co-located by the local-boot repair migration
-> (`2026-07-25-authority-family-colocation`) on in-memory / local-SQLite
-> profiles; a Net world receives correct placement from install/cutover
-> (identity carries the anchor). These verbs remain NATIVE, so the Net MCP
+> catalog cell is written. These verbs remain NATIVE, so the Net MCP
 > gateway — which advertises only bytecode-backed `tool_exposed` pages — does
 > not surface them as MCP tools; drive them through `/net-api/turn` (or the
 > account surface), not `tools/call`.
+>
+> **Supported scope (explicit).** Net promote/demote is supported for authority
+> families placed under the anchoring regime: fresh installs, cutover imports
+> (the identity export carries each object's `anchor`, §8), and any agent minted
+> by `create_agent` from this version forward. For those the family is
+> co-resident in one cluster by construction and the transition is atomic.
+>
+> **Not auto-repaired on Net (deliberate limitation).** A family already deployed
+> and partitioned BEFORE anchoring — an account left catalog-scoped and an agent
+> self-clustered — is NOT silently migrated on the live Net profile. Re-anchoring
+> already-partitioned cells is a recursive cross-Durable-Object host migration (a
+> spec-version scope migration,
+> [migrations.md M6](../operations/migrations.md#m6-world-level-spec-versioning)),
+> which is deferred. Until then such a family's promote/demote **refuses cleanly
+> and never half-applies**: the transition cannot commit because the account's
+> cells are catalog-scoped and the agent's are in a different cluster, so the
+> committing scope rejects it (a catalog-mutation / cross-scope rejection over
+> Net; `E_CROSS_HOST_WRITE` at the co-residency pre-check on a single-host
+> profile). The operator's remedy is to re-provision the agent (mint a fresh
+> anchored agent with `create_agent`) or re-import through cutover. The local-boot
+> repair migration
+> (`2026-07-25-authority-family-colocation`) co-locates legacy families
+> automatically ONLY on the in-memory / local-SQLite (single-host) profiles.
 
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,
