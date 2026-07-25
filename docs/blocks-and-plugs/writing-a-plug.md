@@ -41,6 +41,15 @@ credential plus the returned session for exact cell reads and
 `/net-api/turn` calls. Operational verbs do not need to be exposed as
 MCP tools.
 
+Scheduled and disconnected plugs should mint with
+`{"roster_visible":false}`. This keeps the session's authorization presence
+and room fanout intact without presenting the appliance as a social room
+occupant. A per-tick session should always close with
+`DELETE /net-api/session` in a `finally` path. A deliberately cached session
+may instead live until its bounded expiry, but must be invalidated when Net
+returns `E_NOSESSION`. Hidden-roster mode does not replace either cleanup
+policy.
+
 ## What apikey to use
 
 Each plug uses an **apikey** that authenticates as the block's actor,
@@ -179,7 +188,11 @@ backoff, observability):
 
 ```python
 token = "apikey:<id>:<secret>"
-session = post("https://deployment/net-api/session", {}, bearer=token)["session"]
+session = post(
+    "https://deployment/net-api/session",
+    {"roster_visible": False},
+    bearer=token,
+)["session"]
 
 while True:
     data = fetch_external()

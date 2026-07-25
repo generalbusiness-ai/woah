@@ -21,7 +21,14 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): { fetchImpl: typeof 
     const call: Call = { url, method, body };
     calls.push(call);
     const handler = handlers[i++];
-    const reply: Reply = handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
+    // Every authenticated tick closes in finally. Keep the individual
+    // scenario fixtures focused on their domain calls while still recording
+    // and asserting the cleanup request.
+    const reply: Reply = handler
+      ? handler(call)
+      : method === "DELETE" && url.endsWith("/net-api/session")
+        ? { status: 200, body: { closed: true } }
+        : { status: 404, body: { error: { code: "E_NOMATCH" } } };
     const headers = new Headers(reply.headers ?? {});
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(reply.body), { status: reply.status, headers });
@@ -121,6 +128,7 @@ describe("runWeatherTick", () => {
     expect(result).toMatchObject({ block: "the_weather_block", place: "Mountain View, CA" });
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
+    expect(calls[0].body).toEqual({ roster_visible: false });
     expect(calls[1].url).toContain("/net-api/cell?");
     expect(calls[1].url).toContain("property_cell%3Athe_weather_block%3Aplace");
     expect(calls[2].url).toContain("property_cell%3Athe_weather_block%3Aunits");
@@ -196,6 +204,11 @@ describe("runWeatherTick", () => {
     // fixture's hourly values landed somewhere in the array.
     expect(ts.fields.temperature.values).toContain(73);
     expect(ts.fields.temperature.values).toContain(70);
+    expect(calls.at(-1)).toMatchObject({
+      url: "https://woo.example/net-api/session",
+      method: "DELETE",
+      body: { session: "sess_w" }
+    });
   });
 
   it("honors block-set units=metric (default) and emits °C", async () => {
@@ -248,7 +261,7 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toMatchObject({ code: "E_BAD_TIMEZONE" });
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(6);
     expect(calls[4].url).toBe("https://woo.example/net-api/turn");
     expect(calls[4].body).toMatchObject({ target: "the_weather_block", verb: "set_properties" });
     const props = (calls[4].body as { args: [Record<string, any>] }).args[0];
@@ -258,6 +271,11 @@ describe("runWeatherTick", () => {
       code: "E_BAD_TIMEZONE",
       place: "Mountain View, CA",
       timezone: "not/a-zone"
+    });
+    expect(calls.at(-1)).toMatchObject({
+      url: "https://woo.example/net-api/session",
+      method: "DELETE",
+      body: { session: "sess_w" }
     });
   });
 

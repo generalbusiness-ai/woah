@@ -499,8 +499,8 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
   const transitionLineage = transition && transition.session === session
     ? snapshot.get(cellKey("object_lineage", transition.actor))?.value as { name?: unknown } | undefined
     : undefined;
+  const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
   if (transition && transition.session === session) {
-    const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
     const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
     writes.push({
       cell: { kind: "session", object: session },
@@ -513,8 +513,14 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
     ...recorded,
     reads,
     writes,
-    ...(transition && transition.session === session && typeof transitionLineage?.name === "string"
-      ? { sessionScopeTransition: { ...transition, actorName: transitionLineage.name } }
+    ...(transition && transition.session === session
+      ? {
+          sessionScopeTransition: {
+            ...transition,
+            ...(typeof transitionLineage?.name === "string" ? { actorName: transitionLineage.name } : {}),
+            ...(priorRow.rosterVisible === false ? { rosterVisible: false as const } : {})
+          }
+        }
       : {})
   };
 }

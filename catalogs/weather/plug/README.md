@@ -11,7 +11,9 @@ This is the outside-world half of the weather block. The catalog half (the
 
 Cron-triggered hourly. Each tick:
 
-1. POSTs to `/net-api/session` with the actor-bound apikey for the weather block.
+1. POSTs to `/net-api/session` with the actor-bound apikey for the weather
+   block and `roster_visible:false`, retaining Net authorization/fanout
+   presence without appearing in the room roster.
 2. Reads the block's exact owner-set config cells (`place`, `timezone`, `units`).
 3. Fetches three tomorrow.io endpoints in parallel: `weather/realtime`,
    `weather/forecast` (1h+1d timesteps), and `weather/history/recent`
@@ -24,7 +26,7 @@ Cron-triggered hourly. Each tick:
    `timeseries` (column-major ±7d hourly chart payload), `last_pushed_at`,
    `last_error`, and `config_state` — all in a single bundle so a reader
    never sees a torn snapshot.
-5. Disconnects.
+5. Closes the Net session in a `finally` path, including failed ticks.
 
 If the block has no `place` configured, has an invalid timezone, or
 tomorrow.io rejects the place, the plug writes `config_state.status = "error"`

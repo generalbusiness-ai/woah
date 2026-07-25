@@ -428,7 +428,11 @@ catalog-visible compatibility surface for a projection. Presence projections use
 `{"key": "actor"}` declares a list of actor/object ids. `{"key": "session"}`
 declares row objects, with field names supplied by the catalog or defaulting to
 `session` and `actor`. Runtime core consults this metadata, not property names,
-when treating a property as a movement-coupled projection.
+when treating a property as a movement-coupled projection. These are social
+presence projections, not delivery indexes: a session minted with
+`roster_visible:false` contributes no add or remove row. The accepted
+`sessionScopeTransition` carries that immutable session policy so cold rebuild,
+warm catch-up, and cross-scope materialization agree.
 
 Class and feature objects may declare lifecycle `flags` for ordinary
 authoring/template behavior. `fertile: true` means instances may be created

@@ -247,6 +247,24 @@ async function buildDoorHarness(options: {
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
+  it("refuses hidden or malformed social-roster policy at the human door", async () => {
+    const h = await buildDoorHarness();
+    const visible = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(visible.status, JSON.stringify(visible.body)).toBe(200);
+    expect(visible.body).toMatchObject({ roster_visible: true });
+
+    const hidden = await h.api("POST", "/net-api/guest", { body: { roster_visible: false } });
+    expect(hidden.status).toBe(403);
+    expect(hidden.body).toMatchObject({
+      error: { code: "E_PERM", detail: { reason: "roster_visibility_requires_apikey" } }
+    });
+
+    const malformed = await h.api("POST", "/net-api/guest", { body: { roster_visible: "false" } });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body).toMatchObject({ error: { code: "E_INVARG" } });
+    await h.close();
+  });
+
   it("dispatches the template-declared reset verb rather than a worker command literal", async () => {
     const h = await buildDoorHarness({ renamedGuestResetVerb: "restore_pool_identity" });
     const claimed = await h.api("POST", "/net-api/guest", { body: {} });

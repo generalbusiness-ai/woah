@@ -1,9 +1,9 @@
 ---
 name: weather
-version: 1.1.0
+version: 1.2.0
 spec_version: v1
 license: MIT
-description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week. v1.1 adds an `:ask` chat verb backed by `current.local_date` and `daily[*].weekday`.
+description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week. v1.2 adds durable plug health to `:look`.
 keywords:
   - block
   - weather
@@ -73,9 +73,17 @@ so a reader never sees a torn snapshot:
 `The weather panel shows that the temperature in Mountain View CA was 72°F
 at May 6, 2026, 9:01 AM PDT.` The plug formats this from the observation
 timestamp and the block's `timezone`; `:look_self()` does not show the raw
-`last_pushed_at` epoch. The look return also exposes `daily` for verbs
-that need a per-day summary; `timeseries` is intentionally projected
-separately and is not in the look return.
+`last_pushed_at` epoch. It includes a durable `plug_status` map derived from
+`last_pushed_at`, `last_error`, and `config_state`: `healthy`, `stale`
+(older than two hours), `pending`, `error`, or `never`; `current.observed_at`
+is the fallback success timestamp for imported/seeded readings that lack
+`last_pushed_at`. A reading with no timestamp remains `never` in the structured
+status but does not print “no successful update yet” beside the reading. The
+two-hour threshold is paired with the plug's hourly cron and must change with
+that schedule. This status never depends on whether the plug happens to hold an
+ephemeral Net session. The look return also exposes `daily` for verbs that need
+a per-day summary; `timeseries` is intentionally projected separately and is
+not in the look return.
 
 ## Chat: `ask weather <when>`
 

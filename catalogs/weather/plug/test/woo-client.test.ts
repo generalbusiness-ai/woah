@@ -61,8 +61,29 @@ describe("WooClient", () => {
       url: "https://woo.example.com/net-api/session",
       method: "POST",
       headers: { Authorization: "Bearer apikey:abc:def", "Content-Type": "application/json" },
-      body: {}
+      body: { roster_visible: false }
     });
+  });
+
+  it("closes the current session and clears local credentials", async () => {
+    const { fetchImpl, calls } = makeFetch([
+      { status: 200, body: { actor: "x", session: "sess_close", expires_at: 123 } },
+      { status: 200, body: { closed: true } }
+    ]);
+    const client = new WooClient({ baseUrl: "https://w", fetchImpl });
+    await client.authenticate("apikey:a:b");
+
+    await client.close();
+
+    expect(calls[1]).toMatchObject({
+      url: "https://w/net-api/session",
+      method: "DELETE",
+      headers: { Authorization: "Bearer apikey:a:b", "Content-Type": "application/json" },
+      body: { session: "sess_close" }
+    });
+    expect(client.currentSession).toBeNull();
+    await client.close();
+    expect(calls).toHaveLength(2);
   });
 
   it("getProperty issues a GET to the property route with the session header", async () => {

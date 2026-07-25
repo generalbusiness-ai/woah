@@ -323,6 +323,56 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     }
   });
 
+  it("keeps API-key service sessions authoritative but out of the public room roster", async () => {
+    const h = await buildHarness();
+    try {
+      const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+      const invalid = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token,
+        body: { roster_visible: "no" }
+      });
+      expect(invalid.status).toBe(400);
+      expect(invalid.body).toMatchObject({ error: { code: "E_INVARG" } });
+
+      const opened = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token,
+        body: { ttl_ms: 60_000, roster_visible: false }
+      });
+      expect(opened.status, JSON.stringify(opened.body)).toBe(200);
+      expect(opened.body).toMatchObject({
+        actor: h.actor,
+        active_scope: "capi_room",
+        roster_visible: false
+      });
+
+      // The session remains a valid room-scoped authority anchor, while its
+      // client-safe actor projection is empty because the sole live session
+      // is hidden. The lower-level transcript test pins the raw presence row.
+      const roster = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/relation?session=${encodeURIComponent(String(opened.body.session))}&relation=session_presence&owner=capi_room`,
+        { token }
+      );
+      expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+      expect(roster.body).toEqual({
+        relation: "session_presence",
+        owner: "capi_room",
+        members: []
+      });
+
+      const own = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/cell?session=${encodeURIComponent(String(opened.body.session))}&key=${encodeURIComponent(`object_live:${h.actor}`)}`,
+        { token }
+      );
+      expect(own.status, JSON.stringify(own.body)).toBe(200);
+    } finally {
+      h.close();
+    }
+  });
+
   it("bounds verifier RPCs with an expiring cache and names authority outages on REST and MCP", async () => {
     const h = await buildHarness({ credentialTtlMs: "60000" });
     try {
