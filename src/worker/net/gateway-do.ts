@@ -3848,13 +3848,15 @@ export class NetGatewayDO {
     if (rosterRefusal) return rosterRefusal;
     const requestedRosterVisibility = body.roster_visible;
     const rosterVisible = requestedRosterVisibility !== false;
-    // The mint needs the actor's lineage (cluster-scope derivation) in
-    // view; the CO15 `cluster:<actor>` convention names the pull
-    // destination without needing lineage first (the planScheduled
-    // idiom). Best-effort: sessionOpen's own E_MISSING_STATE names the
-    // failure when the pull could not land.
+    // The mint needs the actor's lineage (cluster-scope derivation) in view. A
+    // self-routing apikey names the actor's home cluster directly — an anchored
+    // agent's cells live in its authority root's cluster, NOT `cluster:<agent>`,
+    // so the CO15 `cluster:<actor>` convention would warm an empty scope and
+    // sessionOpen would fail E_MISSING_STATE. Fall back to that convention for
+    // legacy/unrouted keys (an unanchored actor IS its own cluster root).
+    const homeScope = (options.apiKeyId && routedApiKeyScope(options.apiKeyId)) || `cluster:${actor}`;
     await this.warmScopes(
-      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      [CATALOG_SCOPE, { scope: homeScope, objects: [actor] }],
       "net_client_pull_miss_failed"
     );
     // Identity eligibility at EVERY mint (the one gate every credential
