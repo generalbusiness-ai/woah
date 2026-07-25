@@ -380,6 +380,16 @@ unpublished (prog not installed), provisioning sets the flag and quota
 only and the actor simply has no authoring surface. `revoke_agent` also
 removes the surface when it clears the flag.
 
+**Audit is profile-materialized, not a separate observation.** The transition
+emits one structured provisioning audit event (caller, target agent, account,
+desired state, transition-vs-repair) through a profile adapter. The in-memory
+and local-SQLite profiles materialize it into `$system.wizard_actions`. The Net
+profile materializes NOTHING extra: the canonical Net audit is the durable
+commit record minted from the committed transcript (its verb, arguments,
+principal, and trace), so writing `$system.wizard_actions` — a catalog cell — is
+deliberately suppressed rather than committed as a forbidden catalog mutation.
+There is no separate provisioning observation on the wire.
+
 The transition is atomic — all three commit in one authoritative turn or
 none do. Because the flag/surface live on the agent and the counter lives
 on the `$account`, `promote`/`demote`/`revoke` first assert the agent and
