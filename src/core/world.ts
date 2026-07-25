@@ -1245,6 +1245,63 @@ export class WooWorld {
     return obj ? this.effects.shadowStructuralCellVersion(kind, obj) : undefined;
   }
 
+  /** The semantic state of an object's lineage cell (object_lineage): the
+   *  fields a runtime mutation can change. Net-only metadata (event schemas,
+   *  epoch_immutable_definition) is carried on the cell but not here — the
+   *  commit apply preserves it from the prior cell. Shape mirrors the lineage
+   *  payload bridge.cellsFromSerialized emits so post-state parity holds. */
+  private lineageSemantic(obj: WooObject): Record<string, WooValue> {
+    return {
+      parent: obj.parent,
+      owner: obj.owner,
+      name: obj.name,
+      anchor: obj.anchor,
+      flags: { ...obj.flags } as unknown as WooValue
+    };
+  }
+
+  /**
+   * The single controlled lineage-mutation seam. `flags`, `parent`, `owner`,
+   * `name`, and `anchor` all live in the one object_lineage cell, and — unlike
+   * a create — an existing-object change to any of them was NEVER recorded in
+   * the net transcript, so Net promote/demote, chparent, and @rename silently
+   * dropped their lineage writes. Every RUNTIME lineage mutation on an existing
+   * object routes through here:
+   *
+   *  1. record a READ of the prior object_lineage version — the CAS basis
+   *     (scope.ts step 7): a concurrent lineage change bumps the version, so a
+   *     stale plan's read mismatches and replans rather than losing the update;
+   *  2. run the caller's in-world mutation;
+   *  3. record ONE deterministic lineage replacement carrying the resulting
+   *     semantic state. The commit apply writes it to the existing
+   *     object_lineage cell and preserves untouched net-only metadata (event
+   *     schemas, epoch_immutable_definition) from the prior cell.
+   *
+   * Bootstrap/catalog/migration lineage rewrites do NOT route here — they are
+   * pre-net authoritative construction, recorded (if at all) by the install
+   * pipeline, not by a runtime turn transcript.
+   */
+  private mutateLineage(objRef: ObjRef, mutate: () => void): void {
+    const obj = this.object(objRef);
+    const priorVersion = this.effects.shadowStructuralCellVersion("lifecycle", obj);
+    this.recordTurnEvent({
+      kind: "cell_read",
+      cell: { kind: "lifecycle", object: objRef },
+      version: priorVersion,
+      value: this.lineageSemantic(obj)
+    });
+    mutate();
+    const nextVersion = this.effects.shadowStructuralCellVersion("lifecycle", obj);
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "lifecycle", object: objRef },
+      value: this.lineageSemantic(obj),
+      op: "set",
+      prior: priorVersion,
+      next: nextVersion
+    });
+  }
+
   private recordUntrackedEffect(name: string, detail?: Record<string, WooValue>): void {
     this.recordTurnEvent({
       kind: "untracked_effect",
@@ -3796,7 +3853,8 @@ export class WooWorld {
         // The transition writes the account counter; refuse across a host
         // boundary before mutating anything.
         await this.assertProgrammerProvisioningColocated(actor, account);
-        this.object(actor).flags.programmer = programmer;
+        // Flag write through the lineage seam so it commits over Net.
+        this.mutateLineage(actor, () => { this.object(actor).flags.programmer = programmer; });
         this.markObjectDirty(actor);
         const delta = programmer ? 1 : -1;
         const next = Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + delta);
@@ -9824,9 +9882,13 @@ export class WooWorld {
     // can never leave an author-capable actor without a resolvable surface, nor
     // a surface stranded on a non-authoring actor. No quota accounting:
     // set_object_flags is the deliberate quota-bypassing wizard primitive.
-    for (const [key, change] of Object.entries(changes)) {
-      (obj.flags as Record<string, boolean>)[key] = change.to;
-    }
+    // The flag write goes through the lineage seam so it is recorded in the net
+    // transcript (flags live in the object_lineage cell).
+    this.mutateLineage(target, () => {
+      for (const [key, change] of Object.entries(changes)) {
+        (obj.flags as Record<string, boolean>)[key] = change.to;
+      }
+    });
     if (changes.programmer || changes.wizard) {
       this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
     }

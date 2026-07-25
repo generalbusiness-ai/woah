@@ -1345,8 +1345,14 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "create_agent", "human_create_agent", "verb :create_agent(name, purpose?, programmer?) rxd { /* native: self-service agent provisioning. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["name", "purpose?", "programmer?"] } });
   native(world, "$human", "list_agents", "human_list_agents", "verb :list_agents() rxd { /* native: list agents owned by this human. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: [] } });
   native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"] } });
-  native(world, "$human", "promote_agent_to_programmer", "human_promote_agent_to_programmer", "verb :promote_agent_to_programmer(actor_id) rxd { /* native: consume programmer-agent quota and set programmer flag. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"] } });
-  native(world, "$human", "demote_agent_from_programmer", "human_demote_agent_from_programmer", "verb :demote_agent_from_programmer(actor_id) rxd { /* native: clear programmer flag on an owned agent. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"] } });
+  // The prefetch warms the two authority objects this turn reads beyond the
+  // target (the human): the account behind `target.account` (its
+  // programmer_grant_quota / programmer_agent_count) and the owned agent named
+  // by the first argument (its flags/features). Both are co-resident in the
+  // human's authority cluster; without the prefetch a Net plan reads their
+  // unwarmed instances as class defaults (quota 0) and mis-decides the turn.
+  native(world, "$human", "promote_agent_to_programmer", "human_promote_agent_to_programmer", "verb :promote_agent_to_programmer(actor_id) rxd { /* native: consume programmer-agent quota and set programmer flag. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
+  native(world, "$human", "demote_agent_from_programmer", "human_demote_agent_from_programmer", "verb :demote_agent_from_programmer(actor_id) rxd { /* native: clear programmer flag on an owned agent. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");

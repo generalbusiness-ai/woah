@@ -5695,6 +5695,18 @@ export class NetGatewayDO {
       }
       return [];
     }
+    // `{arg: N}`: the object-valued positional argument itself is the
+    // prefetch target. A verb that operates on an object passed by the
+    // caller (promote/demote an agent, gift an item) names the arg here so
+    // its authority cells — flags, features, owned-object lineage — are warm
+    // before planning, rather than defaulting silently (a property read of an
+    // unwarmed instance returns the class default, never an E_MISSING_STATE
+    // the repair loop could act on). This is the arg-value analogue of the
+    // `target`/`actor`/`scope` roots.
+    if (typeof map.arg === "number" && Number.isInteger(map.arg) && map.arg >= 0) {
+      const ref = call.args[map.arg];
+      return typeof ref === "string" && ref.trim().length > 0 ? [ref.trim()] : [];
+    }
     if (!Array.isArray(map.path) || map.path.length === 0 || typeof map.path[0] !== "string") return [];
     let cursor: unknown = this.netAuthorityPrefetchRoot(map.path[0], call);
     for (const rawPart of map.path.slice(1)) {

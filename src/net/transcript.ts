@@ -262,6 +262,27 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         }
         const existing = post.get(key);
         const prior = (existing?.value ?? {}) as Record<string, unknown>;
+        if (write.op === "set") {
+          // A runtime lineage replacement (mutateLineage in world.ts): a flag,
+          // parent, owner, name, or anchor change on an EXISTING object. Take
+          // the semantic fields from the write value and PRESERVE untouched
+          // net-only metadata (event schemas, epoch-immutable-definition
+          // marker) from the prior cell, so the applied cell content-addresses
+          // exactly the way bridge.cellsFromSerialized would serialize the
+          // mutated object (post-state parity).
+          const semantic = (write.value ?? {}) as Record<string, unknown>;
+          const nextValue: Record<string, unknown> = {
+            parent: semantic.parent ?? null,
+            owner: semantic.owner ?? null,
+            name: semantic.name,
+            anchor: semantic.anchor ?? null,
+            flags: semantic.flags ?? {}
+          };
+          if (prior.eventSchemas !== undefined) nextValue.eventSchemas = prior.eventSchemas;
+          if (prior.epoch_immutable_definition !== undefined) nextValue.epoch_immutable_definition = prior.epoch_immutable_definition;
+          post.commit({ kind: "object_lineage", object: write.cell.object, value: nextValue, stamp });
+          break;
+        }
         post.commit({ kind: "object_lineage", object: write.cell.object, value: { ...prior, lifecycle: write.op }, stamp });
         break;
       }
