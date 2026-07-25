@@ -157,7 +157,26 @@ export type RejectReason =
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
   | "catalog_mutation"    // step 5 — epoch-immutable definition write without an epoch transition
   | "write_unauthorized"  // step 9
+  | "schedule_unauthorized" // CO16.2 — schedule/cancel effect failed provenance, namespace, authority, or quota; terminal
   | "post_state_mismatch"; // step 10
+
+/** CO16.6/CO16.7 — the scheduling envelope, enforced at commit. The VM
+ * clamps a short delay before recording; the scope re-checks because it does
+ * not trust the planner with its own rules. */
+export const SCHEDULE_MIN_LEAD_MS = 60_000;
+export const SCHEDULE_MAX_HORIZON_MS = 365 * 24 * 60 * 60 * 1000;
+export const SCHEDULE_MAX_PER_SCOPE = 1000;
+export const SCHEDULE_MAX_PER_OBJECT = 32;
+export const SCHEDULE_MAX_PER_TURN = 16;
+export const SCHEDULE_MAX_ENTRY_BYTES = 8 * 1024;
+export const SCHEDULE_MAX_SCOPE_BYTES = 2 * 1024 * 1024;
+
+/** Serialized size of a pending row, measured over what the scope stores.
+ * Counts bound durable bytes; the byte caps are what actually bound storage,
+ * since ids, verb names and args are author-supplied (CO16.7). */
+export function scheduledTurnBytes(turn: ScheduledTurn): number {
+  return JSON.stringify(turn).length;
+}
 
 const RETRYABLE_VERDICTS: ReadonlySet<RejectReason> = new Set([
   "stale_epoch",
@@ -210,6 +229,12 @@ export type ScheduledTurn = {
   id: string;
   at_logical_time: number;
   call: { actor: string; target: string; verb: string; args: unknown[] };
+  /** CO16.6. `while_active` entries do not fire while the scope has no live
+   * session subscribers; `always` entries fire unattended and cost a world
+   * money in scopes nobody visits, which is why arming one needs wizard
+   * authority. Absent on rows written before the policy existed — those
+   * read as `always`, the pre-existing behaviour. */
+  idle_policy?: "while_active" | "always";
   /** AU3.2: attribution captured at SCHEDULE time, so the session-less
    * scheduled turn stays attributable when it eventually runs. This is
    * attribution only — CO16's deferred engine-side authority field is a
@@ -1062,6 +1087,15 @@ export class ScopeSequencer {
       }
     }
 
+    // CO16.2: schedule/cancellation effects are validated by the SCOPE, on
+    // provenance the transcript carries, before anything is applied. Terminal:
+    // a namespace claim, an authority claim, or a quota breach does not become
+    // valid on retry.
+    const scheduleError = this.scheduleEffectsError(submit.transcript);
+    if (scheduleError !== null) {
+      return this.reject(submit, "schedule_unauthorized", { schedule: scheduleError });
+    }
+
     // The head this acceptance WILL have is computable before the apply
     // (rolling digest over prior hash + next seq + transcript hash), so
     // applied cells are stamped with the actual `(scope_head,
@@ -1118,6 +1152,21 @@ export class ScopeSequencer {
       else this.store.delete(key);
     }
     this.headState = nextHead;
+    // CO16.2: apply the queue effects ATOMICALLY with the turn's writes.
+    // Cancellations run before schedules so a turn that cancels one id and
+    // arms another in the same breath cannot have the cancel clobber a fresh
+    // entry; an id in both arrays was already rejected above.
+    for (const entry of submit.transcript.cancellations ?? []) this.cancel(entry.id);
+    for (const request of submit.transcript.schedules ?? []) {
+      const row = this.scheduledTurnFromRequest(request);
+      const durable = this.options.durable;
+      // Upsert straight into the queue rather than going through schedule():
+      // that helper re-checks "future time" against a live clock, which would
+      // reject a validly-armed row if the commit lands slowly. The lead-time
+      // rule was already enforced against the turn's recorded clock.
+      if (durable) durable.writeScheduled(row);
+      else this.scheduled.set(row.id, row);
+    }
     // Advance the allocation counter past every accepted create (phase i;
     // no-op when the counter has not been derived yet — derivation reads
     // the store, which now holds these ids).
@@ -1888,6 +1937,203 @@ export class ScopeSequencer {
   /** The scope's bounded recovery log (CO5: read by the scope alone). */
   recoveryTail(): ReadonlyArray<TailEntry> {
     return this.tail;
+  }
+
+
+  /**
+   * CO16.2 validation for `schedules` / `cancellations`. Runs before the
+   * apply, so a violation rejects the whole turn: a partially-applied
+   * schedule set is exactly the split state CO2.2 forbids.
+   *
+   * The scope checks these ITSELF rather than trusting the submitter. Every
+   * rule below is one a compromised or buggy planner could otherwise defeat:
+   * claim another object's namespace, arm `always` without wizard authority,
+   * back-date a delay under the floor, or grow the queue without bound.
+   */
+  private scheduleEffectsError(transcript: EffectTranscript): string | null {
+    const schedules = transcript.schedules ?? [];
+    const cancellations = transcript.cancellations ?? [];
+    if (schedules.length === 0 && cancellations.length === 0) return null;
+
+    if (schedules.length > SCHEDULE_MAX_PER_TURN) {
+      return `turn armed ${schedules.length} schedules; per-turn cap is ${SCHEDULE_MAX_PER_TURN}`;
+    }
+
+    // An id in both arrays is rejected outright (CO16.2): "cancel then re-arm
+    // the same key in one turn" is ambiguous about which wins, and the upsert
+    // form already expresses re-arming.
+    const cancelledIds = new Set(cancellations.map((entry) => entry.id));
+    for (const request of schedules) {
+      if (cancelledIds.has(request.id)) return `schedule id ${request.id} appears in both schedules and cancellations`;
+    }
+
+    // The reference clock is the turn's own recorded `now` logical input, not
+    // a fresh read: it is what the planner computed against and what replay
+    // reproduces. A turn that armed a schedule without ever reading the clock
+    // cannot have its lead time validated, so it fails closed.
+    let recordedNow: number | null = null;
+    for (const input of transcript.logicalInputs ?? []) {
+      if (input.name === "now" && typeof input.value === "number") {
+        recordedNow = input.value;
+        break;
+      }
+    }
+
+    for (const request of schedules) {
+      const armedBy = request.armed_by;
+      if (!armedBy) return `schedule ${request.id} carries no arming-frame provenance`;
+
+      // CO16.3: the id namespace IS the arming object. This single check is
+      // the whole enforcement — without it any verb could upsert over another
+      // object's timer, a same-scope denial of service with no audit signal.
+      const separator = request.id.lastIndexOf(":");
+      const namespace = separator < 0 ? "" : request.id.slice(0, separator);
+      if (namespace !== armedBy.thisObj) {
+        return `schedule ${request.id} is outside the arming object's namespace (${armedBy.thisObj})`;
+      }
+
+      const policy = request.idlePolicy;
+      if (policy !== "while_active" && policy !== "always") {
+        return `schedule ${request.id} has unknown idle_policy ${String(policy)}`;
+      }
+      // CO16.6: `always` is the shape that bills a world forever in a scope
+      // nobody visits. The gate is on the ARMING FRAME's programmer authority,
+      // so ordinary one-shots reach it through wizard-owned catalog verbs.
+      if (policy === "always" && !this.isWizardRef(armedBy.progr)) {
+        return `schedule ${request.id} requests idle_policy "always" without wizard authority (${armedBy.progr})`;
+      }
+
+      if (typeof request.at !== "number" || !Number.isFinite(request.at)) {
+        return `schedule ${request.id} has a non-finite delivery time`;
+      }
+      if (recordedNow === null) {
+        return `schedule ${request.id} cannot be validated: the arming turn recorded no clock reading`;
+      }
+      if (request.at < recordedNow + SCHEDULE_MIN_LEAD_MS) {
+        return `schedule ${request.id} fires in ${request.at - recordedNow}ms; the minimum lead time is ${SCHEDULE_MIN_LEAD_MS}ms`;
+      }
+      if (request.at > recordedNow + SCHEDULE_MAX_HORIZON_MS) {
+        return `schedule ${request.id} is beyond the ${SCHEDULE_MAX_HORIZON_MS}ms horizon`;
+      }
+
+      // Same-scope only (CO16.1/CO16.10): waking another scope is an ordinary
+      // committed turn submitted by the fired verb, never a queue entry here.
+      if (this.options.scopeOf) {
+        const targetScope = this.options.scopeOf(request.call.target);
+        if (targetScope !== null && targetScope !== this.scope) {
+          return `schedule ${request.id} targets ${request.call.target} in scope ${targetScope}, not ${this.scope}`;
+        }
+      }
+
+      const bytes = scheduledTurnBytes(this.scheduledTurnFromRequest(request));
+      if (bytes > SCHEDULE_MAX_ENTRY_BYTES) {
+        return `schedule ${request.id} serializes to ${bytes} bytes; the per-entry cap is ${SCHEDULE_MAX_ENTRY_BYTES}`;
+      }
+    }
+
+    for (const entry of cancellations) {
+      const armedBy = entry.armed_by;
+      if (!armedBy) return `cancellation ${entry.id} carries no arming-frame provenance`;
+      const separator = entry.id.lastIndexOf(":");
+      const namespace = separator < 0 ? "" : entry.id.slice(0, separator);
+      if (namespace !== armedBy.thisObj && !this.isWizardRef(armedBy.progr)) {
+        return `cancellation ${entry.id} is outside the calling object's namespace (${armedBy.thisObj})`;
+      }
+    }
+
+    // Queue-level caps are checked against the POST-apply queue, so a turn
+    // that replaces existing entries (the upsert form) is not charged twice.
+    if (schedules.length > 0) {
+      const pending = this.pendingScheduleSummary();
+      const perObject = new Map(pending.perObject);
+      let count = pending.count;
+      let bytes = pending.bytes;
+      for (const request of schedules) {
+        const row = this.scheduledTurnFromRequest(request);
+        const existing = pending.byId.get(request.id);
+        if (existing !== undefined) {
+          bytes -= existing.bytes;
+          perObject.set(existing.owner, (perObject.get(existing.owner) ?? 1) - 1);
+        } else {
+          count += 1;
+        }
+        bytes += scheduledTurnBytes(row);
+        const owner = request.armed_by?.thisObj ?? "";
+        perObject.set(owner, (perObject.get(owner) ?? 0) + 1);
+      }
+      for (const entry of cancellations) {
+        const existing = pending.byId.get(entry.id);
+        if (!existing) continue;
+        count -= 1;
+        bytes -= existing.bytes;
+        perObject.set(existing.owner, (perObject.get(existing.owner) ?? 1) - 1);
+      }
+      if (count > SCHEDULE_MAX_PER_SCOPE) {
+        return `scope would hold ${count} pending schedules; the cap is ${SCHEDULE_MAX_PER_SCOPE}`;
+      }
+      if (bytes > SCHEDULE_MAX_SCOPE_BYTES) {
+        return `scope schedule queue would hold ${bytes} bytes; the cap is ${SCHEDULE_MAX_SCOPE_BYTES}`;
+      }
+      for (const [owner, owned] of perObject) {
+        if (owned > SCHEDULE_MAX_PER_OBJECT) {
+          return `object ${owner} would hold ${owned} pending schedules; the per-object cap is ${SCHEDULE_MAX_PER_OBJECT}`;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /** The durable row for a validated request. Provenance is deliberately NOT
+   * carried across: `armed_by` is validated above and discarded, so nothing
+   * about the arming frame's authority survives into the fired turn (CO16.4). */
+  private scheduledTurnFromRequest(request: NonNullable<EffectTranscript["schedules"]>[number]): ScheduledTurn {
+    return {
+      id: request.id,
+      at_logical_time: request.at,
+      idle_policy: request.idlePolicy,
+      call: {
+        actor: request.call.actor,
+        target: request.call.target,
+        verb: request.call.verb,
+        args: request.call.args as unknown[]
+      }
+    };
+  }
+
+  /** Current queue shape for the CO16.7 caps. Bounded by the per-scope cap,
+   * so this is a bounded read, not an unbounded scan. */
+  private pendingScheduleSummary(): {
+    count: number;
+    bytes: number;
+    perObject: Map<string, number>;
+    byId: Map<string, { bytes: number; owner: string }>;
+  } {
+    const rows = this.options.durable ? this.options.durable.readScheduled() : [...this.scheduled.values()];
+    const perObject = new Map<string, number>();
+    const byId = new Map<string, { bytes: number; owner: string }>();
+    let bytes = 0;
+    for (const row of rows) {
+      const separator = row.id.lastIndexOf(":");
+      const owner = separator < 0 ? "" : row.id.slice(0, separator);
+      const rowBytes = scheduledTurnBytes(row);
+      bytes += rowBytes;
+      perObject.set(owner, (perObject.get(owner) ?? 0) + 1);
+      byId.set(row.id, { bytes: rowBytes, owner });
+    }
+    return { count: rows.length, bytes, perObject, byId };
+  }
+
+  /** Wizard test for an arming frame's programmer. Uses the same authority
+   * cells the rest of validation reads, so it works on a sparse scope that
+   * holds the object's lifecycle cell. Absent lineage fails CLOSED. */
+  private isWizardRef(ref: string): boolean {
+    const cell = this.store.get(cellKey("object_lineage", ref));
+    const value = cell?.value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const flags = (value as Record<string, unknown>).flags;
+    if (!flags || typeof flags !== "object" || Array.isArray(flags)) return false;
+    return (flags as Record<string, unknown>).wizard === true;
   }
 
   // ---- Durable continuations (CO2.8) ----------------------------------

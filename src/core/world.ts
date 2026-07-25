@@ -1332,6 +1332,10 @@ export class WooWorld {
       case "prop_write":
       case "object_create":
       case "object_move":
+      // Schedule effects are stamped exactly like writes (CO16.2): the frame
+      // that armed or cancelled is what the scope validates against.
+      case "schedule":
+      case "cancel_schedule":
         return event.writer ? event : { ...event, writer: this.currentTurnWriter };
       default:
         return event;

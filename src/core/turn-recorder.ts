@@ -58,7 +58,24 @@ export type TurnRecorderEvent =
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }
   | { kind: "state_probe"; cell: RecordedCell }
   | { kind: "logical_input"; name: string; value: WooValue }
-  | { kind: "untracked_effect"; name: string; detail?: WooValue };
+  | { kind: "untracked_effect"; name: string; detail?: WooValue }
+  // CO16.2: arming and cancelling a scheduled turn are authority-bearing
+  // effects, not writes. They carry the same per-frame `writer` provenance a
+  // write does, and for the same reason: the commit scope must be able to
+  // prove which object's namespace the id belongs to (CO16.3) and whether the
+  // arming frame held wizard authority for an `always` entry (CO16.6),
+  // without taking the planner's word for either.
+  | { kind: "schedule"; request: RecordedScheduleRequest; writer?: RecordedWriteAuthority }
+  | { kind: "cancel_schedule"; id: string; writer?: RecordedWriteAuthority };
+
+/** A scheduled turn as the arming turn recorded it. `id` is already
+ * namespaced (`<object>:<key>`) by the engine — see CO16.3. */
+export type RecordedScheduleRequest = {
+  id: string;
+  at: number;
+  idlePolicy: "while_active" | "always";
+  call: { actor: ObjRef; target: ObjRef; verb: string; args: WooValue[] };
+};
 
 export type RecordedTurn = {
   start: TurnStart;

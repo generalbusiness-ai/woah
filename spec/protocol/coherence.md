@@ -1199,9 +1199,14 @@ One write path per fact (CO9), concretized:
 
 ## CO16. Scheduled turns
 
-> Status: **delivery implemented** (CO16.5); **production, envelope,
-> quotas, and lifecycle specified, not yet implemented** (CO16.2–CO16.4,
-> CO16.6–CO16.9). Design rationale in
+> Status: **delivery implemented** (CO16.5). **Transcript-carried queue
+> effects, provenance, namespacing, the `always` gate, the lead time, and
+> the quotas implemented** at the commit scope (CO16.2–CO16.4, CO16.7);
+> no producer arms them yet — the DSL builtins are the next step, so in a
+> running world the arrays are always absent. **Not yet implemented:** the
+> idle-policy delivery filter and no-catch-up (CO16.6), lifecycle
+> cancellation (CO16.8), and the failure record (CO16.8/CO16.9). Design
+> rationale in
 > `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
 > [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
 > where the two differ, this governs.
