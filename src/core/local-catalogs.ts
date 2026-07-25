@@ -2030,11 +2030,14 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   // Co-locate legacy anchorless authority families (account + owned agents)
   // into one cluster so a promote/demote quota transition stays single-scope.
   // Local-boot / single-host only; Net placement comes from install/cutover.
-  // Idempotent (each object gates on a null anchor); the ledger skips the walk
-  // once applied. Gated on the account seed class so an empty world is a no-op.
+  // Idempotent (each object gates on a null anchor). The ledger records only an
+  // actual repair (the mark-on-work pattern): a core-only or already-anchored
+  // world walks, finds nothing, changes nothing, and stays a true no-op — so a
+  // later imported legacy family is still caught on its first boot.
   if (world.objects.has("$account") && !migrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION)) {
-    world.repairAuthorityFamilyColocation();
-    markMigrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION);
+    if (world.repairAuthorityFamilyColocation() > 0) {
+      markMigrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION);
+    }
   }
   // $note descendants (dispensed notes, pins, tasks) often live on
   // self-hosted slices. Walk text: list<str> → str here so the host's
