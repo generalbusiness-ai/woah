@@ -25,6 +25,7 @@
  */
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import {
+  SCHEDULE_CLOCK_INPUT,
   SCHEDULE_MAX_ENTRY_BYTES,
   SCHEDULE_MAX_HORIZON_MS,
   SCHEDULE_MAX_PER_OBJECT,
@@ -173,6 +174,7 @@ export type RejectReason =
  * enforce it and the dependency runs core → net); re-exported here so
  * net-layer consumers and tests keep one import site. */
 export {
+  SCHEDULE_CLOCK_INPUT,
   SCHEDULE_MIN_LEAD_MS,
   SCHEDULE_MAX_HORIZON_MS,
   SCHEDULE_MAX_PER_SCOPE,
@@ -183,8 +185,12 @@ export {
 } from "../core/scheduling";
 
 /** Serialized size of a pending row, measured over what the scope stores. */
+const SCHEDULE_BYTE_ENCODER = new TextEncoder();
+
 export function scheduledTurnBytes(turn: ScheduledTurn): number {
-  return JSON.stringify(turn).length;
+  // UTF-8 bytes. `.length` counts UTF-16 code units and undercounts non-ASCII
+  // payloads by up to ~4x against a byte cap the spec states in bytes.
+  return SCHEDULE_BYTE_ENCODER.encode(JSON.stringify(turn)).length;
 }
 
 const RETRYABLE_VERDICTS: ReadonlySet<RejectReason> = new Set([
@@ -1100,7 +1106,7 @@ export class ScopeSequencer {
     // provenance the transcript carries, before anything is applied. Terminal:
     // a namespace claim, an authority claim, or a quota breach does not become
     // valid on retry.
-    const scheduleError = this.scheduleEffectsError(submit.transcript);
+    const scheduleError = this.scheduleEffectsError(submit);
     if (scheduleError !== null) {
       return this.reject(submit, "schedule_unauthorized", { schedule: scheduleError });
     }
@@ -1141,6 +1147,12 @@ export class ScopeSequencer {
       applied.projectionWrites.length === 0 &&
       (submit.transcript.projectionWrites?.length ?? 0) === 0 &&
       submit.transcript.sessionScopeTransition === undefined &&
+      // Queue effects are effects. Without these two clauses a direct turn
+      // that ONLY armed or cancelled a schedule was classified as a read and
+      // returned early, discarding the arming silently — the exact failure
+      // mode this whole design exists to remove.
+      (submit.transcript.schedules?.length ?? 0) === 0 &&
+      (submit.transcript.cancellations?.length ?? 0) === 0 &&
       submit.transcript.untrackedEffects.length === 0;
     if (pureDirectRead) {
       return {
@@ -1167,7 +1179,7 @@ export class ScopeSequencer {
     // entry; an id in both arrays was already rejected above.
     for (const entry of submit.transcript.cancellations ?? []) this.cancel(entry.id);
     for (const request of submit.transcript.schedules ?? []) {
-      const row = this.scheduledTurnFromRequest(request);
+      const row = this.scheduledTurnFromRequest(request, this.scheduleAttribution(submit));
       const durable = this.options.durable;
       // Upsert straight into the queue rather than going through schedule():
       // that helper re-checks "future time" against a live clock, which would
@@ -1959,7 +1971,8 @@ export class ScopeSequencer {
    * claim another object's namespace, arm `always` without wizard authority,
    * back-date a delay under the floor, or grow the queue without bound.
    */
-  private scheduleEffectsError(transcript: EffectTranscript): string | null {
+  private scheduleEffectsError(submit: CommitSubmit): string | null {
+    const transcript = submit.transcript;
     const schedules = transcript.schedules ?? [];
     const cancellations = transcript.cancellations ?? [];
     if (schedules.length === 0 && cancellations.length === 0) return null;
@@ -1982,7 +1995,7 @@ export class ScopeSequencer {
     // cannot have its lead time validated, so it fails closed.
     let recordedNow: number | null = null;
     for (const input of transcript.logicalInputs ?? []) {
-      if (input.name === "now" && typeof input.value === "number") {
+      if (input.name === SCHEDULE_CLOCK_INPUT && typeof input.value === "number") {
         recordedNow = input.value;
         break;
       }
@@ -1991,6 +2004,14 @@ export class ScopeSequencer {
     for (const request of schedules) {
       const armedBy = request.armed_by;
       if (!armedBy) return `schedule ${request.id} carries no arming-frame provenance`;
+
+      // The fired turn runs as this actor. Binding it to the arming turn's
+      // own actor is what stops a planner substituting a different (or
+      // future, or more privileged) principal into a durable row that will
+      // execute long after anyone is looking.
+      if (request.call.actor !== submit.transcript.call.actor) {
+        return `schedule ${request.id} names actor ${request.call.actor}, not the arming turn's actor ${submit.transcript.call.actor}`;
+      }
 
       // CO16.3: the id namespace IS the arming object. This single check is
       // the whole enforcement — without it any verb could upsert over another
@@ -2034,7 +2055,7 @@ export class ScopeSequencer {
         }
       }
 
-      const bytes = scheduledTurnBytes(this.scheduledTurnFromRequest(request));
+      const bytes = scheduledTurnBytes(this.scheduledTurnFromRequest(request, this.scheduleAttribution(submit)));
       if (bytes > SCHEDULE_MAX_ENTRY_BYTES) {
         return `schedule ${request.id} serializes to ${bytes} bytes; the per-entry cap is ${SCHEDULE_MAX_ENTRY_BYTES}`;
       }
@@ -2058,7 +2079,7 @@ export class ScopeSequencer {
       let count = pending.count;
       let bytes = pending.bytes;
       for (const request of schedules) {
-        const row = this.scheduledTurnFromRequest(request);
+        const row = this.scheduledTurnFromRequest(request, this.scheduleAttribution(submit));
         const existing = pending.byId.get(request.id);
         if (existing !== undefined) {
           bytes -= existing.bytes;
@@ -2096,7 +2117,10 @@ export class ScopeSequencer {
   /** The durable row for a validated request. Provenance is deliberately NOT
    * carried across: `armed_by` is validated above and discarded, so nothing
    * about the arming frame's authority survives into the fired turn (CO16.4). */
-  private scheduledTurnFromRequest(request: NonNullable<EffectTranscript["schedules"]>[number]): ScheduledTurn {
+  private scheduledTurnFromRequest(
+    request: NonNullable<EffectTranscript["schedules"]>[number],
+    attribution?: { principal?: Principal; trace?: TraceContext }
+  ): ScheduledTurn {
     return {
       id: request.id,
       at_logical_time: request.at,
@@ -2106,7 +2130,22 @@ export class ScopeSequencer {
         target: request.call.target,
         verb: request.call.verb,
         args: request.call.args as unknown[]
-      }
+      },
+      // AU3.2/AU2: attribution and trace are captured at ARMING time and ride
+      // the durable row, so a turn that fires days later is still attributable
+      // and still joins the originating trace. This is attribution only — it
+      // never widens authority (CO16.4), and it is measured by the byte caps
+      // because it is part of the stored row.
+      ...(attribution?.principal !== undefined ? { principal: attribution.principal } : {}),
+      ...(attribution?.trace !== undefined ? { trace: attribution.trace } : {})
+    };
+  }
+
+  /** Attribution captured from the ARMING turn, for the durable row. */
+  private scheduleAttribution(submit: CommitSubmit): { principal?: Principal; trace?: TraceContext } {
+    return {
+      ...(submit.transcript.principal !== undefined ? { principal: submit.transcript.principal } : {}),
+      ...(submit.transcript.trace !== undefined ? { trace: submit.transcript.trace } : {})
     };
   }
 

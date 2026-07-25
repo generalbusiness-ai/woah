@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
+import { SCHEDULE_CLOCK_INPUT } from "../../src/core/scheduling";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { replayPageVersion } from "../../src/net/replay-pages";
 
@@ -738,7 +739,9 @@ describe("scheduled-turn effects (CO16.2)", () => {
   }
 
   function armingTurn(seq: ScopeSequencer, partial: Partial<EffectTranscript>, key: string) {
-    return submitFor(seq, transcript({ logicalInputs: [{ name: "now", value: NOW }], ...partial }), key);
+    // Use the SHARED constant, never a literal: the producer and the validator
+    // disagreeing on this name is exactly the bug these tests missed once.
+    return submitFor(seq, transcript({ logicalInputs: [{ name: SCHEDULE_CLOCK_INPUT, value: NOW }], ...partial }), key);
   }
 
   it("accepts a well-formed schedule and lands it in the pending queue", () => {

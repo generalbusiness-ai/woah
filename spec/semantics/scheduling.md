@@ -1,6 +1,6 @@
 ---
 date: 2026-07-25
-status: partial — SC2/SC3/SC4/SC9/SC10 implemented (builtins, clamping, namespaced ids, fork sugar, errors); SC5's fire-time context, SC7's idle-policy delivery filter, and SC11's catalog surface are specified and not yet built
+status: partial — SC1–SC10 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records); SC11's `$scheduling` catalog surface and SC2's live introspection read are specified and not yet built
 ---
 
 # Scheduling

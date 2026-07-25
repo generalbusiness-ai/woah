@@ -53,7 +53,6 @@ export const BUILTIN_NAMES = [
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "schedule", "schedule_at", "cancel_schedule",
   // builder_create_object and builder_chparent stay native: both bypass
   // the substrate's programmer-flag check in assertCanCreateObject so
   // builder-class actors (no programmer flag) can build. Moving them
@@ -143,7 +142,11 @@ export const BUILTIN_NAMES = [
   // Declared event-schema lookup (spec/semantics/introspection.md): the shape
   // for one event type via class-then-features precedence, or null. The acts
   // kernel validates act payloads against it. Appended last; keeps indices.
-  "event_schema"
+  "event_schema",
+  // APPENDED, never inserted: persisted bytecode addresses this table by
+  // INDEX, so putting these anywhere but the end silently re-points every
+  // later name in an aged world's compiled verbs.
+  "schedule", "schedule_at", "cancel_schedule"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -660,6 +663,18 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           if (!current.handlers.pop()) throw wooError("E_RANGE", "handler stack underflow");
           break;
 
+        // Tombstones. These opcodes existed, never worked (nothing resumed a
+        // parked task), and were removed with the model. A verb persisted
+        // before the removal still carries them, so name what happened
+        // instead of reporting a generic unknown-opcode fault.
+        case "FORK":
+        case "SUSPEND":
+        case "READ":
+          throw wooError(
+            "E_VERSION",
+            `${op} was removed with the parked-task model; recompile this verb using schedule() (spec/semantics/scheduling.md)`,
+            op
+          );
         default:
           throw wooError("E_INVARG", `unknown VM opcode: ${op}`);
       }
@@ -861,9 +876,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "schedule_at": {
         // schedule(target, verb, args, delay_ms|at_ms, opts?)
         const [target, verbName, verbArgs, when, opts] = builtinArgs;
-        const at = name === "schedule"
-          ? frame.ctx.world.logicalNow("schedule.base") + numeric(when, "delay_ms")
-          : numeric(when, "at_ms");
+        // Never read a clock here: recordScheduleRequest owns the turn's one
+        // scheduling clock reading, so a relative delay is resolved there.
+        const delayMs = name === "schedule" ? numeric(when, "delay_ms") : undefined;
+        const atMs = name === "schedule_at" ? numeric(when, "at_ms") : undefined;
         const options = opts === undefined || opts === null ? {} : assertMap(opts);
         const key = options.key === undefined || options.key === null ? undefined : assertString(options.key);
         const idlePolicy = options.idle_policy === undefined || options.idle_policy === null
@@ -874,7 +890,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           assertObj(target),
           assertString(verbName),
           Array.isArray(verbArgs) ? (verbArgs as WooValue[]) : [],
-          at,
+          { ...(delayMs !== undefined ? { delayMs } : {}), ...(atMs !== undefined ? { atMs } : {}) },
           { ...(key !== undefined ? { key } : {}), ...(idlePolicy !== undefined ? { idlePolicy } : {}) }
         );
       }

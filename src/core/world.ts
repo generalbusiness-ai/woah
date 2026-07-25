@@ -41,7 +41,7 @@ import {
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
-import { SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
+import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
 import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
   createV2TurnEffects,
@@ -616,6 +616,17 @@ export class WooWorld {
   /** Schedules armed by the turn in progress: the CO16.7 per-turn budget and
    * the derivation of turn-unique schedule ids. */
   private turnScheduleCount = 0;
+  /** The turn's ONE scheduling clock reading, recorded under
+   * SCHEDULE_CLOCK_INPUT. Every schedule armed by a turn is measured against
+   * the same instant, so the committing scope has a single unambiguous value
+   * to validate all of them against — with one reading per call the validator
+   * could not tell which entry belonged to which reading, and any choice
+   * (first/last/max) would misjudge some entry in a multi-schedule turn. */
+  private turnScheduleClock: number | null = null;
+  /** Unique-per-turn token for implicit schedule keys. Derived from the
+   * recorded turn's id, which is unique per call — `seq` is NOT, because a
+   * direct route always carries seq -1 and would collide across calls. */
+  private turnScheduleToken = "";
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
   // CA11.2 occupancy-transition: per-cell provenance for the ephemeral planning
   // world this WooWorld was built from. Only the sparse gateway planning path
@@ -1148,11 +1159,20 @@ export class WooWorld {
     const previousWriter = this.currentTurnWriter;
     const active = recorder.startTurn(turn);
     const previousScheduleCount = this.turnScheduleCount;
+    const previousScheduleClock = this.turnScheduleClock;
+    const previousScheduleToken = this.turnScheduleToken;
     this.activeTurnRecorder = active;
     this.currentTurnWriter = null;
-    // Per-turn schedule budget and the turn-unique id counter both reset
-    // here, so a nested recorded turn cannot inherit either (CO16.7).
+    // Per-turn schedule budget, clock, and id token all reset here, so a
+    // nested recorded turn cannot inherit any of them (CO16.7).
     this.turnScheduleCount = 0;
+    this.turnScheduleClock = null;
+    // Turn identity, deterministic across re-plans of the SAME turn (so a
+    // retried turn upserts its own entry rather than arming a second one) and
+    // distinct between different turns. `seq` alone is not enough: the direct
+    // route always carries -1.
+    this.turnScheduleToken = turn.id
+      ?? hashSource(`${turn.scope}:${turn.seq}:${turn.actor}:${turn.target}:${turn.verb}:${JSON.stringify(turn.args ?? [])}`);
     try {
       const result = await fn(active);
       active.event({ kind: "turn_finish", ok: true, result: result as WooValue });
@@ -1164,6 +1184,8 @@ export class WooWorld {
       this.activeTurnRecorder = previous;
       this.currentTurnWriter = previousWriter;
       this.turnScheduleCount = previousScheduleCount;
+      this.turnScheduleClock = previousScheduleClock;
+      this.turnScheduleToken = previousScheduleToken;
     }
   }
 
@@ -1217,11 +1239,15 @@ export class WooWorld {
     target: ObjRef,
     verbName: string,
     args: WooValue[],
-    atMs: number,
+    when: { delayMs?: number; atMs?: number },
     opts: { key?: string; idlePolicy?: "while_active" | "always" } = {}
   ): string {
     assertObj(target);
-    if (!Number.isFinite(atMs)) throw wooError("E_TYPE", "schedule time must be numeric", atMs);
+    const relative = when.delayMs;
+    const absolute = when.atMs;
+    if (relative === undefined && absolute === undefined) throw wooError("E_INVARG", "schedule needs a delay or a time");
+    if (relative !== undefined && !Number.isFinite(relative)) throw wooError("E_TYPE", "schedule delay must be numeric", relative);
+    if (absolute !== undefined && !Number.isFinite(absolute)) throw wooError("E_TYPE", "schedule time must be numeric", absolute);
     const idlePolicy = opts.idlePolicy ?? "while_active";
     if (idlePolicy !== "while_active" && idlePolicy !== "always") {
       throw wooError("E_INVARG", `unknown idle_policy ${String(idlePolicy)}`, idlePolicy);
@@ -1240,11 +1266,16 @@ export class WooWorld {
       });
     }
 
-    const now = this.logicalNow("schedule.now");
+    // One reading per turn, recorded under the name the scope validates
+    // against. Reading per call would put several clock inputs in the
+    // transcript with no way to say which schedule each belonged to.
+    if (this.turnScheduleClock === null) this.turnScheduleClock = this.logicalNow(SCHEDULE_CLOCK_INPUT);
+    const now = this.turnScheduleClock;
     // The floor CLAMPS rather than failing (SC3): a v1 author's `fork(1, ...)`
     // reflex becomes a minute, not an error. The horizon does fail — a time a
     // year out is a mistake, not a rounding.
-    const at = Math.max(atMs, now + SCHEDULE_MIN_LEAD_MS);
+    const requested = relative !== undefined ? now + relative : (absolute as number);
+    const at = Math.max(requested, now + SCHEDULE_MIN_LEAD_MS);
     if (at > now + SCHEDULE_MAX_HORIZON_MS) {
       throw wooError("E_QUOTA", `schedule is beyond the ${SCHEDULE_MAX_HORIZON_MS}ms horizon`, {
         quota: "schedule_horizon",
@@ -1256,7 +1287,9 @@ export class WooWorld {
     // CO16.3: the namespace half is the arming object and is built HERE, never
     // supplied by the author — that is the entire defence against one verb
     // upserting over or cancelling another object's timer.
-    const key = opts.key ?? `t${hashSource(`${ctx.space}:${ctx.seq}:${this.turnScheduleCount}`).slice(0, 12)}`;
+    // Turn-unique, not seq-unique: a direct route always carries seq -1, so
+    // `space:seq:counter` collided across every direct call on a scope.
+    const key = opts.key ?? `t${hashSource(`${this.turnScheduleToken}:${this.turnScheduleCount}`).slice(0, 12)}`;
     const id = `${ctx.thisObj}:${key}`;
     this.turnScheduleCount += 1;
 

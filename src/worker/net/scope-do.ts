@@ -943,6 +943,14 @@ export class NetScopeDO {
         if (reply.status === "accepted" && reply.touched.some((key) => key.startsWith("session:"))) {
           this.armSessionReapAlarm(seq);
         }
+        // CO16: an accepted commit is the ONLY thing that arms scheduling
+        // work on this path. Two distinct cases, both previously dormant:
+        // a turn whose only effect was a schedule left no outbox row, so the
+        // retry alarm above never covered it; and CO16.6 says a parked
+        // `while_active` entry is re-armed by the next accepted turn in the
+        // scope, which requires re-arming on ANY acceptance, not just on
+        // turns that happened to schedule something.
+        if (reply.status === "accepted") this.rearmAlarm(this.host.now());
         this.metric({
           kind: "net_scope_submit",
           scope: seq.scope,
@@ -1910,7 +1918,7 @@ export class NetScopeDO {
    */
   private recordScheduledFailure(
     turn: ScheduledTurn,
-    outcome: "rejected" | "abandoned",
+    outcome: "rejected" | "errored" | "abandoned",
     detail: string
   ): void {
     const firedAt = this.host.now();
@@ -1937,6 +1945,29 @@ export class NetScopeDO {
     } catch (err) {
       this.metric({ kind: "net_scope_sched_failure_write_failed", id: turn.id, status: "error", error: String(err) });
     }
+    // CO16.8 requires the failure to reach the scope as an observation, not
+    // only the metric stream: an operator dashboard is not where a room finds
+    // out its deadline did not fire.
+    try {
+      const meta = this.store.readMeta();
+      if (meta !== null) {
+        const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
+        this.enqueueScopeObservation(seq, {
+          type: "scheduled_turn_failed",
+          source: meta.scope,
+          id: turn.id,
+          at: turn.at_logical_time,
+          fired_at: firedAt,
+          target: turn.call.target,
+          verb: turn.call.verb,
+          actor: turn.call.actor,
+          outcome,
+          detail: detail.slice(0, SCHEDULED_FAILURE_DETAIL_CHARS)
+        });
+      }
+    } catch (err) {
+      this.metric({ kind: "net_scope_sched_failure_observe_failed", id: turn.id, status: "error", error: String(err) });
+    }
     this.metric({
       kind: "net_scope_scheduled_turn_failed",
       scope: this.store.readMeta()?.scope ?? "",
@@ -1951,16 +1982,58 @@ export class NetScopeDO {
     });
   }
 
-  /** Inspect a /plan-scheduled reply and record a terminal rejection. An
-   * accepted TurnResult, or any shape this does not recognize, records
-   * nothing: a false failure report is worse than none. */
-  private recordScheduledFailureIfRejected(turn: ScheduledTurn, reply: unknown, outcome: "rejected"): void {
+  /**
+   * Inspect a /plan-scheduled reply and record a failure if there was one.
+   *
+   * The reply is a gateway TurnResult, and it fails in TWO shapes that look
+   * nothing alike:
+   *
+   *  - the commit was REJECTED — the verdict is nested at `reply.reply.status`
+   *    (an earlier cut read a top-level `status`, which only the test stub
+   *    ever produced, so no real rejection was ever recorded);
+   *  - the commit was ACCEPTED but the VERB THREW. A verb that raises still
+   *    commits its transcript, so an accepted reply carrying a top-level
+   *    `error` is a scheduled turn that did not do its job — precisely the
+   *    case a deadline cares about, and the one most likely in practice.
+   *
+   * Anything else records nothing: a false failure report is worse than none.
+   */
+  private recordScheduledFailureIfFailed(turn: ScheduledTurn, reply: unknown): void {
     if (!reply || typeof reply !== "object" || Array.isArray(reply)) return;
-    const status = (reply as { status?: unknown }).status;
-    if (status !== "rejected") return;
-    const reason = (reply as { reason?: unknown }).reason;
-    const error = (reply as { error?: unknown }).error;
-    this.recordScheduledFailure(turn, outcome, JSON.stringify({ reason: reason ?? null, error: error ?? null }));
+    const result = reply as { reply?: { status?: unknown; reason?: unknown }; status?: unknown; reason?: unknown; error?: unknown };
+    const commit = result.reply && typeof result.reply === "object" ? result.reply : result;
+    if (commit.status === "rejected") {
+      this.recordScheduledFailure(turn, "rejected", JSON.stringify({ reason: commit.reason ?? null }));
+      return;
+    }
+    if (result.error !== undefined && result.error !== null) {
+      this.recordScheduledFailure(turn, "errored", JSON.stringify({ error: result.error }));
+    }
+  }
+
+  /** Fan one scope-level observation out to the live audience. Used by the
+   * CO16.8 failure record; best-effort, and never allowed to fail the caller
+   * (a drain that dies while reporting a failure reports nothing at all). */
+  private enqueueScopeObservation(seq: ScopeSequencer, observation: Record<string, unknown>): void {
+    const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+      this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+    );
+    if (subscribers.length === 0) return;
+    const head = seq.head();
+    const body: FanoutBody = {
+      scope: seq.scope,
+      seq: head.seq,
+      head_hash: head.hash,
+      head_generation: head.generation,
+      cells: [],
+      observations: [observation as unknown as FanoutBody["observations"][number]]
+    };
+    const text = JSON.stringify(body);
+    this.state.storage.transactionSync(() => {
+      for (const { destination, delivery_seq } of subscribers) {
+        this.persistFanoutRow(destination, delivery_seq, body, text);
+      }
+    });
   }
 
   /** Pending failure records, newest first. Read by the live introspection
@@ -3037,7 +3110,7 @@ export class NetScopeDO {
               // waiting on a scheduled turn: the actor has no session and may
               // not exist any more. Silence is the one outcome a deadline
               // must never have.
-              this.recordScheduledFailureIfRejected(schedBody.scheduled_turn, dispatchReply, "rejected");
+              this.recordScheduledFailureIfFailed(schedBody.scheduled_turn, dispatchReply);
             } else if (route === "/audit") {
               // AU6.2: at-least-once append; the shard no-ops on
               // (partition, idempotency), so redelivery is harmless.

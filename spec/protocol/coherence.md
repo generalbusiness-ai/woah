@@ -292,8 +292,9 @@ is a pending *scheduled turn* (CO16). The scope sequencer stores the
 pending queue durably, sets its alarm to the earliest `at_logical_time`,
 wakes itself, and validates a fired turn exactly as a live-submitted one
 (`ScheduledTurnRequest` per CO16.2: `schedules` / `cancellations` are typed
-transcript arrays, included in the `post_state_hash` preimage, never
-fabricated `TranscriptWrite` ops). A pending entry survives DO eviction and
+transcript arrays with their own validation path, never fabricated
+`TranscriptWrite` ops, and — unlike writes — **not** in the
+`post_state_hash` preimage; CO16.2 says why). A pending entry survives DO eviction and
 fires via the scope alarm; this is a conformance gate (CO12), not an
 aspiration — the v2 worker never implemented it, so this layer carries the
 obligation explicitly.
@@ -1587,10 +1588,18 @@ session and by construction may not even exist — so unless the scope
 writes it down, a broken deadline fails in perfect silence, which is the
 one outcome a deadline must never have.
 
-The rule: on a terminal rejection or an error result, the scope records a
-`scheduled_turn_failed` entry — `{id, at, fired_at, target, verb, actor,
-error}` — in the same transaction that deletes the outbox row, and emits
-it to the scope as an observation. Recording is what makes the "one
+The rule: on a terminal rejection **or an accepted turn whose verb threw**,
+the scope records a `scheduled_turn_failed` entry — `{id, at, fired_at,
+target, verb, actor, outcome, detail}` — in the same transaction that
+deletes the outbox row, and emits it to the scope as an observation.
+
+Both shapes matter and they look nothing alike. A rejected commit carries
+its verdict nested inside the planner's `TurnResult.reply`; an accepted
+commit whose verb raised carries a top-level `error` and a `status` of
+accepted, because a verb that throws still commits its transcript. Reading
+only one of them — or reading a top-level `status` that the real reply
+never has — records nothing for the case most likely to happen in
+practice. Recording is what makes the "one
 recorded failure per broken timer" claim above true rather than
 aspirational. It is bounded by the same caps as the queue and ages out on
 the ordinary schedule.

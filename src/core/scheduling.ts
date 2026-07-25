@@ -42,3 +42,15 @@ export const SCHEDULE_MAX_PER_TURN = 16;
  */
 export const SCHEDULE_MAX_ENTRY_BYTES = 8 * 1024;
 export const SCHEDULE_MAX_SCOPE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The logical-input name under which a turn records its scheduling clock.
+ *
+ * Producer and validator MUST agree on this string, and both import it from
+ * here for that reason: an earlier cut had the VM record `schedule.base` /
+ * `schedule.now` while the commit scope searched for `now`, so no real
+ * scheduling transcript could pass validation at all. The unit tests did not
+ * catch it because they hand-built the transcript shape instead of driving
+ * the producer.
+ */
+export const SCHEDULE_CLOCK_INPUT = "schedule.now";
