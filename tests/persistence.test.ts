@@ -120,55 +120,6 @@ class CountingLocalSQLiteRepository extends LocalSQLiteRepository {
   }
 }
 
-function installForkFixture(world: ReturnType<typeof createWorld>): void {
-  world.addVerb(
-    "delay_1",
-    addBytecodeVerb("mark_after_restart", {
-      literals: ["after_restart", null],
-      num_locals: 0,
-      max_stack: 3,
-      version: 1,
-      ops: [["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_ARG", 0], ["SET_PROP"], ["PUSH_LIT", 1], ["RETURN"]]
-    })
-  );
-  world.addVerb(
-    "delay_1",
-    addBytecodeVerb("schedule_restart_mark", {
-      literals: ["mark_after_restart"],
-      num_locals: 0,
-      max_stack: 5,
-      version: 1,
-      ops: [["PUSH_INT", 0], ["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_ARG", 0], ["FORK", 1], ["RETURN"]]
-    })
-  );
-}
-
-function installSuspendFixture(world: ReturnType<typeof createWorld>): void {
-  world.addVerb(
-    "delay_1",
-    addBytecodeVerb("suspend_after_restart", {
-      literals: ["after_restart_suspend", null],
-      num_locals: 0,
-      max_stack: 4,
-      version: 1,
-      ops: [["PUSH_INT", 0], ["SUSPEND"], ["POP"], ["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_ARG", 0], ["SET_PROP"], ["PUSH_LIT", 1], ["RETURN"]]
-    })
-  );
-}
-
-function installReadFixture(world: ReturnType<typeof createWorld>): void {
-  world.addVerb(
-    "delay_1",
-    addBytecodeVerb("read_after_restart", {
-      literals: ["after_restart_read", null],
-      num_locals: 1,
-      max_stack: 4,
-      version: 1,
-      ops: [["PUSH_ACTOR"], ["READ"], ["POP_LOCAL", 0], ["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_LOCAL", 0], ["SET_PROP"], ["PUSH_LIT", 1], ["RETURN"]]
-    })
-  );
-}
-
 describe("sqlite persistence", () => {
   it("reloads host-scoped cluster state from per-object writes after initial seed save", async () => {
     const { dir, path } = tempDb();

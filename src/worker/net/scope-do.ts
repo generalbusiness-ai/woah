@@ -614,6 +614,13 @@ export class NetScopeDO {
    * submitting to this scope. This queue is intentionally in-memory
    * because direct observations are live-only; eviction may drop them. */
   private readonly pendingLiveDeliveries: Array<{ destination: string; body: LiveFanoutBody }> = [];
+  /** CO16.8 failure records awaiting their durable write. */
+  private readonly pendingScheduledFailures: Array<{
+    turn: ScheduledTurn;
+    outcome: "rejected" | "errored" | "abandoned";
+    detail: string;
+    firedAt: number;
+  }> = [];
   private liveAlarmArmed = false;
   /** In-memory mirror of the rider residue ledger (net_scope_rider_cache),
    * hydrated lazily and appended on insert — `owns` consults it per read
@@ -950,7 +957,15 @@ export class NetScopeDO {
         // `while_active` entry is re-armed by the next accepted turn in the
         // scope, which requires re-arming on ANY acceptance, not just on
         // turns that happened to schedule something.
-        if (reply.status === "accepted") this.rearmAlarm(this.host.now());
+        if (reply.status === "accepted") {
+          // `dueNow` matters here: a `while_active` entry parked during an
+          // idle spell is OVERDUE, and rearmAlarm's default picks only the
+          // next FUTURE row — so without this the "next accepted turn
+          // re-arms parked work" rule (CO16.6) never fired for exactly the
+          // entries it exists to serve.
+          const nowMs = this.host.now();
+          this.rearmAlarm(nowMs, { dueNow: this.store.hasScheduledDue(nowMs) });
+        }
         this.metric({
           kind: "net_scope_submit",
           scope: seq.scope,
@@ -1916,43 +1931,67 @@ export class NetScopeDO {
    * room sees it. Recording failures must not itself fail the drain, so
    * every path here is best-effort.
    */
-  private recordScheduledFailure(
+  /**
+   * Write the durable failure row. Deliberately does NOT catch: it runs
+   * inside the same transaction that deletes the delivered outbox row, so an
+   * insert failure must abort that transaction and leave the row for retry.
+   * Swallowing the error here would delete the row and lose the record, which
+   * is precisely the silence CO16.8 exists to prevent.
+   */
+  private writeScheduledFailureRow(
     turn: ScheduledTurn,
     outcome: "rejected" | "errored" | "abandoned",
-    detail: string
+    detail: string,
+    firedAt: number
   ): void {
-    const firedAt = this.host.now();
-    try {
-      this.state.storage.sql.exec(
-        "INSERT INTO net_scope_sched_failure (id, at_logical_time, fired_at, target, verb, actor, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          + " ON CONFLICT(id) DO UPDATE SET at_logical_time = excluded.at_logical_time, fired_at = excluded.fired_at, outcome = excluded.outcome, detail = excluded.detail",
-        turn.id,
-        turn.at_logical_time,
-        firedAt,
-        turn.call.target,
-        turn.call.verb,
-        turn.call.actor,
-        outcome,
-        detail.slice(0, SCHEDULED_FAILURE_DETAIL_CHARS)
-      );
-      // Bounded retention, like the abandoned-row tail: this is a diagnostic
-      // record, not a queue, and it must not grow with a broken chain's
-      // lifetime.
-      this.state.storage.sql.exec(
-        "DELETE FROM net_scope_sched_failure WHERE rowid NOT IN (SELECT rowid FROM net_scope_sched_failure ORDER BY fired_at DESC, rowid DESC LIMIT ?)",
-        SCHEDULED_FAILURE_KEEP
-      );
-    } catch (err) {
-      this.metric({ kind: "net_scope_sched_failure_write_failed", id: turn.id, status: "error", error: String(err) });
+    this.state.storage.sql.exec(
+      "INSERT INTO net_scope_sched_failure (id, at_logical_time, fired_at, target, verb, actor, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        + " ON CONFLICT(id) DO UPDATE SET at_logical_time = excluded.at_logical_time, fired_at = excluded.fired_at, outcome = excluded.outcome, detail = excluded.detail",
+      turn.id,
+      turn.at_logical_time,
+      firedAt,
+      turn.call.target,
+      turn.call.verb,
+      turn.call.actor,
+      outcome,
+      detail.slice(0, SCHEDULED_FAILURE_DETAIL_CHARS)
+    );
+    // Bounded retention: a diagnostic tail, not a queue.
+    this.state.storage.sql.exec(
+      "DELETE FROM net_scope_sched_failure WHERE rowid NOT IN (SELECT rowid FROM net_scope_sched_failure ORDER BY fired_at DESC, rowid DESC LIMIT ?)",
+      SCHEDULED_FAILURE_KEEP
+    );
+  }
+
+  /** Stage a failure for the transactional flush below. Delivery happens
+   * outside a transaction, so the record cannot be written at the moment it
+   * is discovered without breaking CO16.8's atomicity requirement. */
+  private stageScheduledFailure(turn: ScheduledTurn, outcome: "rejected" | "errored" | "abandoned", detail: string): void {
+    this.pendingScheduledFailures.push({ turn, outcome, detail, firedAt: this.host.now() });
+  }
+
+  /** Flush staged records. Called INSIDE the write-back transaction, before
+   * the delivered-row deletes, so a write failure aborts both. */
+  private flushStagedScheduledFailures(): Array<{ turn: ScheduledTurn; outcome: "rejected" | "errored" | "abandoned"; detail: string; firedAt: number }> {
+    const staged = this.pendingScheduledFailures.splice(0, this.pendingScheduledFailures.length);
+    for (const entry of staged) {
+      this.writeScheduledFailureRow(entry.turn, entry.outcome, entry.detail, entry.firedAt);
     }
-    // CO16.8 requires the failure to reach the scope as an observation, not
-    // only the metric stream: an operator dashboard is not where a room finds
-    // out its deadline did not fire.
+    return staged;
+  }
+
+  /** Metric + live observation for a recorded failure. Best-effort by
+   * design and always AFTER the durable write has committed. */
+  private announceScheduledFailure(
+    turn: ScheduledTurn,
+    outcome: "rejected" | "errored" | "abandoned",
+    detail: string,
+    firedAt: number
+  ): void {
     try {
       const meta = this.store.readMeta();
       if (meta !== null) {
-        const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
-        this.enqueueScopeObservation(seq, {
+        this.announceScopeObservation(meta.scope, {
           type: "scheduled_turn_failed",
           source: meta.scope,
           id: turn.id,
@@ -2003,37 +2042,40 @@ export class NetScopeDO {
     const result = reply as { reply?: { status?: unknown; reason?: unknown }; status?: unknown; reason?: unknown; error?: unknown };
     const commit = result.reply && typeof result.reply === "object" ? result.reply : result;
     if (commit.status === "rejected") {
-      this.recordScheduledFailure(turn, "rejected", JSON.stringify({ reason: commit.reason ?? null }));
+      this.stageScheduledFailure(turn, "rejected", JSON.stringify({ reason: commit.reason ?? null }));
       return;
     }
     if (result.error !== undefined && result.error !== null) {
-      this.recordScheduledFailure(turn, "errored", JSON.stringify({ error: result.error }));
+      this.stageScheduledFailure(turn, "errored", JSON.stringify({ error: result.error }));
     }
   }
 
-  /** Fan one scope-level observation out to the live audience. Used by the
-   * CO16.8 failure record; best-effort, and never allowed to fail the caller
-   * (a drain that dies while reporting a failure reports nothing at all). */
-  private enqueueScopeObservation(seq: ScopeSequencer, observation: Record<string, unknown>): void {
-    const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
-      this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+  /**
+   * Announce a scope-level observation that belongs to no committed turn.
+   *
+   * This MUST go on the live plane, not the durable fanout lane. A fanout row
+   * carries the authority head seq, the receiver drops any body whose seq is
+   * not ahead of what it has already seen, and a failure record advances no
+   * head — so a fanout row built here is silently discarded for every
+   * subscriber that is already current, which is the normal case. The
+   * durability that matters is the SQL record written in the same transaction
+   * as the outbox delete; this is the notification.
+   */
+  private announceScopeObservation(scope: string, observation: Record<string, unknown>): void {
+    const subscribers = sqlRows<{ destination: string }>(
+      this.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'fanout' ORDER BY destination"
+      )
     );
     if (subscribers.length === 0) return;
-    const head = seq.head();
-    const body: FanoutBody = {
-      scope: seq.scope,
-      seq: head.seq,
-      head_hash: head.hash,
-      head_generation: head.generation,
-      cells: [],
-      observations: [observation as unknown as FanoutBody["observations"][number]]
+    const body: LiveFanoutBody = {
+      scope,
+      observations: [observation as unknown as LiveFanoutBody["observations"][number]]
     };
-    const text = JSON.stringify(body);
-    this.state.storage.transactionSync(() => {
-      for (const { destination, delivery_seq } of subscribers) {
-        this.persistFanoutRow(destination, delivery_seq, body, text);
-      }
-    });
+    const available = Math.max(0, LIVE_DELIVERY_QUEUE_CAP - this.pendingLiveDeliveries.length);
+    for (const { destination } of subscribers.slice(0, available)) {
+      this.pendingLiveDeliveries.push({ destination, body });
+    }
   }
 
   /** Pending failure records, newest first. Read by the live introspection
@@ -3220,6 +3262,7 @@ export class NetScopeDO {
         }
         let abandonedCount = 0;
         sqlStarted = Date.now();
+        let flushedFailures: Array<{ turn: ScheduledTurn; outcome: "rejected" | "errored" | "abandoned"; detail: string; firedAt: number }> = [];
         this.state.storage.transactionSync(() => {
           // One batched DELETE for the delivered set (bounded at
           // LANES_PER_PASS × ROWS_PER_LANE ids): per-row DELETEs made the
@@ -3259,7 +3302,7 @@ export class NetScopeDO {
               if (route === "/plan-scheduled") {
                 const abandonedTurn = (row.body as PlanScheduledOutboxBody | undefined)?.scheduled_turn;
                 if (abandonedTurn) {
-                  this.recordScheduledFailure(abandonedTurn, "abandoned", deliveryErrors.get(row.id) ?? "E_OUTBOX_ABANDONED");
+                  this.stageScheduledFailure(abandonedTurn, "abandoned", deliveryErrors.get(row.id) ?? "E_OUTBOX_ABANDONED");
                 }
               }
               this.metric({
@@ -3306,7 +3349,18 @@ export class NetScopeDO {
               lane
             );
           }
+          // CO16.8: the failure records and the deletes of the rows they
+          // describe are ONE transaction. Flushed LAST because the abandon
+          // loop above stages into the same buffer, and written without a
+          // catch, so a write failure aborts the deletes too and the dispatch
+          // retries — the alternative is deleting the row and losing the only
+          // trace that a deadline did not fire.
+          flushedFailures = this.flushStagedScheduledFailures();
         });
+        // Announce only what actually committed.
+        for (const entry of flushedFailures) {
+          this.announceScheduledFailure(entry.turn, entry.outcome, entry.detail, entry.firedAt);
+        }
         sqlMs += Date.now() - sqlStarted;
         // Phase 0/CO10 observability for the Phase-3 invariant: rows a
         // pass considered must stay bounded as the backlog grows (the
@@ -3665,6 +3719,13 @@ export class NetScopeDO {
    * it would fire the alarm in a tight loop that can do no useful work.
    * Dispatched rows live in the outbox family, whose retry alarm covers
    * them. */
+  /** Test seam for the CO16.6 acceptance re-arm: exercising it through a
+   * full commit would drag in the whole planning stack for a one-line
+   * scheduling rule. Mirrors exactly what the accepted path does. */
+  rearmForTest(now: number): void {
+    this.rearmAlarm(now, { dueNow: this.store.hasScheduledDue(now) });
+  }
+
   private rearmAlarm(now: number, opts?: { dueNow?: boolean }): void {
     // One indexed MIN over due_at (Phase 3) — re-arming must not read and
     // parse every parked row. `dueNow` is the alarm handler's bounded-

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
+import { BUILTIN_NAMES, runTinyVm } from "../src/core/tiny-vm";
 import { freezeTinyBytecode, type Message, type TinyBytecode, type VerbDef } from "../src/core/types";
 
 function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
@@ -449,5 +450,47 @@ describe("v0.5 in-memory VM", () => {
         []
       )
     ).toBe(14);
+  });
+});
+
+describe("builtin index stability", () => {
+  it("keeps every previously-published builtin at its original index", () => {
+    // Persisted bytecode encodes builtins by INDEX. Inserting a name anywhere
+    // but the end silently re-points every later builtin in an aged world's
+    // stored verbs — which is exactly what the scheduling work did once, and
+    // a green test suite said nothing. This freezes a prefix so the next
+    // insert fails here instead of in someone's world.
+    const frozenPrefix = [
+      "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
+      "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled",
+      "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
+      "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
+      "current_location", "current_session", "session_location", "all_locations", "primary_session",
+      "is_connected", "idle_seconds"
+    ];
+    expect(BUILTIN_NAMES.slice(0, frozenPrefix.length)).toEqual(frozenPrefix);
+    // The scheduling builtins must be at the END, after everything else.
+    expect(BUILTIN_NAMES.slice(-3)).toEqual(["schedule", "schedule_at", "cancel_schedule"]);
+    // No duplicates: a duplicate would make one index unreachable.
+    expect(new Set(BUILTIN_NAMES).size).toBe(BUILTIN_NAMES.length);
+  });
+
+  it("names the removal when aged bytecode still carries FORK/SUSPEND/READ", async () => {
+    // Verbs persisted before the parked-task deletion still contain these
+    // opcodes. A bare "unknown VM opcode" is a worse diagnosis than saying
+    // what happened and where to go.
+    const { world, actor } = authedWorld();
+    for (const op of ["FORK", "SUSPEND", "READ"]) {
+      const bytecode: TinyBytecode = {
+        literals: [],
+        num_locals: 0,
+        max_stack: 4,
+        version: 1,
+        ops: [["PUSH_INT", 1], [op, 0], ["RETURN"]] as never
+      };
+      await expect(
+        runTinyVm(vmCtx(world, actor, "delay_1", `aged_${op.toLowerCase()}`), freezeTinyBytecode(bytecode), [])
+      ).rejects.toMatchObject({ code: "E_VERSION" });
+    }
   });
 });

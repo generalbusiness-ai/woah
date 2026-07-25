@@ -1270,13 +1270,25 @@ type ScheduleCancellation = {
 **Frame provenance is mandatory.** `armed_by` is the same
 `RecordedWriteAuthority` an ordinary `TranscriptWrite` carries, naming the
 VM frame that performed the effect. Without it the scope has nothing to
-check its own rules against: it would have to take the planner's word for
-which object's namespace an id belongs to and whether the arming frame
-held wizard authority, and a compromised or faulty planner could then arm
-`always` entries or overwrite another object's timer with no proof
-required. Schedule effects are authority-bearing and are validated
-per-frame exactly like writes — **never** against the union of frames in
-the transcript.
+check its own rules against at all: which object's namespace an id belongs
+to, and whether the arming frame held wizard authority, would both be
+unanswerable. Schedule effects are validated per-frame exactly like
+writes — **never** against the union of frames in the transcript.
+
+**What that does and does not prove.** The scope validates provenance for
+*consistency*: the namespace matches `armed_by.this_obj`, the scheduled
+actor matches the turn's actor, and the wizard flag is read from the
+scope's own authority cells rather than asserted by the submitter. It does
+**not** prove that the named frame really ran — a planner that fabricated
+`armed_by` naming an existing wizard could arm an `always` entry.
+
+That is the same trust posture every `TranscriptWrite` already has: a
+planner that fabricates provenance can fabricate a write's `writer` too,
+and CO1 places the gateway inside the deployment trust boundary. Schedule
+effects are therefore no weaker than writes — but they are not stronger,
+and this section should not be read as promising a proof the layer cannot
+give. Closing it needs frame attestation for writes generally, which is
+out of scope here (CO11).
 
 `armed_by` is **validated and discarded**. It does not enter the pending
 entry and does not ride into the fired turn; CO16.4's rule that no

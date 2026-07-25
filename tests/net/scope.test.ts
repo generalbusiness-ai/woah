@@ -738,7 +738,30 @@ describe("scheduled-turn effects (CO16.2)", () => {
     };
   }
 
+  /** Materialize the schedule target in this scope. CO16.1 is same-scope
+   * only, and the scope proves that by holding the target itself rather than
+   * trusting a routing hint — so a target it has never seen is refused. */
+  const seededTargets = new WeakSet<ScopeSequencer>();
+  function seedTarget(seq: ScopeSequencer): void {
+    if (seededTargets.has(seq)) return;
+    seededTargets.add(seq);
+    const reply = seq.submit(submitFor(seq, transcript({
+      creates: [{
+        object: "#thing",
+        name: "Thing",
+        parent: "$thing",
+        owner: "#actor",
+        anchor: null,
+        location: null,
+        flags: {},
+        writer: WRITER
+      }]
+    }), "seed-thing"));
+    expect(reply.status).toBe("accepted");
+  }
+
   function armingTurn(seq: ScopeSequencer, partial: Partial<EffectTranscript>, key: string) {
+    seedTarget(seq);
     // Use the SHARED constant, never a literal: the producer and the validator
     // disagreeing on this name is exactly the bug these tests missed once.
     return submitFor(seq, transcript({ logicalInputs: [{ name: SCHEDULE_CLOCK_INPUT, value: NOW }], ...partial }), key);

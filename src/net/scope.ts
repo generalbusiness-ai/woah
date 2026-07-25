@@ -2016,7 +2016,11 @@ export class ScopeSequencer {
       // CO16.3: the id namespace IS the arming object. This single check is
       // the whole enforcement — without it any verb could upsert over another
       // object's timer, a same-scope denial of service with no audit signal.
-      const separator = request.id.lastIndexOf(":");
+      // Split on the FIRST colon: the namespace is the arming object, whose
+      // ref never contains one, while a caller-supplied stable key may. A
+      // lastIndexOf split terminally rejected every legitimate key with a
+      // colon in it.
+      const separator = request.id.indexOf(":");
       const namespace = separator < 0 ? "" : request.id.slice(0, separator);
       if (namespace !== armedBy.thisObj) {
         return `schedule ${request.id} is outside the arming object's namespace (${armedBy.thisObj})`;
@@ -2046,13 +2050,23 @@ export class ScopeSequencer {
         return `schedule ${request.id} is beyond the ${SCHEDULE_MAX_HORIZON_MS}ms horizon`;
       }
 
-      // Same-scope only (CO16.1/CO16.10): waking another scope is an ordinary
-      // committed turn submitted by the fired verb, never a queue entry here.
+      // Same-scope only (CO16.1). `scopeOf` alone does not establish this:
+      // the Scope DO answers "this scope" for every target it has no routing
+      // hint for, and gateway routing never contributes schedule targets, so
+      // a foreign target read as local. Require instead that this scope HOLDS
+      // the target — a fact it can check against its own authority, with no
+      // hint and no trust in the submitter.
       if (this.options.scopeOf) {
         const targetScope = this.options.scopeOf(request.call.target);
         if (targetScope !== null && targetScope !== this.scope) {
           return `schedule ${request.id} targets ${request.call.target} in scope ${targetScope}, not ${this.scope}`;
         }
+      }
+      const targetKnownHere =
+        this.store.get(cellKey("object_lineage", request.call.target)) !== undefined ||
+        (submit.transcript.creates ?? []).some((create) => create.object === request.call.target);
+      if (!targetKnownHere) {
+        return `schedule ${request.id} targets ${request.call.target}, which this scope does not hold`;
       }
 
       const bytes = scheduledTurnBytes(this.scheduledTurnFromRequest(request, this.scheduleAttribution(submit)));
@@ -2064,7 +2078,7 @@ export class ScopeSequencer {
     for (const entry of cancellations) {
       const armedBy = entry.armed_by;
       if (!armedBy) return `cancellation ${entry.id} carries no arming-frame provenance`;
-      const separator = entry.id.lastIndexOf(":");
+      const separator = entry.id.indexOf(":");
       const namespace = separator < 0 ? "" : entry.id.slice(0, separator);
       if (namespace !== armedBy.thisObj && !this.isWizardRef(armedBy.progr)) {
         return `cancellation ${entry.id} is outside the calling object's namespace (${armedBy.thisObj})`;
@@ -2162,7 +2176,7 @@ export class ScopeSequencer {
     const byId = new Map<string, { bytes: number; owner: string }>();
     let bytes = 0;
     for (const row of rows) {
-      const separator = row.id.lastIndexOf(":");
+      const separator = row.id.indexOf(":");
       const owner = separator < 0 ? "" : row.id.slice(0, separator);
       const rowBytes = scheduledTurnBytes(row);
       bytes += rowBytes;

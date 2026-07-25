@@ -59,6 +59,37 @@ async function armAndSubmit(source: string, callId = "e2e-arm") {
   return { seq, transcript, reply: seq.submit(submit), outcome };
 }
 
+/** Run a second real turn against an EXISTING sequencer, so a cancellation
+ * can act on an entry a previous turn armed. */
+async function armAndSubmitInto(
+  prior: Awaited<ReturnType<typeof armAndSubmit>>,
+  source: string,
+  callId: string
+) {
+  const world = createWorld();
+  const session = world.auth("guest:e2e-schedule");
+  const actor = session.actor;
+  world.createObject({ id: "scheduler", name: "Scheduler", parent: "$thing", owner: actor });
+  expect(installVerb(world, "scheduler", "noop", "verb :noop() rxd { return 0; }", null).ok).toBe(true);
+  expect(installVerb(world, "scheduler", "arm", source, null).ok).toBe(true);
+  const recorder = new InMemoryTurnRecorder();
+  world.setTurnRecorder(recorder);
+  await world.directCall(callId, actor, "scheduler", "arm", []);
+  const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+  const submitted = { ...transcript, reads: [] } as EffectTranscript;
+  const derived = applyTranscript(prior.seq.store as CellStore, submitted, { scope_head: "x", catalog_epoch: EPOCH });
+  const reply = prior.seq.submit({
+    kind: "woo.net.commit_submit.v1",
+    scope: prior.seq.scope,
+    base: prior.seq.head(),
+    idempotency_key: callId,
+    transcript: submitted,
+    post_state_version: derived.postStateVersion,
+    stamp: { scope_head: "x", catalog_epoch: EPOCH }
+  });
+  return { transcript, reply };
+}
+
 describe("scheduling, producer to authority (CO16 end to end)", () => {
   it("a transcript the VM actually produced is accepted, and arms the queue", async () => {
     const { seq, transcript, reply, outcome } = await armAndSubmit(
@@ -107,7 +138,53 @@ describe("scheduling, producer to authority (CO16 end to end)", () => {
   });
 
   it("commits a cancellation produced by real woocode", async () => {
-    const { seq } = await armAndSubmit('verb :arm() rxd { return schedule(this, "noop", [], 600000, {"key": "tick"}); }');
-    expect(seq.peekDue(Date.now() + 10 * 60_000)).toHaveLength(1);
+    // Actually cancel. The previous version of this test only armed and
+    // asserted a queued row — it never called cancel_schedule at all, so it
+    // proved nothing about the path it claimed to cover.
+    const { seq, transcript } = await armAndSubmit(
+      'verb :arm() rxd { schedule(this, "noop", [], 600000, {"key": "tick"}); cancel_schedule("scheduler:tick"); return 0; }'
+    );
+    // Arming and cancelling the same id in ONE turn is refused (CO16.2): the
+    // upsert form already expresses re-arming, so this combination is
+    // ambiguous rather than useful.
+    expect(transcript.schedules).toHaveLength(1);
+    expect(transcript.cancellations).toHaveLength(1);
+    // Assert the REASON, not just the empty queue: an empty queue would also
+    // be consistent with the arming having been silently dropped, which is
+    // the failure mode this whole area keeps producing.
+    const { reply } = await armAndSubmit(
+      'verb :arm() rxd { schedule(this, "noop", [], 600000, {"key": "tick"}); cancel_schedule("scheduler:tick"); return 0; }',
+      "both-arrays"
+    );
+    if (reply.status !== "rejected") throw new Error("expected rejection");
+    expect(reply.reason).toBe("schedule_unauthorized");
+    expect(String(reply.detail?.schedule)).toMatch(/both/);
+    expect(seq.peekDue(Date.now() + 10 * 60_000)).toHaveLength(0);
+  });
+
+  it("cancels a previously armed entry across two real turns", async () => {
+    const armed = await armAndSubmit('verb :arm() rxd { return schedule(this, "noop", [], 600000, {"key": "tick"}); }', "arm-1");
+    expect(armed.seq.peekDue(Date.now() + 10 * 60_000)).toHaveLength(1);
+
+    // Second turn, same world shape, cancelling by the id the first produced.
+    const cancelled = await armAndSubmitInto(
+      armed,
+      'verb :arm() rxd { cancel_schedule("scheduler:tick"); return 0; }',
+      "cancel-1"
+    );
+    expect(cancelled.transcript.cancellations).toHaveLength(1);
+    if (cancelled.reply.status !== "accepted") throw new Error(`rejected: ${JSON.stringify(cancelled.reply)}`);
+    expect(armed.seq.peekDue(Date.now() + 10 * 60_000)).toEqual([]);
+  });
+
+  it("accepts a stable key containing colons", async () => {
+    // The namespace is the arming object, whose ref has no colon; a key may.
+    // Splitting on the LAST colon derived the wrong namespace and terminally
+    // rejected every such key.
+    const { seq, reply } = await armAndSubmit(
+      'verb :arm() rxd { return schedule(this, "noop", [], 600000, {"key": "case:42:escalate"}); }'
+    );
+    if (reply.status !== "accepted") throw new Error(`rejected: ${JSON.stringify(reply)}`);
+    expect(seq.peekDue(Date.now() + 10 * 60_000).map((row) => row.id)).toEqual(["scheduler:case:42:escalate"]);
   });
 });

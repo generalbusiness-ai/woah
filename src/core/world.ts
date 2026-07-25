@@ -1315,7 +1315,9 @@ export class WooWorld {
    * computed here could be falsified before the turn commits. */
   recordScheduleCancellation(ctx: CallContext, scheduleId: string): null {
     assertString(scheduleId);
-    const separator = scheduleId.lastIndexOf(":");
+    // First colon, matching the authority's split: the namespace is the
+    // arming object, and a stable key may itself contain colons.
+    const separator = scheduleId.indexOf(":");
     const namespace = separator < 0 ? "" : scheduleId.slice(0, separator);
     if (namespace !== ctx.thisObj && !this.isWizard(ctx.progr)) {
       throw wooError("E_PERM", `cannot cancel schedule ${scheduleId} outside ${ctx.thisObj}`, { id: scheduleId, this: ctx.thisObj });

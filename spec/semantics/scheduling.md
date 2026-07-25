@@ -96,11 +96,17 @@ consequence: a chain that re-arms at a fixed offset drifts relative to
 local wall time across a DST boundary. A chain that must hold to local
 time recomputes its next instant from a timezone rule each time it fires.
 
-**Determinism.** The clock reading comes from the same recorded logical
-input `now()` uses, so the value is fixed when the turn is planned and
-replayed identically at validation and on replay. A scheduled time is part
-of the turn's committed effect, not a property of when some host happened
-to execute it.
+**Determinism.** Scheduling records its own clock reading as a logical
+input — one per turn, shared by every schedule that turn arms — so the
+value is fixed when the turn is planned and replayed identically at
+validation and on replay. A scheduled time is part of the turn's committed
+effect, not a property of when some host happened to execute it.
+
+It is a *separate* reading from `now()`, and the two can differ by the
+execution time between them. One reading per turn rather than one per call
+is required, not tidy: with several the committing scope could not tell
+which schedule was measured against which, and any rule for picking one
+would misjudge some entry in a multi-schedule turn.
 
 **Minimum lead time: 60 seconds.** A scheduled turn fires no sooner than
 60 seconds after the turn that armed it. Ask for less and you get 60
