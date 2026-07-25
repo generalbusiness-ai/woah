@@ -223,6 +223,40 @@ async function buildHarness(
     null
   );
   expect(wave.ok).toBe(true);
+  const speak = installVerb(
+    world,
+    "ws_wave_box",
+    "speak",
+    `verb :speak(text) rxd {
+      observe({ type: "spoke", actor: actor, text: text });
+      return true;
+    }`,
+    null
+  );
+  expect(speak.ok).toBe(true);
+  const speakVerb = world.object("ws_wave_box").verbs.find((verb) => verb.name === "speak");
+  if (!speakVerb) throw new Error("speak verb missing after install");
+  speakVerb.direct_callable = true;
+  expect(speakVerb.direct_callable).toBe(true);
+  const speakExceptSubmitter = installVerb(
+    world,
+    "ws_wave_box",
+    "speak_except_submitter",
+    `verb :speak_except_submitter(text) rxd {
+      /* The submitter sees the call result; peers use the same cross-shard
+       * presence-minus transport shape as chat:say_to. */
+      observe({ type: "spoke", actor: actor, text: text, _audience_exclude: [actor] });
+      return true;
+    }`,
+    null
+  );
+  expect(speakExceptSubmitter.ok).toBe(true);
+  const speakExceptSubmitterVerb = world.object("ws_wave_box").verbs.find(
+    (verb) => verb.name === "speak_except_submitter"
+  );
+  if (!speakExceptSubmitterVerb) throw new Error("speak_except_submitter verb missing after install");
+  speakExceptSubmitterVerb.direct_callable = true;
+  expect(speakExceptSubmitterVerb.direct_callable).toBe(true);
   // A third room for the "present elsewhere" push case: a session that
   // transitioned HERE must receive nothing from an annex-scope fanout.
   world.createObject({ id: "ws_side", name: "WS Side Room", parent: "$space", owner: actor });
@@ -250,6 +284,12 @@ async function buildHarness(
   world.ensureApiKey("$wiz", other, "ws-key-2", "ws-secret-2", "net-ws-test-2");
 
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  const speakCell = [...partitions.values()].flat().find((cell) =>
+    cell.kind === "verb_bytecode" && cell.object === "ws_wave_box" && cell.name === "speak"
+  );
+  if ((speakCell?.value as { direct_callable?: unknown } | undefined)?.direct_callable !== true) {
+    throw new Error(`speak cell lost direct-call metadata: ${JSON.stringify(speakCell)}`);
+  }
   // Activation barrier: the fixture installs a pre-verified world, so it
   // self-activates with the catalog partition.
   partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
@@ -353,18 +393,18 @@ async function buildHarness(
     }
   };
 
-  const mint = async (): Promise<string> => {
+  const mint = async (rosterVisible = true): Promise<string> => {
     const minted = await clientFetch(gateway, "POST", "/net-api/session", {
       token: `apikey:${KEY_ID}:${KEY_SECRET}`,
-      body: { ttl_ms: 600_000 }
+      body: { ttl_ms: 600_000, ...(rosterVisible ? {} : { roster_visible: false }) }
     });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     return minted.body.session as string;
   };
-  const mintOther = async (): Promise<string> => {
+  const mintOther = async (rosterVisible = true): Promise<string> => {
     const minted = await clientFetch(gateway, "POST", "/net-api/session", {
       token: "apikey:ws-key-2:ws-secret-2",
-      body: { ttl_ms: 600_000 }
+      body: { ttl_ms: 600_000, ...(rosterVisible ? {} : { roster_visible: false }) }
     });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     return minted.body.session as string;
@@ -718,6 +758,145 @@ describe("gateway self-subscribe (H1)", () => {
 });
 
 describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () => {
+  it("delivers presence-mode room speech to a socially hidden service session", async () => {
+    const h = await buildHarness();
+    const humanToken = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const serviceToken = "apikey:ws-key-2:ws-secret-2";
+    await h.subscribe(h.annexScope);
+    const human = await h.mint();
+    const service = await h.mintOther(false);
+    const enter = async (token: string, session: string, key: string): Promise<void> => {
+      const response = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "ws_annex", verb: "welcome", session, idempotency_key: key }
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    };
+    await enter(humanToken, human, "hidden-speech-human-enter");
+    await enter(serviceToken, service, "hidden-speech-service-enter");
+    await h.settle();
+
+    // Social presentation omits the service actor even though its raw
+    // session_presence row remains the delivery carrier.
+    const roster = await clientFetch(
+      h.gateway,
+      "GET",
+      `/net-api/relation?session=${human}&relation=session_presence&owner=ws_annex`,
+      { token: humanToken }
+    );
+    expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+    expect((roster.body.members as Array<{ member: string }>).map((row) => row.member)).toEqual([h.actor]);
+
+    const humanUpgrade = await upgrade(h, human);
+    expect(humanUpgrade.status).toBe(101);
+    const humanSocket = humanUpgrade.server as FakeWebSocket;
+    const serviceTicket = await mintTicket(h, service, serviceToken);
+    const serviceUpgrade = await upgrade(h, service, { ticket: serviceTicket });
+    expect(serviceUpgrade.status).toBe(101);
+    const serviceSocket = serviceUpgrade.server as FakeWebSocket;
+    await h.gateway.webSocketMessage(
+      humanSocket as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "hidden-speech",
+        route: "direct",
+        target: "ws_wave_box",
+        verb: "speak_except_submitter",
+        args: ["service-visible"],
+        idempotency_key: "hidden-speech"
+      })
+    );
+    await h.settle();
+
+    const speechResult = frames(humanSocket).find(
+      (frame) => frame.type === "turn_result" && frame.id === "hidden-speech"
+    );
+    expect(speechResult?.status, JSON.stringify(speechResult)).toBe(200);
+    expect(speechResult?.observations).toEqual([
+      expect.objectContaining({ type: "spoke", text: "service-visible" })
+    ]);
+    expect(frames(serviceSocket).filter((frame) => frame.type === "live_observations")).toEqual([
+      expect.objectContaining({
+        scope: h.annexScope,
+        observations: [expect.objectContaining({ type: "spoke", text: "service-visible" })]
+      })
+    ]);
+    h.close();
+  });
+
+  it("relays a validated effect-free direct observation without minting a scope sequence", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const s1 = await h.mint();
+    const s2 = await h.mint();
+    const enter = async (session: string, key: string): Promise<void> => {
+      const response = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "ws_annex", verb: "welcome", session, idempotency_key: key }
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    };
+    await enter(s1, "live-enter-1");
+    await enter(s2, "live-enter-2");
+    await h.settle();
+
+    const a = await upgrade(h, s1);
+    const b = await upgrade(h, s2);
+    const socketA = a.server as FakeWebSocket;
+    const socketB = b.server as FakeWebSocket;
+    await h.gateway.webSocketMessage(
+      socketA as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "live-speak",
+        route: "direct",
+        target: "ws_wave_box",
+        verb: "speak",
+        args: ["hello"],
+        idempotency_key: "live-speak"
+      })
+    );
+    const reply = frames(socketA).at(-1) as {
+      reply?: { head?: { seq?: number } };
+      observations?: Array<{ type?: string }>;
+    };
+    if (!reply.observations) throw new Error(`direct turn lacked observations: ${JSON.stringify(frames(socketA))}`);
+    expect(reply.observations).toContainEqual(
+      expect.objectContaining({ type: "spoke", text: "hello" })
+    );
+    const stableSeq = reply.reply?.head?.seq;
+    await h.settle();
+
+    const peer = frames(socketB).filter((frame) => frame.type === "live_observations");
+    expect(peer).toEqual([
+      expect.objectContaining({
+        scope: h.annexScope,
+        observations: [expect.objectContaining({ type: "spoke", text: "hello" })]
+      })
+    ]);
+    expect(peer[0]).not.toHaveProperty("seq");
+    expect(frames(socketA).filter((frame) => frame.type === "live_observations")).toHaveLength(0);
+
+    // A second live turn validates against the same head: delivery is real,
+    // but it never masquerades as a durable authority event.
+    await h.gateway.webSocketMessage(
+      socketA as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "live-speak-2",
+        route: "direct",
+        target: "ws_wave_box",
+        verb: "speak",
+        args: ["again"],
+        idempotency_key: "live-speak-2"
+      })
+    );
+    const second = frames(socketA).at(-1) as { reply?: { head?: { seq?: number } } };
+    expect(second.reply?.head?.seq).toBe(stableSeq);
+    await h.settle();
+    h.close();
+  });
+
   it("labels a redundant submitter frame after gateway hibernation loses the echo LRU", async () => {
     const h = await buildHarness();
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
@@ -886,13 +1065,11 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // nor blocked the peer delivery, which the s2 assertion above proves.
     expect(frames(socketC).filter((frame) => frame.type === "observations")).toHaveLength(0);
 
-    // Phase 2 invariant: the fanout scan touched exactly the ANNEX
-    // occupants (s1, s2, s4 — three rows), NOT the off-scope s3, and never
-    // the whole session_presence table. This is the O(occupants) property
-    // the owner_scope index gives: adding sessions in OTHER scopes cannot
-    // grow this count.
+    // Phase 2 invariant: the fanout scan touched exactly the ANNEX sessions
+    // with carriers on this shard (s1, s2 — two rows), NOT socket-less s4 or
+    // off-scope s3. Cost follows local carriers, not room population.
     logSpy.mockRestore();
-    expect(scanRows).toEqual([3]);
+    expect(scanRows).toEqual([2]);
 
     // SECURITY: the only correlation value the peer learns is a one-way
     // digest. Reusing it as an idempotency key must execute the peer's own
@@ -914,6 +1091,57 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     expect(peerAttempt?.reply?.status).toBe("accepted");
     expect(peerAttempt?.replayed).not.toBe(true);
     expect(peerAttempt?.result).toBe(2);
+
+    // The peer turn queued its ordinary fanout. Drain it before closing the
+    // fake SQLite stores so the test cannot hide a post-assertion delivery
+    // failure behind waitUntil teardown.
+    await h.settle();
+    h.close();
+  });
+
+  it("resolves a presence-derived live audience on the destination shard instead of trusting a partial planner enumeration", async () => {
+    const h = await buildHarness();
+    const s1 = await h.mint();
+    const s2 = await h.mint();
+    const enter = async (session: string, key: string): Promise<void> => {
+      const response = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+        body: { target: "ws_annex", verb: "welcome", session, idempotency_key: key }
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    };
+    await enter(s1, "presence-mode-enter-1");
+    await enter(s2, "presence-mode-enter-2");
+    await h.settle();
+
+    const a = await upgrade(h, s1);
+    const b = await upgrade(h, s2);
+    const socketA = a.server as FakeWebSocket;
+    const socketB = b.server as FakeWebSocket;
+    const request = new Request("https://do/net/live", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scope: h.annexScope,
+        observations: [{ type: "spoke", text: "from another shard" }],
+        // Model the submitting planner seeing only s1. Presence mode is the
+        // completeness signal: this enumeration must not suppress s2.
+        observationSessionAudiences: [[s1]],
+        observationAudiences: [[h.actor]],
+        observationAudienceModes: ["presence"]
+      })
+    });
+    const response = await h.gateway.fetch(
+      await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, request)
+    );
+    expect(response.ok).toBe(true);
+    expect(frames(socketA).filter((frame) => frame.type === "live_observations")).toHaveLength(1);
+    expect(frames(socketB).filter((frame) => frame.type === "live_observations")).toEqual([
+      expect.objectContaining({
+        scope: h.annexScope,
+        observations: [expect.objectContaining({ text: "from another shard" })]
+      })
+    ]);
 
     h.close();
   });

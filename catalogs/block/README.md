@@ -29,7 +29,10 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 
 - writability tiers (`writable_owner`, `writable_self`) as ordinary
   class properties
-- live `block_data` observation route (no sequencing, no replay)
+- Net-sequenced production calls, best-effort observation delivery, and
+  current-state recovery via `:get_data`
+- the acts boundary: external-authoritative values stay block properties;
+  typed coordination verbs emit acts internally
 - credential management (mint/revoke/list apikeys via the block)
 - summary-vs-detail tier filtering for `RoomSnapshot`
 
@@ -54,12 +57,13 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 | `:moveto(target)` | wizard | Block is anchored; non-wizard raises `E_PERM`. |
 | `:acceptable(object)` | rxd | Always false (nothing enters a block). |
 | `:mint_apikey(label?)` | owner/wizard | Mints an apikey bound to this block's actor. |
-| `:revoke_apikey(id)` | owner/wizard | Revokes a key (closes any sessions minted from it). |
+| `:revoke_apikey(id)` | owner/wizard | Revokes a key and fences sessions minted from it. |
 | `:list_apikeys()` | rxd | Returns the apikey records for this block. |
 
 After minting, store the returned credential as the full token string:
 `apikey:<id>:<secret>`. The id is part of the credential, not just
-metadata; `apikey:<secret>` is not the documented token form. Validate
+metadata; new ids contain public routing hints but no secret.
+`apikey:<secret>` is not the documented token form. Validate
 the full token before putting it into a plug's secret store:
 
 ```bash
@@ -80,4 +84,13 @@ unknown, or revoked.
 
 Concrete block classes set their own `writable_owner` (config knobs) and
 extend `writable_self` (data fields). Tier lists are inherited via the
-property-def chain. They are catalog data, not special substrate fields.
+property-def chain. They are catalog data, not special substrate fields:
+today these subclass values are declared in a catalog manifest and applied
+by the catalog installer.
+
+This is not yet an ordinary `@create` recipe. `$block` is non-fertile,
+self-hosted deployment needs an explicit resource-allocation and placement
+boundary, and a programmer cannot replace the inherited read-only tier
+lists on an ad-hoc child. The current supported authoring path and the
+planned programmer-owned blueprint/factory path are documented in
+[`docs/blocks-and-plugs/writing-a-block.md`](../../docs/blocks-and-plugs/writing-a-block.md).

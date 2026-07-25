@@ -339,7 +339,31 @@ export async function runHoroscopeTick(
 
     const description = horoscopeNoteDescription(request);
     try {
-      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text, description]);
+      // Generated prose is written directly to the empty room-anchored
+      // artifact allocated by :order. A fresh key is intentional: after a
+      // lost reply the next tick calls prepare_artifact again, and its domain
+      // check returns the same note. Sequenced delivery carries only that ref.
+      const prepared = await client.directCall(
+        env.BLOCK_ID,
+        "prepare_artifact",
+        [next.order_id, name, text, description],
+        undefined,
+        "direct"
+      ) as { prepared?: boolean; note?: string } | undefined;
+      if (!prepared?.prepared || typeof prepared.note !== "string" || !prepared.note) {
+        throw new WooError(
+          "E_AMBIGUOUS_RESULT",
+          "artifact preparation committed without a recoverable note reference",
+          503,
+          { order_id: next.order_id }
+        );
+      }
+      await client.directCall(
+        env.BLOCK_ID,
+        "deliver",
+        [next.order_id, prepared.note],
+        `plug:deliver:${env.BLOCK_ID}:${next.order_id}`
+      );
       delivered++;
       logEvent({
         event: "order_delivered",
@@ -378,7 +402,12 @@ export async function runHoroscopeTick(
       // ticks than silently drop a user's order on a flaky network.
       if (err instanceof WooError && PERMANENT_DELIVER_ERRORS.has(err.code)) {
         try {
-          await client.directCall(env.BLOCK_ID, "cancel", [next.order_id]);
+          await client.directCall(
+            env.BLOCK_ID,
+            "cancel",
+            [next.order_id],
+            `plug:cancel:${env.BLOCK_ID}:${next.order_id}`
+          );
           logEvent({
             event: "order_canceled_by_plug",
             block: env.BLOCK_ID,

@@ -16,9 +16,12 @@
  * 4. Predict `post_state_version` by running the SAME applyTranscript
  *    the scope runs, against an authority-role scratch copy of the view
  *    (CellStore.scratchAuthorityFrom — planner parity only, discarded).
- * 5. Account the read-closure envelope bytes (CO7 ceilings). A breach is
- *    a plain Error: the planner built an oversized closure — a misplan
- *    bug to fix, not a divergence to repair (never a NetError code).
+ *
+ * Envelope bytes (CO7 ceilings) are NOT accounted here: the committing
+ * scope validates read versions and attestations and never re-executes
+ * bytecode, so no read state ships with a submit. The gateway measures
+ * the ACTUAL serialized submit RPC body and enforces the ceiling
+ * immediately before the RPC (scope.ts assertEnvelopeCeiling).
  *
  * The caller (gateway loop) submits the returned CommitSubmit; a
  * retryable rejection's `mismatched_reads` names exactly the view cells
@@ -33,18 +36,16 @@ import {
   type ShadowTurnCall
 } from "./bridge";
 import type { Principal } from "./attribution";
-import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
+import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./cells";
 import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
+import { compactNetLiveAudience, type LiveAudience } from "./live";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
+import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
-import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
-
-/** CO7/CO10 envelope byte ceilings, enforced at plan time. */
-export const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
-export const CROSS_SCOPE_ENVELOPE_BYTE_LIMIT = 256 * 1024;
+import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
 
 export type PlanTurnInput = {
   call: ShadowTurnCall;
@@ -74,20 +75,16 @@ export type PlanTurnInput = {
    * deterministic given the counter). Turns that do not create run fine
    * at the bridge defaults. */
   counters?: SerializedFromCellsOptions;
-  /** Lineage keys the receiver universally holds (CO15: the catalog
-   * scope's closure is receiver-known in every transfer — class chains
-   * never reship). The read closure omits these cells and declares them
-   * `assumes_known` instead; only `object_lineage:*` keys belong here.
-   * The function form is invoked with the PLANNING STORE (the seed slice
-   * under slicePlanning) once the run settles, so a caller can classify
-   * just the lineage keys the plan can actually reference instead of
-   * scanning its whole view per turn (ready-to-scale blocker #1). */
-  receiverKnown?: ReadonlySet<string> | ((planStore: CellStore) => ReadonlySet<string>);
+  /** The gateway has a COMPLETE copy of `scope` at the submit base head.
+   * When selection stays on that scope, the base-head CAS covers every
+   * same-scope read, so their per-cell entries may be omitted from the wire
+   * transcript. Foreign/session reads remain explicit and attested. */
+  compactOwnedReads?: { scope: string };
   /** Phase 1 (slice-based planning): when true, the planner runs the VM
    * against the turn's SEED SLICE (actor/session/target + their class
    * chain), slice-cloned per attempt from the live view's indexes and
    * grown on a sparse miss — so the WHOLE warm turn (clone, execution,
-   * rewrite, scratch, closure) costs O(read-set), not O(view) (blocker
+   * rewrite, scratch) costs O(read-set), not O(view) (blocker
    * #1). Genuinely-absent cells still escape as E_MISSING_STATE to the
    * gateway's pull path. Default (absent/false) plans against one full
    * view clone — byte-identical to the pre-slice path, so non-turn
@@ -121,7 +118,7 @@ export type PlanTurnInput = {
   /** Owner-computed ordered-children values (one per container + parent), installed only
    * in the ephemeral execution world for generic ordered_children(parent, container)
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
-   * off the O(N)-edge-cell read closure. */
+   * out of the O(N)-edge-cell read set. */
   planningOrderedChildren?: readonly { container: string; parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
   /** Owner-answered bounded neighbour queries (P2.4), installed only in the
    * ephemeral execution world for generic ordered_neighbors(parent, query, container)
@@ -130,28 +127,41 @@ export type PlanTurnInput = {
    * same-parent mutations identically — the answer is just O(1) instead of
    * O(width). */
   planningOrderedNeighbors?: readonly { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
+  /** Owner-served committed replay pages (sequenced-log.md SL4), one per
+   * exact `(space, from, limit)` query, installed only in the ephemeral
+   * execution world for `space:replay(from, limit)` reads. `space` is the
+   * SEMANTIC space id; `scope` is the owning authority the page was
+   * fetched from; `version` is the page's authority content address (the
+   * attestation below carries it, so a committed-log append between plan
+   * and submit invalidates the read). `entries` are already in the
+   * planning shape (no per-entry space key). */
+  planningReplayPages?: readonly { space: string; from: number; limit: number; scope: string; entries: readonly Record<string, unknown>[]; version: string }[];
 };
 
 export type PlanTurnResult = {
   submit: CommitSubmit;
   selection: ScopeSelection;
-  /** UTF-8 bytes of the full CO7 envelope (transcript + read-closure). */
-  envelopeBytes: number;
   /** The submitted transcript (rewritten reads, commit-scope target). */
   transcript: EffectTranscript;
+  /** True when the submitted transcript used complete-head read compaction. */
+  ownedReadsCompacted: boolean;
   /** Phase 0 / CO10: the number of cells fed to `planningWorldFromCells`
    * — the planner's INPUT size, the thing that scales with view size on
    * the current (pre-slice) path and must stay ~read-set once planning is
    * slice-based (the `plan_cells` structural counter). Sourced from the
-   * exact array so it measures the resident-view clone/rebuild CPU, not
-   * the post-hoc read closure. */
+   * exact array so it measures the resident-view clone/rebuild CPU. */
   planCells: number;
   /** Phase 0 (honesty): cells in the fix-6 SNAPSHOT the settled attempt
    * planned against. Under slicePlanning this is the seed SLICE (the
-   * clone, scratch, rewrite and closure all operate on it), so it must
+   * clone, scratch and rewrite all operate on it), so it must
    * stay flat as the view grows — the load gate's blocker-#1 invariant.
    * On the default path it is the full `view.clone()`, O(view). */
   snapshotCells: number;
+  /** Non-authoritative routing hints computed by the direct-call runtime.
+   * They never enter the transcript/hash; a scope uses them only after it
+   * validates an effect-free direct turn, then discards them after live
+   * best-effort fanout. */
+  liveAudience?: LiveAudience;
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
@@ -160,7 +170,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // ONE consistent snapshot per planning attempt, taken synchronously
   // (fix 6: the version-laundering window). The cells the ephemeral world
   // executes against, the versions the recorded reads are rewritten with,
-  // the post-state pre-image, and the read-closure bytes must all come
+  // and the post-state pre-image must all come
   // from the same instant: the VM run below yields the event loop, and a
   // concurrent fanout/refresh mutating the live view mid-plan would
   // otherwise stamp the reads with versions the execution never saw —
@@ -171,8 +181,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // (Phase 1 / ready-to-scale blocker #1) instead clones ONLY the seed
   // slice's keys, re-cloned from the live view at the top of every
   // attempt: each clone is synchronous, so the fix-6 single-instant
-  // property holds for the attempt that settles (its execution, rewrite,
-  // scratch and closure all read the SAME detached slice), while the copy
+  // property holds for the attempt that settles (its execution, rewrite
+  // and scratch all read the SAME detached slice), while the copy
   // cost is O(read-set), never O(view).
   const sliceMode = input.slicePlanning === true;
   const snapshot = sliceMode ? null : view.clone();
@@ -236,6 +246,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
         require_room_roster_projection: true,
         require_ordered_children_projection: true,
+        require_replay_page_projection: true,
         record_authoring_cell_writes: true,
         // Net profile: provisioning audit is the commit record, never a
         // catalog $system.wizard_actions write (audit.md AU1).
@@ -246,6 +257,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
           : {}),
         ...(input.planningOrderedNeighbors && input.planningOrderedNeighbors.length > 0
           ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ container: n.container, query: n.query, value: n.value })) }
+          : {}),
+        ...(input.planningReplayPages && input.planningReplayPages.length > 0
+          ? { replay_pages: input.planningReplayPages.map((p) => ({ space: p.space, from: p.from, limit: p.limit, entries: p.entries })) }
           : {})
       });
     } catch (err) {
@@ -258,6 +272,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       if (thrownOrdered) throw orderedChildrenMissState(thrownOrdered);
       const thrownNeighbors = orderedNeighborsMiss(err as { code?: unknown; value?: unknown } | null);
       if (thrownNeighbors) throw orderedNeighborsMissState(thrownNeighbors);
+      const thrownReplay = replayPageMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownReplay) throw replayPageMissState(thrownReplay);
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
       // surface the miss against the VIEW so the gateway pulls exactly
@@ -286,6 +302,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     if (recordedOrdered) throw orderedChildrenMissState(recordedOrdered);
     const recordedNeighbors = orderedNeighborsMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
     if (recordedNeighbors) throw orderedNeighborsMissState(recordedNeighbors);
+    const recordedReplay = replayPageMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedReplay) throw replayPageMissState(recordedReplay);
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
     const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
@@ -314,7 +332,16 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // selection, so the folded write participates in the write-set routing.
   const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
-  const transcript = submitTranscript(withSession, planStore, selection.scope, {
+  // Sequenced seq-allocation ownership (SL1): the space's `next_seq`
+  // advance can only apply — and serialize — at the scope that OWNS the
+  // space, where the accepted turn also appends its committed log entry.
+  // When the write set routes the commit elsewhere (CA3 pure movement at
+  // the actor's cluster), the turn consumes NO seq: strip the allocation
+  // read+write instead of shipping a foreign-cell rider, which would
+  // CAS-collide with real allocations (a duplicate space seq) and chain
+  // movement latency to the room's attestation freshness.
+  const forSubmit = stripUnownedSequencedAllocation(withSession, selection.scope, classifier);
+  const transcript = submitTranscript(forSubmit, planStore, selection.scope, {
     ...(input.principal ? { principal: input.principal } : {}),
     ...(input.trace ? { trace: input.trace } : {})
   });
@@ -338,6 +365,18 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   if (orderingReads.size > 0) {
     transcript.orderingReads = [...orderingReads.values()];
   }
+  // Replay pages attest identically (SL4): every page this plan was given
+  // rides in `replayReads` with the authority content version it was
+  // fetched at — a supplied-but-unread page is a stable window whose
+  // attestation is harmless, and dual versions for one query (a mid-turn
+  // fetch race) attest both so the authority rejects the stale one.
+  const replayReads = new Map<string, { space: string; from: number; limit: number; scope: string; version: string }>();
+  for (const p of input.planningReplayPages ?? []) {
+    replayReads.set(`${p.scope}\0${p.space}\0${p.from}\0${p.limit}\0${p.version}`, { space: p.space, from: p.from, limit: p.limit, scope: p.scope, version: p.version });
+  }
+  if (replayReads.size > 0) {
+    transcript.replayReads = [...replayReads.values()];
+  }
 
   // Planner-parity post-state: same apply, same prior cells (the settled
   // attempt's store is a read-through of authority, and every write
@@ -348,22 +387,12 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // and a stale view is caught by the read-version check before
   // post-state ever disagrees.
   const applied = applyTranscript(CellStore.scratchAuthorityFrom(planStore), transcript, stamp);
-
-  // The function form classifies just the settled store's lineage keys
-  // (O(slice)) instead of a per-turn whole-view scan (blocker #1).
-  const receiverKnown =
-    typeof input.receiverKnown === "function" ? input.receiverKnown(planStore) : input.receiverKnown ?? new Set<string>();
-  const closure = serializeTransfer(readClosureCells(planStore, transcript, call, receiverKnown), receiverKnown);
-  // The CO7 envelope is the transcript plus its read-closure; measure the
-  // whole shape that would go on the wire.
-  const envelopeBytes = new TextEncoder().encode(JSON.stringify({ transcript, closure })).byteLength;
-  const warm = selection.scope === planningScope && selection.riders.length === 0;
-  const limit = warm ? WARM_ENVELOPE_BYTE_LIMIT : CROSS_SCOPE_ENVELOPE_BYTE_LIMIT;
-  if (envelopeBytes > limit) {
-    throw new Error(
-      `planner built an oversized ${warm ? "warm" : "cross-scope"} envelope: ${envelopeBytes} bytes > ${limit} (misplan bug — shrink the read closure, do not raise the ceiling)`
-    );
-  }
+  const ownedReadsCompacted = input.compactOwnedReads?.scope === selection.scope;
+  const wireTranscript = compactTranscriptForSubmit(
+    transcript,
+    classifier,
+    ownedReadsCompacted ? selection.scope : null
+  );
 
   return {
     submit: {
@@ -371,16 +400,65 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       scope: selection.scope,
       base,
       idempotency_key: idempotencyKey,
-      transcript,
+      transcript: wireTranscript,
       post_state_version: applied.postStateVersion,
-      stamp
+      stamp,
+      ...(ownedReadsCompacted ? { owned_reads_compacted: true as const } : {})
     },
     selection,
-    envelopeBytes,
     transcript,
+    ownedReadsCompacted,
     planCells: planInput.length,
-    snapshotCells: planStore.size
+    snapshotCells: planStore.size,
+    ...(call.route === "direct" && run.frame.op === "result"
+      ? {
+          liveAudience: compactNetLiveAudience(run.frame)
+        }
+      : {})
   };
+}
+
+/**
+ * The scope never executes bytecode and never consumes a successful return
+ * value or state-probe closure. Keep those on the gateway for the client
+ * response. When the gateway proves its whole owner copy is at the submit's
+ * base head, the scope's existing stale-head check validates every owned read
+ * as one generation; only foreign/session/allocation reads must still ride.
+ */
+function compactTranscriptForSubmit(
+  transcript: EffectTranscript,
+  classifier: ScopeClassifier,
+  compactScope: string | null
+): EffectTranscript {
+  const retainedReads = compactScope === null
+    ? transcript.reads
+    : transcript.reads.filter((read) => {
+        // Session authorization consumes the value, and sequenced allocation
+        // consumes both version and claimed logical value. Never compact them.
+        if (read.cell.kind === "session" || isSequencedAllocationCell(transcript, read.cell)) return true;
+        try {
+          return classifier.scopeOf(read.cell.object) !== compactScope;
+        } catch {
+          return true;
+        }
+      });
+  // A read is a proof of one exact cell value/version, not a record of how
+  // many times bytecode happened to consult that value. Repeated dispatches
+  // can read the same immutable catalog verb thousands of times while
+  // rendering one collection; keeping one byte-identical proof preserves
+  // validation and prevents execution shape from amplifying the wire proof.
+  // Distinct versions or values remain distinct and therefore still expose a
+  // mid-turn authority change to the sequencer.
+  const seenReads = new Set<string>();
+  const reads = retainedReads.filter((read) => {
+    const identity = cellVersion(read);
+    if (seenReads.has(identity)) return false;
+    seenReads.add(identity);
+    return true;
+  });
+  const { hash: _hash, result: _result, stateProbes: _stateProbes, ...rest } = transcript;
+  const body = { ...rest, reads };
+  return { ...body, hash: cellVersion(body) } as EffectTranscript;
 }
 
 /**
@@ -424,8 +502,8 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
   const transitionLineage = transition && transition.session === session
     ? snapshot.get(cellKey("object_lineage", transition.actor))?.value as { name?: unknown } | undefined
     : undefined;
+  const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
   if (transition && transition.session === session) {
-    const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
     const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
     writes.push({
       cell: { kind: "session", object: session },
@@ -438,9 +516,46 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
     ...recorded,
     reads,
     writes,
-    ...(transition && transition.session === session && typeof transitionLineage?.name === "string"
-      ? { sessionScopeTransition: { ...transition, actorName: transitionLineage.name } }
+    ...(transition && transition.session === session
+      ? {
+          sessionScopeTransition: {
+            ...transition,
+            ...(typeof transitionLineage?.name === "string" ? { actorName: transitionLineage.name } : {}),
+            ...(priorRow.rosterVisible === false ? { rosterVisible: false as const } : {})
+          }
+        }
       : {})
+  };
+}
+
+/**
+ * Sequenced seq-allocation ownership (see the call site): keep the
+ * engine-folded `next_seq` read+write only when the SELECTED commit scope
+ * owns the sequencing space; otherwise remove both. Selection already
+ * ignores the allocation (route.ts), so this never changes the chosen
+ * scope — it only keeps the submitted write set honest about where a seq
+ * was actually consumed. The classifier throw-fallback assumes the
+ * production shape (a sequenced turn plans at its space's own scope).
+ */
+function stripUnownedSequencedAllocation(
+  recorded: EffectTranscript,
+  selectedScope: string,
+  classifier: ScopeClassifier
+): EffectTranscript {
+  const allocation = recorded.writes.some((write) => isSequencedAllocationCell(recorded, write.cell));
+  if (!allocation) return recorded;
+  const space = recorded.space ?? recorded.scope;
+  let spaceScope: string;
+  try {
+    spaceScope = classifier.scopeOf(space);
+  } catch {
+    spaceScope = selectedScope;
+  }
+  if (spaceScope === selectedScope) return recorded;
+  return {
+    ...recorded,
+    reads: recorded.reads.filter((read) => !isSequencedAllocationCell(recorded, read.cell)),
+    writes: recorded.writes.filter((write) => !isSequencedAllocationCell(recorded, write.cell))
   };
 }
 
@@ -476,71 +591,20 @@ function submitTranscript(
     ...recorded,
     reads,
     scope: scope as EffectTranscript["scope"],
+    // Semantic/authority identity split (sequenced-log.md SL4): the scope
+    // rewrite above retargets the transcript at the commit AUTHORITY
+    // ADDRESS, so a sequenced turn preserves its SEMANTIC sequencing space
+    // here — the identity the authority's committed log entry keys on.
+    // The engine recorded it as the pre-rewrite scope (the space the call
+    // dispatched on). Present-only-for-sequenced keeps direct-route
+    // transcript hashes unchanged.
+    ...(recorded.route === "sequenced" ? { space: recorded.scope } : {}),
     // AU3.2/AU2: attribution and trace ride the hashed body (present-
     // only-when-set keeps principal-less transcript hashes unchanged).
     ...(audit?.principal ? { principal: audit.principal } : {}),
     ...(audit?.trace ? { trace: audit.trace } : {})
   };
   return { ...body, hash: cellVersion(body) };
-}
-
-/**
- * The read-closure cell set (CO7): the actor row, the session row, every
- * read-set cell and write preimage present in the view, closed over
- * lineage (each referenced object's `object_lineage` plus its transitive
- * parent chain). Cells absent from the view ship nothing — their
- * absence is already encoded in the transcript's "absent" read versions.
- * Receiver-known lineage keys (CO15: the catalog closure) are walked for
- * their parents but never shipped — that is how class chains stay off
- * the wire. `serializeTransfer` then asserts the closure (E_LINEAGE =
- * planner bug).
- */
-function readClosureCells(
-  view: CellStore,
-  transcript: EffectTranscript,
-  call: ShadowTurnCall,
-  receiverKnown: ReadonlySet<string>
-): Cell[] {
-  const keys = new Set<string>();
-  const objects = new Set<string>();
-  const add = (key: string | null, object?: string): void => {
-    if (object !== undefined) objects.add(object);
-    if (key !== null && view.has(key)) keys.add(key);
-  };
-
-  for (const read of transcript.reads) add(netCellKeyFor(read.cell), read.cell.object);
-  for (const write of transcript.writes) add(netCellKeyFor(write.cell), write.cell.object);
-  for (const move of transcript.moves) add(cellKey("object_live", move.object), move.object);
-  for (const create of transcript.creates ?? []) {
-    // A create ships no preimage (the object does not exist yet) but its
-    // parent/destination must be resolvable at the receiver.
-    if (create.parent) objects.add(create.parent);
-    if (create.location) objects.add(create.location);
-  }
-  // CO7: the actor row and session rows ride in every envelope.
-  add(cellKey("object_live", call.actor), call.actor);
-  if (call.session) add(cellKey("session", call.session));
-
-  // Lineage closure: walk each referenced object's parent chain through
-  // the view. A parent missing from the view is caught by
-  // serializeTransfer's assert if any of its cells are present.
-  const pending = [...objects];
-  const walked = new Set<string>();
-  while (pending.length > 0) {
-    const object = pending.pop() as string;
-    if (walked.has(object)) continue;
-    walked.add(object);
-    const lineage = view.get(cellKey("object_lineage", object));
-    if (!lineage) continue;
-    // Receiver-known lineage never ships (CO15) but its parent chain is
-    // still walked: a shipped child may hang below a known ancestor whose
-    // OWN parent is not known and must therefore ride.
-    if (!receiverKnown.has(lineage.key)) keys.add(lineage.key);
-    const parent = (lineage.value as { parent?: unknown }).parent;
-    if (typeof parent === "string") pending.push(parent);
-  }
-
-  return [...keys].sort().map((key) => view.get(key) as Cell);
 }
 
 /**
@@ -651,8 +715,8 @@ function collectStrings(value: unknown, out: Set<string>): void {
  * objects; unrelated objects are never referenced, so the slice stays
  * independent of view size — the Phase-0 invariant). A lineage payload's
  * `parent`/`owner` are strings too, so each seeded object's class chain
- * closes transitively here — the read-closure walk and serializeTransfer's
- * dangle assert both depend on that. */
+ * closes transitively here — dispatch through inherited verbs depends on
+ * the whole chain being slice-resident. */
 function expandObjRefs(seed: Set<string>, view: CellStore): void {
   for (;;) {
     const strings = new Set<string>();
@@ -769,6 +833,31 @@ function orderedNeighborsMissState(request: OrderedNeighborsRequest): NetError {
   );
 }
 
+/**
+ * The exact page query named by a replay-page miss (SL4), or null if
+ * `errorish` is not one. The world's require-getter throws
+ * `E_NEED_REPLAY_PAGE` with `value = {space, from, limit}` when a verb
+ * reads a committed-log window the sparse planning world does not hold;
+ * both the thrown and the recorded (transcript.error) forms carry the same
+ * shape. Bounds are re-validated here so a malformed value is terminal,
+ * never a fetch the authority would refuse.
+ */
+function replayPageMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): ReplayPageQuery | null {
+  if (!errorish || errorish.code !== "E_NEED_REPLAY_PAGE") return null;
+  return validReplayPageQuery(errorish.value) ? { space: errorish.value.space, from: errorish.value.from, limit: errorish.value.limit } : null;
+}
+
+/** Package a replay-page miss as the repairable escape the gateway's turn
+ * loop recovers with one authority page fetch: a distinct
+ * `missing_replay_pages` detail keeps it off the cell-pull path. */
+function replayPageMissState(query: ReplayPageQuery): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning replay page not yet fetched for ${query.space} from ${query.from} limit ${query.limit}`,
+    { missing_replay_pages: [query] }
+  );
+}
+
 function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {
   if (isNetError(err)) return err;
   const woo = err as { code?: unknown; message?: unknown; value?: unknown } | null;
@@ -815,7 +904,7 @@ function sparseMissFromRecordedError(transcript: EffectTranscript, view: CellSto
  * lineage+live for unmaterialized subjects; the specific verb page for a
  * verb miss whose object IS materialized (dispatch found the object but
  * not the page — inherited verbs resolve through the class chain, which
- * is receiver-known catalog closure and already in view). */
+ * is already resident in the view). */
 function sparseMissingKeys(
   code: string,
   value: unknown,
@@ -841,7 +930,13 @@ function sparseMissingKeys(
     call.actor ?? null
   ].filter((ref): ref is string => typeof ref === "string" && ref.length > 0);
   for (const ref of refs) {
-    if (!view.has(cellKey("object_lineage", ref))) {
+    // A tombstone is a complete terminal answer, not missing lineage.
+    // Re-requesting lineage after authority supplied the tombstone would turn
+    // an honest E_OBJNF into a non-convergent repair loop.
+    if (
+      !view.has(cellKey("object_lineage", ref)) &&
+      !view.has(cellKey("object_tombstone", ref))
+    ) {
       missing.add(cellKey("object_lineage", ref));
       missing.add(cellKey("object_live", ref));
     }

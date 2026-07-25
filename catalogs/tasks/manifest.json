@@ -39,6 +39,7 @@
         "subject": "$task_registry",
         "view": "default",
         "layout": "space-workspace",
+        "navigation": { "tab": "tasks", "label": "Tasks", "aliases": ["tasks", "kanban"], "host_attribute": "data-tasks-board" },
         "regions": {
           "main": [
             {

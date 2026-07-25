@@ -26,6 +26,12 @@ import type { RelationDelta } from "./relations";
 export type FanoutBody = {
   scope: string;
   seq: number;
+  /** Rolling authority head at `seq`. Complete derived copies use this to
+   * retain whole-scope completeness across contiguous fanout. */
+  head_hash?: string;
+  /** Authority generation paired with `head_hash`; includes head-stable
+   * seed/activation mutations that `seq` alone cannot distinguish. */
+  head_generation?: number;
   /** Monotonic position in this scope's lane for one subscriber. Authority
    * `seq` may legitimately skip when an event produces no row for that
    * subscriber, so it cannot diagnose outbox loss. New senders stamp this

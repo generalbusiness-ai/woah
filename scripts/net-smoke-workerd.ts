@@ -33,7 +33,9 @@
 //                    moves the due bump turn through the durable outbox
 //                    to /net/plan-scheduled, the planner runs the normal
 //                    turn machinery, and the effect lands in the room's
-//                    authority (counter cell polled at the scope).
+//                    authority (counter cell polled at the scope). A
+//                    sequenced-log read then misses in the sparse planner
+//                    and repairs from the room's durable authority page.
 //   run 2 (latency): WOO_NET_FAULTS latency 100 ms on /submit — the warm
 //                    turn still converges with attempt === 1 (latency is
 //                    not divergence; the CO12.5 gate the v2 era lacked).
@@ -299,6 +301,38 @@ async function main(): Promise<number> {
         clickBody.result === 1 &&
         (clickBody.observations ?? []).some((o) => o.type === "clicked"),
       `status=${clickRes.status} body=${JSON.stringify({ reply: clickBody.reply?.status, result: clickBody.result, error: (clickBody as { error?: unknown }).error })}`
+    );
+    // SL4 over REAL workerd: the click above is now in the room Scope's
+    // durable log. A replay call starts from the sparse planner image, misses
+    // that log page, repairs from /net/replay-page, and then commits. This is
+    // the storage/RPC half of the acts rebuild proof; the outliner worker test
+    // asserts the actual fresh projection converges to the live watermark.
+    const replayRes = await fetch(`${base}/net-api/turn`, {
+      method: "POST",
+      headers: clientHeaders,
+      body: JSON.stringify({
+        target: "net_lane_room",
+        verb: "replay_count",
+        args: [1, 100],
+        session: mintBody.session,
+        idempotency_key: "lane-replay-count"
+      })
+    });
+    const replayBody = (await replayRes.json()) as {
+      reply?: { status?: string };
+      result?: unknown;
+      attempt?: number;
+      trace?: AttemptTraceEntry[];
+    };
+    step(
+      "sequenced-log replay repairs from the room authority under real workerd",
+      replayRes.status === 200 &&
+        replayBody.reply?.status === "accepted" &&
+        typeof replayBody.result === "number" &&
+        replayBody.result >= 1 &&
+        typeof replayBody.attempt === "number" &&
+        replayBody.attempt > 1,
+      `status=${replayRes.status} count=${String(replayBody.result)} attempt=${String(replayBody.attempt)} trace=${JSON.stringify(replayBody.trace ?? [])}`
     );
     // The cross-scope move step related the actor into the room's
     // contents; that row reaches the `net-api` shard either by refan

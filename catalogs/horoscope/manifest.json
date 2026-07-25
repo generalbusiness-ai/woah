@@ -1,6 +1,6 @@
 {
   "name": "horoscope",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "spec_version": "v1",
   "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory with name `Horoscope: Scorpio` and the generated text as its markdown body.",
   "license": "MIT",
@@ -10,7 +10,7 @@
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
       "flags": { "fertile": true },
-      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, derives a note name from the request (e.g. `Horoscope: Scorpio`), and calls :deliver(order_id, name, text, description) to drop a note into the requester's inventory — name is the inventory listing label, text is the LLM body shown by `read`, description is the one-line look-at flavour shown by `look`. Default rate_limit_seconds=60 (one order per requester per minute).",
+      "description": "A vending-machine block that produces short generated text artifacts. The owner configures system_prompt. Its authenticated plug reads bounded work through :next_pending, fills the preallocated note through direct :prepare_artifact, and sequences :deliver(order_id, note). Dispenser Acts own queue coordination; the delivered note owns its listing name, look description, and readable markdown body.",
       "properties": [],
       "verbs": [
         {
@@ -46,7 +46,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["max_pending_orders", "max_request_chars"] },
-          "source": "verb :set_queue_limits(max_pending_orders, max_request_chars) rx { this:assert_configurable(); let pending = max_pending_orders; if (typeof(pending) == \"string\") { pending = to_int(str_trim(pending)); } let chars = max_request_chars; if (typeof(chars) == \"string\") { chars = to_int(str_trim(chars)); } if (typeof(pending) != \"number\" || pending < 0) { raise { code: \"E_INVARG\", message: \"max_pending_orders must be a non-negative number\", value: max_pending_orders }; } if (typeof(chars) != \"number\" || chars < 0) { raise { code: \"E_INVARG\", message: \"max_request_chars must be a non-negative number\", value: max_request_chars }; } return this:set_properties({ max_pending_orders: round(pending), max_request_chars: round(chars) }); }"
+          "source": "verb :set_queue_limits(max_pending_orders, max_request_chars) rx { this:assert_configurable(); let pending = max_pending_orders; if (typeof(pending) == \"string\") { pending = to_int(str_trim(pending)); } let chars = max_request_chars; if (typeof(chars) == \"string\") { chars = to_int(str_trim(chars)); } if (typeof(pending) != \"number\" || pending < 0 || pending > 50) { raise { code: \"E_INVARG\", message: \"max_pending_orders must be between 0 and 50\", value: max_pending_orders }; } if (typeof(chars) != \"number\" || chars < 0 || chars > 200) { raise { code: \"E_INVARG\", message: \"max_request_chars must be between 0 and 200\", value: max_request_chars }; } return this:set_properties({ max_pending_orders: round(pending), max_request_chars: round(chars) }); }"
         },
         {
           "name": "title",
@@ -62,7 +62,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = this:pending_count(); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
         }
       ]
     }

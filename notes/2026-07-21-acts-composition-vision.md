@@ -147,16 +147,20 @@ second, through write amplification rather than volume; expressiveness
 holds best, with three named walls.**
 
 **Perf.** Every act adds validation + fold fan-out to a sequenced turn
-on a single-threaded lane (space.md §S9). The NC8 bake failure
-(2026-07-20: hot-room stalls, wall p99 2920ms vs 500ms target, without
-fold machinery) shows hot-room turn cost is already the binding
-constraint. Rules, not hopes: **acts are for coordination-rate facts**
+on a single-threaded lane (space.md §S9). NC8's original 2026-07-20
+bake (hot-room wall p99 2920ms against the then-500ms target, without
+fold machinery) established that hot-room turn cost is the binding
+constraint. Main now batches the durable `/fanout` lane and evaluates
+it under the re-scoped p95 ≤750ms / p99 ≤5s envelope. The first Acts
+canary predates that batching, so its 513/1944/2634ms p50/p95/p99 is
+not an Acts-overhead result; the merged fanout mechanisms must be
+remeasured before attribution. Rules, not hopes: **acts are for coordination-rate facts**
 (~1/s sustained per room; machine-rate signals aggregate at ingress —
 the router's occurrence-ledger, gravity G1, is the pressure valve);
 rollup fan-in makes coordination centers the bottleneck (batching,
 `rollup` reserved for low-rate types, digest coalescing at
 satellites); a budget-exhausting fold fails the write, hence the
-O(payload) fold contract and measured act-rate ceilings (kernel gate
+payload-or-declared-cap fold contract and measured act-rate ceilings (kernel gate
 5). The mitigation backlog is the same backlog NC8 already owes —
 one instrumentation effort, not two.
 
@@ -290,27 +294,32 @@ last activity — the agent-orientation surface on entry, and the
 per-practice metrics feed (§3). Deferred only because the slice must
 stay thin; both are ordinary projections with nothing novel.
 
-### 5.7 Migration order: tasks → dispenser → rest
+### 5.7 Migration order: outliner → dispenser → tasks → rest
 
 Stated so the sequence is a decision, not drift:
 
-1. **Tasks** (the kernel v1 slice) — proves the contracts.
-2. **Dispenser** — the next one-rule violation in the bundled set, and
-   the most valuable: its directly-written `pending_orders` list *is*
-   the E5 propose-don't-act approval buffer. Re-expressed as
-   `orders.placed / orders.approved / orders.delivered / orders.failed`
-   acts with a `pending` projection, it is a strictly better E5:
-   approval state is fold-derived from a sequenced `orders.approved`
-   act naming the approver, `:next_pending` reads the projection (and
-   structurally cannot return unapproved rows), and the whole approval
-   history is recorded acts. Idempotent `:deliver` maps to act identity.
-3. **Workflows** — `workflows.md` predates acts: `:set_status` writes
+1. **Outliner** — landed as the first real consumer. Its structural
+   relation remains substrate-authoritative; the acts projection supplies
+   the completeness checkpoint without mirroring tree rows.
+2. **Dispenser** — landed as the first plug-backed consumer. Its typed Net
+   verbs emit from the anchored block onto the containing room log; the plug
+   never emits raw acts. One bounded projection owns pending membership,
+   order allocation, admission indexes, and terminal receipts. Delivery
+   preallocates a room-anchored note, the plug fills it directly, and the
+   sequenced transition records only that reference. SQLite v0 genesis, dropped-reply
+   idempotency, adversarial authority, fail-closed artifact rollback, and a
+   meaningful sparse-Net rebuild are covered. Approval and failure acts wait
+   for a real policy transition rather than being invented by the base class.
+3. **Tasks** — next. The temporary casework slice has proved the kernel; the
+   real migration must prove full field disposition, state-machine parity,
+   client Kanban conversion, E4/E5 approval safety, and deletion delta.
+4. **Workflows** — `workflows.md` predates acts: `:set_status` writes
    a status prop directly. It should emit `workflow.status_changed`
    acts (status becomes a fold target), which matters doubly because
    the practice-promotion workflow (§3) leans on exactly those
    predicates. Spec amendment lands when the acts contracts promote.
-4. **Rest** (outliner, pinboard order state) — each per the same
-   playbook, opportunistically.
+5. **Rest** (pinboard order state and later coordination surfaces) — each
+   per the same playbook, opportunistically.
 
 ### 5.8 Pattern-language additions (acts era)
 

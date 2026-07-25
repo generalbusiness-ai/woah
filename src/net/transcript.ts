@@ -19,6 +19,8 @@
  * | verb {object,name}      | verb_bytecode:<object>:<name>  |
  * | location {object}       | object_live:<object>           |
  * | lifecycle {object}      | object_lineage:<object>        |
+ * | recycle {object}        | object_tombstone:<object>, and  |
+ * |                         | removal of the live object page |
  * | contents {object}       | — none: contents is a derived   |
  * |                         |   projection (CA4/CO9), never an|
  * |                         |   authority cell; those writes  |
@@ -34,9 +36,17 @@ import type {
   TranscriptRead as EngineTranscriptRead,
   TranscriptWrite as EngineTranscriptWrite
 } from "../core/effect-transcript";
+import { isSequencedAllocationCell } from "../core/effect-transcript";
+
+// The sequenced seq-allocation classifier (SL1's reserved `next_seq`
+// bookkeeping), re-exported at the bridge so route selection and the
+// planner treat it uniformly with the engine's own commit classifiers.
+export { isSequencedAllocationCell };
 import { finalWritesByCell } from "../core/shadow-commit-scope";
+import { ORDERED_EDGE_PROP } from "../core/ordered-edge";
 import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, type EpochStamp } from "./cells";
+import { readOrderedEdge } from "./ordered-edges";
 import type { TraceContext } from "./trace";
 import { netError } from "./errors";
 
@@ -84,6 +94,18 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * invalidates the read that produced the rank, in-scope or cross-scope.
    * Present-only-when-nonempty keeps prior transcript hashes unchanged. */
   orderingReads?: Array<{ container: string; parent: string | null; scope: string; version: string }>;
+  /** Replay pages this plan read (sequenced-log.md SL4): one entry per exact
+   * `(space, from, limit)` query, attested at the page's authority content
+   * `version` and the OWNING scope it was fetched from. `space` is the
+   * SEMANTIC space id; `scope` is the authority address the page came from
+   * (`classifier.scopeOf(space)`). Validation mirrors orderingReads: the
+   * committing scope re-derives pages it OWNS from its durable log and
+   * rejects the plan (`read_version_mismatch` with `replay_conflicts`) when
+   * an append landed inside the window between plan and submit; FOREIGN
+   * pages validate against the owner's `replays` attestation carried in the
+   * submit. Present-only-when-nonempty keeps prior transcript hashes
+   * unchanged. */
+  replayReads?: Array<{ space: string; from: number; limit: number; scope: string; version: string }>;
   /** Audit attribution (audit.md AU3.2): stamped by the gateway at the
    * trust boundary, never accepted from client input. Lives INSIDE the
    * transcript so it participates in the transcript hash and survives
@@ -164,6 +186,16 @@ export type ApplyResult = {
   /** Contents writes routed to the projection applier (CO9) — the single
    * write path for derived relations; never applied to authority cells. */
   projectionWrites: TranscriptWrite[];
+  /** Structural consequences of accepted recycles, captured while the
+   * pre-delete cells still exist. The relation applier consumes this compact
+   * record to retract membership/ordering rows without retaining deleted
+   * object cells or rescanning the scope. */
+  recycledObjects: Array<{
+    object: string;
+    from: string | null;
+    displaced: string[];
+    hadOrderedEdge: boolean;
+  }>;
   /** Deterministic digest of touched-cell versions: the CO4 step-10
    * post-state comparison value. */
   postStateVersion: string;
@@ -205,6 +237,7 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
   const post = pre.clone();
   const touched = new Set<string>();
   const projectionWrites: TranscriptWrite[] = [];
+  const recycledObjects: ApplyResult["recycledObjects"] = [];
 
   // Creates first: they materialize lineage + live cells the writes may
   // then touch (v2 constructs post-state the same way: creates, writes,
@@ -360,11 +393,85 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
     touched.add(key);
   }
 
+  // RC3 lifecycle apply. The executor records one typed recycle fact from
+  // its tombstone persistence write; authority re-derives every structural
+  // consequence from validated pre-state instead of trusting a shipped
+  // executor image. The reverse indexes make both graph walks proportional
+  // to the deleted object's own children/contents.
+  for (const recycle of transcript.recycles ?? []) {
+    const object = recycle.object;
+    const tombstoneKey = cellKey("object_tombstone", object);
+    const existingTombstone = post.get(tombstoneKey);
+    if (existingTombstone) {
+      // A valid executor cannot recycle an already-recycled object. Keep the
+      // applier deterministic for a duplicated typed entry while submit's
+      // lifecycle validation rejects stale/malicious external transcripts.
+      touched.add(tombstoneKey);
+      continue;
+    }
+    const lineageKey = cellKey("object_lineage", object);
+    const lineage = post.get(lineageKey);
+    const lineageValue = (lineage?.value ?? {}) as Record<string, unknown>;
+    const formerParent = typeof lineageValue.parent === "string" ? lineageValue.parent : null;
+    const live = post.get(cellKey("object_live", object));
+    const liveValue = (live?.value ?? {}) as Record<string, unknown>;
+    const from = typeof liveValue.location === "string" ? liveValue.location : null;
+    const edgeCell = post.get(cellKey("property_cell", object, ORDERED_EDGE_PROP));
+    const hadOrderedEdge = edgeCell !== undefined && readOrderedEdge(edgeCell.value) !== null;
+
+    const children = post.lineageChildrenOf(object);
+    for (const child of children) {
+      const key = cellKey("object_lineage", child);
+      const childCell = post.get(key);
+      if (!childCell) continue;
+      const prior = (childCell.value ?? {}) as Record<string, unknown>;
+      post.commit({
+        kind: "object_lineage",
+        object: child,
+        value: { ...prior, parent: formerParent },
+        stamp
+      });
+      touched.add(key);
+    }
+
+    const displaced = post.membersAt(object);
+    for (const member of displaced) {
+      const key = cellKey("object_live", member);
+      const memberCell = post.get(key);
+      if (!memberCell) continue;
+      const prior = (memberCell.value ?? {}) as Record<string, unknown>;
+      post.commit({
+        kind: "object_live",
+        object: member,
+        value: { ...prior, location: "$nowhere" },
+        stamp
+      });
+      touched.add(key);
+    }
+
+    // Delete every object-owned row before installing the one terminal
+    // marker. cellsForObject is backed by the object index, so properties and
+    // verbs do not turn recycle into a whole-scope scan.
+    for (const cell of post.cellsForObject(object)) {
+      post.delete(cell.key);
+      touched.add(cell.key);
+    }
+    post.commit({
+      kind: "object_tombstone",
+      object,
+      value: { recycled: true },
+      stamp
+    });
+    touched.add(tombstoneKey);
+    recycledObjects.push({ object, from, displaced, hadOrderedEdge });
+  }
+
   const touchedSorted = [...touched].sort();
   return {
     post,
     touched: touchedSorted,
     projectionWrites,
+    recycledObjects,
     postStateVersion: postStateVersion(post, touchedSorted)
   };
 }

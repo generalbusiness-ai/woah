@@ -13,6 +13,8 @@ import {
   ObservationRegistry,
   registerCoreObservationHandlers
 } from "../../src/client/framework";
+import noteManifest from "../../catalogs/note/manifest.json";
+import * as noteUiModule from "../../catalogs/note/ui/note-chat";
 import { wireNetFeed } from "../../src/client/net-feed-adapter";
 import { NetFeed, type NetSocketLike } from "../../src/client/net-feed";
 
@@ -46,7 +48,7 @@ async function openWiredFeed(target?: Parameters<typeof wireNetFeed>[0]) {
   if (!target) {
     const registry = new ObservationRegistry(projection);
     registerCoreObservationHandlers(registry);
-    target = { observations: registry };
+    target = { ingestDeliveredObservation: (observation, delivered) => { registry.deliver(observation, delivered); } };
   }
   const feed = new NetFeed({
     baseUrl: "https://woo.test",
@@ -125,6 +127,8 @@ describe("wireNetFeed → registerCoreObservationHandlers reducers", () => {
     // drives through ingestAppliedFrame (core handlers only; the pinboard
     // catalog overlay handler is out of scope here).
     const v2 = createWooClientFramework();
+    v2.catalogUi.installCatalogUi({ alias: "note", catalog: "note", ui: (noteManifest as any).ui });
+    v2.catalogUi.registerModuleExports("note", "note-chat", noteUiModule, v2.observations, v2.chatFormatters);
     v2.ingestAppliedFrame({
       op: "applied",
       seq: 14,
@@ -137,9 +141,53 @@ describe("wireNetFeed → registerCoreObservationHandlers reducers", () => {
     // pinboard room's scope, wired straight into a full framework instance
     // — WooClientFramework IS a NetFeedReducerTarget, no shim.
     const ui = createWooClientFramework();
+    ui.catalogUi.installCatalogUi({ alias: "note", catalog: "note", ui: (noteManifest as any).ui });
+    ui.catalogUi.registerModuleExports("note", "note-chat", noteUiModule, ui.observations, ui.chatFormatters);
     const { socket } = await openWiredFeed(ui);
     peerFrame(socket, "room:the_pinboard", 14, [{ type: "note_edited", note: "note_1", text: "new\ntext" }]);
     expect(ui.observe("note_1")?.props.text).toBe(v2.observe("note_1")?.props.text);
+  });
+
+  it("enters through the framework boundary so a committed Net event invalidates semantic views", async () => {
+    const ui = createWooClientFramework();
+    ui.catalogUi.installCatalogUi({ alias: "test", catalog: "test", ui: { abi: "woo-ui/v1" } });
+    let rows: string[] = [];
+    let reads = 0;
+    ui.catalogUi.defineView("test", {
+      id: "items",
+      read: async () => { reads += 1; return rows; },
+      parse: (value) => value as string[],
+      invalidateOn: ["changed"]
+    });
+    const woo = {
+      actor: "#alice",
+      frame: { id: "frame", subject: "one", get: () => undefined, set: () => true },
+      neighborhood: { subject: "one", refs: [], related: {}, has: () => true },
+      observe: (ref: string) => ui.observe(ref) ?? null,
+      call: async () => undefined,
+      send: async () => undefined,
+      directCall: async () => undefined,
+      emit: () => true
+    };
+    const view = ui.view<string[]>("#alice", woo, { view: "items", subject: "one" });
+    view.subscribe(() => undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(view.getSnapshot().data).toEqual([]);
+
+    const { socket } = await openWiredFeed(ui);
+    rows = ["committed"];
+    // NetFeed emits carrier observations separately. They must still form one
+    // semantic invalidation boundary and therefore one follow-up read.
+    peerFrame(socket, "room:one", 2, [
+      { type: "changed", source: "one" },
+      { type: "changed", source: "one" }
+    ]);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(reads).toBe(2);
+    expect(view.getSnapshot().data).toEqual(["committed"]);
   });
 
   it("unwire() stops delivery", async () => {

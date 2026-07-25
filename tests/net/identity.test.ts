@@ -195,6 +195,39 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect(plan.world.propOrNull("acct_multi", "actors")).toEqual(["z_human", "a_agent"]);
   });
 
+  it("carries actor-owned credential authority and an aged re-import cannot resurrect revocation", async () => {
+    const old = createWorld();
+    old.createObject({
+      id: "agent_owned_key",
+      name: "Owned Key Agent",
+      parent: "$agent",
+      owner: "$wiz",
+      location: "$nowhere"
+    });
+    const key = old.createApiKey("$wiz", "agent_owned_key", "carry routed authority");
+    const identity = exportIdentity(old.exportWorld());
+
+    expect(identity.api_keys).toEqual({});
+    expect(identity.actors.map((actor) => actor.id)).toContain("agent_owned_key");
+    expect(identity.actors.find((actor) => actor.id === "agent_owned_key")?.props.api_keys).toMatchObject({
+      [key.id]: expect.objectContaining({ actor: "agent_owned_key", hash: expect.any(String), salt: expect.any(String) })
+    });
+
+    const fresh = createWorld();
+    await importIdentity(fresh, identity);
+    expect(fresh.auth(`apikey:${key.id}:${key.secret}`).actor).toBe("agent_owned_key");
+
+    expect(fresh.revokeApiKey("$wiz", key.id)).toBe(true);
+    const revoked = fresh.propOrNull("agent_owned_key", "api_keys") as Record<string, Record<string, unknown>>;
+    expect(revoked[key.id]?.revoked_at).toEqual(expect.any(Number));
+
+    // The carry file predates revocation. Existing authority wins per key.
+    await importIdentity(fresh, identity);
+    const after = fresh.propOrNull("agent_owned_key", "api_keys") as Record<string, Record<string, unknown>>;
+    expect(after[key.id]?.revoked_at).toBe(revoked[key.id]?.revoked_at);
+    expect(() => fresh.auth(`apikey:${key.id}:${key.secret}`)).toThrow(/not found or revoked/);
+  });
+
   it("carries deactivated_at (reviewer finding 2) and rebuilds primary_actor only as the fallback", async () => {
     const world = createWorld();
     world.createObject({ id: "h_only", name: "H", parent: "$human", owner: "$wiz" });

@@ -96,7 +96,9 @@ export type DerivedRelationDeltas = {
  */
 export function deriveRelationDeltas(
   transcript: EffectTranscript,
-  applied: Pick<ApplyResult, "projectionWrites">,
+  applied: Pick<ApplyResult, "projectionWrites"> & {
+    recycledObjects?: ApplyResult["recycledObjects"];
+  },
   homeScope: string,
   scopeOf?: (object: string) => string,
   post?: Pick<CellStore, "get">
@@ -146,6 +148,22 @@ export function deriveRelationDeltas(
     if (edge || orderedEdgeWriters.has(move.object)) {
       if (move.from) put("remove", ORDERED_EDGE_RELATION, move.from, move.object);
       if (edge) put("add", ORDERED_EDGE_RELATION, move.to, move.object, edge);
+    }
+  }
+  for (const recycle of applied.recycledObjects ?? []) {
+    // RC3 removes the recycled object from its former container and
+    // displaces each contained object to $nowhere (whose contents relation is
+    // deliberately not maintained). The compact apply record is captured
+    // before object cells disappear, so this remains O(the object's own
+    // membership) and needs no post-delete scan.
+    if (recycle.from) {
+      put("remove", "contents", recycle.from, recycle.object);
+      if (recycle.hadOrderedEdge) {
+        put("remove", ORDERED_EDGE_RELATION, recycle.from, recycle.object);
+      }
+    }
+    for (const member of recycle.displaced) {
+      put("remove", "contents", recycle.object, member);
     }
   }
   // An in-place reparent/reorder updates the same owner row. Local children
@@ -257,9 +275,19 @@ export function roomRosterRows(
     if (row.relation !== SESSION_PRESENCE_RELATION || row.owner !== room) continue;
     const body = row.body as SessionPresenceBody | undefined;
     if (!body || typeof body.actor !== "string") continue;
-    const session = body.session as { actor?: unknown; started?: unknown; expiresAt?: unknown; activeScope?: unknown } | undefined;
+    const session = body.session as {
+      actor?: unknown;
+      started?: unknown;
+      expiresAt?: unknown;
+      activeScope?: unknown;
+      rosterVisible?: unknown;
+    } | undefined;
     if (!session || session.actor !== body.actor || session.activeScope !== room) continue;
     if (typeof session.expiresAt === "number" && session.expiresAt <= now) continue;
+    // Authorization presence and social visibility are deliberately
+    // independent. Hidden API-key service sessions retain this relation row
+    // for reads/fanout but never become a public actor-level roster row.
+    if (session.rosterVisible === false) continue;
     const started = typeof session.started === "number" ? session.started : now;
     const prior = byActor.get(body.actor);
     byActor.set(body.actor, {

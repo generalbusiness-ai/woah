@@ -1,0 +1,135 @@
+{
+  "src/client/main.ts": {
+    "$channel": 1,
+    "$chatroom": 2,
+    "$delay": 1,
+    "$drum_loop": 1,
+    "$dubspace": 2,
+    "$filter": 1,
+    "$loop_slot": 1,
+    "$note": 2,
+    "$pin": 2,
+    "$room": 3,
+    "$scene": 1,
+    "$space": 4
+  },
+  "src/core/bootstrap.ts": {
+    "$account": 19,
+    "$actor": 15,
+    "$agent": 12,
+    "$ambiguous_match": 2,
+    "$block": 1,
+    "$failed_match": 2,
+    "$guest": 7,
+    "$human": 12,
+    "$match": 2,
+    "$player": 27,
+    "$room": 2,
+    "$root": 17,
+    "$sequenced_log": 6,
+    "$space": 16,
+    "$thing": 13
+  },
+  "src/core/dsl-compiler.ts": {
+    "$root": 1
+  },
+  "src/core/local-catalogs.ts": {
+    "$chatroom": 1,
+    "$conversational": 14,
+    "$dispensed_note": 4,
+    "$dubspace": 3,
+    "$exit": 4,
+    "$horoscope_note": 5,
+    "$note": 12,
+    "$pin": 7,
+    "$pinboard": 8,
+    "$player": 9,
+    "$room": 14,
+    "$semitransparent": 1,
+    "$space": 6,
+    "$task": 28,
+    "$task_registry": 16,
+    "$taskspace": 9,
+    "$transparent": 11
+  },
+  "src/core/repository.ts": {
+    "$sequenced_log": 2,
+    "$space": 1
+  },
+  "src/core/tiny-vm.ts": {
+    "$actor": 1,
+    "$agent": 1,
+    "$builder": 3,
+    "$player": 1,
+    "$programmer": 4,
+    "$root": 1
+  },
+  "src/core/world.ts": {
+    "$account": 3,
+    "$actor": 26,
+    "$agent": 15,
+    "$ambiguous_match": 2,
+    "$block": 3,
+    "$builder": 3,
+    "$conversational": 1,
+    "$failed_match": 5,
+    "$guest": 14,
+    "$help": 1,
+    "$help_db_main": 1,
+    "$horoscope_note": 1,
+    "$human": 12,
+    "$loop_class": 1,
+    "$match": 1,
+    "$note": 1,
+    "$player": 14,
+    "$programmer": 7,
+    "$recycle_handler_error": 3,
+    "$resume": 4,
+    "$room": 2,
+    "$root": 6,
+    "$sequenced_log": 1,
+    "$space": 20,
+    "$thing": 2,
+    "$transparent": 1,
+    "$xxx": 1
+  },
+  "src/net/identity.ts": {
+    "$account": 9,
+    "$actor": 18,
+    "$agent": 2,
+    "$programmer": 2
+  },
+  "src/net/install.ts": {
+    "$actor": 1,
+    "$guest": 3,
+    "$space": 1
+  },
+  "src/net/route.ts": {
+    "$space": 1
+  },
+  "src/net/scope.ts": {
+    "$sequenced_log": 1,
+    "$space": 1
+  },
+  "src/net/topology.ts": {
+    "$actor": 2,
+    "$chatroom": 2,
+    "$guest": 2,
+    "$player": 1,
+    "$room": 1,
+    "$root": 3,
+    "$sequenced_log": 1,
+    "$space": 2
+  },
+  "src/worker/net/client-auth.ts": {
+    "$account": 1
+  },
+  "src/worker/net/gateway-do.ts": {
+    "$account": 4,
+    "$agent": 3,
+    "$guest": 1,
+    "$human": 3,
+    "$room": 1,
+    "$space": 2
+  }
+}

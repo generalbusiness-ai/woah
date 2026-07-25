@@ -34,7 +34,7 @@
 // activation always precedes the route switch, so no traffic exists yet.
 import { readFileSync } from "node:fs";
 import { planNetInstall, type NetInstallOptions } from "../src/net/install";
-import { importIdentity, parseIdentityExport } from "../src/net/identity";
+import { importIdentity, parseIdentityExport, type IdentityExport } from "../src/net/identity";
 import { CATALOG_SCOPE } from "../src/net/topology";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
@@ -42,6 +42,9 @@ export type NetInstallArgs = {
   baseUrl: string;
   catalogs?: string[];
   identity?: string;
+  /** Composition-only identity input for controlled proving lanes. The public
+   * CLI still accepts carried identity only through --identity. */
+  identityData?: IdentityExport;
   verifyApikey?: string;
   /** §8 step-3 second half: `email:password` for a carried account — the
    * prove step must log in with a carried apikey AND a carried password. */
@@ -113,13 +116,15 @@ export async function runNetInstall(args: NetInstallArgs, env: { WOO_INTERNAL_SE
   // authenticates must not activate — a world nobody can log into is not
   // installed, whatever the scope heads say. The override exists for
   // identity-less rehearsals of the carry machinery, and it is loud.
-  if (args.identity && !args.verifyApikey && !args.skipIdentityVerify && !args.dryRun) {
+  if ((args.identity || args.identityData) && !args.verifyApikey && !args.skipIdentityVerify && !args.dryRun) {
     throw new Error(
       "--identity requires WOO_VERIFY_APIKEY=apikey:<id>:<secret> or --verify-apikey (the carried-credential proof); " +
         "pass --skip-identity-verify ONLY for a rehearsal where no credential can be probed"
     );
   }
-  const identity = args.identity ? parseIdentityExport(JSON.parse(readFileSync(args.identity, "utf8"))) : null;
+  if (args.identity && args.identityData) throw new Error("identity path and inline identity are mutually exclusive");
+  const identity = args.identityData
+    ?? (args.identity ? parseIdentityExport(JSON.parse(readFileSync(args.identity, "utf8"))) : null);
   // activate:false — the namespace must stay INSTALLING (client traffic
   // refused) until every verification below passes; this script seeds
   // the activation cell as its last act.

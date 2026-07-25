@@ -15,7 +15,9 @@ Cron-triggered every minute. Each tick:
    (apikey-class sessions are valid for 24h; the plug re-authenticates
    only when the cached session is within 1h of expiry, or when the
    isolate cold-started). Otherwise POSTs to `/net-api/session` with the
-   actor-bound apikey for the block. The `tick_ok` log line carries
+   actor-bound apikey for the block and `roster_visible:false`: the service
+   session keeps Net authorization/fanout presence without appearing in the
+   social room roster. The `tick_ok` log line carries
    `auth: "warm" | "cold"` so the cache hit rate is greppable from
    `wrangler tail`.
 2. Reads the block's exact `system_prompt` cell through a short in-isolate TTL cache
@@ -25,15 +27,22 @@ Cron-triggered every minute. Each tick:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
-   - POSTs `:deliver(order_id, name, text, description)` — `name` is
+   - POSTs direct `:prepare_artifact(order_id, name, text, description)`;
+     this is the only call carrying generated prose. `name` is
      built from the order request (`scorpio` → `"Horoscope: Scorpio"`)
      so the inventory listing reads cleanly; `text` is the markdown
      content shown by `read`; `description` is a one-line look-at
      flavour (`A horoscope reading the machine produced for "scorpio".
      Try \`read\` to see what it says.`) shown by `look`, per the
-     LambdaCore `$note` slot split. The block creates a `$note` with
-     those fields, moves it to the orderer's inventory, and tells the
-     orderer it arrived.
+     LambdaCore `$note` slot split.
+   - POSTs sequenced `:deliver(order_id, note)` with a stable Net idempotency
+     key derived from block + order. The block moves the prepared note to the
+     orderer's inventory and tells the orderer it arrived. A dropped-reply
+     retry under the same Net key returns
+     the recorded acceptance and cannot create a duplicate artifact; Net may
+     omit the application result on that replay. A later fresh-key retry is
+     resolved by Dispenser's bounded terminal receipt, which returns the
+     original note reference.
 
 Failure handling:
 
@@ -41,7 +50,7 @@ Failure handling:
   plug delivers a placeholder note instead so the queue drains, and writes
   an `ai fallback: <reason>` line to `last_error` so `:look_self` reflects
   the degraded mode.
-- **`:deliver` raised a permanent code** (`E_INVARG`, `E_PERM`, `E_VERBNF`,
+- **Preparation or delivery raised a permanent code** (`E_INVARG`, `E_PERM`, `E_VERBNF`,
   `E_TYPE`, `E_RANGE`) — retrying with the same data won't change the
   outcome, so the plug calls the catalog's plug-actor `:cancel` path to
   peel the order off the queue head. The user gets nothing for that order;
@@ -52,7 +61,8 @@ Failure handling:
 - **`E_NOSESSION`** — the apikey-bound session no longer authenticates;
   the plug stops the tick and the next cron re-auths.
 
-`:deliver` is idempotent on `order_id`, so retries are safe.
+Both preparation and delivery are idempotent on `order_id`, so retries are
+safe; conflicting preparation content never overwrites a completed artifact.
 
 `last_pushed_at` is a health heartbeat, not a work record. Empty ticks only
 write it when `HEARTBEAT_INTERVAL_MS` has elapsed (default 5 minutes);
@@ -63,9 +73,9 @@ immediately.
 
 The plug's calls are operational (queue drain, artifact production), not
 agent tool discovery. Authenticated net turns enforce woo permissions without
-going through MCP's `tool_exposed` gate, which keeps `:next_pending` and
-`:deliver` hidden from agent tool listings while the block's apikey-bound
-session can still call them. See `src/mcp-client.ts` for an MCP-attached
+going through MCP's `tool_exposed` gate, which keeps `:next_pending`,
+`:prepare_artifact`, and `:deliver` hidden from agent tool listings while the
+block's apikey-bound session can still call them. See `src/mcp-client.ts` for an MCP-attached
 variant kept for the day we want event-driven (`woo_wait`) drain instead
 of cron polling — at that point we'd flip the catalog to mark the
 relevant verbs `tool_exposed: true` and switch the plug to use that

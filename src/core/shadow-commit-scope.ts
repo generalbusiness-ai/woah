@@ -3,6 +3,7 @@ import {
   applyPresenceProjectionRowDelta,
   createTranscriptCellReader,
   createTranscriptCellReaderFromObjectMap,
+  isSequencedAllocationCell,
   presenceProjectionPropsFromReader,
   sessionScopePresenceDeltas,
   readTranscriptCell,
@@ -601,6 +602,10 @@ export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscr
   if (transcript.creates.length > 0) return null;
   for (const write of transcript.writes) {
     if (write.cell.kind === "location" && write.cell.object === object) continue;
+    // The sequenced seq allocation is sequencer bookkeeping, not a verb
+    // effect: it must not reclassify a pure move onto the room sequencer
+    // (sequencedAllocationCell — the CA3/CA13.2 rule).
+    if (isSequencedAllocationCell(transcript, write.cell)) continue;
     // A movement transcript may include duplicate location writes: one from
     // the object_move event and one from the lower-level cell_write. Any other
     // authoritative write means this is not the single-location CA3 path.
@@ -776,6 +781,14 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
   }
 
   for (const write of transcript.writes) {
+    // The sequenced seq allocation (the space's reserved `next_seq` —
+    // sequenced-log.md SL1) is the SEQUENCER's own act, folded into the
+    // transcript by the engine before any verb frame runs: there is no
+    // recorded dispatch to validate it against, and no verb authority is
+    // exercised (user code may never write the name). Its integrity is
+    // covered structurally instead: readMatchesSequencedAllocation pins
+    // the read/write pair to the turn's own seq.
+    if (isSequencedAllocationCell(transcript, write.cell)) continue;
     if (!write.writer) {
       errors.push(`permission_denied: missing writer for ${cellLabel(write.cell)}`);
       continue;
@@ -1392,6 +1405,13 @@ function applyTranscriptSequencerToState(
   options: ShadowTranscriptApplyOptions
 ): void {
   if (transcript.route !== "sequenced") return;
+  // The engine folds the seq allocation into the transcript as an ordinary
+  // recorded write (world.recordSequencedAllocation). When present, the
+  // generic write path above already applied value AND version — this
+  // legacy out-of-band advance would double-bump the version and fail the
+  // post-state check. It remains only for transcripts recorded before the
+  // fold existed.
+  if (transcript.writes.some((write) => isSequencedAllocationCell(transcript, write.cell))) return;
   const scopeObject = mutableObject(transcript.scope);
   if (!scopeObject) return;
   const nextSeq = transcript.seq + 1;
@@ -1728,7 +1748,12 @@ export function transcriptLogEntry(transcript: EffectTranscript): SerializedWorl
     args: structuredClone(transcript.call.args) as WooValue[]
   };
   return {
-    space: transcript.scope,
+    // The entry keys on the SEMANTIC space id. A net-planned transcript's
+    // `scope` is the commit-scope AUTHORITY ADDRESS (room:the_room); the
+    // preserved `space` field carries the sequencing space (the_room).
+    // Engine-recorded transcripts have no `space` field and their `scope`
+    // IS the semantic space, so the fallback is exact there.
+    space: transcript.space ?? transcript.scope,
     seq: transcript.seq,
     ts: 0,
     actor: transcript.call.actor,

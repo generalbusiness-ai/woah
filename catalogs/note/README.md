@@ -1,6 +1,6 @@
 ---
 name: note
-version: 2.0.1
+version: 2.0.2
 spec_version: v1
 license: MIT
 description: Generic note class — portable text-bearing things, modeled after LambdaMOO's $note (#9). Identity (name), cosmetic flavour (description), markdown content (text). Subclass for richer per-note behavior.
@@ -51,6 +51,7 @@ Identity (`.name`) and cosmetic (`.description`) are inherited from
 :text_summary(limit)    bounded display summary {lines, length, preview, truncated}
 :read                   show the text and emit a note_read observation
 :set_text(str)          replace the entire text (writers only); enforces 262144-char cap
+:_set_initial_text(str) non-public one-shot constructor write; same cap, no edit observation
 :write(line)            append a line (writers only); inserts a newline if non-empty
 :erase                  clear the text (writers only)
 :add_writer(who)        add a writer (owner or wizard only)

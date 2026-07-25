@@ -1,101 +1,69 @@
 ---
 name: horoscope
-version: 0.2.0
+version: 0.3.0
 spec_version: v1
 license: MIT
-description: Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The plug derives a clean inventory name (`Horoscope: Scorpio`) from the request and delivers it alongside the markdown body.
+description: Workers-AI artifact dispenser built on the Acts-backed Dispenser contract.
 keywords:
   - block
   - dispenser
   - horoscope
   - llm
-  - demo
 ---
 
 # horoscope
 
-A `$horoscope_block` is a `$dispenser_block` subclass — the demo
-artifact-producing block. You `:order` a request (e.g. `"scorpio"`) and
-a `$dispensed_note` lands in your inventory carrying a generated
-horoscope.
-`$horoscope_block` is a fertile template: behavior and owner tools live
-on the class, while deployed horoscope machines are ordinary instances.
+`$horoscope_block < $dispenser_block` is the small end-to-end example of an
+external producer. A requester orders a sign or topic; the plug calls Workers
+AI; a `$dispensed_note` arrives in the requester’s inventory.
 
-The plug Worker lives at [`plug/`](plug/). It runs on a short cron
-trigger, reads `pending_orders` via the apikey-bound REST surface,
-calls Workers AI (`@cf/meta/llama-3.2-1b-instruct`) with
-`system_prompt + request`, and calls `:deliver(order_id, name, text,
-description)` with a derived listing name (e.g. `"Horoscope: Scorpio"`),
-the LLM reply as the note text, and a one-line look-at description so
-`look <note>` returns the LambdaCore-style cosmetic flavour while
-`read <note>` returns the body.
+The catalog adds only the LLM-facing configuration and presentation. Dispenser
+owns the bounded queue, Acts, retry receipts, and delivery transaction.
 
-See [DESIGN.md](DESIGN.md) for design notes.
+## Plug flow
 
-## Properties
+The Worker in [`plug/`](plug/) authenticates as the block with an apikey,
+briefly caches `system_prompt`, polls `next_pending()`, generates the body,
+fills the allocated note, and then delivers its reference:
 
-| Name | Tier | Notes |
-|---|---|---|
-| `system_prompt` | owner | Persona / instructions the LLM runs under. Inherited from `$dispenser_block`. |
-| `rate_limit_seconds` | owner | Per-requester order interval. Default 60s. Inherited from `$dispenser_block`. |
-| `pending_orders` | self | Queue of pending orders. Plug-managed. |
-| `last_pushed_at` | self | Plug heartbeat timestamp. `0` means the machine presents as disconnected. |
-| `last_error` | self | Last plug drain error, if any. |
+```text
+prepare_artifact(order_id, name, text, description)  # direct
+deliver(order_id, note)                              # sequenced
+```
 
-## Owner Tools
+`name` is the inventory label, `description` is the cosmetic `look` text, and
+`text` is the markdown returned by `read`. Generated prose never enters the
+room log. The plug uses a stable delivery idempotency key; Dispenser’s domain
+receipt handles later retries.
 
-`$horoscope_block` exposes narrow configuration verbs on each instance:
+## Configuration
 
-| Verb | Notes |
+| Verb | Meaning |
 |---|---|
-| `set_system_prompt(prompt)` | Sets the LLM persona/instructions. |
-| `set_rate_limits(requester_seconds, block_seconds)` | Sets per-requester and block-wide cooldowns. Use `0` to disable either. |
-| `set_queue_limits(max_pending_orders, max_request_chars)` | Sets queue length and request-size caps. Use `0` for unbounded. |
+| `set_system_prompt(prompt)` | Set the model persona/instructions. |
+| `set_rate_limits(requester_seconds, block_seconds)` | Set cooldowns; zero disables either interval. |
+| `set_queue_limits(max_pending, max_chars)` | Lower the hard caps; zero selects 50 rows / 200 characters. |
 
-Only the block owner or a wizard can use these verbs. The generic
-`$block:set_property` / `:set_properties` surface remains hidden from MCP
-tools; plug sessions still use it for queue bookkeeping.
+Only the owner or a wizard may configure the block. The plug’s ordinary
+`set_properties` use is limited to inherited heartbeat and error diagnostics;
+it cannot write queue state.
 
-## Look Surface
-
-`:look_self()` reports `connected` / `disconnected`, queue count, and a
-usage line. From a room command surface, use:
+`look_self()` reports connection health and the projection-backed pending
+count. From a room:
 
 ```text
 order horoscope scorpio
 order horoscope "the launch review"
 ```
 
-The command returns a ticket immediately and tells the requester the order
-was accepted. The generated note appears when the plug next drains the
-queue; delivery also sends the requester a text notification.
-
 ## Provisioning
 
 ```text
 @create_instance $horoscope_block as the_deck_horoscope location: the_deck
-:set_system_prompt("You are a wry, slightly weary fortune-teller. Reply with two short sentences for the asker's sign or topic.")
-:set_property("description", "A horoscope vending machine on the deck. It hums faintly.")
+:set_system_prompt("You are a wry fortune-teller. Reply in two short sentences.")
 :mint_apikey("horoscope-cf-worker-prod")
-# paste secret into wrangler secret put WOO_APIKEY
-# wrangler deploy from catalogs/horoscope/plug
 ```
 
-Validate the minted token before storing it:
-
-```bash
-export WOO_BASE_URL="https://woo.example.com"
-export WOO_APIKEY="apikey:<id>:<secret>"
-
-curl -fsS "$WOO_BASE_URL/net-api/session" \
-  -H "Authorization: Bearer $WOO_APIKEY" \
-  -H "content-type: application/json" \
-  --data '{}'
-```
-
-The response should include `actor` equal to the horoscope block and
-a net `session`. Use the full `apikey:<id>:<secret>` token;
-`apikey:<secret>` is not the documented token form.
-
-After deploy, `:order("scorpio")` returns immediately with a ticket;
-within ~60s a note arrives in the requester's inventory.
+Store the complete `apikey:<id>:<secret>` value as the Worker’s `WOO_APIKEY`
+secret and set `BLOCK_ID` to the instance id. See [DESIGN.md](DESIGN.md) and
+the [plug README](plug/README.md).

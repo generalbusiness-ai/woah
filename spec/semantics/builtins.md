@@ -233,6 +233,12 @@ caller-controlled work; non-wizard frames cannot use it to escalate.
 `subscribe(self, source, type)`, `unsubscribe`,  
 `event_schema(obj, type)`, `declare_event(obj, type, schema)`.
 
+`event_schema(obj, type)` is implemented: it returns a defensive copy of the
+declared shape for `type`, resolved with verb-dispatch precedence — `obj`'s
+parent chain first, then (for feature carriers) each feature's parent chain in
+declared list order — or `null` when no chain declares the type. The acts
+kernel validates act payloads against it. `declare_event` remains unimplemented.
+
 `observe_to_space(space, event)` records `event` on the current invocation route
 but routes live delivery to the session audience of `space`. It is for ordinary
 object behavior such as a mounted pinboard or control surface emitting visible
@@ -247,9 +253,13 @@ audience, or something else.
 `active_actors(space)` returns actors with live, unexpired sessions whose
 current active scope is exactly `space`, plus placement-backed live presence
 rows used by distributed room hosts before their session table projection has
-caught up. It is the substrate-owned answer for visible embodied occupancy;
-unlike `present_actors`, it does not include subscriber-only observers that
-receive events for a space while scoped elsewhere.
+caught up. It is the substrate-owned local actor view of active-scope
+occupancy; it includes locally materialized API-key service sessions that opt
+out of the social `room_roster` projection. Unlike `present_actors`, it does
+not include subscriber-only observers that receive events for a space while
+scoped elsewhere. In a distributed turn its positive enumeration is not a
+complete transport audience; presence-mode delivery is resolved independently
+at each gateway. Presentation code uses `room_roster`, never `active_actors`.
 
 `visible_contents(obj)` returns `obj.contents` filtered to objects the current
 task authority may inspect. It exists because contents and permission checks are

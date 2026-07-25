@@ -1875,6 +1875,7 @@ type LiveEvent = {
     actors?: ActorRef[];
     sessions?: SessionRef[];
     scope?: ScopeRef;
+    exclude_actors?: ActorRef[];
   };
   observation: WooObservation;
   coalesce?: string;
@@ -1890,10 +1891,22 @@ audio engines, or presence views.
 When a relay converts live/direct turn transcript observations into live
 events, it MUST preserve the observation's private or directed audience in
 `LiveEvent.audience`. Actor/session-private transcript hints such as
-`_audience_override` are internal routing data: they MUST be translated into
-the live event audience and MUST NOT be emitted inside `LiveEvent.observation`.
+`_audience_override` and `_audience_exclude` are internal routing data: they
+MUST be translated into the live event audience and MUST NOT be emitted inside
+`LiveEvent.observation`.
 An event with an explicit `actors` or `sessions` audience is not also delivered
-to its `scope` unless `audience.scope` is explicitly present.
+to its `scope` unless `audience.scope` is explicitly present. Conversely, a
+presence-derived audience MUST use `audience.scope`; a planner's local
+actor/session enumeration is not globally complete, so each destination relay
+resolves that scope against its own presence slice.
+An `_audience_exclude` list becomes `audience.exclude_actors` and remains
+presence-derived: the relay resolves `audience.scope` first and then removes
+sessions belonging to the excluded actors. `exclude_actors` is valid only with
+`scope`, not as a standalone positive audience. The negative list may cross
+shards because it constrains, rather than claims to enumerate, the distributed
+audience. When an observation already has an explicit positive audience, the
+sender folds exclusions into that exact actor/session list instead of emitting
+`exclude_actors`.
 
 `coalesce` is a sender-chosen ASCII key with grammar:
 

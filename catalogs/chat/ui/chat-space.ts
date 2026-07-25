@@ -110,8 +110,8 @@ export class WooChatSpaceElement extends HTMLElement {
             ${this.model.lines.map((line) => renderChatLineHtml(line, (id) => this.actorLabel(id))).join("") || `<div class="chat-empty">${escapeHtml(this.model.roomDescription || "No chat events yet.")}</div>`}
           </div>
           <form class="chat-form" data-chat-form>
-            <input data-chat-input autocomplete="off" placeholder="say something - or :waves, look cockatoo, tell guest_2 hi" value="${escapeHtml(this.model.draft)}" />
-            <button>Send</button>
+            <input data-chat-input autocomplete="off" placeholder="say something - or :waves, look cockatoo, tell guest_2 hi" value="${escapeHtml(this.model.draft)}" ${this.model.canSend ? "" : "disabled"} />
+            <button ${this.model.canSend ? "" : "disabled"}>Send</button>
           </form>
         </div>
         <aside class="card chat-presence">

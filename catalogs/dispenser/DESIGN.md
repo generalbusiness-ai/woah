@@ -1,135 +1,159 @@
-# dispenser — design notes
+# Dispenser design
 
-## The pattern
+## Purpose
 
-A `$dispenser_block` decouples the request from the work:
+Dispenser is the asynchronous “ticket, external work, artifact” pattern:
 
-1. Requester calls `:order(request)` — the verb appends a record to
-   `pending_orders`, mints an `order_id`, and returns synchronously
-   with `{order_id, queued: true, text, ts}`. It also tells the requester
-   that the order was accepted. The verb does NOT wait for the plug.
-2. The plug (a CF Worker, or any apikey-bound WS/REST client) drains
-   the queue at its own cadence — either on a cron tick or in response
-   to a directed `text` wakeup hint emitted by `:order` (best-effort).
-   It calls `:next_pending()` to read the oldest record.
-3. The plug processes the request *outside woo* (LLM, API call,
-   compute) and calls `:deliver(order_id, name, text, description)`.
-   The plug supplies the `name` (inventory listing label, e.g.
-   `"Horoscope: Capricorn"`), the `text` (markdown body — what `read`
-   returns), and an optional `description` (one-line look-at flavour
-   shown by `look`; per LambdaCore `$note` convention, the description
-   and text slots are kept distinct). The verb removes the entry,
-   creates a `$dispensed_note` owned by the block with that name, sets
-   `description` if provided, calls `:set_text(text)` to write the
-   markdown payload (subject to the 262144-char cap on `$note.text`),
-   and moves the note to the requester's inventory.
-4. The requester sees the note arrive — that's the visible delivery.
-   The requester also receives a direct text observation; the room sees a
-   sequenced `delivered` observation for bystanders.
+1. `order(request)` durably accepts bounded work and returns immediately.
+2. An apikey-authenticated plug polls `next_pending()`.
+3. The plug performs external work, fills the allocated artifact, then calls
+   `deliver(...)` or `cancel(...)`.
+4. Delivery places a `$dispensed_note` in the requester’s inventory.
 
-## Why a queue and not parked tasks
+A durable queue makes wakeups advisory. A missed hint or cold plug delays work;
+it does not lose it.
 
-Cross-DO parking is not supported in v1
-([R6.2](../../spec/reference/cloudflare.md)) and even when fork/suspend
-lands in the VM the plug would still need a queue for the parts that
-happen outside woo. The queue is authoritative: lost wakeup hints don't
-matter because the plug catches up on the next poll.
+## Authority
 
-`:order` is not a parked-task style verb. It's a "ticket-then-go"
-pattern: the request is durable, the work is asynchronous, the result
-is delivered as an artifact rather than a return value.
+`order`, `deliver`, and `cancel` are the only queue-fact writers. They execute
+on the block, but the block is an anchored actor: its containing room owns the
+sequenced log. A queue mutation therefore requires:
 
-## Idempotency
+```text
+seq >= 1
+space == location(block)
+caller == block for the internal Act primitive
+```
 
-`:deliver(order_id, name, text, description)` is keyed on `order_id`. If the plug
-retries after a partial failure (network error after the deliver
-landed), the second call returns
-`{order_id, delivered: false, reason: "unknown_or_already_delivered"}`
-rather than producing a duplicate note.
+The plug invokes typed verbs; it never receives a raw Act or fold capability.
+All helpers and projection operations omit public execute permission and check
+their internal caller. Once genesis binds the projection, cross-space movement
+is refused: queue relocation needs a future explicit two-authority migration.
 
-## Why the plug supplies `name` and `description`
+The fixed fact vocabulary is:
 
-LambdaMOO's `$note` keeps three slots — `name` (listing identity),
-`description` (cosmetic look-at flavour), and `text` (the readable
-content) — and they never mix. v0.1 of this catalog dispensed notes
-whose `name` was unset and whose body was injected as a single `text`
-list-line, so the inherited title heuristic concatenated
-`name + ": " + text[1]` and the entire horoscope rendered into the
-inventory listing.
+```text
+dispenser.genesis        {next_order_seq}
+dispenser.legacy_ordered {order_id, requester, request, artifact}
+dispenser.ordered        {order_id, request, artifact}
+dispenser.delivered      {order_id, note}
+dispenser.canceled       {order_id}
+```
 
-v0.2 hands name responsibility to the producer. v0.2.2 extends this to
-`description` as well: the plug knows the request, the order, the
-text, and what kind of artifact it's producing, so it owns all three
-labels. The block stores `name` on the note's identity slot, sets
-`description` (if provided) for the cosmetic look-at flavour, and
-calls `:set_text(text)` for the markdown content. Inventory shows the
-name; `look note` shows the description; `read note` shows the text.
-Same as LambdaMOO. The plug may pass `null`/empty as `description` if
-it doesn't have a useful flavour line; the slot stays at `$note`'s
-default.
+Composer source distinguishes several Dispensers on one room log. A normal
+order’s requester comes from the log-envelope actor. The legacy form alone
+carries `requester`, because a migration turn’s actor is not the historical
+requester. Room, sequence, actor, timestamp, and invoked verb are never copied
+into a normal payload.
+`order` preallocates one empty room-anchored `$dispensed_note` and records its
+reference as `artifact`. The authenticated plug fills that exact note through
+direct `prepare_artifact`; `deliver(order_id, artifact)` sequences only the
+reference. Generated name, description, and text therefore remain on the note
+and never enter the room transcript or an Act.
 
-A subclass that prefers to compute the name from request+text in-world
-(rather than at the plug) can expose a `:default_note_name(request,
-text)` hook and have the plug consult it before calling `:deliver`,
-but the contract on the block stays the same: name is required.
+## Projection
 
-## Admission limits
+`$dispenser_queue < $projection` is the sole writer of:
 
-Per-requester interval enforced by `rate_limit_seconds` (default 60s).
-The verb consults `this.last_request_at[requester]` and rejects with
-`E_RATE_LIMIT` if too soon, including a `retry_in_seconds` hint in the
-error value. Set `rate_limit_seconds` to `0` to disable.
+- pending rows and their FIFO order;
+- the next order and queue counters;
+- block and per-requester admission sequence indexes; and
+- terminal delivery/cancellation receipts.
 
-Three owner-writable caps cover the cases a requester-level limit cannot:
-`block_cooldown_seconds` (default 5) throttles the block across all
-requesters, `max_pending_orders` (default 50) bounds the queue, and
-`max_request_chars` (default 200) bounds each request body. Set the
-cooldown to `0` to disable it; set either `max_*` value to `0` for
-unbounded.
+The fold has no clock or foreign reads. It stores envelope sequence numbers;
+admission and `next_pending` resolve the corresponding authority timestamp
+from the room log when needed. Its only scans are over explicitly capped maps.
 
-All checks run *before* the queue append, so rejected orders do not
-pollute the queue. The mutating queue append lives in an internal helper
-verb and is not direct-callable; public callers enter through `:order`.
+Hard bounds are part of the contract, not configuration defaults:
 
-## Sequencing
+| State | Cap | Overflow |
+|---|---:|---|
+| pending rows | 50 | refuse `E_QUEUE_FULL` / `E_QUOTA` |
+| inline request | 200 chars | refuse `E_INVARG` |
+| artifact name / description / body | 256 / 4,096 / 262,144 chars | refuse `E_INVARG` |
+| requester index | 50 | deterministic oldest-seq/key eviction |
+| terminal receipts | 50 | deterministic oldest-seq/key eviction |
 
-`order_placed`, `delivered`, and `canceled` are emitted via
-`observe_to_space(location(this), ...)` — they are sequenced when the
-verb is invoked through `$space:call` (the normal command path) and
-live when invoked via direct call. In v0.1 the room-level command path
-makes `:order` and `:cancel` sequenced; `:deliver` is plug-driven via
-direct call, so the `delivered` observation is live. The note arrival
-in the requester's inventory is durable regardless; direct requester text
-is a live notification and may not survive a reconnect.
+Owner settings can impose smaller limits. Zero selects the hard ceiling.
 
-## Ephemeral by drop
+The v0 fields have one explicit disposition:
 
-`$dispensed_note` overrides `:moveto` so that moving the note into a
-`$space` (a room) recycles it instead, emitting a `note_dispersed`
-observation to the room ("X drops Horoscope: Scorpio, which disperses in
-a puff of smoke."). Hand-offs to other actors or containers fall through
-to the default move chain. The intent: dispensed notes are read in
-inventory and then thrown away, not pinned to walls. If a player wants a
-durable copy they can `:write` its content into a regular `$note`.
+| v0 field | v1 authority |
+|---|---|
+| `pending_orders` | projection `rows` |
+| `next_order_seq` | projection `next_order_seq` |
+| `last_request_at` | capped `requester_index` of Act sequences |
+| `last_order_at` | projection `last_order_seq` |
+| row `ts` | owning room-log envelope timestamp |
+| `last_pushed_at`, `last_error` | unchanged plug-health state |
 
-## TTL on pending orders (deferred)
+## Atomicity and retry
 
-A long-offline plug can accumulate ghost orders. The design note's
-"order TTL" enhancement (auto-deliver an "unattended" note for orders
-older than N seconds) is deferred to a future revision. For v0.1 the
-expectation is the plug's apikey, deployment health, and rate-limit
-keep the queue small.
+Order allocates the note before emitting its Act. Delivery moves that note
+before emitting its terminal Act. In either operation, schema validation,
+every fold, artifact lifecycle, and log append share the outer behavior
+savepoint. Any error must escape; nothing catches fold or lifecycle failures.
 
-## What this catalog does NOT include
+Artifact preparation is deliberately a direct object-authority write, not a
+queue fact. It accepts only the block actor or wizard, validates the queued
+order’s exact preallocated reference, and is one-shot. A retry returns the
+same note without replacing its content. A pending artifact refuses movement
+except from its producing block.
 
-- Concrete dispensers (`$horoscope_block`) ship in their own catalogs.
-- The plug process — that's an external CF Worker, deployed
-  independently.
-- TTL / retry / dead-letter shapes (deferred).
-- A persistent "subscribe to delivery" affordance — the requester gets a
-  live text notification and sees the note in inventory; room bystanders
-  see the sequenced observation. No additional durable notification API in
-  v0.1.
+There are two idempotency layers:
 
-See [`notes/2026-05-05-block-and-plug.md`](../../notes/2026-05-05-block-and-plug.md)
-for the full pattern.
+- Net’s stable key proves a dropped-reply retry commits the turn at most once.
+  A replay is marked `replayed` and may omit the application result because the
+  gateway cannot prove its new plan reproduced the original output.
+- The projection’s terminal receipt is the domain result. A later fresh-key
+  retry returns the original note reference with `duplicate: true`.
+
+`prepare_artifact` also has domain idempotency: after a lost direct reply, a
+fresh-key retry returns the already-prepared reference. The stable key is
+reserved for the sequenced `deliver`, whose single commit matters to the log.
+
+The receipt is bounded. After deterministic eviction, the honest answer is
+`unknown`; the system never guesses or creates a replacement for an already
+terminal order.
+
+## Legacy genesis
+
+The v0 catalog stored `pending_orders`, `next_order_seq`,
+`last_request_at`, and `last_order_at` directly on the block. The v1 migration
+renames them to private inputs. On the first sequenced mutation, one fail-closed
+turn:
+
+1. creates and binds the projection;
+2. emits `dispenser.genesis` with the preserved counter;
+3. preallocates one empty artifact and emits one
+   `dispenser.legacy_ordered` per pending row, in list order;
+4. performs the requested v1 mutation; and
+5. clears the inputs and marks genesis complete.
+
+Until then, read-only plug/status operations may inspect the legacy queue.
+Historical rate-limit timestamps expire deliberately: preserving them would
+copy wall-clock policy state into the new fold without a corresponding fact.
+
+The new bounded contract cannot silently absorb formerly unbounded data.
+Cutover refuses atomically if a legacy queue exceeds 50 rows or a request
+exceeds 200 characters. Operator repair is explicit; truncation and
+behind-the-fold seeding are forbidden.
+
+The 50-row/200-character ceiling is also a wire bound, not an arbitrary
+product default. A Net regression fills all 50 rows, then cancels all 50 into
+terminal receipts, and asserts every production-shaped envelope remains below
+64 KiB; the saturated order measured about 48.3 KiB in the proof lane.
+
+Rebuild starts from declared empty state and reproduces rows, counters,
+indexes, receipts, genesis status, and `at_seq` from recorded observations.
+Composer source filters Acts for another Dispenser on the same room log.
+
+## Deliberate exclusions
+
+- Note content and physical location retain artifact authority; the queue
+  records only the allocated/delivered reference.
+- Plug heartbeat and error diagnostics remain ordinary `$block` data; they are
+  health signals, not queue facts.
+- The base catalog has no approval, failure, TTL, or dead-letter transition.
+  Those facts should be added only when a real domain policy earns them.
+- Dropping a dispensed note is artifact lifecycle, not queue state.

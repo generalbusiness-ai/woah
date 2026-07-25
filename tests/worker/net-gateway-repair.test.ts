@@ -230,8 +230,8 @@ type TurnBody = {
   observations?: Array<{ type?: string }>;
 };
 
-describe("idempotent replay does not fabricate output (B2)", () => {
-  it("a touchless verb's replay returns replayed:true with NO result/observations", async () => {
+describe("pure direct read replay", () => {
+  it("a pure direct read safely re-executes at a stable head instead of entering the reply cache", async () => {
     const { scopeDO, pingCall, close } = await seededScope();
     const gwState = netState("gw-replay");
     const gwEnv = gatewayEnvFor(scopeDO);
@@ -243,16 +243,16 @@ describe("idempotent replay does not fabricate output (B2)", () => {
     expect(first.reply.status).toBe("accepted");
     expect(first.replayed).toBeUndefined();
     expect(first.observations?.some((o) => o.type === "pinged")).toBe(true);
+    const head = first.reply.head;
 
-    // Replay under the SAME key: post-state is identical (nothing was
-    // touched), so the old digest guess said "fresh" and re-planned new
-    // output. The fix returns replayed:true and omits result/observations
-    // — the committed turn's real output was the first reply's.
+    // No durable fact was committed, so the scope deliberately stores no
+    // idempotency reply. The same key validates again and returns the current
+    // read result without advancing authority.
     const replay = await call<TurnBody>(gw, gwEnv, "/turn", turnRequest(pingCall("ping-1"), "ping-key"));
     expect(replay.reply.status).toBe("accepted");
-    expect(replay.replayed).toBe(true);
-    expect(replay.result).toBeUndefined();
-    expect(replay.observations ?? []).toEqual([]);
+    expect(replay.replayed).toBeUndefined();
+    expect(replay.reply.head).toEqual(head);
+    expect(replay.observations?.some((o) => o.type === "pinged")).toBe(true);
     close();
   });
 });
@@ -381,7 +381,7 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
     gState.close();
   });
 
-  it("keeps a real head-zero seed A -> B -> A cycle ineligible for terminal detection", async () => {
+  it("distinguishes a real head-zero seed A -> B -> A cycle by authority generation", async () => {
     const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
     const key = "property_cell:repair_box:counter";
     const stuckCell = { kind: "prop" as const, object: "repair_box", name: "counter" };
@@ -425,11 +425,11 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
       turnRequest(bumpCall("turn-seed-aba"), "seed-aba")
     );
 
-    expect(status).toBe(503);
-    expect(body.error.code).toBe("E_BUDGET");
-    expect(snapshots.length).toBe(MAX_TURN_ATTEMPTS);
-    expect(snapshots[0]).toEqual(snapshots[1]);
-    expect(middle[0]?.head).toEqual(snapshots[0]?.head);
+    expect(status).toBe(400);
+    expect(body.error.code).toBe("E_NONCONVERGENT_READ");
+    expect(snapshots.length).toBeGreaterThanOrEqual(3);
+    expect(snapshots[0]?.head.generation).toBeLessThan(snapshots[1]?.head.generation ?? 0);
+    expect(middle[0]?.head.generation).toBeGreaterThan(snapshots[0]?.head.generation ?? 0);
     expect(middle[0]?.version).not.toBe(snapshots[0]?.version);
     expect(snapshots[0]?.head.seq).toBe(0);
 
@@ -437,7 +437,7 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
     state.close();
   });
 
-  it("keeps a real post-traffic activation A -> null -> A cycle ineligible for terminal detection", async () => {
+  it("distinguishes a real post-traffic activation A -> null -> A cycle by authority generation", async () => {
     const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
     await advanceScopeOnce(scopeDO, bumpCall, "activation-aba");
     const key = "property_cell:$system:net_active_epoch";
@@ -480,11 +480,11 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
       turnRequest(bumpCall("turn-activation-aba"), "activation-aba")
     );
 
-    expect(status).toBe(503);
-    expect(body.error.code).toBe("E_BUDGET");
-    expect(snapshots.length).toBe(MAX_TURN_ATTEMPTS);
-    expect(snapshots[0]).toEqual(snapshots[1]);
-    expect(middle[0]?.head).toEqual(snapshots[0]?.head);
+    expect(status).toBe(400);
+    expect(body.error.code).toBe("E_NONCONVERGENT_READ");
+    expect(snapshots.length).toBeGreaterThanOrEqual(3);
+    expect(snapshots[0]?.head.generation).toBeLessThan(snapshots[1]?.head.generation ?? 0);
+    expect(middle[0]?.head.generation).toBeGreaterThan(snapshots[0]?.head.generation ?? 0);
     expect(middle[0]?.version).not.toBe(snapshots[0]?.version);
     expect(snapshots[0]?.head.seq).toBeGreaterThan(0);
 

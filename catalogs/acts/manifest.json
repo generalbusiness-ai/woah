@@ -1,0 +1,174 @@
+{
+  "name": "acts",
+  "version": "0.2.0",
+  "spec_version": "v1",
+  "description": "Generic Acts kernel. The $acts feature gives a space, or a catalog-owned actor anchored in one, an internal schema-validated fail-closed emission primitive on that sequenced log. $projection binds one composer and one log to single-writer folds, bounded views, and incremental idempotent rebuild from recorded observations. Domain facts and concrete projections live in consuming catalogs.",
+  "license": "MIT",
+  "depends": [],
+  "features": [
+    {
+      "local_name": "$acts",
+      "parent": "$thing",
+      "description": "Stateless feature carrying the internal act-emission primitive. Mounted on a $space composer, or on a catalog-owned anchored $actor composer such as $dispenser_block, its effective surface is <composer>:act. Emission requires a sequenced turn on the composer's bound log and an internal caller; payloads validate against event_schema; attached projections fold in the same turn, fail-closed.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "can_be_attached_by",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "who"
+            ]
+          },
+          "source": "verb :can_be_attached_by(who) rxd {\n  /* Mounting the acts feature is a seed/owner act on the consumer side\n     ($case:initialize); the feature itself is freely attachable. */\n  return true;\n}",
+          "direct_callable": true
+        },
+        {
+          "name": "act",
+          "perms": "r",
+          "arg_spec": {
+            "args": [
+              "type",
+              "payload"
+            ]
+          },
+          "source": "verb :act(type, payload) r {\n  /* Internal emission primitive (ACT3). A space composes on its own log;\n     a catalog-owned anchored actor composes on its containing space's log.\n     Direct routes carry seq == -1. In both forms only the composer's own\n     verbs may call this primitive (caller == this). Any fold failure aborts\n     the whole turn: fail-closed. */\n  if (seq < 1) { raise { code: \"E_INVARG\", message: \"acts require a sequenced turn\" }; }\n  let bound_log = null;\n  if (isa(this, $space)) { bound_log = this; }\n  else if (isa(this, $actor)) { bound_log = location(this); }\n  if (bound_log == null || !isa(bound_log, $space) || space != bound_log) {\n    raise { code: \"E_INVARG\", message: \"act composer is not bound to this sequenced log\", value: { composer: this, log_space: space } };\n  }\n  if (caller != this) { raise { code: \"E_PERM\", message: \"acts are emitted by composer verbs only\" }; }\n  let shape = event_schema(this, type);\n  if (shape == null) { raise { code: \"E_INVARG\", message: \"unknown act type\", value: type }; }\n  this:_validate_payload(type, shape, payload);\n  /* source is generic carrier metadata naming the composer, not a semantic\n     Act field. It lets rebuild distinguish several composers on one log. */\n  let act = { \"type\": type, \"version\": 1, \"payload\": payload, \"source\": this };\n  /* Live emission and rebuild inject the same recorded envelope identity.\n     None of seq, actor, or source belongs in the validated payload. */\n  let fold_input = { \"type\": type, \"version\": 1, \"payload\": payload, \"seq\": seq, \"actor\": actor, \"source\": this };\n  let projections = [];\n  try { projections = this.projections; } except e in (E_PROPNF) { }\n  for p in projections {\n    if (!valid(p) || !isa(p, $projection) || p.source_space != this || p.log_space != bound_log) {\n      raise { code: \"E_INVARG\", message: \"projection is not bound to the emitting composer and log\", value: p };\n    }\n    if (type in p.consumes) { p:fold(fold_input); }\n  }\n  observe(act);\n  return act;\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "_validate_payload",
+          "perms": "r",
+          "arg_spec": {
+            "args": [
+              "type",
+              "shape",
+              "payload"
+            ]
+          },
+          "source": "verb :_validate_payload(type, shape, payload) r {\n  /* Closed flat shape vocabulary (S2.2): obj, str, bool, int, float,\n     num, list, map, null \u2014 with unions as \"a|b\" alternatives (earned by\n     the outliner migration, whose declared shapes use \"obj|null\").\n     Every declared key is required; undeclared keys refuse. Exact\n     typing: \"str\" refuses live object refs (refs are strings at the VM\n     level - an obj must not pass as a code/label); \"obj\" requires a\n     live ref. */\n  if (caller != this) { raise { code: \"E_PERM\", message: \"payload validation is internal\" }; }\n  if (typeof(payload) != \"map\") { raise { code: \"E_INVARG\", message: \"act payload must be a map\", value: type }; }\n  for pk, pv in payload {\n    if (!(pk in shape)) { raise { code: \"E_INVARG\", message: \"undeclared act payload key\", value: pk }; }\n  }\n  for k, spec in shape {\n    if (!(k in payload)) { raise { code: \"E_INVARG\", message: \"missing act payload key\", value: k }; }\n    let val = payload[k];\n    let ok = false;\n    for t in str_split(spec, \"|\") {\n      if (ok) { continue; }\n      if (t == \"obj\") { ok = typeof(val) == \"string\" && valid(val); }\n      else if (t == \"str\") { ok = typeof(val) == \"string\" && !valid(val); }\n      else if (t == \"bool\") { ok = typeof(val) == \"boolean\"; }\n      else if (t == \"int\") { ok = typeof(val) == \"number\" && floor(val) == val; }\n      else if (t == \"float\" || t == \"num\") { ok = typeof(val) == \"number\"; }\n      else if (t == \"list\") { ok = typeof(val) == \"list\"; }\n      else if (t == \"map\") { ok = typeof(val) == \"map\"; }\n      else if (t == \"null\") { ok = val == null; }\n      else { raise { code: \"E_INVARG\", message: \"unsupported shape tag\", value: t }; }\n    }\n    if (!ok) { raise { code: \"E_INVARG\", message: \"act payload type mismatch\", value: k }; }\n  }\n  return true;\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "_rebuild_projection",
+          "perms": "r",
+          "arg_spec": {
+            "args": [
+              "projection",
+              "log_space",
+              "page_budget"
+            ]
+          },
+          "source": "verb :_rebuild_projection(projection, log_space, page_budget) r {\n  /* Composer-mediated replay keeps :fold single-authority. An anchored actor\n     composes while its separately bound containing space owns the log. The\n     projection may request replay but cannot supply fold input. */\n  if (!valid(projection) || !isa(projection, $projection) || projection.source_space != this || projection.log_space != log_space || caller != projection) {\n    raise { code: \"E_PERM\", message: \"projection rebuild is authority-internal\", value: projection };\n  }\n  if (!valid(log_space) || !isa(log_space, $space)) { raise { code: \"E_INVARG\", message: \"projection rebuild requires its bound log space\", value: log_space }; }\n  if (actor != projection.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"rebuild is owner-only\" }; }\n  let budget = 100;\n  if (typeof(page_budget) == \"number\" && page_budget >= 1 && page_budget <= 100) { budget = toint(page_budget); }\n  let from = projection.at_seq;\n  if (projection.rebuild_scan_seq > from) { from = projection.rebuild_scan_seq; }\n  from = from + 1;\n  let entries = log_space:replay(from, budget);\n  let scanned = from - 1;\n  for e in entries {\n    scanned = e[\"seq\"];\n    if (!e[\"applied_ok\"]) { continue; }\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o) && o[\"source\"] == this && (o[\"type\"] in projection.consumes)) {\n        /* Reconstruct exactly the live fold envelope. Source selects this\n           composer on a shared log; actor comes from its recorded message. */\n        let input = { \"type\": o[\"type\"], \"version\": o[\"version\"], \"payload\": o[\"payload\"], \"seq\": e[\"seq\"], \"actor\": e[\"message\"][\"actor\"], \"source\": this };\n        projection:fold(input);\n      }\n    }\n  }\n  projection.rebuild_scan_seq = scanned;\n  return { \"at_seq\": projection.at_seq, \"scanned_seq\": scanned, \"done\": length(entries) < budget };\n}",
+          "skip_presence_check": true
+        }
+      ]
+    }
+  ],
+  "classes": [
+    {
+      "local_name": "$projection",
+      "parent": "$thing",
+      "flags": {
+        "fertile": true
+      },
+      "description": "Base class for act projections (ACT4): non-public composer and log bindings, consumes + internal fold, rows + bounded view, and incremental rebuild. Projection configuration and state are perms-empty; only the bound composer may fold. Rebuild is composer-mediated, so it never grants the projection a self-fold capability. The projection lives in its log space's anchor cluster so fold writes share the turn's atomicity.",
+      "properties": [
+        {
+          "name": "rows",
+          "type": "map",
+          "default": {},
+          "perms": ""
+        },
+        {
+          "name": "consumes",
+          "type": "list",
+          "default": [],
+          "perms": ""
+        },
+        {
+          "name": "source_space",
+          "type": "obj|null",
+          "default": null,
+          "perms": "",
+          "description": "The sole composer authority allowed to fold this projection, both live and during source-mediated rebuild. Set when the projection is created."
+        },
+        {
+          "name": "log_space",
+          "type": "obj|null",
+          "default": null,
+          "perms": "",
+          "description": "The sole sequenced space whose recorded Acts this projection consumes. Equals source_space for a space composer and names the containing space for an anchored actor composer."
+        },
+        {
+          "name": "row_cap",
+          "type": "int",
+          "default": 1000,
+          "perms": ""
+        },
+        {
+          "name": "at_seq",
+          "type": "int",
+          "default": 0,
+          "perms": ""
+        },
+        {
+          "name": "rebuild_scan_seq",
+          "type": "int",
+          "default": 0,
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "r",
+          "arg_spec": {
+            "args": [
+              "act"
+            ]
+          },
+          "source": "verb :fold(act) r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"projection fold is authority-internal\" }; }\n  /* Subclass responsibility (ACT4): deterministic given (projection state,\n     act), sole writer of that state, no scan beyond the payload and declared\n     fixed caps, no clock, and no foreign reads. The act input carries recorded\n     envelope seq, actor, and composer source alongside the semantic body. The\n     base refuses so an unimplemented projection fails loudly. */\n  raise { code: \"E_VERBNF\", message: \"projection must implement :fold\" };\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "view",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "opts"
+            ]
+          },
+          "source": "verb :view(opts) rxd {\n  /* The one authoritative bounded read (S2.3). Pages rows in key order\n     with a continuation cursor: pass opts[\"after\"] = the previous\n     page's \"cursor\" to fetch the next page (a stale/unknown cursor\n     yields an empty page). at_seq is the seq of the LAST CONSUMED act -\n     a conservative completeness watermark, not the room's head seq.\n     Each row renders through :view_row so subclasses join\n     object-authoritative facts at view time without mirroring them. */\n  if (typeof(opts) != \"map\") { opts = {}; }\n  let limit = 50;\n  if (\"limit\" in opts) { limit = toint(opts[\"limit\"]); }\n  if (limit < 1 || limit > 200) { limit = 50; }\n  let after = \"\";\n  if (\"after\" in opts) { after = to_string(opts[\"after\"]); }\n  let skipping = after != \"\";\n  let page = [];\n  let cursor = null;\n  let has_more = false;\n  for k in keys(this.rows) {\n    if (skipping) { if (k == after) { skipping = false; } continue; }\n    if (length(page) >= limit) { has_more = true; break; }\n    page = page + [this:view_row(k, this.rows[k])];\n    cursor = k;\n  }\n  return { \"page\": page, \"at_seq\": this.at_seq, \"cursor\": cursor, \"has_more\": has_more };\n}",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "view_row",
+          "perms": "r",
+          "arg_spec": {
+            "args": [
+              "key",
+              "row"
+            ]
+          },
+          "source": "verb :view_row(key, row) r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"projection row rendering is internal\" }; }\n  /* Default rendering: the stored row itself. */\n  return row;\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "rebuild_from",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "log_space",
+              "page_budget"
+            ]
+          },
+          "source": "verb :rebuild_from(log_space, page_budget) rxd {\n  /* Operator rebuild (ACT4): the bound composer mediates replay from the\n     separately bound log, preserving one fold caller for space and anchored\n     actor composers alike. */\n  if (log_space != this.log_space) { raise { code: \"E_INVARG\", message: \"rebuild source does not match projection log authority\", value: log_space }; }\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"rebuild is owner-only\" }; }\n  return this.source_space:_rebuild_projection(this, log_space, page_budget);\n}",
+          "direct_callable": true,
+          "skip_presence_check": true
+        }
+      ]
+    }
+  ]
+}

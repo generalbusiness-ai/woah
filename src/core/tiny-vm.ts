@@ -200,6 +200,10 @@ export const BUILTIN_NAMES = [
   // after, child_index} answer a MUTATION reads instead of the parent's full
   // ordered_children list. Appended last to keep every bytecode index stable.
   "ordered_neighbors",
+  // Declared event-schema lookup (spec/semantics/introspection.md): the shape
+  // for one event type via class-then-features precedence, or null. The acts
+  // kernel validates act payloads against it. Appended last; keeps indices.
+  "event_schema",
   // Surface membership predicate: has_surface(actor, class) is true when the
   // actor carries the authoring surface `class` through its parent chain OR
   // through an attached feature. Catalog authoring guards call this instead of
@@ -779,8 +783,11 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       // if woocode could catch it, a `try { ...detach... } except {}` would
       // "succeed" with children still edged to a recycled/moved node.
       // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the same
-      // miss (P2.4) and would be swallowed identically.
-      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN" || error.code === "E_NEED_ORDERED_NEIGHBORS") throw error;
+      // miss (P2.4) and would be swallowed identically. E_NEED_REPLAY_PAGE
+      // is the committed-log-page variant: a catchable miss would let a
+      // `try { space:replay(...) } except` treat "page not fetched yet" as
+      // "log is empty" and silently truncate a journal/rebuild.
+      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN" || error.code === "E_NEED_ORDERED_NEIGHBORS" || error.code === "E_NEED_REPLAY_PAGE") throw error;
       if (!raise(error)) throw error;
     }
   }
@@ -1112,6 +1119,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
         return frame.ctx.world.isDescendantOfChecked(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), frame.ctx.hostMemo);
+      }
+      case "event_schema": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "event_schema expects object and type");
+        return frame.ctx.world.eventSchemaFor(assertObj(builtinArgs[0]), assertString(builtinArgs[1] ?? "")) as unknown as WooValue;
       }
       case "has_surface": {
         // Surface membership = ancestry OR attached-feature chain. The actor is

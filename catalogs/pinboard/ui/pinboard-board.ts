@@ -6,7 +6,8 @@ import {
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
-  type WooContext
+  type WooContext,
+  type WooWorldSnapshotAdapterRegistry
 } from "../../../src/client/framework";
 
 export type PinboardNote = Record<string, unknown> & {
@@ -385,6 +386,26 @@ function pinboardLayoutState(note: any): Record<string, unknown> {
     if (note?.[key] !== undefined) fields[key] = note[key];
   }
   return fields;
+}
+
+/** Translate the retired v2 `world.pinboard.notes` envelope at the catalog
+ * boundary. The generic projection store sees only ordinary patches. */
+export function registerWooWorldSnapshotAdapters(registry: WooWorldSnapshotAdapterRegistry): void {
+  registry.adapt((world) => {
+    const notes = Array.isArray((world as any)?.pinboard?.notes) ? (world as any).pinboard.notes : [];
+    return notes.flatMap((note: any) => {
+      const subject = String(note?.id ?? "");
+      if (!subject) return [];
+      return [{
+        subject,
+        fields: {
+          name: typeof note?.name === "string" ? note.name : undefined,
+          owner: typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : undefined
+        },
+        catalogState: { pinboard_note: pinboardNoteState(note) }
+      }];
+    });
+  });
 }
 
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {

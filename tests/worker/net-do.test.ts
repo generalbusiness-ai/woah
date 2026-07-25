@@ -113,7 +113,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     b.close();
   });
 
-  it("serializes concurrent independent submits from one retained base without repair", async () => {
+  it("keeps concurrent read-only direct submits at one stable authority head", async () => {
     const scope = makeScope("room-a", env);
     await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
     const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
@@ -154,8 +154,79 @@ describe("NetScopeDO over fake-DO storage", () => {
       Array.from({ length: 12 }, (_, index) => call<CommitReply>(scope.instance, env, "/submit", makeSubmit(index)))
     );
     expect(replies.every((reply) => reply.status === "accepted")).toBe(true);
-    expect(new Set(replies.map((reply) => reply.head.seq)).size).toBe(12);
-    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(12);
+    expect(new Set(replies.map((reply) => reply.head.seq))).toEqual(new Set([0]));
+    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(0);
+    scope.close();
+  });
+
+  it("crosses an alarm event before a direct submit calls subscriber gateways", async () => {
+    const deliveries: Array<{ destination: string; path: string }> = [];
+    const envWithGateways: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => ({
+        fetch: async (request) => {
+          deliveries.push({ destination, path: new URL(request.url).pathname });
+          return new Response(JSON.stringify({ delivered: true }), {
+            headers: { "content-type": "application/json" }
+          });
+        }
+      })
+    };
+    const scope = makeScope("room-live", envWithGateways);
+    await call(scope.instance, envWithGateways, "/seed", {
+      scope: "room-live",
+      catalog_epoch: EPOCH,
+      cells: seedCells()
+    });
+    for (const destination of ["gateway:origin", "gateway:peer"]) {
+      await call(scope.instance, envWithGateways, "/subscribe", { destination });
+    }
+    const head = (await call<{ head: ScopeHead }>(scope.instance, envWithGateways, "/head")).head;
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "room-live",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "look", args: [], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [{ type: "looked", to: "#actor", text: "live view" }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-live-alarm"
+    };
+    const twin = new ScopeSequencer("room-live", EPOCH);
+    twin.seed(seedCells());
+    const submit = {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-live",
+      base: head,
+      idempotency_key: "live-alarm-1",
+      transcript,
+      post_state_version: applyTranscript(
+        twin.store,
+        transcript as never,
+        { scope_head: "x", catalog_epoch: EPOCH }
+      ).postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+
+    const reply = await call<CommitReply>(scope.instance, envWithGateways, "/submit", {
+      submit,
+      origin_gateway: "gateway:origin"
+    });
+    expect(reply.status).toBe("accepted");
+    expect(deliveries, "no gateway RPC may inherit /submit's lineage").toEqual([]);
+
+    await scope.instance.alarm();
+    expect(deliveries).toEqual([{ destination: "gateway:peer", path: "/net/live" }]);
+    expect((await call<{ head: ScopeHead }>(scope.instance, envWithGateways, "/head")).head).toEqual(head);
     scope.close();
   });
 
@@ -613,7 +684,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 });
 
 describe("NetGatewayDO end-to-end over fake-DO", () => {
-  it("treats a full catalog pull as exact for definition pages missed while offline", async () => {
+  it("replaces every compactable catalog cell before certifying a full pull", async () => {
     const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
     const catalog = makeScope("catalog-exact", scopeEnv);
     await call(catalog.instance, scopeEnv, "/seed", {
@@ -695,6 +766,15 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
           stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
         },
         {
+          key: "object_lineage:custom_room",
+          kind: "object_lineage",
+          object: "custom_room",
+          value: { parent: "$space", owner: "$wiz", name: "custom_room", anchor: null, flags: {} },
+          version: "room-lineage",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
           key: roomVerbKey,
           kind: "verb_bytecode",
           object: "custom_room",
@@ -730,9 +810,17 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(pulled).toMatchObject({ source: "live", installed: 3 });
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
-    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    // Full-pull exactness is not definition-specific. This ordinary
+    // catalog-owned property would be eligible for complete-head read
+    // compaction too, so retaining it would certify a stale value.
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
+    expect(durableRows(
+      gatewayState.state,
+      "SELECT owner_scope FROM net_gateway_cell WHERE key = ?",
+      roomVerbKey
+    )).toEqual([{ owner_scope: "room:custom_room" }]);
     expect(durableRows(gatewayState.state,
       "SELECT body FROM net_gateway_cell WHERE key = 'verb_bytecode:$outliner:list_items'"
     )).toHaveLength(1);
@@ -742,7 +830,7 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     await call(restarted, gatewayEnv, "/pull", { scope: CATALOG_SCOPE, destination: "scope:catalog" });
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
-    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
     catalog.close();
@@ -848,10 +936,17 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     await call(cluster.instance, scopeEnv, "/seed", { scope: "cluster:#actor", catalog_epoch: EPOCH, cells: seedCells() });
 
     const gatewayState = netState("gateway-sessions");
+    let clusterHeadCalls = 0;
+    const countedCluster = {
+      fetch: async (request: Request): Promise<Response> => {
+        if (new URL(request.url).pathname.endsWith("/head")) clusterHeadCalls += 1;
+        return cluster.instance.fetch(request);
+      }
+    };
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
       NET_RESOLVE: (destination) => {
-        if (destination === "scope:cluster:#actor") return cluster.instance;
+        if (destination === "scope:cluster:#actor") return countedCluster;
         throw new Error(`unexpected destination ${destination}`);
       }
     };
@@ -866,6 +961,19 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(opened.reply.status, JSON.stringify(opened.reply)).toBe("accepted");
     expect(opened.scope).toBe("cluster:#actor");
     expect(opened.value).toMatchObject({ id: "s-open-1", actor: "#actor" });
+    expect(clusterHeadCalls).toBe(1);
+
+    // The accepted mint returned the cluster's exact new head. A second
+    // session substrate commit on this gateway reuses it and therefore pays
+    // no routine /head RPC; /submit remains the authority check.
+    const openedAgain = await call<{ reply: CommitReply }>(
+      gateway,
+      gatewayEnv,
+      "/session-open",
+      { session: "s-open-2", actor: "#actor", ttl_ms: 60_000, catalog_epoch: EPOCH, cluster_destination: "scope:cluster:#actor" }
+    );
+    expect(openedAgain.reply.status, JSON.stringify(openedAgain.reply)).toBe("accepted");
+    expect(clusterHeadCalls).toBe(1);
 
     // The accepted cell is authoritative at the cluster…
     const closure = await call<{ cells: Array<{ key: string; value: unknown }> }>(
@@ -922,6 +1030,19 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
       stamp: { scope_head: "x", catalog_epoch: EPOCH }
     });
     expect(sequencedReply.status, JSON.stringify(sequencedReply)).toBe("accepted");
+
+    // A write from another gateway advances authority after the retained
+    // hint. The scope, not the cache, proves that base through its bounded
+    // retained tail and safely rebases this readless session commit without
+    // adding a /head round trip.
+    const repaired = await call<{ reply: CommitReply }>(
+      gateway,
+      gatewayEnv,
+      "/session-open",
+      { session: "s-open-3", actor: "#actor", ttl_ms: 60_000, catalog_epoch: EPOCH, cluster_destination: "scope:cluster:#actor" }
+    );
+    expect(repaired.reply.status, JSON.stringify(repaired.reply)).toBe("accepted");
+    expect(clusterHeadCalls).toBe(1);
 
     // Phase 5: a zero/negative TTL can no longer even CONSTRUCT a mint —
     // the no-expiry guard refuses at the library boundary, through the

@@ -126,16 +126,26 @@ read -sr WOO_VERIFY_PASSWORD; export WOO_VERIFY_PASSWORD
 Deploy only `wrangler.net-canary.template.toml` with a dedicated KV namespace
 and no custom-domain routes. Drive at least 500 turns and all configured shards;
 for `who_all` acceptance, use enough guests to guarantee multiple shards and
-pass `--enforce-who`.
+pass `--enforce-who`. The acceptance load is deliberately paced: 30 actors
+produce 60 turns per round, so the driver must not release the whole round as
+one hot-room burst. The stronger burst shape is a separate overload probe and
+does not replace the acceptance run.
 
 ```sh
 npx wrangler deploy -c wrangler.net-canary.template.toml
 npm run load:net-canary -- --base-url https://<canary>.workers.dev \
-  --actors 30 --rounds 10 --requests-per-actor 2 --enforce-who
+  --actors 30 --rounds 10 --requests-per-actor 2 \
+  --turn-concurrency 8 --round-delay-ms 500 --enforce-who
 CF_ACCOUNT_ID=... CF_ANALYTICS_TOKEN=... npm run metrics:net-ae -- \
   --dataset woo_v1_net_canary --from <ISO_START> --min-turns 500
 npx wrangler delete -c wrangler.net-canary.template.toml
 ```
+
+After the acceptance run is green, probe the known overload boundary
+separately with `--turn-concurrency 16 --round-delay-ms 250`. Refusals or
+client timeouts in that 60-turn hot-room burst describe saturation; they do
+not authorize larger queues or weaker NC8 deadlines. Record both shapes and
+never combine their results.
 
 Tail is diagnostic only. It is sampled under load and cannot satisfy an
 acceptance envelope.

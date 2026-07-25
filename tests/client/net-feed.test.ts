@@ -166,7 +166,7 @@ describe("NetFeed turn() over WS", () => {
     const socket = FakeSocket.instances[0];
     socket.open();
 
-    const turn = feed.turn({ target: "#bob", verb: "wave", args: [] });
+    const turn = feed.turn({ target: "#bob", verb: "wave", args: [], route: "direct" });
     await tick();
     // Echo overlay: the submitted INTENT is pending (not predicted cells
     // — the Phase-4 decision).
@@ -176,6 +176,7 @@ describe("NetFeed turn() over WS", () => {
     // idempotency key.
     expect(socket.sent).toHaveLength(1);
     const frame = socket.sent[0];
+    expect(frame.route).toBe("direct");
     expect(frame).toMatchObject({ type: "turn", target: "#bob", verb: "wave", args: [] });
     expect(frame.idempotency_key).toBe(frame.id);
 
@@ -308,7 +309,7 @@ describe("NetFeed turn() REST fallback", () => {
     const outcome = await feed.turn({ target: "#bob", verb: "wave", args: ["hi"] });
     expect(outcome.status).toBe("accepted");
     const turnCall = calls.find((call) => call.path === "/net-api/turn");
-    expect(turnCall?.body).toMatchObject({ target: "#bob", verb: "wave", args: ["hi"], session: "s_1" });
+    expect(turnCall?.body).toMatchObject({ target: "#bob", verb: "wave", args: ["hi"], route: "sequenced", session: "s_1" });
     expect(typeof (turnCall?.body as Record<string, unknown>).idempotency_key).toBe("string");
     expect(events).toHaveLength(1);
     expect(events[0].source).toBe("self");
@@ -664,6 +665,40 @@ describe("NetFeed reads + cache", () => {
     // Change signal → re-read (correctness comes from the re-read; the
     // cache never holds across a change).
     socket.frame({ type: "observations", scope: "room:the_hall", seq: 1, observations: [{ type: "entered" }] });
+    await feed.relation("session_presence", "the_hall");
+    expect(reads()).toBe(2);
+  });
+
+  it("delivers unsequenced live observations with seq:null and invalidates reads", async () => {
+    const members = [{ member: "s_2", body: { actor: "#bob" } }];
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "GET /net-api/relation": () => ({ body: { relation: "session_presence", owner: "the_hall", members } })
+    });
+    const events: NetFeedObservationEvent[] = [];
+    feed.onObservation((event) => events.push(event));
+    await feed.open();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+
+    await feed.relation("session_presence", "the_hall");
+    await feed.relation("session_presence", "the_hall");
+    const reads = () => calls.filter((call) => call.path.startsWith("/net-api/relation")).length;
+    expect(reads()).toBe(1);
+
+    socket.frame({
+      type: "live_observations",
+      scope: "room:the_hall",
+      observations: [{ type: "said", actor: "#bob", text: "hi" }]
+    });
+    expect(events).toEqual([
+      {
+        source: "peer",
+        scope: "room:the_hall",
+        seq: null,
+        observation: { type: "said", actor: "#bob", text: "hi" }
+      }
+    ]);
     await feed.relation("session_presence", "the_hall");
     expect(reads()).toBe(2);
   });

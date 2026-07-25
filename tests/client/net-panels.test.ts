@@ -23,7 +23,7 @@ function wiredRegistry(register: (registry: ObservationRegistry) => void): { pro
   const registry = new ObservationRegistry(projection);
   register(registry);
   let handler: Parameters<NetFeedSource["onObservation"]>[0] = () => {};
-  wireNetFeed({ observations: registry }, {
+  wireNetFeed({ ingestDeliveredObservation: (observation, delivered) => { registry.deliver(observation, delivered); } }, {
     onObservation: (fn) => {
       handler = fn;
       return () => {};
@@ -115,6 +115,34 @@ describe("net feed → catalog panel reducers (phase iii)", () => {
     expect(item?.props).toMatchObject({ text: "first item", hidden: false });
     expect(item?.props).not.toHaveProperty("parent");
     expect(item?.props).not.toHaveProperty("position");
+    expect(item?.catalogState?.outliner_tree).toEqual({ parent_id: null, index: 0 });
+  });
+
+  // v3 emits the same event as an act ({type, version, payload}); the reducer
+  // must land the identical projection as the flat shape above
+  // (catalogs/outliner/migration-v2-to-v3.json).
+  it("a peer act-enveloped outline_item_added reduces identically to the flat shape", () => {
+    const { projection, emit } = wiredRegistry(outlinerHandlers);
+    emit({
+      observation: {
+        type: "outline_item_added",
+        version: 1,
+        payload: {
+          outliner: "the_outline",
+          actor: "#alice",
+          item: "obj_item_1",
+          text: "first item",
+          parent_id: null,
+          index: 0
+        }
+      },
+      source: "peer",
+      scope: "room:the_outline",
+      seq: 3
+    });
+    const item = projection.observe("obj_item_1");
+    expect(item?.location).toBe("the_outline");
+    expect(item?.props).toMatchObject({ text: "first item", hidden: false });
     expect(item?.catalogState?.outliner_tree).toEqual({ parent_id: null, index: 0 });
   });
 

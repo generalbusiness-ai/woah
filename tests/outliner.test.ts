@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { installVerb, installVerbAs } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { installLocalCatalogs } from "../src/core/local-catalogs";
 
@@ -12,6 +13,31 @@ type CallResult =
   | { op: "result"; result: unknown; observations: Array<Record<string, unknown>> }
   | { op: "error"; error: { code: string; message?: string; value?: unknown } };
 
+// Structure mutations emit acts, and acts require the sequenced route on the
+// outliner's own log (the production path post-net-cutover). These verbs go
+// through world.call with the actor's session; everything else stays direct.
+const SEQUENCED_VERBS = new Set(["add_item", "move_item", "reorder_item", "hide", "remove_item", "eject_item", "undo", "add", "hide_command", "recycle"]);
+
+async function sequencedCall(
+  world: ReturnType<typeof createWorld>,
+  actor: string,
+  space: string,
+  target: string,
+  verb: string,
+  args: unknown[],
+  reqId = `${verb}-${Math.random().toString(36).slice(2, 7)}`
+): Promise<CallResult> {
+  let sessionId: string | null = null;
+  for (const [id, s] of world.sessions) if (s.actor === actor) { sessionId = id; break; }
+  if (!sessionId) throw new Error(`no session for ${actor}`);
+  const f = await world.call(reqId, sessionId, space, { actor, target, verb, args: args as never[] });
+  if (f.op !== "applied") return f as unknown as CallResult;
+  const obs = ((f as { observations?: Array<Record<string, unknown>> }).observations ?? []);
+  const err = obs.find((o) => o && (o as { type?: unknown }).type === "$error");
+  if (err) return { op: "error", error: err as unknown as { code: string; message?: string; value?: unknown } };
+  return { op: "result", result: (f as { result: unknown }).result, observations: obs };
+}
+
 async function call(
   world: ReturnType<typeof createWorld>,
   actor: string,
@@ -20,6 +46,9 @@ async function call(
   args: unknown[],
   reqId = `${verb}-${Math.random().toString(36).slice(2, 7)}`
 ): Promise<CallResult> {
+  if (SEQUENCED_VERBS.has(verb)) {
+    return sequencedCall(world, actor, target, target, verb, args, reqId);
+  }
   return (await world.directCall(reqId, actor, target, verb, args as never[])) as CallResult;
 }
 
@@ -93,6 +122,30 @@ function seedOutlineItem(world: ReturnType<typeof createWorld>, text: string, po
   return item;
 }
 
+/** Attach a same-anchor projection whose fold always refuses. The real
+ * $outline_meta remains first, so these tests prove the savepoint rolls back a
+ * fold that already advanced before a later projection fails. */
+function attachRefusingProjection(world: ReturnType<typeof createWorld>, code: string): string {
+  const projection = world.createRuntimeObject("$outline_meta", "$wiz", "the_outline", {
+    progr: "$wiz",
+    location: "the_outline",
+    name: "refusing projection"
+  });
+  world.setProp(projection, "source_space", "the_outline");
+  world.setProp(projection, "log_space", "the_outline");
+  const installed = installVerb(
+    world,
+    projection,
+    "fold",
+    `verb :fold(act) rx { raise { code: "${code}", message: "adversarial fold refusal" }; }`,
+    null
+  );
+  expect(installed.ok).toBe(true);
+  const current = world.getProp("the_outline", "projections") as string[];
+  world.setProp("the_outline", "projections", [...current, projection]);
+  return projection;
+}
+
 describe("outliner catalog: seed + basic shape", () => {
   it("seeds the_outline as an $outliner instance in the Living Room", () => {
     const world = setupWorld();
@@ -113,6 +166,204 @@ describe("outliner catalog: seed + basic shape", () => {
     const world = setupWorld();
     // Default-property reads on a class with default `false` and no instance.
     expect(world.getProp("$outline_item", "portable")).toBe(false);
+  });
+});
+
+describe("outliner catalog: internal authority surface", () => {
+  async function sharedItem(label: string) {
+    const world = setupWorld();
+    const author = world.auth(`guest:${label}-author`);
+    const participant = world.auth(`guest:${label}-participant`);
+    await expectResult(call(world, author.actor, "the_outline", "enter", []));
+    await expectResult(call(world, participant.actor, "the_outline", "enter", []));
+    const item = await addItem(world, author.actor, `${label} private text`);
+    const projection = (world.getProp("the_outline", "projections") as string[])[0];
+    return { world, author, participant, item, projection };
+  }
+
+  it("refuses sequenced capture of another author's private undo state", async () => {
+    const { world, participant, item } = await sharedItem("capture");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", "the_outline", "_capture_item", [item]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+  });
+
+  it("refuses emit:false detach and preserves structure and watermark", async () => {
+    const { world, participant, item, projection } = await sharedItem("detach");
+    const edgeBefore = edgeOf(world, item);
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(
+      world,
+      participant.actor,
+      "the_outline",
+      "the_outline",
+      "_detach_item",
+      [item, { emit: false, clear_item: true }]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(edgeOf(world, item)).toEqual(edgeBefore);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("refuses public projection folds and preserves at_seq", async () => {
+    const { world, participant, item, projection } = await sharedItem("fold");
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(
+      world,
+      participant.actor,
+      "the_outline",
+      projection,
+      "fold",
+      [{ type: "outline_item_hidden", version: 1, payload: { item, hidden: true }, seq: 999_999 }]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("does not grant projections a self-fold capability for rebuild", async () => {
+    const { world, participant, item } = await sharedItem("self-fold");
+    const projection = "participant_projection";
+    world.createObject({
+      id: projection,
+      name: "participant projection",
+      parent: "$outline_meta",
+      owner: participant.actor,
+      location: "the_outline"
+    });
+    world.setProp(projection, "source_space", "the_outline");
+    // Install the wrapper as a wizard so the nested call bypasses `fold`'s
+    // missing x bit. The refusal must come from caller != source_space, not
+    // ordinary verb permissions.
+    expect(installVerbAs(
+      world,
+      "$wiz",
+      projection,
+      "forge_fold",
+      `verb :forge_fold(item) rxd {
+        return this:fold({
+          "type": "outline_item_hidden",
+          "version": 1,
+          "payload": { "item": item, "hidden": true },
+          "seq": 999999
+        });
+      }`,
+      null
+    ).ok).toBe(true);
+
+    const denied = await world.directCall(
+      "self-fold-forge",
+      "$wiz",
+      projection,
+      "forge_fold",
+      [item]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(projection, "at_seq")).toBe(0);
+  });
+
+  it("refuses item-level hidden writes outside the Act-producing domain verb", async () => {
+    const { world, participant, item, projection } = await sharedItem("hidden");
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", item, "set_hidden", [true]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(item, "hidden")).toBe(false);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("refuses moveto($nowhere) outside remove/eject and preserves the tree", async () => {
+    const { world, participant, item, projection } = await sharedItem("nowhere");
+    const edgeBefore = edgeOf(world, item);
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", item, "moveto", ["$nowhere"]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.object(item).location).toBe("the_outline");
+    expect(edgeOf(world, item)).toEqual(edgeBefore);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("caller guards refuse privileged ingress that bypasses execute permissions", async () => {
+    const world = setupWorld();
+    const wizard = world.createSessionForActor("$wiz", "bearer");
+    await expectResult(call(world, "$wiz", "the_outline", "enter", []));
+    const item = await addItem(world, "$wiz", "guarded");
+    const projection = (world.getProp("the_outline", "projections") as string[])[0];
+
+    // A wizard progr bypasses the `x` permission check, so these refusals
+    // exercise each verb's caller/authority guard itself. External ingress
+    // starts with caller == #-1; only a containing composer may proceed.
+    const attempts: Array<[string, string, unknown[]]> = [
+      ["the_outline", "_capture_item", [item]],
+      ["the_outline", "_detach_item", [item, { emit: false, clear_item: true }]],
+      ["the_outline", "_set_undo", ["$wiz", null]],
+      ["the_outline", "_restore_item", [{ text: "forged" }, false]],
+      ["the_outline", "_acts_meta", []],
+      ["the_outline", "_ensure_acts", []],
+      ["the_outline", "enterfunc", [item]],
+      ["the_outline", "exitfunc", [item]],
+      [item, "set_hidden", [true]],
+      [item, "moveto", ["$nowhere"]],
+      [item, "recycle", []],
+      [projection, "fold", [{ type: "outline_item_hidden", version: 1, payload: { item, hidden: true }, seq: 999_999 }]]
+    ];
+    for (const [target, verb, args] of attempts) {
+      const denied = await sequencedCall(world, "$wiz", "the_outline", target, verb, args, `guard-${verb}`);
+      expect(denied.op, verb).toBe("error");
+      if (denied.op === "error") expect(denied.error.code, verb).toBe("E_PERM");
+    }
+    expect(world.object(item).location).toBe("the_outline");
+    expect(world.getProp(item, "hidden")).toBe(false);
+  });
+
+  it("internal mutators have no public execute or direct capability", () => {
+    const world = setupWorld();
+    const internal: Array<[string, string]> = [
+      ["$outline_item", "moveto"],
+      ["$outline_item", "set_hidden"],
+      ["$outliner", "_detach_item"],
+      ["$outliner", "_set_undo"],
+      ["$outliner", "_restore_item"],
+      ["$outliner", "_capture_item"],
+      ["$outliner", "_acts_meta"],
+      ["$outliner", "_ensure_acts"],
+      ["$outline_meta", "fold"],
+      ["$projection", "fold"],
+      ["$projection", "view_row"],
+      ["$acts", "act"],
+      ["$acts", "_validate_payload"],
+      ["$acts", "_rebuild_projection"]
+    ];
+    for (const [target, verb] of internal) {
+      const info = world.verbInfo(target, verb);
+      expect(info.perms, `${target}:${verb}`).not.toContain("x");
+      expect(info.direct_callable, `${target}:${verb}`).toBe(false);
+    }
+    // The substrate lifecycle callback is the deliberate exception: it must
+    // be dispatchable by recycleChecked, and its caller == this guard is
+    // exercised above.
+    const lifecycle: Array<[string, string]> = [
+      ["$outline_item", "recycle"],
+      ["$outliner", "enterfunc"],
+      ["$outliner", "exitfunc"]
+    ];
+    for (const [target, verb] of lifecycle) {
+      expect(world.verbInfo(target, verb)).toMatchObject({ perms: "rx", direct_callable: false });
+    }
   });
 });
 
@@ -264,24 +515,30 @@ describe("outliner catalog: move / reorder / hide", () => {
     const a = await addItem(world, session.actor, "secret");
     const r = await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
     expect(world.propOrNull(a, "hidden")).toBe(true);
-    expect(r.observations.some((o) => o.type === "outline_item_hidden" && o.hidden === true)).toBe(true);
+    // Acts envelope the domain fields under payload (kernel S2.1) — the
+    // observation wire shape changed with the acts migration; client
+    // reducers migrate in the adoption chunk.
+    expect(r.observations.some((o) => o.type === "outline_item_hidden" && (o.payload as Record<string, unknown> | undefined)?.hidden === true)).toBe(true);
     await expectResult(call(world, session.actor, "the_outline", "hide", [a, false]));
     expect(world.propOrNull(a, "hidden")).toBe(false);
   });
 });
 
 describe("outliner catalog: not portable / defensive recycle", () => {
-  it("$outline_item:moveto rejects non-outliner targets with E_NOT_PORTABLE", async () => {
+  it("$outline_item:moveto is not an externally callable structural path", async () => {
     const world = setupWorld();
     const session = world.auth("guest:portless");
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const a = await addItem(world, session.actor, "stay");
     const r = await call(world, session.actor, a, "moveto", [session.actor]);
     expect(r.op).toBe("error");
-    if (r.op === "error") expect(r.error.code).toBe("E_NOT_PORTABLE");
+    if (r.op === "error") expect(r.error.code).toBe("E_DIRECT_DENIED");
+    const sequenced = await sequencedCall(world, session.actor, "the_outline", a, "moveto", [session.actor]);
+    expect(sequenced.op).toBe("error");
+    if (sequenced.op === "error") expect(sequenced.error.code).toBe("E_PERM");
   });
 
-  it("cross-outliner moveto re-homes the item as a root in the destination; children stay behind (no stale parent ref)", async () => {
+  it("refuses cross-outliner movement at the execute boundary", async () => {
     const world = setupWorld();
     const session = world.auth("guest:xoutline");
     const actor = session.actor;
@@ -291,21 +548,16 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     const a = await addItem(world, actor, "a");
     const b = await addItem(world, actor, "b", a); // b is a child of a
     const c = await addItem(world, actor, "c", b); // c is a child of b
-    // Move b (a nested item with its own child) into the second outliner.
-    const r = await expectResult(call(world, actor, b, "moveto", ["the_outline_2"]));
-    // b now lives in outliner 2 as a ROOT with a fresh valid edge — the stale
-    // cross-outliner parent ref (a, in the source) is gone.
-    expect(world.object(b).location).toBe("the_outline_2");
-    const eb = edgeOf(world, b);
-    expect(eb?.parent).toBeNull();
-    expect((eb?.rank ?? "").length).toBeGreaterThan(0);
-    // c stayed behind, re-homed to b's former parent (a) in the source outliner.
+    const before = edgeOf(world, b);
+    const r = await sequencedCall(world, actor, "the_outline", b, "moveto", ["the_outline_2"]);
+    expect(r.op).toBe("error");
+    if (r.op === "error") expect(r.error.code).toBe("E_PERM");
+    // No lifecycle hook rewrites either tree behind its room's Act log.
+    expect(world.object(b).location).toBe("the_outline");
+    expect(edgeOf(world, b)).toEqual(before);
     expect(world.object(c).location).toBe("the_outline");
-    expect(parentOf(world, c)).toBe(a);
-    // enterfunc announced b's arrival in outliner 2 (the destination UI needs it).
-    expect(r.observations.some((o) => o.type === "outline_item_added" && o.item === b && o.outliner === "the_outline_2")).toBe(true);
-    // The destination now lists b as a visible root.
-    expect(position(world, b)).toBe(1);
+    expect(parentOf(world, c)).toBe(b);
+    expect(world.contentsOf("the_outline_2")).not.toContain(b);
   });
 
   it("remove_item reparents direct children to the removed item's parent", async () => {
@@ -337,6 +589,24 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     await (world as any).recycleChecked("$wiz", "$wiz", middle, { force: true, reason: "test" });
     expect(world.objects.has(middle)).toBe(false);
     expect(parentOf(world, leaf)).toBe(grand);
+  });
+
+  it("refuses ordinary dispatch to the internal recycle lifecycle callback", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:recycle-hook-bypass");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const parent = await addItem(world, session.actor, "parent");
+    const item = await addItem(world, session.actor, "item", parent);
+    const before = edgeOf(world, item);
+    const watermarkBefore = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+
+    const refused = await call(world, session.actor, item, "recycle", []);
+    expect(refused.op).toBe("error");
+    if (refused.op === "error") expect(refused.error.code).toBe("E_PERM");
+    expect(world.objects.has(item)).toBe(true);
+    expect(edgeOf(world, item)).toEqual(before);
+    const watermarkAfter = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+    expect(watermarkAfter.structure_at_seq).toBe(watermarkBefore.structure_at_seq);
   });
 
   it("eject_item rejects non-owner non-wizard", async () => {
@@ -707,5 +977,274 @@ describe("outliner catalog: room_roster (presence aside)", () => {
     expect(entered.observations.map((o) => o.type)).toContain("outliner_entered");
     const left = await expectResult(call(world, a.actor, "the_outline", "leave", []));
     expect(left.observations.map((o) => o.type)).toContain("outliner_left");
+  });
+});
+
+describe("outliner acts: watermark projection + tree_view", () => {
+  it("tree_view stays byte-for-byte equal to list_items through every structural verb", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-parity");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    let watermark = 0;
+    const parity = async (advances: boolean) => {
+      const view = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { items: unknown[]; structure_at_seq: number };
+      const rows = (await expectResult(call(world, session.actor, "the_outline", "list_items", []))).result;
+      expect(view.items).toEqual(rows);
+      if (advances) expect(view.structure_at_seq).toBeGreaterThan(watermark);
+      else expect(view.structure_at_seq).toBe(watermark);
+      watermark = view.structure_at_seq;
+    };
+
+    // Empty/new is the same genesis as an upgraded outline with no v3 acts.
+    await parity(false);
+    const a = await addItem(world, session.actor, "a");
+    await parity(true);
+    const b = await addItem(world, session.actor, "b");
+    await parity(true);
+    const child = await addItem(world, session.actor, "child", a);
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "move_item", [child, b, 0]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "reorder_item", [b, 0]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "hide", [child, true]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "set_item_text", [child, "child edited"]));
+    await parity(false);
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [a]));
+    await parity(true);
+  });
+
+  it("structure_at_seq tracks acted structural changes, rebuilds, and gates tree_view", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "first");
+    await addItem(world, session.actor, "second");
+    await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
+
+    // tree_view: substrate-authoritative items + the STRUCTURAL act
+    // watermark. The key is structure_at_seq, not at_seq: the returned value
+    // covers only the five acted structural domain operations, never content
+    // edits or raw administrative recycle (the $outline_meta property keeps
+    // the kernel-generic at_seq name).
+    const tv = await expectResult(call(world, session.actor, "the_outline", "tree_view", []));
+    const view = tv.result as { items: unknown[]; structure_at_seq: number };
+    const flat = await expectResult(call(world, session.actor, "the_outline", "list_items", []));
+    expect(view.items).toEqual(flat.result);
+    expect(view.structure_at_seq).toBeGreaterThan(0);
+
+    // The watermark equals the last acted structural entry's seq, and the
+    // meta projection holds NO tree rows (no-mirror rule).
+    const meta = (world.getProp("the_outline", "projections") as string[])[0];
+    expect(world.getProp(meta, "at_seq")).toBe(view.structure_at_seq);
+    expect(world.getProp(meta, "rows")).toEqual({});
+
+    // Rebuild reproduces the watermark from recorded acts alone.
+    world.createObject({ id: "wm2", name: "wm2", parent: "$outline_meta", owner: session.actor, location: "the_outline" });
+    world.setProp("wm2", "source_space", "the_outline");
+    world.setProp("wm2", "log_space", "the_outline");
+    for (let i = 0; i < 20; i++) {
+      const r = (await world.directCall(`wm-rb-${i}`, session.actor, "wm2", "rebuild_from", ["the_outline", 100])) as unknown as { op: string; result?: { done: boolean } };
+      if (r.op !== "result" || !r.result) throw new Error("rebuild failed");
+      if (r.result.done) break;
+    }
+    expect(world.getProp("wm2", "at_seq")).toBe(view.structure_at_seq);
+  });
+
+  it("structure_at_seq does NOT advance for content edits (structural watermark only)", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-content");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "body v1");
+    const before = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+
+    // A content edit changes what tree_view RETURNS but is not a structural
+    // act — the watermark must hold still. Facades cache-bust content via
+    // their own read-generation, not this value.
+    await expectResult(call(world, session.actor, "the_outline", "set_item_text", [a, "body v2"]));
+    const after = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { items: unknown[]; structure_at_seq: number };
+    expect(after.structure_at_seq).toBe(before.structure_at_seq);
+    expect(JSON.stringify(after.items)).toContain("body v2");
+  });
+
+  it("preserves and repairs an Acts 0.1 watermark projection with no log binding", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-log-upgrade");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    await addItem(world, session.actor, "before upgrade");
+    const meta = (world.getProp("the_outline", "projections") as string[])[0]!;
+    const before = world.getProp(meta, "at_seq") as number;
+
+    // Catalog patch 0.2 adds log_space. Existing projection instances see
+    // its inherited null default until the next composer mutation.
+    world.setProp(meta, "log_space", null);
+    const read = (await expectResult(call(
+      world,
+      session.actor,
+      "the_outline",
+      "tree_view",
+      []
+    ))).result as { structure_at_seq: number };
+    expect(read.structure_at_seq).toBe(before);
+
+    await addItem(world, session.actor, "after upgrade");
+    expect(world.getProp("the_outline", "projections")).toContain(meta);
+    expect(world.getProp(meta, "log_space")).toBe("the_outline");
+    expect(world.getProp(meta, "at_seq")).toBeGreaterThan(before);
+  });
+
+  it("_ensure_acts / tree_view reject a foreign projections entry and mint the real $outline_meta", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-robust");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    // Poison the slot: a nonempty projections list whose entry is NOT a live
+    // co-located $outline_meta. Positional trust (projections[1]) would
+    // accept it and never mint the real projection.
+    world.createObject({ id: "fake_meta", name: "fake", parent: "$thing", owner: "$wiz" });
+    world.setProp("the_outline", "projections", ["fake_meta"]);
+
+    const a = await addItem(world, session.actor, "row");
+    await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
+
+    // The validated lookup refused the foreign entry, _ensure_acts PRUNED it
+    // (the kernel's fold loop reads .consumes on every entry — a foreign ref
+    // left in place would refuse every later act), and a real live meta was
+    // minted; tree_view reads that one.
+    const projections = world.getProp("the_outline", "projections") as string[];
+    expect(projections).not.toContain("fake_meta");
+    const minted = projections.find((ref) => world.objects.has(ref) && world.object(ref).parent === "$outline_meta");
+    expect(minted).toBeTruthy();
+    const view = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+    expect(view.structure_at_seq).toBeGreaterThan(0);
+    expect(world.getProp(minted!, "at_seq")).toBe(view.structure_at_seq);
+  });
+});
+
+describe("outliner acts: adversarial fold rollback", () => {
+  it("failed remove preserves the item, child edge, projections, and successful Act log", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:remove-fold-refusal");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const parent = await addItem(world, session.actor, "parent");
+    const child = await addItem(world, session.actor, "child", parent);
+    const meta = (world.getProp("the_outline", "projections") as string[])[0];
+    const refusing = attachRefusingProjection(world, "E_TEST_REMOVE_FOLD");
+    const parentEdge = edgeOf(world, parent);
+    const childEdge = edgeOf(world, child);
+    const watermark = world.getProp(meta, "at_seq");
+    const successfulActs = world.replay("the_outline", 1, 100)
+      .filter((entry) => entry.applied_ok)
+      .flatMap((entry) => entry.observations)
+      .filter((observation) => observation.type.startsWith("outline_item_"));
+    const entriesBefore = world.replay("the_outline", 1, 100).length;
+
+    const failed = await call(world, session.actor, "the_outline", "remove_item", [parent]);
+    expect(failed.op).toBe("error");
+    if (failed.op === "error") expect(failed.error.code).toBe("E_TEST_REMOVE_FOLD");
+
+    expect(world.objects.has(parent)).toBe(true);
+    expect(edgeOf(world, parent)).toEqual(parentEdge);
+    expect(edgeOf(world, child)).toEqual(childEdge);
+    expect(world.getProp(meta, "at_seq")).toBe(watermark);
+    expect(world.getProp(refusing, "at_seq")).toBe(0);
+    const entries = world.replay("the_outline", 1, 100);
+    expect(entries).toHaveLength(entriesBefore + 1);
+    expect(entries.at(-1)).toMatchObject({ applied_ok: false });
+    expect(entries.at(-1)?.observations).toEqual([
+      expect.objectContaining({ type: "$error", code: "E_TEST_REMOVE_FOLD" })
+    ]);
+    expect(entries.filter((entry) => entry.applied_ok).flatMap((entry) => entry.observations)
+      .filter((observation) => observation.type.startsWith("outline_item_"))).toEqual(successfulActs);
+  });
+
+  it("failed undo preserves hidden state, undo slot, projections, and successful Act log", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:undo-fold-refusal");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const item = await addItem(world, session.actor, "item");
+    await expectResult(call(world, session.actor, "the_outline", "hide", [item, true]));
+    const meta = (world.getProp("the_outline", "projections") as string[])[0];
+    const refusing = attachRefusingProjection(world, "E_TEST_UNDO_FOLD");
+    const undoBefore = world.getProp("the_outline", "last_undo");
+    const watermark = world.getProp(meta, "at_seq");
+    const entriesBefore = world.replay("the_outline", 1, 100).length;
+
+    const failed = await call(world, session.actor, "the_outline", "undo", []);
+    expect(failed.op).toBe("error");
+    if (failed.op === "error") expect(failed.error.code).toBe("E_TEST_UNDO_FOLD");
+
+    expect(world.getProp(item, "hidden")).toBe(true);
+    expect(world.getProp("the_outline", "last_undo")).toEqual(undoBefore);
+    expect(world.getProp(meta, "at_seq")).toBe(watermark);
+    expect(world.getProp(refusing, "at_seq")).toBe(0);
+    const entries = world.replay("the_outline", 1, 100);
+    expect(entries).toHaveLength(entriesBefore + 1);
+    expect(entries.at(-1)?.observations).toEqual([
+      expect.objectContaining({ type: "$error", code: "E_TEST_UNDO_FOLD" })
+    ]);
+    expect(entries.at(-1)).toMatchObject({ applied_ok: false });
+  });
+});
+
+describe("outliner acts: undo emits structural acts (P1-2)", () => {
+  it("leaf remove→undo emits exactly one added act for the restored row and advances the watermark", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:undo-act-leaf");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "keep");
+    await addItem(world, session.actor, "doomed");
+    // Focus assertions on the LAST undo slot: remove "doomed".
+    const doomed = (await expectResult(call(world, session.actor, "the_outline", "list_items", []))).result as Array<{ id: string; text: string }>;
+    const target = doomed.find((row) => row.text === "doomed")!.id;
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [target]));
+    const removedView = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+
+    const undoR = await expectResult(call(world, session.actor, "the_outline", "undo", []));
+    const restored = undoR.result as string;
+
+    // Exactly one enveloped outline_item_added act, for the restored row, at
+    // its ACTUAL restored slot (index 1: after "keep").
+    const added = undoR.observations.filter((o) => o.type === "outline_item_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({
+      version: 1,
+      payload: { item: restored, parent_id: null, index: 1 }
+    });
+    expect(added[0].payload).not.toHaveProperty("text");
+    expect(added[0].payload).not.toHaveProperty("actor");
+    expect(added[0].payload).not.toHaveProperty("outliner");
+    expect(parentOf(world, restored)).toBeNull();
+    expect(position(world, a)).toBe(1);
+    expect(position(world, restored)).toBe(2);
+
+    // The watermark moved past the remove-time value: undo is a structural
+    // change like any other (this was the stale-watermark repro).
+    const restoredView = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+    expect(restoredView.structure_at_seq).toBeGreaterThan(removedView.structure_at_seq);
+  });
+
+  it("subtree remove→undo emits added for the parent and moved acts for each restored child", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:undo-act-subtree");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const groceries = await addItem(world, session.actor, "groceries");
+    const milk = await addItem(world, session.actor, "milk", groceries);
+    const bread = await addItem(world, session.actor, "bread", groceries);
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [groceries]));
+
+    const undoR = await expectResult(call(world, session.actor, "the_outline", "undo", []));
+    const restored = undoR.result as string;
+
+    const added = undoR.observations.filter((o) => o.type === "outline_item_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ version: 1, payload: { item: restored } });
+    const moved = undoR.observations.filter((o) => o.type === "outline_item_moved");
+    const movedItems = moved.map((o) => (o.payload as { item: string }).item).sort();
+    expect(movedItems).toEqual([bread, milk].sort());
+    for (const o of moved) expect(o).toMatchObject({ version: 1, payload: { to_parent: restored } });
+    // The added act precedes the child moves in the recorded order.
+    const types = undoR.observations.map((o) => o.type);
+    expect(types.indexOf("outline_item_added")).toBeLessThan(types.indexOf("outline_item_moved"));
   });
 });

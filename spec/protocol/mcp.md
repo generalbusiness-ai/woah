@@ -71,6 +71,7 @@ tool exposure, or verb permissions.
 ```json
 {
   "scope": "active",
+  "active_scope": "the_chatroom",
   "object": null,
   "query": null,
   "limit": 64,
@@ -81,6 +82,10 @@ tool exposure, or verb permissions.
 }
 ```
 
+`active_scope` always names the authenticated session's current command focus
+(or `null` when it has none), independently of the requested presentation
+`scope`. A client can therefore interpret or navigate the returned descriptors
+without guessing focus from contextual objects that may include mounted spaces.
 `query` is a case-insensitive match over name, object, verb, aliases, and
 description. `include_schema:true` adds `input_schema` to descriptor summaries.
 Limits default to 64 and cap at 256.
@@ -192,8 +197,13 @@ must also pass the concrete runtime-object-id validator before it can consume
 turn planning or repair budget.
 
 Every accepted invocation enters the normal Net client-turn path with a fresh
-idempotency key. MCP does not choose a classic direct/sequenced route and does
-not run a private VM.
+idempotency key; MCP never runs a private VM. Routing comes from the descriptor's
+command contract: `persistence:"live"` selects `direct` (and therefore still
+requires `direct_callable:true` at ingress), while `persistence:"durable"`
+selects `sequenced`. A tool-exposed verb without either declaration defaults to
+`sequenced`. Thus chat reads and speech do not contend on a space log merely
+because they arrived over MCP, while durable domain operations retain their
+ordering boundary.
 
 Successful `tools/call` results use:
 

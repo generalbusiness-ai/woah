@@ -1,0 +1,7 @@
+{
+  "from_version": "2.x.x",
+  "to_version": "3.0.0",
+  "spec_version": "v1",
+  "note": "v3 adopts the acts kernel for the five structural events: outline_item_added/removed/moved/reordered/hidden become concise schema-validated Acts under {type, version, payload}. Payloads contain only structure (item, parent/rank-derived slot, and changed state); actor, outliner/space, timestamp, and verb stay in the committed log envelope, while note prose stays on the $outline_item artifact. No stored object state changes shape, so steps is empty; the manifest update delivers the verbs, $outline_meta, and @local:acts dependency. Consumers accept both the pre-v3 flat observation shape and the v3 Act shape during rolling upgrades. Internal helpers, adopted-fact writers, and projection folds are non-public and caller-guarded because underscore names and direct_callable metadata do not constrain sequenced dispatch. Each lazily minted $outline_meta is explicitly bound to its source outliner; an unbound legacy candidate is pruned and replaced on the next Act mount. Outline items are physically anchored: there is no public or $nowhere movement escape, and cross-outliner movement waits for routed multi-space Acts. Raw substrate recycle remains an explicitly out-of-band destructive repair path whose executable callback accepts only substrate self-dispatch and performs defensive edge cleanup without emitting an Act.",
+  "steps": []
+}

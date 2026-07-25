@@ -1,8 +1,120 @@
 import { describe, expect, it } from "vitest";
 
-import { isTimeoutDetail, SmokeCascadeHalt, raceWithAbort } from "../scripts/smoke-walkthrough";
+import {
+  isTimeoutDetail,
+  smokeMcpTokens,
+  SmokeCascadeHalt,
+  raceWithAbort
+} from "../scripts/smoke-walkthrough";
+import { ensureInChatroom } from "../scripts/smoke/scenario";
+import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
+  it("uses the authenticated Net actor from initialize without probing removed native tools", async () => {
+    const methods: string[] = [];
+    const transport: McpTransport = async (request) => {
+      const body = request.body ? JSON.parse(String(request.body)) : {};
+      methods.push(body.method);
+      if (body.method === "initialize") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            protocolVersion: "2025-06-18",
+            instructions: "You are woo actor carried_alice. Dynamic tools follow your context."
+          }
+        }, { headers: { "mcp-session-id": "s_net-api-0_walkthrough" } });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected MCP method ${String(body.method)}`);
+    };
+
+    const session = await SmokeSession.open(transport, {
+      token: "apikey:key:secret",
+      label: "alice",
+      clientName: "smoke-session-test"
+    });
+
+    expect(session.actor).toBe("carried_alice");
+    expect(methods).toEqual(["initialize", "notifications/initialized"]);
+  });
+
+  it("requires two explicit API keys for the deployed Net MCP walkthrough", () => {
+    expect(smokeMcpTokens({
+      WOO_SMOKE_ALICE_APIKEY: "apikey:alice:secret-a",
+      WOO_SMOKE_BOB_APIKEY: "apikey:bob:secret-b"
+    })).toEqual({
+      alice: "apikey:alice:secret-a",
+      bob: "apikey:bob:secret-b"
+    });
+    expect(() => smokeMcpTokens({})).toThrow("WOO_SMOKE_ALICE_APIKEY");
+    expect(() => smokeMcpTokens({
+      WOO_SMOKE_ALICE_APIKEY: "session:s_alice",
+      WOO_SMOKE_BOB_APIKEY: "apikey:bob:secret-b"
+    })).toThrow("apikey:<id>:<secret>");
+  });
+
+  it("routes a persistent taskboard actor back to the chatroom through public exits", async () => {
+    const calls: string[] = [];
+    const sessionStub: {
+      currentRoom: string | null;
+      label: string;
+      callTool(): Promise<unknown>;
+      call(object: string, verb: string, args: string[]): Promise<unknown>;
+    } = {
+      currentRoom: null,
+      label: "bob",
+      async callTool(): Promise<unknown> {
+        return {
+          result: {
+            structuredContent: {
+              result: {
+                active_scope: "the_taskboard",
+                tools: [
+                  { object: "the_taskboard", verb: "look" },
+                  { object: "the_taskboard", verb: "go" }
+                ]
+              }
+            }
+          }
+        };
+      },
+      async call(object: string, verb: string, args: string[]): Promise<unknown> {
+        calls.push(`${object}:${verb}:${args[0]}`);
+        const next =
+          object === "the_taskboard" ? "the_garden" :
+          object === "the_garden" ? "the_deck" :
+          "the_chatroom";
+        sessionStub.currentRoom = next;
+        return { room: next };
+      }
+    };
+    const session = sessionStub as unknown as SmokeSession;
+
+    await ensureInChatroom(session);
+
+    expect(calls).toEqual([
+      "the_taskboard:go:out",
+      "the_garden:go:north",
+      "the_deck:go:west"
+    ]);
+    expect(session.currentRoom).toBe("the_chatroom");
+  });
+
+  it("fails closed when the reachable surface does not identify one current room", async () => {
+    const session = {
+      currentRoom: null,
+      label: "bob",
+      async callTool(): Promise<unknown> {
+        return { result: { structuredContent: { result: { tools: [] } } } };
+      }
+    } as unknown as SmokeSession;
+
+    await expect(ensureInChatroom(session)).rejects.toThrow("active_scope=null");
+  });
+
   it("aborts the in-flight step body when the watchdog fires", async () => {
     let observedAbort = false;
     const startedAt = Date.now();

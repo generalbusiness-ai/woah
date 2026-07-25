@@ -1,0 +1,12 @@
+{
+  "from_version": "0.x.x",
+  "to_version": "1.0.0",
+  "spec_version": "v1",
+  "note": "v1 moves the authoritative queue and admission indexes into an Acts projection. Old values are renamed to private genesis inputs; the first sequenced mutation records one dispenser.genesis Act, preallocates one empty artifact per legacy row, and records each as dispenser.legacy_ordered before clearing those inputs. Rate-limit history deliberately expires at cutover. No projection rows are seeded behind fold.",
+  "steps": [
+    { "kind": "rename_property", "class": "$dispenser_block", "from": "pending_orders", "to": "legacy_pending_orders" },
+    { "kind": "rename_property", "class": "$dispenser_block", "from": "next_order_seq", "to": "legacy_next_order_seq" },
+    { "kind": "rename_property", "class": "$dispenser_block", "from": "last_request_at", "to": "legacy_last_request_at" },
+    { "kind": "rename_property", "class": "$dispenser_block", "from": "last_order_at", "to": "legacy_last_order_at" }
+  ]
+}

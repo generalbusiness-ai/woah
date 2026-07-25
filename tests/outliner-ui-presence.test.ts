@@ -3,9 +3,12 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   WooOutlinerTreeElement,
+  registerWooObservationHandlers,
+  registerWooViews,
   type OutlinerData
 } from "../catalogs/outliner/ui/outliner-tree";
-import type { WooContext } from "../src/client/framework";
+import outlinerManifest from "../catalogs/outliner/manifest.json";
+import { createWooClientFramework, type WooClientFramework, type WooContext } from "../src/client/framework";
 
 // jsdom render tests for the presence aside introduced by outliner-presence.
 // These pin (a) the .outliner-presence aside exists inside .outliner-layout,
@@ -13,20 +16,36 @@ import type { WooContext } from "../src/client/framework";
 // (c) the empty roster falls back to the same "No one is here." placeholder
 // shape as chat-presence / tasks-presence.
 
+let viewFramework: WooClientFramework;
+let deliveredSeq = 1;
+
+function deliver(...observations: Record<string, unknown>[]): void {
+  viewFramework.ingestAppliedFrame({ seq: deliveredSeq++, space: "the_outline", observations });
+}
+
 function ctx(names: Record<string, string> = {}, options: { refs?: string[]; projections?: Record<string, any>; directCall?: WooContext["directCall"] } = {}): WooContext {
-  return {
+  const context: WooContext = {
     actor: "guest_1",
     frame: { id: "frame", subject: "the_outline", get: () => undefined, set: () => true },
     neighborhood: { subject: "the_outline", refs: options.refs ?? [], related: {}, has: () => true },
     observe: (ref) => options.projections?.[ref] ?? ({ id: ref, name: names[ref] ?? ref, props: {}, catalogState: {} }),
-    directCall: options.directCall ?? (async () => undefined),
+    directCall: async (target, verb, args, callOptions) => {
+      const result = await (options.directCall ?? (async () => undefined))(target, verb, args, callOptions);
+      // Most historical fixtures return the old tree_view array directly.
+      // Keep their row data focused while exercising the real tree_view parser.
+      return verb === "tree_view" && Array.isArray(result)
+        ? { items: result, structure_at_seq: 0 }
+        : result;
+    },
     send: async () => undefined,
     call: async () => undefined,
+    view: (request) => viewFramework.view(context.actor, context, request),
     emit: () => true
   };
+  return context;
 }
 
-async function flushPromises(turns = 4): Promise<void> {
+async function flushPromises(turns = 12): Promise<void> {
   for (let i = 0; i < turns; i++) await Promise.resolve();
 }
 
@@ -39,6 +58,11 @@ describe("outliner-tree presence aside", () => {
 
   beforeEach(() => {
     document.body.innerHTML = "";
+    viewFramework = createWooClientFramework();
+    deliveredSeq = 1;
+    viewFramework.catalogUi.installCatalogUi({ alias: "outliner", catalog: "outliner", ui: (outlinerManifest as any).ui });
+    registerWooViews({ view: (definition) => viewFramework.catalogUi.defineView("outliner", definition) });
+    registerWooObservationHandlers(viewFramework.observations);
     // The outliner persists known item text to localStorage (display accelerator
     // for cold reloads); clear it so cached text from one case can't leak into
     // another's projection-fill.
@@ -128,6 +152,52 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector(".presence-list")?.textContent).toContain("Guest One");
   });
 
+  it("retries a cold tree_view after outliner presence becomes authoritative", async () => {
+    let treeReads = 0;
+    const directCall = vi.fn(async (_subject: string, verb: string) => {
+      if (verb === "room_roster") return [{ id: "guest_1", name: "Guest One", presence: "online" }];
+      if (verb !== "tree_view") return undefined;
+      treeReads += 1;
+      if (treeReads === 1) throw new Error("actor is not present yet");
+      return {
+        items: [{
+          id: "item_1",
+          name: "item_1",
+          text: "authoritative after enter",
+          parent_id: null,
+          index: 0,
+          hidden: false,
+          owner: "guest_1",
+          writers: [],
+          has_children: false
+        }],
+        structure_at_seq: 1
+      };
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
+      showCompanion: boolean;
+      subject: string;
+    };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["the_outline"],
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} }
+      },
+      directCall
+    });
+    document.body.append(element);
+    await flushPromises();
+    expect(treeReads).toBe(1);
+    expect(element.querySelector("[data-outliner-row]")).toBeNull();
+
+    element.showCompanion = true;
+    await flushPromises();
+
+    expect(treeReads).toBe(2);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("authoritative after enter");
+  });
+
   it("shows the present actor and retries when the first roster read fails", async () => {
     const directCall = vi.fn(async (_subject: string, verb: string) => {
       if (verb === "room_roster") throw new Error("owner projection not ready");
@@ -214,7 +284,7 @@ describe("outliner-tree presence aside", () => {
     expect(shell?.contains(toolbar), "toolbar must NOT be a descendant of the shell — keep it as a sibling so the shell's calc(100dvh - 5.25rem) lines up").toBe(false);
   });
 
-  it("renders projection refs immediately and verifies the complete tree with list_items", async () => {
+  it("renders projection refs immediately and verifies the complete tree with tree_view", async () => {
     const directCall = vi.fn(async () => [{
       id: "item_1",
       name: "item_1",
@@ -252,15 +322,15 @@ describe("outliner-tree presence aside", () => {
     await flushPromises();
 
     expect(directCall).toHaveBeenCalledTimes(1);
-    expect(directCall).toHaveBeenCalledWith("the_outline", "list_items", [], { serverRead: true });
+    expect(directCall).toHaveBeenCalledWith("the_outline", "tree_view", [], { serverRead: true });
     expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("projection row");
     expect(element.querySelector(".presence-list")?.textContent).toContain("Guest One");
   });
 
-  it("hydrates item text from list_items when projection refs carry default-empty note text", async () => {
+  it("hydrates item text from tree_view when projection refs carry default-empty note text", async () => {
     const directCall = vi.fn(async (subject: string, verb: string) => {
       expect(subject).toBe("the_outline");
-      expect(verb).toBe("list_items");
+      expect(verb).toBe("tree_view");
       return [
         {
           id: "item_1",
@@ -304,7 +374,7 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
   });
 
-  it("paints cached item text immediately on a cold load while the list_items read is still in flight", async () => {
+  it("paints cached item text immediately on a cold load while the tree_view read is still in flight", async () => {
     // Simulate a prior session (same actor guest_1) having stashed the readable
     // text. The cache key is namespaced by the viewing actor — a different
     // principal must not read it.
@@ -316,7 +386,7 @@ describe("outliner-tree presence aside", () => {
     let releaseRead!: () => void;
     const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
     const directCall = vi.fn(async (_subject: string, verb: string) => {
-      if (verb === "list_items") await readGate;
+      if (verb === "tree_view") await readGate;
       return [
         { id: "item_1", name: "item_1", text: "authoritative text", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false }
       ];
@@ -507,7 +577,7 @@ describe("outliner-tree presence aside", () => {
       location: "the_outline",
       props: { text: id, hidden: false },
       // This stamp represents the observation-time ordering before a peer
-      // reorder. It remains in generic projection after list_items returns.
+      // reorder. It remains in generic projection after tree_view returns.
       catalogState: { outliner_tree: { parent_id: null, index } }
     });
     const directCall = vi.fn(async () => authoritative);
@@ -620,7 +690,7 @@ describe("outliner-tree presence aside", () => {
     await element.hydrate();
     await flushPromises();
 
-    element.applyObservation({
+    deliver({
       type: "outline_item_added",
       outliner: "the_outline",
       item: "child_1",
@@ -630,10 +700,11 @@ describe("outliner-tree presence aside", () => {
       actor: "guest_1"
     });
     await flushPromises();
-    expect(directCall).toHaveBeenCalledTimes(2);
+    expect(directCall).toHaveBeenCalledTimes(1);
 
     releaseInitial();
     await flushPromises();
+    expect(directCall).toHaveBeenCalledTimes(2);
 
     expect(element.querySelectorAll("[data-outliner-row]")).toHaveLength(2);
     expect(element.querySelector<HTMLElement>('[data-id="child_1"]')?.style.getPropertyValue("--indent")).toBe("20px");
@@ -674,7 +745,7 @@ describe("outliner-tree presence aside", () => {
     document.body.append(element);
     element.data = { outlinerId: "the_outline", outlinerName: "Outline", items: [], focus: null, actor: "guest_1", roster: [] };
 
-    element.applyObservation({ type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: null, index: 0, text: "applied row", actor: "guest_1" });
+    deliver({ type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: null, index: 0, text: "applied row", actor: "guest_1" });
 
     expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("applied row");
     await flushPromises();
@@ -684,7 +755,7 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector("[data-outliner-row]")).toBeNull();
   });
 
-  it("hydrates readable item text from list_items when generic projection omits it", async () => {
+  it("hydrates readable item text from tree_view when generic projection omits it", async () => {
     const directCall = vi.fn(async () => [
       {
         id: "item_1",
@@ -724,13 +795,54 @@ describe("outliner-tree presence aside", () => {
 
     expect(directCall).toHaveBeenCalledTimes(1);
     // Read-only display hydration: routed as an authoritative server read.
-    expect(directCall).toHaveBeenCalledWith("the_outline", "list_items", [], { serverRead: true });
+    expect(directCall).toHaveBeenCalledWith("the_outline", "tree_view", [], { serverRead: true });
     const text = element.querySelector(".outliner-rows")?.textContent ?? "";
     expect(text).toContain("authoritative row");
     expect(text).not.toContain("(empty)");
   });
 
-  it("coalesces list_items while the host rebinds and reconnects the same outliner", async () => {
+  it("refreshes content and writers independently of the structural watermark", async () => {
+    let reads = 0;
+    const directCall = vi.fn(async () => {
+      reads += 1;
+      return [{
+        id: "item_1",
+        name: "item_1",
+        text: reads === 1 ? "before" : "after",
+        parent_id: null,
+        index: 0,
+        hidden: false,
+        owner: "guest_1",
+        writers: reads === 1 ? [] : ["guest_2"],
+        has_children: false
+      }];
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { subject: string };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["item_1"],
+      directCall,
+      projections: {
+        item_1: { id: "item_1", parent: "$outline_item", location: "the_outline", props: {}, catalogState: {} }
+      }
+    });
+    document.body.append(element);
+    await flushPromises();
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("before");
+
+    // The fixture's structure_at_seq remains 0. Content/writer invalidation
+    // uses the facade's own generation and coalesces the accepted frame to one
+    // authoritative replacement read.
+    deliver(
+      { type: "note_edited", note: "item_1", text: "after" },
+      { type: "note_writers_changed", note: "item_1", writers: ["guest_2"] }
+    );
+    await flushPromises();
+    expect(directCall).toHaveBeenCalledTimes(2);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("after");
+  });
+
+  it("coalesces tree_view while the host rebinds and reconnects the same outliner", async () => {
     let releaseListItems!: () => void;
     const listItems = new Promise<void>((resolve) => { releaseListItems = resolve; });
     let calls = 0;
@@ -752,7 +864,7 @@ describe("outliner-tree presence aside", () => {
       refs,
       projections,
       directCall: async (_subject, verb) => {
-        if (verb === "list_items") {
+        if (verb === "tree_view") {
           calls += 1;
           if (calls === 1) await listItems;
         }
@@ -782,14 +894,14 @@ describe("outliner-tree presence aside", () => {
     expect(calls).toBe(1);
 
     // main.ts reassigns a fresh WooContext and calls syncFromProjection on each
-    // render. The outliner should keep the same in-flight list_items fill.
+    // render. The outliner should keep the same in-flight tree_view fill.
     element.woo = makeWoo();
     element.syncFromProjection();
     await flushPromises();
     expect(calls).toBe(1);
 
     // The app shell also removes and reattaches the preserved tool element.
-    // Reconnect must not schedule a duplicate list_items fill for the same
+    // Reconnect must not schedule a duplicate tree_view fill for the same
     // subject/signature while the first read is still in flight.
     element.remove();
     document.body.append(element);
@@ -833,7 +945,8 @@ describe("outliner-tree presence aside", () => {
       }
     });
 
-    element.applyObservation({ type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "observed row", actor: "guest_1" });
+    document.body.append(element);
+    deliver({ type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "observed row", actor: "guest_1" });
     element.syncFromProjection();
 
     // The projection sync joins the mutation-triggered refresh instead of
@@ -883,8 +996,15 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector(".outliner-text")?.textContent).toBe("kept row");
   });
 
-  it("keeps an applied row visible when the next projection snapshot is stale", () => {
-    const directCall = vi.fn(async () => []);
+  it("keeps an applied row visible when the next projection snapshot is stale", async () => {
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    let reads = 0;
+    const directCall = vi.fn(async () => {
+      reads += 1;
+      if (reads > 1) await refreshGate;
+      return [{ id: "item_1", name: "item_1", text: "projection row", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false }];
+    });
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
       applyObservation: (observation: Record<string, unknown>) => void;
       subject: string;
@@ -911,13 +1031,16 @@ describe("outliner-tree presence aside", () => {
     document.body.append(element);
 
     element.syncFromProjection();
-    element.applyObservation({ type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: null, index: 1, text: "applied row", actor: "guest_1" });
+    await flushPromises();
+    deliver({ type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: null, index: 1, text: "applied row", actor: "guest_1" });
     element.syncFromProjection();
 
     expect(directCall).toHaveBeenCalledTimes(2);
     const text = element.querySelector(".outliner-rows")?.textContent ?? "";
     expect(text).toContain("projection row");
     expect(text).toContain("applied row");
+    releaseRefresh();
+    await flushPromises();
   });
 
   it("coalesces a burst of structural observations into one tree verification read", async () => {
@@ -936,11 +1059,72 @@ describe("outliner-tree presence aside", () => {
     await flushPromises();
     expect(directCall).toHaveBeenCalledTimes(1);
 
-    element.applyObservation({ type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "one" });
-    element.applyObservation({ type: "outline_item_moved", outliner: "the_outline", item: "item_1", to_parent: null, to_index: 0 });
-    element.applyObservation({ type: "outline_item_hidden", outliner: "the_outline", item: "item_1", hidden: true });
+    deliver(
+      { type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "one" },
+      { type: "outline_item_moved", outliner: "the_outline", item: "item_1", to_parent: null, to_index: 0 },
+      { type: "outline_item_hidden", outliner: "the_outline", item: "item_1", hidden: true }
+    );
     await flushPromises();
 
     expect(directCall).toHaveBeenCalledTimes(2);
+  });
+
+  // Dual-shape tolerance: v3 emits the five structural events as acts
+  // ({type, version, payload: {...domain fields...}}) while pre-v3 deployed
+  // definitions emit flat fields on the observation itself. The same event
+  // sequence in either shape must reduce to
+  // the identical tree model (catalogs/outliner/migration-v2-to-v3.json).
+  it("reduces act-enveloped structural events identically to flat ones", () => {
+    type ObservingElement = WooOutlinerTreeElement & {
+      applyObservation: (observation: Record<string, unknown>) => void;
+      subject: string;
+    };
+    // The reduced tree model is private; the test reads it through a cast so it
+    // can compare the two reducers' results field-for-field.
+    const modelOf = (element: WooOutlinerTreeElement): OutlinerData => (element as unknown as { model: OutlinerData }).model;
+    const mount = (): ObservingElement => {
+      const element = document.createElement("woo-outliner-tree") as ObservingElement;
+      element.subject = "the_outline";
+      element.woo = ctx({}, {
+        refs: [],
+        directCall: async () => [],
+        projections: { the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} } }
+      });
+      document.body.append(element);
+      return element;
+    };
+    // One sequence exercising all five types and every field the reducer
+    // reads. The final added event is an UNDO RESTORE: server-side,
+    // _restore_item re-emits outline_item_added for the re-created row (a new
+    // objref, item_4) after the remove — the client must hydrate it exactly
+    // like any other added act.
+    const events: Record<string, unknown>[] = [
+      { type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "first", actor: "guest_1" },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: "item_1", index: 0, text: "child", actor: "guest_2" },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_3", parent_id: null, index: 1, text: "third", actor: "guest_1" },
+      { type: "outline_item_moved", outliner: "the_outline", item: "item_2", to_parent: null, to_index: 0 },
+      { type: "outline_item_reordered", outliner: "the_outline", item: "item_3", parent_id: null, to_index: 0 },
+      { type: "outline_item_hidden", outliner: "the_outline", item: "item_2", hidden: true },
+      { type: "outline_item_removed", outliner: "the_outline", item: "item_1", reparented_to: null },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_4", parent_id: null, index: 2, text: "first", actor: "guest_1" }
+    ];
+    const envelop = ({ type, ...fields }: Record<string, unknown>): Record<string, unknown> => ({ type, version: 1, payload: fields });
+
+    const flat = mount();
+    const acts = mount();
+    for (const event of events) {
+      flat.applyObservation(event);
+      acts.applyObservation(envelop(event));
+    }
+
+    // The flat sequence lands the expected structure (proving each event took
+    // effect, including the restored row), and the enveloped sequence lands
+    // the exact same model.
+    expect(modelOf(flat).items).toMatchObject([
+      { id: "item_3", text: "third", parent_id: null, index: 0, hidden: false, owner: "guest_1" },
+      { id: "item_2", text: "child", parent_id: null, index: 1, hidden: true, owner: "guest_2" },
+      { id: "item_4", text: "first", parent_id: null, index: 2, hidden: false, owner: "guest_1" }
+    ]);
+    expect(modelOf(acts).items).toEqual(modelOf(flat).items);
   });
 });

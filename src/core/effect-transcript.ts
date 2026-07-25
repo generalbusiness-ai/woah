@@ -45,6 +45,16 @@ export type TranscriptMove = {
   writer?: RecordedWriteAuthority;
 };
 
+/** Irreversible object deletion. The host recorder already persists the
+ * matching tombstone projection write; this typed lifecycle effect promotes
+ * that same fact into the canonical transcript vocabulary (coherence CO3)
+ * so Net can re-derive deletion rather than treating tombstones as opaque
+ * host persistence. */
+export type TranscriptRecycle = {
+  object: ObjRef;
+  final_version?: string;
+};
+
 // A first-class session active-scope transition (CA8). Distinct from a physical
 // `TranscriptMove`: it is recorded whenever a session's active scope changes —
 // including a no-op physical enter (actor already in the room) — and it is the
@@ -60,6 +70,9 @@ export type TranscriptSessionScopeTransition = {
    * lineage. Presence owners use it for roster projection without importing
    * the actor's authority cells into every room turn. */
   actorName?: string;
+  /** Immutable service-session presentation policy, copied from the
+   * authoritative session row. False suppresses social projections only. */
+  rosterVisible?: false;
   from: ObjRef | null;
   to: ObjRef | null;
 };
@@ -74,6 +87,15 @@ export type EffectTranscript = {
   id?: string;
   route: TurnStart["route"];
   scope: ObjRef;
+  /** The SEMANTIC sequencing space of a sequenced turn, preserved when net
+   * planning retargets `scope` at the commit-scope AUTHORITY ADDRESS
+   * (`the_room` vs `room:the_room` — plan.ts submitTranscript). Committed
+   * log entries key on THIS identity (sequenced-log.md SL4), so
+   * `space == this` guards, journal output, and `rebuild_from(room, ...)`
+   * read the same ids on every lane. Absent on engine-recorded transcripts
+   * (there `scope` IS the semantic space) and on direct routes;
+   * present-only-when-set keeps prior transcript hashes unchanged. */
+  space?: ObjRef;
   seq: number;
   session?: string | null;
   call: Pick<TurnStart, "actor" | "target" | "verb" | "args" | "body">;
@@ -86,6 +108,7 @@ export type EffectTranscript = {
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
+  recycles?: TranscriptRecycle[];
   // Net session active-scope transition for this turn (coalesced first.from →
   // last.to). Drives presence projections + session-row materialization. CA8.
   sessionScopeTransition?: TranscriptSessionScopeTransition;
@@ -130,6 +153,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
+  const recycles: TranscriptRecycle[] = [];
   let sessionScopeTransition: TranscriptSessionScopeTransition | undefined;
   const projectionWrites: RecordedProjectionWrite[] = [];
   const observations: Observation[] = [];
@@ -210,11 +234,17 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           session: event.session,
           actor: event.actor,
           from: sessionScopeTransition ? sessionScopeTransition.from : event.from,
-          to: event.to
+          to: event.to,
+          ...((sessionScopeTransition?.rosterVisible === false || event.rosterVisible === false)
+            ? { rosterVisible: false as const }
+            : {})
         };
         break;
       case "projection_write":
         projectionWrites.push(structuredClone(event.write) as RecordedProjectionWrite);
+        if (event.write.table === "tombstones" && event.write.op === "upsert") {
+          recycles.push({ object: event.write.key });
+        }
         break;
       case "observe":
         observations.push(event.observation);
@@ -279,6 +309,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     writes,
     creates,
     moves,
+    ...(turnFinishedOk && recycles.length > 0 ? { recycles } : {}),
     ...(sessionScopeTransition ? { sessionScopeTransition } : {}),
     ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
@@ -364,8 +395,9 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
   // write authority (it is routing/presence state, not a CA3 authoritative
   // write), but NOT trust-exempt — check it structurally. It must name this
   // turn's session and actor, and (when the session's pre-state is readable on
-  // this host) its `from` must agree with the authoritative pre-state scope so a
-  // stale transition cannot silently rewrite presence.
+  // this host) its `from` and roster policy must agree with the authoritative
+  // pre-state session so a stale or crafted transition cannot silently rewrite
+  // either delivery placement or social presence.
   const transition = transcript.sessionScopeTransition;
   if (transition) {
     if (!transcript.session) {
@@ -376,9 +408,22 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     if (transition.actor !== transcript.call.actor) {
       errors.push(`session scope transition actor mismatch: transition=${transition.actor} call=${transcript.call.actor}`);
     }
-    const priorScope = readerSessionActiveScope(reader, transition.session);
-    if (priorScope !== undefined && (priorScope ?? null) !== (transition.from ?? null)) {
-      errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
+    if (transition.rosterVisible !== undefined && transition.rosterVisible !== false) {
+      errors.push("session scope transition rosterVisible must be false when present");
+    }
+    const priorSession = readerSessionAuthority(reader, transition.session);
+    if (priorSession) {
+      const priorScope = priorSession.activeScope ?? priorSession.currentLocation ?? null;
+      if (priorScope !== (transition.from ?? null)) {
+        errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
+      }
+      const transitionRosterVisible = transition.rosterVisible === false;
+      const authoritativeRosterVisible = priorSession.rosterVisible === false;
+      if (transitionRosterVisible !== authoritativeRosterVisible) {
+        errors.push(
+          `session scope transition rosterVisible mismatch: transition=${transitionRosterVisible ? "false" : "default"} actual=${authoritativeRosterVisible ? "false" : "default"}`
+        );
+      }
     }
   }
 
@@ -494,6 +539,11 @@ export function sessionScopePresenceDeltas(
 ): PresenceProjectionRowDelta[] {
   const transition = transcript.sessionScopeTransition;
   if (!transition || !transition.session || !transition.actor) return [];
+  // Hidden-roster is immutable for the session lifetime. Such a session never
+  // contributes to catalog social projections, so neither movement nor close
+  // may add OR remove a row (the latter could erase a visible sibling session's
+  // actor-keyed row).
+  if (transition.rosterVisible === false) return [];
   const { session, actor, from, to } = transition;
   if (from === to) return [];
   const deltas: PresenceProjectionRowDelta[] = [];
@@ -534,10 +584,44 @@ export function applyPresenceProjectionRowDelta(
   return Array.from(new Set([...without, delta.actor] as ObjRef[])).sort() as unknown as WooValue;
 }
 
+/**
+ * The sequenced-call seq-allocation cell of a transcript: the sequencing
+ * space's reserved `next_seq` property (sequenced-log.md SL1 — `append` is
+ * the only blessed increment, and user code may never write the name), or
+ * null for non-sequenced routes. The engine folds the allocation into the
+ * transcript as an ordinary read+write (world.recordSequencedAllocation);
+ * commit-scope selection treats it as sequencer BOOKKEEPING rather than a
+ * verb effect — a CA3 pure-movement turn must not be dragged onto the room
+ * sequencer by its own allocation — and a turn that commits away from the
+ * space's own scope strips it (consuming no seq; see plan.ts).
+ */
+export function sequencedAllocationCell(transcript: Pick<EffectTranscript, "route" | "scope" | "space">): { kind: "prop"; object: ObjRef; name: "next_seq" } | null {
+  if (transcript.route !== "sequenced") return null;
+  const space = transcript.space ?? transcript.scope;
+  if (typeof space !== "string" || space.length === 0) return null;
+  return { kind: "prop", object: space, name: "next_seq" };
+}
+
+/** True when `cell` is `transcript`'s own seq-allocation cell. */
+export function isSequencedAllocationCell(
+  transcript: Pick<EffectTranscript, "route" | "scope" | "space">,
+  cell: { kind: string; object: ObjRef; name?: string }
+): boolean {
+  const allocation = sequencedAllocationCell(transcript);
+  return allocation !== null && cell.kind === "prop" && cell.object === allocation.object && cell.name === "next_seq";
+}
+
 function readMatchesSequencedAllocation(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
   if (!actual.ok) return false;
   if (transcript.route !== "sequenced") return false;
-  if (read.cell.kind !== "prop" || read.cell.object !== transcript.scope || read.cell.name !== "next_seq") return false;
+  const allocation = sequencedAllocationCell(transcript);
+  if (allocation === null || !sameCell(read.cell, allocation)) return false;
+  // New net transcripts carry the allocation as an explicit pre-state
+  // read+write pair. That read validates normally; a later verb-body read
+  // validates against the same-turn write. This compatibility exception is
+  // only for older/local transcripts whose preamble increment happened
+  // before recording opened.
+  if (transcript.writes.some((write) => isSequencedAllocationCell(transcript, write.cell))) return false;
   if (typeof actual.value !== "number" || typeof read.value !== "number") return false;
   if (actual.value !== transcript.seq || read.value !== transcript.seq + 1) return false;
   const actualVersion = numericVersion(actual.version);
@@ -715,14 +799,12 @@ function serializedObject(reader: TranscriptCellReader, object: ObjRef): Seriali
   return reader.objectById.get(object);
 }
 
-// The session's active scope in the reader's pre-state, or undefined when the
-// session row is not present on this host (so the caller skips the check rather
-// than treating "absent" as null). Used to validate a session-scope transition's
-// `from` against authoritative pre-state where it is locally knowable.
-function readerSessionActiveScope(reader: TranscriptCellReader, sessionId: string): ObjRef | null | undefined {
-  const session = reader.serialized.sessions.find((row) => row.id === sessionId);
-  if (!session) return undefined;
-  return session.activeScope ?? session.currentLocation ?? null;
+// The authoritative session row in the reader's pre-state, or undefined when
+// this host does not carry it. Keeping the row intact lets every transition
+// field be checked against one authority lookup; absence remains distinct from
+// an authoritative null active scope for newly minted sessions.
+function readerSessionAuthority(reader: TranscriptCellReader, sessionId: string): SerializedWorld["sessions"][number] | undefined {
+  return reader.serialized.sessions.find((row) => row.id === sessionId);
 }
 
 function serializedVerb(reader: TranscriptCellReader, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {

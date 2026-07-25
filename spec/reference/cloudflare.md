@@ -609,7 +609,7 @@ aggregation; the `/admin/stats` panel queries the AE SQL API.
 
 ```ts
 env.METRICS.writeDataPoint({
-  blobs:   [/* fixed-width 18-slot dimension map; see "Slot map" below */],
+  blobs:   [/* fixed-width 20-slot dimension map; see "Slot map" below */],
   doubles: [/* fixed-width 20-slot numeric map; see "Slot map" below */],
   indexes: [host_key]                  // the only high-cardinality index
 });
@@ -625,7 +625,7 @@ hosts. This also matches the dashboard's primary pivot — "by component".
 
 #### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
 
-The slot map is fixed-width: every data point fills all 18 blobs and 20
+The slot map is fixed-width: every data point fills all 20 blobs and 20
 doubles. Axes the event doesn't carry land as empty strings (blob) or 0
 (double). New axes get a NEW slot; existing slots are never reordered
 or repurposed.
@@ -637,7 +637,7 @@ or repurposed.
 | `blobs[2]`  | `class`     | `do_constructor`, `do_handler` |
 | `blobs[3]`  | `route`     | `do_handler.route`, `cross_host_rpc.route`, `shadow_*_step.route`, browser turn route |
 | `blobs[4]`  | `method`    | `do_handler.method`, `mcp_request.method`, browser IndexedDB/WebSocket method |
-| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase` |
+| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase`; for `net_turn_structure`, the bounded phase paired with `rpc_max_ms` |
 | `blobs[6]`  | `what`      | `storage_direct_write.what`, browser cache/IndexedDB store |
 | `blobs[7]`  | `status`    | `"ok" \| "error" \| "timeout"` |
 | `blobs[8]`  | `error`     | error code (`E_*`) or diagnostic event code |
@@ -662,14 +662,14 @@ or repurposed.
 | `doubles[9]` | `attempt` | net turn attempt count |
 | `doubles[10]` | `reconstructions` | net turn authority reconstruction count |
 | `doubles[11]` | `plan_cells` | net planner input cells |
-| `doubles[12]` | `envelope_bytes` | net submitted envelope bytes |
+| `doubles[12]` | `envelope_bytes` | net submit envelope bytes: the actual serialized submit RPC body (transcript + attestations + routing metadata), measured at the gateway immediately before the submit RPC (CO7) |
 | `doubles[13]` | `outbox_enqueued` | authority outbox rows enqueued by a submit |
 | `doubles[14]` | `delivered` | outbox rows delivered by a drain pass |
 | `doubles[15]` | `failed` | outbox rows failed by a drain pass |
 | `doubles[16]` | `abandoned` | outbox rows abandoned by a drain pass |
 | `doubles[17]` | `audience` | net push audience rows |
 | `doubles[18]` | `frames` | net WebSocket frames sent |
-| `doubles[19]` | `presence_scan_rows` | indexed presence rows scanned |
+| `doubles[19]` | `presence_scan_rows` | in-scope local carrier rows matched by the indexed presence intersection |
 
 The canonical v2 event union is `MetricEvent` in `src/core/types.ts`; net
 metrics remain structurally typed beside the frozen stack. This table is the
@@ -1405,12 +1405,52 @@ distinct DO instances addressed by shard-hinted `idFromName`
 stably (sticky routing); anonymous claims spread by edge entropy; a
 `validShardHint` check blocks arbitrary DO naming.
 
+The production entry also exposes one internal-signed credential bootstrap
+operation: `POST /net-operator/credentials/ensure`. It accepts an actor,
+authority scope, versioned self-routing key id, and verifier record
+(`hash`, `salt`, actor, label, creation time)—never the replayable secret.
+The actor scope stores that record and derives an authority-private verifier
+index. The index is never a transferable/fanned-out relation and has no public
+read surface. Exact replay is success, while disagreement at an existing id is
+a collision refusal. This is an operator recovery/provisioning surface, not a client API:
+the edge verifies `WOO_INTERNAL_SECRET`, strips the inbound signature, and
+freshly signs the authority hop. Secrets must not enter logs, metrics, command
+arguments, or repository files. Operator tooling generates the secret
+locally and writes the one-time full token to an owner-only (`0600`) file
+before sending the verifier or installing it as a Worker secret.
+
+For a Net world installed before `$actor.api_keys` existed, deploy the runtime
+and then run the explicit, idempotent bootstrap-definition migration before
+minting through block verbs:
+
+```bash
+npm run repair:net-definitions -- \
+  https://woah1.generalbusiness.ai \
+  'prop:$actor:api_keys'
+```
+
+The command requires the currently deployed `WOO_INTERNAL_SECRET`. A missing
+local copy is not recoverable from Cloudflare (Worker secret values are
+write-only); rotate that secret deliberately and store the replacement in the
+owner-only operations credential file before running signed repair/bootstrap
+commands.
+
+The two production custom domains deliberately have different root behavior:
+`woah.generalbusiness.ai` serves `/landing` for `GET`/`HEAD` of `/`,
+`/index.html`, `/landing`, and `/landing.html`, serves only the landing's
+declared static asset paths directly, and preserves protocol routes such as
+`/mcp` and `/net-api/*`. Other paths redirect with 308 to
+`woah1.generalbusiness.ai`, which is the world application host. This routing
+belongs in the Net-only entry; deleting the classic entry must not delete the
+public-site contract.
+
 Net turn-path `[vars]`:
 
 | Var | Default | Meaning |
 |---|---|---|
 | `NET_API_GATEWAY_SHARDS` | `"8"` | Gateway DO fan-out width. `NET_GATEWAY_SELF` is a test/legacy override that MUST be absent when >1 shard. |
 | `NET_RPC_TIMEOUT_MS` | `"5000"` | Deadline on every coherence RPC and hot-scope queue wait → `E_RPC_TIMEOUT` (HTTP 503, retryable). A submit timeout is ambiguous, so the gateway performs one CO2.5-preserving same-key replay before surfacing it. |
+| `NET_CREDENTIAL_TTL_MS` | `"1000"` | Maximum age of an actor-authority API-key verifier cached by a gateway. `0` forces an exact authority RPC per check; values above 30,000ms are clamped to that hard revocation-staleness ceiling. |
 | `NET_TURN_QUEUE_WAIT_MS` | `"1500"` | Per-scope serializer queue deadline. |
 | `NET_TURN_SCOPE_CONCURRENCY` | `"12"` | Bounded per-scope lanes per gateway shard. |
 | `WOO_AE_DATASET` | `"woo_v1_prod"` | Selects the AE dataset (§R10.1); the net acceptance canary sets `"woo_v1_net_canary"` so its evidence never mixes with prod's. Also a **deployed-environment marker**: when set, un-metered dev-only surfaces such as `/net-smoke` are hard-refused (`src/worker/net-only-index.ts`, `src/worker/net/workerd-host.ts`). |

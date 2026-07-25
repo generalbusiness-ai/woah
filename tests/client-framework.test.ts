@@ -6,10 +6,13 @@ import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
+import noteManifest from "../catalogs/note/manifest.json";
+import outlinerManifest from "../catalogs/outliner/manifest.json";
+import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import * as dubspaceUiModule from "../catalogs/dubspace/ui/dubspace-workspace";
-import { registerWooObservationHandlers as registerDubspaceObservationHandlers } from "../catalogs/dubspace/ui/dubspace-workspace";
-import { registerWooObservationHandlers as registerOutlinerObservationHandlers } from "../catalogs/outliner/ui/outliner-tree";
-import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
+import * as noteUiModule from "../catalogs/note/ui/note-chat";
+import * as outlinerUiModule from "../catalogs/outliner/ui/outliner-tree";
+import * as pinboardUiModule from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
   clearDisplayTextCaches,
@@ -29,9 +32,15 @@ import {
 // installs through CatalogUiRegistry.registerModuleExports.
 function createWooClientFramework() {
   const ui = createBareWooClientFramework();
-  registerDubspaceObservationHandlers(ui.observations);
-  registerOutlinerObservationHandlers(ui.observations);
-  registerPinboardObservationHandlers(ui.observations);
+  for (const [alias, manifest, moduleId, mod] of [
+    ["note", noteManifest, "note-chat", noteUiModule],
+    ["dubspace", dubspaceManifest, "dubspace-ui", dubspaceUiModule],
+    ["outliner", outlinerManifest, "outliner-ui", outlinerUiModule],
+    ["pinboard", pinboardManifest, "pinboard-ui", pinboardUiModule]
+  ] as const) {
+    ui.catalogUi.installCatalogUi({ alias, catalog: alias, ui: (manifest as any).ui });
+    ui.catalogUi.registerModuleExports(alias, moduleId, mod, ui.observations, ui.chatFormatters);
+  }
   return ui;
 }
 
@@ -331,6 +340,48 @@ describe("client UI framework projection", () => {
       props: { text: "peer row", hidden: false },
       catalogState: { outliner_tree: { parent_id: null, index: 0 } }
     });
+  });
+
+  it("folds an act-enveloped outliner live fanout identically to the flat shape", () => {
+    // v3 emits the structural events as acts ({type, version, payload}); pre-v3
+    // definitions still emit flat fields. Both shapes must land the same
+    // canonical projection; concise v3 identity comes from the carrier and
+    // prose from the preceding note observation/artifact projection
+    // (catalogs/outliner/migration-v2-to-v3.json).
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
+      { id: "the_outline", name: "Outline", props: {} }
+    ]);
+
+    ui.ingestDeliveredObservation({
+      type: "note_edited",
+      note: "outline_item_act",
+      text: "peer act row",
+      actor: "guest_2"
+    }, { route: "sequenced", space: "the_outline", seq: 1, receivedAt: Date.now() });
+    ui.ingestDeliveredObservation({
+      type: "outline_item_added",
+      version: 1,
+      payload: {
+        item: "outline_item_act",
+        parent_id: null,
+        index: 0
+      }
+    }, { route: "sequenced", space: "the_outline", seq: 1, receivedAt: Date.now() });
+
+    expect(ui.observe("outline_item_act")).toMatchObject({
+      parent: "$outline_item",
+      location: "the_outline",
+      props: { text: "peer act row", hidden: false },
+      catalogState: { outliner_tree: { parent_id: null, index: 0 } }
+    });
+
+    ui.ingestDeliveredObservation({
+      type: "outline_item_hidden",
+      version: 1,
+      payload: { item: "outline_item_act", hidden: true }
+    }, { route: "sequenced", space: "the_outline", seq: 2, receivedAt: Date.now() });
+    expect(ui.observe("outline_item_act")?.props).toMatchObject({ hidden: true });
   });
 
   it("keeps pinboard layout overlays sparse across sequential partial updates", () => {
@@ -1271,6 +1322,48 @@ describe("catalog UI registry", () => {
     const frame = ui.catalogUi.resolveFrame("$dubspace", undefined, () => false);
     expect(frame?.frame.hydration).toEqual({ module: "dubspace-ui", id: "controls" });
     expect(ui.catalogUi.viewHydration(frame)?.id).toBe("dubspace:dubspace-ui:controls");
+  });
+
+  it("registers and resolves a module-owned semantic view", () => {
+    const ui = createBareWooClientFramework();
+    expect(ui.catalogUi.installCatalogUi({ alias: "outliner", catalog: "outliner", ui: (outlinerManifest as any).ui })).toEqual([]);
+    ui.catalogUi.registerModuleExports("outliner", "outliner-ui", outlinerUiModule, ui.observations, ui.chatFormatters);
+    expect(ui.catalogUi.resolveView("outliner.tree")?.id).toBe("outliner:outliner.tree");
+    expect(ui.catalogUi.resolveView("outliner:outliner.tree")?.definition.invalidateOn).toContain("note_writers_changed");
+  });
+
+  it("runs only manifest-declared catalog adapters for legacy whole-world fields", () => {
+    const module = {
+      registerWooWorldSnapshotAdapters(registry: { adapt(adapter: (world: unknown) => any[]): void }): void {
+        registry.adapt((world: any) => [{
+          subject: String(world?.legacy_widget?.id ?? ""),
+          catalogState: { widget: { value: world?.legacy_widget?.value } }
+        }]);
+      }
+    };
+    const undeclared = createBareWooClientFramework();
+    undeclared.catalogUi.installCatalogUi({
+      alias: "widget",
+      catalog: "widget",
+      ui: { abi: "woo-ui/v1", modules: [{ id: "widget-ui", entry: "ui/widget.js" }] }
+    });
+    expect(() => undeclared.catalogUi.registerModuleExports(
+      "widget", "widget-ui", module, undeclared.observations, undeclared.chatFormatters
+    )).toThrow(/snapshot adapter is not declared/);
+
+    const ui = createBareWooClientFramework();
+    ui.catalogUi.installCatalogUi({
+      alias: "widget",
+      catalog: "widget",
+      ui: {
+        abi: "woo-ui/v1",
+        modules: [{ id: "widget-ui", entry: "ui/widget.js" }],
+        world_snapshot_adapters: [{ module: "widget-ui" }]
+      }
+    });
+    ui.catalogUi.registerModuleExports("widget", "widget-ui", module, ui.observations, ui.chatFormatters);
+    ui.ingestWorld({ objects: {}, legacy_widget: { id: "widget_1", value: 7 } });
+    expect(ui.observe("widget_1")?.catalogState.widget).toEqual({ value: 7 });
   });
 });
 

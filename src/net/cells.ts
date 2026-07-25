@@ -44,6 +44,7 @@ export type EpochStamp = {
 export type CellKind =
   | "object_lineage"  // parent/class-chain identity; payload names `parent`
   | "object_live"     // location + liveness cells
+  | "object_tombstone" // terminal recycle marker; replaces the whole object page
   | "property_cell"   // one named property value
   | "verb_bytecode"   // compiled verb page (never carries line_map — CO7)
   | "session"         // session row
@@ -137,6 +138,10 @@ export class CellStore {
    * room's members (name matching, contents projection) without an
    * O(store) scan per turn. */
   private readonly membersByLocation = new Map<string, Set<string>>();
+  /** parent id → direct lineage children. Recycle grafts exactly this set
+   * to the deleted object's former parent; maintaining the reverse index
+   * keeps that lifecycle operation O(children), never O(scope cells). */
+  private readonly lineageChildrenByParent = new Map<string, Set<string>>();
   /** parent (or the "\0root" sentinel for null) → that parent's children,
    * kept RANK-SORTED (tie-break by child id) at write time (P2.4, Adv-b).
    * Lets a mutation's neighbour read and the ordering-version check touch
@@ -220,6 +225,12 @@ export class CellStore {
       if (!members) this.membersByLocation.set(location, (members = new Set()));
       members.add(cell.object);
     }
+    const lineageParent = lineageParentOf(cell);
+    if (lineageParent !== null) {
+      let children = this.lineageChildrenByParent.get(lineageParent);
+      if (!children) this.lineageChildrenByParent.set(lineageParent, (children = new Set()));
+      children.add(cell.object);
+    }
     const edge = CellStore.orderedEdgeOf(cell);
     if (edge !== undefined) {
       const key = CellStore.edgeParentKey(edge.parent);
@@ -249,6 +260,14 @@ export class CellStore {
       if (members) {
         members.delete(cell.object);
         if (members.size === 0) this.membersByLocation.delete(location);
+      }
+    }
+    const lineageParent = lineageParentOf(cell);
+    if (lineageParent !== null) {
+      const children = this.lineageChildrenByParent.get(lineageParent);
+      if (children) {
+        children.delete(cell.object);
+        if (children.size === 0) this.lineageChildrenByParent.delete(lineageParent);
       }
     }
     const edge = CellStore.orderedEdgeOf(cell);
@@ -416,6 +435,13 @@ export class CellStore {
     return members ? [...members] : [];
   }
 
+  /** Direct inheritance children of `parent`, via the reverse lineage index.
+   * The copy prevents callers from mutating the store's index. */
+  lineageChildrenOf(parent: string): string[] {
+    const children = this.lineageChildrenByParent.get(parent);
+    return children ? [...children] : [];
+  }
+
   /** The actor's session cells — O(the actor's own sessions) via the
    * session index (the seed-slice builder's per-turn session lookup,
    * replacing an O(store) key scan). */
@@ -437,6 +463,15 @@ function liveLocationOf(cell: Cell): string | null {
   if (cell.kind !== "object_live") return null;
   const location = (cell.value as { location?: unknown } | null | undefined)?.location;
   return typeof location === "string" && location.length > 0 ? location : null;
+}
+
+/** The direct parent named by a live lineage cell. Tombstones deliberately
+ * do not participate: they are terminal object-page replacements, not class
+ * graph nodes. */
+function lineageParentOf(cell: Cell): string | null {
+  if (cell.kind !== "object_lineage") return null;
+  const parent = (cell.value as { parent?: unknown } | null | undefined)?.parent;
+  return typeof parent === "string" && parent.length > 0 ? parent : null;
 }
 
 /** The actor a session cell belongs to, or null for every other cell kind
@@ -464,12 +499,12 @@ export type CellTransfer = {
   assumes_known: string[];
 };
 
-/** Lineage closure is an *object*-page property (CO7). Session and log
- * cells key on session ids / log streams — subjects with no lineage row —
- * so they ride in transfers (CO7 names session rows as envelope content)
- * without triggering the object closure walk. */
+/** Lineage closure is a *live object-page* property (CO7). Session and log
+ * cells key on subjects with no lineage row. An object_tombstone is itself
+ * the terminal proof that the live page no longer exists. All three ride
+ * without triggering the live lineage walk. */
 function cellRequiresLineageClosure(kind: CellKind): boolean {
-  return kind !== "session" && kind !== "log";
+  return kind !== "session" && kind !== "log" && kind !== "object_tombstone";
 }
 
 export function serializeTransfer(cells: Cell[], receiverKnown: ReadonlySet<string> = new Set()): CellTransfer {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHeartbeatCache, createSessionCache, createSystemPromptCache, horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
 import type { HoroscopeAi } from "../src/horoscope";
-import type { WooSession } from "../src/woo-client";
+import { WooClient, type WooSession } from "../src/woo-client";
 
 type Call = { url: string; method: string; body?: unknown };
 type Reply = { status: number; body: unknown; headers?: Record<string, string> };
@@ -54,6 +54,34 @@ const propertyReply = (value: unknown): Reply => ({
   body: { cell: { value: { value } } }
 });
 
+describe("WooClient Net turn results", () => {
+  it("raises an accepted transport's domain refusal", async () => {
+    const { fetchImpl } = makeFetch([
+      authReply,
+      () => ({
+        status: 200,
+        body: {
+          reply: { status: "accepted" },
+          error: {
+            code: "E_INVARG",
+            message: "deliver requires the prepared artifact",
+            detail: { order_id: "ord_1" }
+          }
+        }
+      })
+    ]);
+    const client = new WooClient({ baseUrl: "https://woo.example", fetchImpl });
+    await client.authenticate("apikey:abc:def");
+
+    await expect(client.directCall("the_horoscope_block", "deliver", ["ord_1", "bad-note"]))
+      .rejects.toMatchObject({
+        code: "E_INVARG",
+        message: "deliver requires the prepared artifact",
+        value: { order_id: "ord_1" }
+      });
+  });
+});
+
 describe("runHoroscopeTick", () => {
   it("auths, reads system_prompt, drains the queue, calls AI per order, delivers each", async () => {
     const ai = { run: vi.fn().mockResolvedValue({ response: "destiny calls." }) };
@@ -63,9 +91,11 @@ describe("runHoroscopeTick", () => {
       authReply,
       () => propertyReply("You are a mystical oracle."),
       () => callReply({ order_id: "ord_1", requester: "guest_5", request: "scorpio", ts: 1700000000000 }),
-      () => callReply({ ok: true, note: "note_1" }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply({ order_id: "ord_2", requester: "guest_6", request: "leo", ts: 1700000000001 }),
-      () => callReply({ ok: true, note: "note_2" }),
+      () => callReply({ prepared: true, note: "note_2" }),
+      () => callReply({ delivered: true, note: "note_2" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
@@ -80,29 +110,50 @@ describe("runHoroscopeTick", () => {
     expect(aiCall0.max_tokens).toBe(200);
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
+    expect(calls[0].body).toEqual({ roster_visible: false });
     expect(calls[1].url).toContain("/net-api/cell?");
     expect(calls[1].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
     expect(calls[2].url).toBe("https://woo.example/net-api/turn");
     expect(calls[2].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
 
-    const deliver1 = calls[3];
-    expect(deliver1.url).toBe("https://woo.example/net-api/turn");
-    expect(deliver1.body).toMatchObject({ target: "the_horoscope_block", verb: "deliver" });
-    expect((deliver1.body as { args: unknown[] }).args).toEqual([
+    const prepare1 = calls[3];
+    expect(prepare1.url).toBe("https://woo.example/net-api/turn");
+    expect(prepare1.body).toMatchObject({
+      target: "the_horoscope_block",
+      verb: "prepare_artifact",
+      route: "direct"
+    });
+    expect((prepare1.body as { args: unknown[] }).args).toEqual([
       "ord_1",
       "Horoscope: Scorpio",
       "destiny calls.",
       expect.stringContaining("scorpio")
     ]);
 
-    const deliver2 = calls[5];
-    expect((deliver2.body as { args: unknown[] }).args).toEqual([
+    const deliver1 = calls[4];
+    expect(deliver1.url).toBe("https://woo.example/net-api/turn");
+    expect(deliver1.body).toMatchObject({
+      target: "the_horoscope_block",
+      verb: "deliver",
+      route: "sequenced",
+      idempotency_key: "plug:deliver:the_horoscope_block:ord_1"
+    });
+    expect((deliver1.body as { args: unknown[] }).args).toEqual(["ord_1", "note_1"]);
+
+    const prepare2 = calls[6];
+    expect(prepare2.body).toMatchObject({ verb: "prepare_artifact", route: "direct" });
+    expect((prepare2.body as { args: unknown[] }).args).toEqual([
       "ord_2",
       "Horoscope: Leo",
       "destiny calls.",
       expect.stringContaining("leo")
     ]);
-    const heartbeat = calls[7];
+    const deliver2 = calls[7];
+    expect(deliver2.body).toMatchObject({
+      idempotency_key: "plug:deliver:the_horoscope_block:ord_2"
+    });
+    expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "note_2"]);
+    const heartbeat = calls[9];
     expect(heartbeat.url).toBe("https://woo.example/net-api/turn");
     expect(heartbeat.body).toMatchObject({ target: "the_horoscope_block", verb: "set_properties" });
     expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
@@ -116,9 +167,11 @@ describe("runHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply({ order_id: "ord_2", requester: "g", request: "x", ts: 2 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_2" }),
+      () => callReply({ delivered: true, note: "note_2" }),
       () => callReply({ ok: true })
     ]);
 
@@ -135,19 +188,19 @@ describe("runHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
     expect(result).toEqual({ block: env.BLOCK_ID, delivered: 1, errors: [], authMode: "cold" });
-    // The plug now calls :deliver with a non-empty placeholder string instead
-    // of leaving the order at the queue head where it would block every
-    // following request.
-    const deliver = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "deliver");
-    expect(deliver).toBeDefined();
-    const args = (deliver!.body as { args: unknown[] }).args;
+    // The fallback prose is written only by the direct artifact-authority
+    // call. The sequenced delivery carries the resulting note reference.
+    const prepare = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "prepare_artifact");
+    expect(prepare).toBeDefined();
+    const args = (prepare!.body as { args: unknown[] }).args;
     expect(args[0]).toBe("ord_1");
     expect(typeof args[2]).toBe("string");
     expect((args[2] as string).length).toBeGreaterThan(0);
@@ -155,6 +208,8 @@ describe("runHoroscopeTick", () => {
     // LambdaCore-style flavour line and the player learns to `read`.
     expect(typeof args[3]).toBe("string");
     expect((args[3] as string).length).toBeGreaterThan(0);
+    const deliver = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "deliver");
+    expect((deliver!.body as { args: unknown[] }).args).toEqual(["ord_1", "note_1"]);
     // Fallback delivery is degraded service — last_error must surface that
     // so :look_self / status reports don't show a healthy block while the
     // user is silently receiving placeholder text.
@@ -216,7 +271,8 @@ describe("runHoroscopeTick", () => {
       authReply,
       () => propertyReply(null),
       () => callReply({ order_id: "ord_1", requester: "g", request: "scorpio", ts: 1 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
@@ -248,7 +304,8 @@ describe("runHoroscopeTick session cache", () => {
     const { fetchImpl, calls } = makeFetch([
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
@@ -352,6 +409,7 @@ describe("runHoroscopeTick session cache", () => {
     const { fetchImpl } = makeFetch([
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ prepared: true, note: "note_1" }),
       () => ({ status: 401, body: { error: { code: "E_NOSESSION", message: "session expired" } } }),
       () => callReply({ ok: true }) // heartbeat at the end
     ]);

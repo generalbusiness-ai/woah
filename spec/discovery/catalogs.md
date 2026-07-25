@@ -271,6 +271,32 @@ source/schema sync repeatable and declaration-free. Explicit one-shot boot
 migrations remain only for data conversions or compatibility repairs that cannot
 be inferred from a manifest diff.
 
+**Bundled catalog version upgrades.** Before the drift pass, boot compares each
+installed `@local` catalog's recorded version against its bundled manifest.
+When the bundle is ahead, boot applies the bundled §CT14 migration whose
+declared range covers the jump, through the ordinary update path with
+`accept_major`. Catalogs ship exactly one migration file per **major edge**
+(`migration-v(N-1)-to-vN.json`, enforced by the migrations guard), so a world
+more than one major behind matches no single file; boot then **composes** the
+adjacent per-major-edge migrations into one — a v1 world booting a v3 bundle
+runs v1→v2's steps then v2→v3's as a single composed migration (steps
+concatenated in edge order; §CT14.4 idempotency makes a composed re-run after
+partial failure safe). A final edge ending at `vN.0.0` also covers later
+`vN.y.z` bundled targets: it supplies the major data rewrite while that same
+update installs the target patch definitions. A major jump with no covering single file or chain —
+or a version migration that fails — is reported as a boot event and **blocks
+that catalog**: every later boot repair phase (one-shot boot migrations and
+the drift schema sync) excludes it, so a warn-only boot leaves the catalog's
+recorded version, its old definitions, and its legacy data untouched for
+operator attention instead of schema-syncing the new definitions without
+their data rewrites. The fail-closed install path (the net-install
+activation rule) aborts at this point, before any boot migration or schema
+sync mutates the world. Migration manifests are
+shape-validated (`{from_version, to_version, spec_version, steps}`) at build
+time by the bundled-index generator and the migrations guard, and again at
+module load, so a malformed file fails with the catalog and file named instead
+of failing inside the version matcher on a deployed world.
+
 In multi-host deployments, every host that owns catalog data must run its own
 host-scoped local lifecycle at cold init. Gateway repair cannot see or safely
 convert state stored in self-hosted object DOs, and a copied
@@ -402,7 +428,11 @@ catalog-visible compatibility surface for a projection. Presence projections use
 `{"key": "actor"}` declares a list of actor/object ids. `{"key": "session"}`
 declares row objects, with field names supplied by the catalog or defaulting to
 `session` and `actor`. Runtime core consults this metadata, not property names,
-when treating a property as a movement-coupled projection.
+when treating a property as a movement-coupled projection. These are social
+presence projections, not delivery indexes: a session minted with
+`roster_visible:false` contributes no add or remove row. The accepted
+`sessionScopeTransition` carries that immutable session policy so cold rebuild,
+warm catch-up, and cross-scope materialization agree.
 
 Class and feature objects may declare lifecycle `flags` for ordinary
 authoring/template behavior. `fertile: true` means instances may be created

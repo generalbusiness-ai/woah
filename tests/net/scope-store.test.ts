@@ -6,6 +6,7 @@ import { CellStore } from "../../src/net/cells";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
+import type { ReplayLogEntry } from "../../src/net/replay-pages";
 
 const SCOPE = "the_room";
 const EPOCH = "cat1";
@@ -42,6 +43,36 @@ function submitFor(seq: ScopeSequencer, t: EffectTranscript, key: string): Commi
     post_state_version: derived.postStateVersion,
     stamp: { scope_head: "x", catalog_epoch: EPOCH }
   };
+}
+
+/** New Net transcript shape: semantic space preserved across the authority-
+ * address rewrite, with the SL1 allocation carried as an ordinary CAS'd
+ * read/write pair. */
+function loggedTranscript(seq: ScopeSequencer, hash: string, logSeq: number, error?: { code: string; message: string }): EffectTranscript {
+  const key = `property_cell:${SCOPE}:next_seq`;
+  const current = seq.store.get(key);
+  if (!current) throw new Error("test fixture has no next_seq cell");
+  return {
+    ...transcript(hash, `v${logSeq}`),
+    space: SCOPE,
+    seq: logSeq,
+    reads: [{ cell: { kind: "prop", object: SCOPE, name: "next_seq" }, version: current.version, value: logSeq }],
+    writes: [{
+      cell: { kind: "prop", object: SCOPE, name: "next_seq" },
+      value: logSeq + 1,
+      op: "set",
+      writer: { ...WRITER, thisObj: SCOPE, verb: "call", definer: SCOPE }
+    }],
+    observations: [{ type: "test.act", version: 1, payload: { n: logSeq } }],
+    ...(error ? { error } : {})
+  } as EffectTranscript;
+}
+
+function seedLog(seq: ScopeSequencer): void {
+  seq.seed([
+    { kind: "object_lineage", object: SCOPE, value: { parent: "$space" } },
+    { kind: "property_cell", object: SCOPE, name: "next_seq", value: { value: 1 } }
+  ]);
 }
 
 describe("hydrate round-trip (CO5 copy #1)", () => {
@@ -87,6 +118,81 @@ describe("hydrate round-trip (CO5 copy #1)", () => {
     a.schedule({ id: "x", at_logical_time: 50, call: { actor: "#a", target: "#t", verb: "tick", args: [] } }, 0);
     a.cancel("x");
     expect(new ScopeSequencer(SCOPE, EPOCH, { durable: store }).nextAlarmAt()).toBeNull();
+  });
+});
+
+describe("authoritative sequenced log (SL1/SL4)", () => {
+  it("persists committed pages across hydration and records failed outcomes once", () => {
+    const store = new InMemoryScopeStore();
+    const first = new ScopeSequencer(SCOPE, EPOCH, { durable: store, now: () => 101 });
+    seedLog(first);
+
+    const t1 = loggedTranscript(first, "log-1", 1);
+    const accepted = first.submit(submitFor(first, t1, "log-k1"));
+    expect(accepted.status).toBe("accepted");
+    expect(first.replayPage(SCOPE, 1, 10)).toEqual([expect.objectContaining({
+      space: SCOPE,
+      seq: 1,
+      ts: 101,
+      applied_ok: true,
+      observations: t1.observations
+    })]);
+
+    // The log is read on demand from its own durable row family, not from
+    // hydrated cells; an idempotent retry appends nothing.
+    const cold = new ScopeSequencer(SCOPE, EPOCH, { durable: store, now: () => 202 });
+    expect(cold.replayPage(SCOPE, 1, 10)).toHaveLength(1);
+    expect(cold.submit(submitFor(cold, t1, "log-k1"))).toEqual({ ...accepted, replayed: true });
+    expect(cold.replayPage(SCOPE, 1, 10)).toHaveLength(1);
+
+    const t2 = loggedTranscript(cold, "log-2", 2, { code: "E_TEST", message: "refused" });
+    expect(cold.submit(submitFor(cold, t2, "log-k2")).status).toBe("accepted");
+    expect(cold.replayPage(SCOPE, 2, 1)).toEqual([expect.objectContaining({
+      seq: 2,
+      ts: 202,
+      applied_ok: false,
+      error: { code: "E_TEST", message: "refused" }
+    })]);
+  });
+
+  it("refuses a missing or forged reserved allocation before it can overwrite history", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store });
+    seedLog(seq);
+
+    const missing = { ...transcript("missing-allocation", "x"), space: SCOPE } as EffectTranscript;
+    const missingReply = seq.submit(submitFor(seq, missing, "missing-allocation"));
+    expect(missingReply).toMatchObject({ status: "rejected", reason: "write_unauthorized", retryable: false });
+
+    const forged = loggedTranscript(seq, "forged-allocation", 1);
+    forged.writes[0] = { ...forged.writes[0], value: 999 };
+    const forgedReply = seq.submit(submitFor(seq, forged, "forged-allocation"));
+    expect(forgedReply).toMatchObject({ status: "rejected", reason: "write_unauthorized", retryable: false });
+
+    // A gateway that knows the current content version still cannot pair it
+    // with a fabricated logical value and jump the allocator forward.
+    const jumped = loggedTranscript(seq, "jumped-allocation", 99);
+    const jumpedReply = seq.submit(submitFor(seq, jumped, "jumped-allocation"));
+    expect(jumpedReply).toMatchObject({ status: "rejected", reason: "write_unauthorized", retryable: false });
+    expect(seq.replayPage(SCOPE, 1, 10)).toEqual([]);
+    expect(seq.store.get(`property_cell:${SCOPE}:next_seq`)?.value).toEqual({ value: 1 });
+  });
+
+  it("never overwrites a different row at the same semantic space and seq", () => {
+    const store = new InMemoryScopeStore();
+    const entry: ReplayLogEntry = {
+      space: SCOPE,
+      seq: 1,
+      ts: 1,
+      actor: "#a",
+      message: { verb: "one" },
+      observations: [],
+      applied_ok: true
+    };
+    store.appendLogEntry(entry);
+    store.appendLogEntry(entry); // byte-identical recovery replay is harmless
+    expect(() => store.appendLogEntry({ ...entry, message: { verb: "two" } })).toThrow(/sequenced log collision/);
+    expect(store.readLogPage(SCOPE, 1, 10)).toEqual([entry]);
   });
 });
 

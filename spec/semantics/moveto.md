@@ -104,6 +104,12 @@ on the prior container if defined. Both are best-effort: errors are
 observed but do not roll back the move (matching LambdaMOO's "post-move
 hooks must not fail the move" pattern).
 
+Both hook frames receive `caller == obj`, set by the substrate rather than
+inherited from whichever room, exit, or object verb initiated `moveto`.
+Catalog hooks that mutate state MUST validate that identity. Hook names remain
+executable for substrate dispatch, so underscore naming, `direct_callable`,
+and execute permission are not substitutes for the caller check.
+
 Hooks may emit observations, mutate the container's audit-log
 properties (e.g. `pinboard.dates`, `pinboard.layout`), or trigger side
 effects on paired objects (e.g. `pinboard.mail_recipient:contents_added`).

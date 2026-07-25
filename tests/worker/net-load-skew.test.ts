@@ -288,7 +288,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     h.close();
   });
 
-  it("large audience: fanout scan and push track room occupancy, not total mirrored sessions", async () => {
+  it("large audience: carrier-free shards skip the scan; active carriers scan only room occupancy", async () => {
     const OCCUPANTS = 24;
     const h = await buildSkewHarness({ actors: OCCUPANTS });
     // The gateway receives the room's fanout (the client shard's
@@ -301,7 +301,11 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     // present sessions in the hot room plus 3x as many sessions mirrored
     // for OTHER scopes — the scan must stay O(room occupants).
     const gw = h.gateway as unknown as {
-      applyRelationDelta(delta: { op: "add"; row: { relation: string; owner: string; member: string; body?: unknown } }): void;
+      applyRelationDelta(
+        delta: { op: "add"; row: { relation: string; owner: string; member: string; body?: unknown } },
+        sourceScope: string
+      ): void;
+      mcpSessionState(session: string, actor: string): unknown;
     };
     for (let i = 0; i < OCCUPANTS; i += 1) {
       gw.applyRelationDelta({
@@ -312,7 +316,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
           member: `s_test_${i}`,
           body: { actor: h.guests[i % h.guests.length] }
         }
-      });
+      }, h.roomScope);
     }
     for (let i = 0; i < OCCUPANTS * 3; i += 1) {
       gw.applyRelationDelta({
@@ -323,24 +327,36 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
           member: `s_away_${i}`,
           body: { actor: "nobody" }
         }
-      });
+      }, "room:skew_annex");
     }
 
-    // One turn in the hot room; its fanout returns to this gateway
-    // (subscribed by the pull) and pushes to the room's audience.
-    const turn = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-1", h.guests[0]));
+    // HTTP-only sessions have no peer-observation carrier. The submitting
+    // session receives its observation on the turn reply, so this shard must
+    // not scan the 24-row presence mirror merely to discover zero delivery.
+    const carrierFree = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-no-carrier", h.guests[0]));
+    expect(carrierFree.reply.status).toBe("accepted");
+    await h.settle();
+    expect(capture.metrics.some((m) => m.kind === "net_push_no_carriers" && m.scope === h.roomScope)).toBe(true);
+    expect(capture.metrics.some((m) => m.kind === "net_presence_scan" && m.scope === h.roomScope)).toBe(false);
+
+    // Once one local MCP feed exists, the gateway must resolve its audience.
+    // The indexed intersection reads that one local in-room carrier, not the
+    // other 23 occupants or the 3x larger off-room mirror.
+    gw.mcpSessionState("s_test_0", h.guests[0]);
+    capture.metrics.length = 0;
+    const turn = await call<TurnBody>(h.gateway, h.gatewayEnv, "/turn", h.turnRequest("skew-aud-with-carrier", h.guests[1]));
     expect(turn.reply.status).toBe("accepted");
     await h.settle();
-
     const scans = capture.metrics.filter((m) => m.kind === "net_presence_scan" && m.scope === h.roomScope);
     const pushes = capture.metrics.filter((m) => m.kind === "net_push" && m.scope === h.roomScope);
     expect(scans.length).toBeGreaterThanOrEqual(1);
     expect(pushes.length).toBeGreaterThanOrEqual(1);
-    // THE INVARIANT: audience == room occupants; the 3x off-room sessions
-    // never enter the scan (indexed owner_scope filter, N+1 fixed).
-    for (const scan of scans) expect(scan.presence_scan_rows).toBe(OCCUPANTS);
+    // THE INVARIANT: scan/audience == local in-scope carriers. Neither other
+    // occupants nor the 3x off-room sessions enter the indexed intersection.
+    for (const scan of scans) expect(scan.presence_scan_rows).toBe(1);
     for (const push of pushes) {
-      expect(push.audience).toBe(OCCUPANTS);
+      expect(push.audience).toBe(1);
+      expect(push.mcp_sessions).toBe(1);
       expect(push.observations).toBeGreaterThanOrEqual(1);
     }
     h.close();
@@ -377,21 +393,27 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     // Backlog: 40 near-due turns with NO planner-role subscriber — the
     // alarm parks them (rows retained). This is the pathological shape:
     // a scope whose scheduled family is saturated.
-    // Keep every row future-dated while the 40 signed requests are
-    // serialized. A tiny wall-clock margin makes the later requests race
-    // the scheduler's strict `at_logical_time > now` admission boundary.
-    const due = Date.now() + 5_000;
-    for (let i = 0; i < 40; i += 1) {
-      await call(scopeDO, h.scopeEnv, "/schedule", {
-        scope: h.roomScope,
-        catalog_epoch: EPOCH,
-        turn: { id: `skew-sched-${i}`, at_logical_time: due, call: { actor: "#a", target: "#t", verb: "tick", args: [] } } satisfies ScheduledTurn
-      });
+    // Pin logical time while filling the batch. A wall-clock `now + 20ms`
+    // deadline can expire during the 40 signed requests under a busy full
+    // suite, making /schedule correctly refuse the tail as no longer future.
+    // Advancing the same clock explicitly keeps this an alarm-backlog test,
+    // not a machine-speed test.
+    const scheduledAt = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(scheduledAt);
+    const due = scheduledAt + 20;
+    try {
+      for (let i = 0; i < 40; i += 1) {
+        await call(scopeDO, h.scopeEnv, "/schedule", {
+          scope: h.roomScope,
+          catalog_epoch: EPOCH,
+          turn: { id: `skew-sched-${i}`, at_logical_time: due, call: { actor: "#a", target: "#t", verb: "tick", args: [] } } satisfies ScheduledTurn
+        });
+      }
+      clock.mockReturnValue(due + 20);
+      await scopeDO.alarm();
+    } finally {
+      clock.mockRestore();
     }
-    // The fake alarm does not self-fire, so advance the host's observed
-    // clock explicitly instead of sleeping and depending on machine load.
-    vi.spyOn(Date, "now").mockReturnValue(due + 1);
-    await scopeDO.alarm();
     await h.settle();
 
     // Foreground turns land first-attempt with the warm RPC budget —

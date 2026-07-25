@@ -86,7 +86,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `applied_migrations` | list<str> | `[]` | Idempotency ledger for deployment-local boot migrations, including local catalog repair migrations. See [catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations). |
 | `catalog_migration_records` | list<map> | `[]` | Trace ledger for content-addressed catalog schema/data plans. Records plan id, catalog, manifest hash, scope, host, steps, status, and postcondition issues. |
 | `help_dbs` | list<obj> | `[]` | Global in-world help database list. The bundled help catalog appends `$help` here with a generic `set_property` catalog hook; future catalogs can append additional DBs without runtime object-name knowledge. |
-| `api_keys` | map | `{}` | Owner-only gateway-local API-key records keyed by key id. Cleartext secrets are returned only once; stored records carry hashes and actor bindings. Redacted from host/shadow seed transfers. |
+| `api_keys` | map | `{}` | Historical carried API-key registry. Read-only compatibility on Net; new keys are actor-owned (§B2.4, auth.md A8). Cleartext secrets are never stored. |
 | `bearer_tokens` | map | `{}` | Owner-only gateway-local short-lived credentialed session records issued by signup verification and password auth. Records are keyed by token hash, not by the replayable bearer token. Redacted from host/shadow seed transfers. |
 | `pending_email_verifications` | list<map> | `[]` | Owner-only gateway-local single-use signup verification records with token hashes, account ids, and expiry timestamps. Expired entries are swept by `$system:gc_pending_credentials()`. Redacted from host/shadow seed transfers. |
 | `signup_invites` | list<map> | `[]` | Owner-only gateway-local invite-gate records containing replayable codes issued by wizards and consumed by signup. Expired unused invites and old used invites are swept by `$system:gc_pending_credentials()`. Redacted from host/shadow seed transfers. |
@@ -115,6 +115,13 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `features` | list<obj> | `[]` | Feature objects contributing verbs to this actor. See [features.md](features.md). |
 | `features_version` | int | 0 | Monotonic counter incremented on feature-list changes; used for verb-lookup cache invalidation. |
 | `focus_list` | list<obj> | `[]` | Actor-scoped list of focused objects/spaces for MCP tool discovery and agent attention. |
+| `api_keys` | map | `{}` | Owner-private authoritative API-key records bound to this actor. Its owning Net scope derives an authority-private O(1) verifier index that never transfers, fans out, or appears in public relation reads; cleartext secrets are returned once and never stored. |
+
+An active Net world installed before `api_keys` joined the universal seed must
+install `prop:$actor:api_keys` through the signed bootstrap-definition repair
+operation before ordinary owner/wizard issuance. Runtime deployment alone does
+not rewrite persisted `$actor` definition pages. Fresh installs already carry
+the property; the repair is idempotent.
 
 ### B2.5 `$actor` verbs
 

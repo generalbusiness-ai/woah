@@ -2,14 +2,17 @@
 
 ## Status
 
-Draft design note, 2026-07-16. This note proposes an additive client-framework
-facility. It does not change the substrate, wire protocol, catalog DSL, or
-deployed catalog definitions.
+Accepted design note, 2026-07-16; first implementation landed on the acts
+worktree 2026-07-22. The additive client-framework store, module registration,
+`WooContext.view()`, vanilla controller, and Outliner `tree_view` adoption are
+built. Pinboard, Tasks, Dubspace, and roster migration remain later slices. The
+facility does not change the substrate, wire protocol, catalog DSL, or deployed
+catalog definitions.
 
 The normative UI model remains
 [`spec/protocol/ui-component-model.md`](../spec/protocol/ui-component-model.md).
-If this design is accepted, its contracts should be incorporated there before
-implementation is considered complete.
+The accepted facade contract is now normative in
+[`spec/protocol/ui-component-model.md` §UCM24.1](../spec/protocol/ui-component-model.md#ucm241-reactive-semantic-views).
 
 ## Problem
 
@@ -174,20 +177,21 @@ export type WooViewDefinition<T> = {
 };
 
 export function registerWooViews(registry: WooViewRegistry): void {
-  registry.view<OutlinerItem[]>({
+  registry.view<OutlinerTreeView>({
     id: "outliner.tree",
     seed: ({ projection, subject }) =>
       projectedOutlinerItems(projection, subject),
     read: ({ woo, subject }) =>
-      woo.directCall(subject, "list_items", [], { serverRead: true }),
-    parse: normalizeOutlinerItems,
+      woo.directCall(subject, "tree_view", [], { serverRead: true }),
+    parse: normalizeOutlinerTreeView,
     invalidateOn: [
       "outline_item_added",
       "outline_item_removed",
       "outline_item_moved",
       "outline_item_reordered",
       "outline_item_hidden",
-      "note_edited"
+      "note_edited",
+      "note_writers_changed"
     ],
     affects: ({ observation, projection, subject }) => {
       const outliner = String(
@@ -346,7 +350,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private _woo?: WooContext;
   private _subject = "";
 
-  private readonly tree = new WooViewController<OutlinerItem[]>(
+  private readonly tree = new WooViewController<OutlinerTreeView>(
     this,
     () => this._woo && this._subject
       ? { view: "outliner.tree", subject: this._subject }
@@ -426,7 +430,7 @@ one at a time.
 
 | Catalog/tool | Current mechanism | Initial facade impact |
 |---|---|---|
-| Outliner | Component-owned `CoalescedViewHydrator` for `list_items` and `room_roster`; component revisions, retry timers, partial-projection merge, display cache | Best first adopter. Register `outliner.tree` first and remove item hydration revision/coalescing and stale-read logic from the element. Keep tree rendering, editing state, projection seed helper, roster behavior, and existing principal-scoped text cache initially. Migrate roster only after its post-entry convergence behavior is specified generically. |
+| Outliner | `outliner.tree` now owns the watermarked `tree_view` read; the component retains only roster hydration, UI-local state, projection seed merge, and its principal-scoped text accelerator | Implemented as the first adopter. Item hydration revision/coalescing and stale-read logic are gone from the element. Roster remains separate until its post-entry convergence behavior is specified generically. |
 | Pinboard | Shell-owned `pinboardNotesHydrator` and canonical patch application in `src/client/main.ts`; hydration starts only when known notes lack text | Register `pinboard.notes`. Move the `list_notes` read and its completeness decision out of `main.ts`. The authoritative result should replace board membership, so a partial projection cannot suppress missing notes. Keep note layout projection and optimistic drag/edit patches. |
 | Tasks | Component-owned `CoalescedRefreshController`; `listing`, `room_roster`, and per-task `available_actions`; late `woo`/`subject` accessors | Register `tasks.board` for the listing and roster. The first migration may keep actor-specific `available_actions` inside the view definition. A later server view should return listing plus available actions in one bounded result to remove the current per-task read fan-out. |
 | Dubspace | Shell detects incomplete control projection and calls `controls_view`, with compatibility fallback for aged deployed definitions; component receives a large `data` object | Register `dubspace.controls` after `outliner.tree`. Move completeness detection and refresh ownership out of `main.ts`. Migration is blocked until the aged-definition fallback is either unnecessary or expressible through a catalog-safe `WooContext` read primitive; the view definition must not import shell internals. The facade does not solve catalog-version migration. |
@@ -474,8 +478,8 @@ world has current bytecode.
 2. Add view registration to the UI module registry and `WooContext.view()`.
 3. Add `WooViewController` for vanilla custom elements.
 4. Implement exact state-machine tests with a synthetic view.
-5. Migrate Outliner `list_items` only. Keep its roster and display cache
-   unchanged for the first slice.
+5. Migrate Outliner through its watermarked `tree_view`. Keep its roster and
+   display cache unchanged for the first slice.
 6. Exercise fresh principal, empty projection, partial projection, concurrent
    mutation, failed refresh, reconnect, and subject change in localdev and real
    workerd browser tests.

@@ -11,6 +11,8 @@
  *       POST /net/fanout  FanoutBody → install cells, advance seen seq,
  *                         mirror relation deltas (CO13) under the same
  *                         high-water
+ *       POST /net/live    LiveFanoutBody → best-effort direct-observation
+ *                         delivery with no sequence or derived-state write
  *       GET  /net/relation ?relation=&owner= → the member rows of one
  *                         relation at one owner (the CO13 client-read
  *                         primitive for who/contents)
@@ -71,8 +73,17 @@ import { exportSpans, spanSampleRate } from "./span-export";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import { LIVE_FANOUT_BATCH_CAP, type LiveFanoutBatchBody, type LiveFanoutBody } from "../../net/live";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
+import {
+  observationsForRelationOwners,
+  relationKey,
+  roomRosterRows,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow,
+  type RoomRosterRow
+} from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import {
@@ -84,12 +95,14 @@ import {
   type OrderedProjectionKey
 } from "../../net/ordered-edges";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
+import { replayPageQueryKey, replayPageVersion, validReplayLogPage, validReplayPageQuery, type ReplayPageQuery } from "../../net/replay-pages";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
-import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
+import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import {
   GUEST_RESET_NATIVE,
   guestResetVerbPageFor,
@@ -102,7 +115,16 @@ import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
-import { ClientAuthError, MAX_EMAIL_BYTES, MAX_PASSWORD_BYTES, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
+import {
+  ClientAuthError,
+  MAX_EMAIL_BYTES,
+  MAX_PASSWORD_BYTES,
+  normalizeEmail,
+  parseClientCredential,
+  verifyApiKeyCredential,
+  verifyApiKeyRecord,
+  verifyPasswordCredential
+} from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -163,6 +185,9 @@ export type NetGatewayEnv = NetBindingsEnv & {
   NET_TURN_QUEUE_WAIT_MS?: string;
   /** Bounded concurrent planning/submission lanes per scope on this shard. */
   NET_TURN_SCOPE_CONCURRENCY?: string;
+  /** Maximum staleness of one authority-verified API-key record. Zero forces
+   * an exact RPC per request. Default: 1000ms; hard-capped at 30s. */
+  NET_CREDENTIAL_TTL_MS?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -190,37 +215,51 @@ type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQu
 type PlanningOrderedNeighborsProjection = Omit<OrderedNeighborsProjection, "authority_head">;
 type OrderingConflict = { scope: string; container: string; parent: string | null };
 
+/** One owner-served committed replay page the gateway fetched for a turn
+ * (sequenced-log.md SL4): the entries for one exact `(space, from, limit)`
+ * window in the planning shape, plus the authority page `version` the plan
+ * attests so a committed-log append inside the window makes the submit
+ * stale. `space` is the SEMANTIC space id; `scope` is the owning authority
+ * the page came from (routed via classifier.scopeOf(space)). */
+type ReplayPageProjection = { space: string; from: number; limit: number; scope: string; entries: readonly Record<string, unknown>[]; version: string; authority_head: ScopeHead };
+type PlanningReplayPageProjection = Omit<ReplayPageProjection, "authority_head">;
+type ReplayConflict = { scope: string; space: string; from: number; limit: number };
+
+function validReplayConflict(value: unknown): value is ReplayConflict {
+  const conflict = value as { scope?: unknown; space?: unknown; from?: unknown; limit?: unknown } | null;
+  return Boolean(
+    conflict && typeof conflict === "object" &&
+    typeof conflict.scope === "string" && conflict.scope.length > 0 &&
+    validReplayPageQuery(conflict)
+  );
+}
+
 /** One successful targeted refresh, identified by the authority's sequenced
  * head as well as the cell's content version. Only receipts backed by an
  * established owner and a mutation-complete head participate in terminal
  * non-convergence detection. */
 type AuthorityReadReceipt = { scope: string; head: ScopeHead; version: string };
 type AuthorityCellTransfer = CellTransfer & { scope?: unknown; head?: unknown };
-const HEAD_STABLE_ACTIVATION_KEY = cellKey("property_cell", "$system", "net_active_epoch");
-
 function validScopeHead(value: unknown): value is ScopeHead {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const candidate = value as { seq?: unknown; hash?: unknown };
+  const candidate = value as { seq?: unknown; hash?: unknown; generation?: unknown };
   return typeof candidate.seq === "number" && Number.isInteger(candidate.seq) && candidate.seq >= 0
-    && typeof candidate.hash === "string" && candidate.hash.length > 0;
+    && typeof candidate.hash === "string" && candidate.hash.length > 0
+    && typeof candidate.generation === "number" && Number.isInteger(candidate.generation) && candidate.generation >= 0;
 }
 
 function authorityReceiptIdentity(receipt: AuthorityReadReceipt): string {
-  return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.version}`;
+  return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.head.generation}\0${receipt.version}`;
 }
 
-/** ScopeHead is a sequenced-commit head, not a generation for every write.
- * Same-epoch seed can rewrite arbitrary cells/relations while seq=0, and the
- * dedicated activation operation can rewrite its one cell at any head. Those
- * paths are deliberately ineligible rather than pretending a stable receipt
- * proves stable authority. After seq>0 seed is refused, and every other
- * authoritative cell/ordering mutation advances the head. */
-function authorityCellReceiptEligible(key: string, head: ScopeHead): boolean {
-  return head.seq > 0 && key !== HEAD_STABLE_ACTIVATION_KEY;
+/** Generation is mutation-complete: commits, seed, and activation all advance
+ * it. A receipt with the new shape is therefore eligible even at seq zero. */
+function authorityCellReceiptEligible(_key: string, head: ScopeHead): boolean {
+  return head.generation !== undefined;
 }
 
 function authorityOrderingReceiptEligible(head: ScopeHead): boolean {
-  return head.seq > 0;
+  return head.generation !== undefined;
 }
 
 function validOrderedProjectionKey(value: unknown): value is OrderedProjectionKey {
@@ -321,6 +360,13 @@ type SessionOpenRequest = {
   issued_at_ms?: number;
   /** Session close (finding 12 — see MintSessionInput.closing). */
   closing?: { priorActiveScope: string | null; ephemeralActor?: boolean };
+  /** Public id of the API key that authenticated this mint. The secret never
+   * enters session state; bearer-only follow-up requests use this id to
+   * re-check the key's current authority record. */
+  apikey_id?: string;
+  /** False suppresses only the public/social roster row. The session remains
+   * present for authorization and fanout. */
+  roster_visible?: boolean;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -329,6 +375,8 @@ type SessionOpenRequest = {
 type TurnResult = {
   reply: CommitReply;
   selection: { scope: string; riders: string[] };
+  /** Actual serialized submit RPC body bytes of the settling round,
+   * measured immediately before the submit RPC (CO7). */
   envelopeBytes: number;
   attempt: number;
   trace: AttemptTraceEntry[];
@@ -433,6 +481,12 @@ export class TurnStructure {
    * meaning as reads parallelize. Wall-clock (Date.now), metrics-grade. */
   rpc_ms = 0;
   rpc_max_ms = 0;
+  /** Phase name paired with rpc_max_ms. Successful turns must retain the
+   * same attribution that failure details provide; otherwise a deployed
+   * latency tail says how long the stall was but not which authority step
+   * owned it. The first zero-millisecond step wins when workerd freezes the
+   * clock, so every turn still carries a bounded, known phase. */
+  rpc_max_phase = "";
   /** NC8a critical-path depth: serial RPC STEPS. A single rpc() is one
    * step; an rpcGroup of K parallel calls is ALSO one step (they overlap),
    * while sync_rpc still counts all K. depth < sync_rpc therefore
@@ -474,7 +528,10 @@ export class TurnStructure {
     } finally {
       const ms = Date.now() - started;
       this.rpc_ms += ms;
-      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+      if (this.rpc_max_phase === "" || ms > this.rpc_max_ms) {
+        this.rpc_max_ms = ms;
+        this.rpc_max_phase = phase;
+      }
     }
   }
   /** One PARALLEL step of independent RPCs (NC8b "parallelize
@@ -498,7 +555,10 @@ export class TurnStructure {
     } finally {
       const ms = Date.now() - started;
       this.rpc_ms += ms;
-      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+      if (this.rpc_max_phase === "" || ms > this.rpc_max_ms) {
+        this.rpc_max_ms = ms;
+        this.rpc_max_phase = phase;
+      }
     }
   }
 }
@@ -549,6 +609,8 @@ type TurnStructureReport = {
   rpc_ms: number;
   /** NC8a: the single slowest RPC step. */
   rpc_max_ms: number;
+  /** NC8a: bounded phase name paired with rpc_max_ms. */
+  rpc_max_phase: string;
   /** NC8a: serial RPC steps (parallel groups count once) — how deep the
    * turn's cross-authority chain ran; depth < sync_rpc measures paid
    * parallelism. */
@@ -647,6 +709,11 @@ const RECENT_CLIENT_TURN_CAP = 512;
  * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
  * outlives the reply it protects by more than the window. */
 const GATEWAY_PIN_LIMIT = 1024;
+/** A session bearer destroys its own credential when close commits. Keep a
+ * bounded gateway-local receipt so a lost close reply can still replay as
+ * success after the session cell is expired/reaped. Same bounded-idempotency
+ * posture as turn pins/replies; this is derived retry state, not authority. */
+const GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT = 4096;
 /** Bounded per-isolate classification memo for offline room members. Losing an
  * entry costs one cold convention probe; lineage fanout invalidates it. */
 const ROOM_PRESENTATION_ACTOR_CACHE_CAP = 256;
@@ -668,11 +735,26 @@ const CLIENT_MINT_RATE_BURST = 20;
  * traffic into a multi-Hz repair loop. The next request may retry after this
  * bounded brake; success is cached naturally by the repaired view page. */
 const GUEST_RESET_REPAIR_BACKOFF_MS = 5_000;
+/** Planning-head hints are an optimistic latency cache, not authority.
+ * Bound them independently of world size; hibernation or eviction merely
+ * restores the ordinary /head path. */
+const PLANNING_HEAD_CACHE_CAP = 256;
+
+type PlanningHead = { head: ScopeHead; catalog_epoch?: string; object_counter?: number };
 
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /** Whole-scope derived copies, exact at one authority head. Ephemeral on
+   * purpose: hibernation merely makes the next large direct read re-pull a
+   * full closure; correctness never depends on retaining this optimization. */
+  private readonly completeHeads = new Map<string, ScopeHead>();
+  /** Exact `/head` replies retained only to avoid a serial warm-path hop.
+   * `/submit` still proves the retained base and validates current reads and
+   * post-state at authority, so a stale entry can cost repair but cannot
+   * authorize stale state. */
+  private readonly planningHeads = new Map<string, PlanningHead>();
   /** Per-subscriber outbox continuity, distinct from authority `seen`.
    * A scope head may advance without emitting a row for this gateway. */
   private readonly deliverySeen = new Map<string, number>();
@@ -726,11 +808,19 @@ export class NetGatewayDO {
     // Phase 5 durable-format stamp (mirrors net_scope_meta's row): the
     // gateway's one branch point for durable evolution + migration ledger.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    const gatewayVersionRow = sqlRows<{ body: string }>(
+      state.storage.sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'")
+    )[0];
+    const gatewayVersion = gatewayVersionRow === undefined
+      ? null
+      : (JSON.parse(gatewayVersionRow.body) as { v?: unknown }).v;
     state.storage.sql.exec(
-      "INSERT OR IGNORE INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
-      JSON.stringify({ v: 1 })
+      "CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL, owner_scope TEXT)"
     );
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    const cellColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_cell)"));
+    if (!cellColumns.some((column) => column.name === "owner_scope")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_cell ADD COLUMN owner_scope TEXT");
+    }
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0)");
     const scopeColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_scope)"));
     if (!scopeColumns.some((column) => column.name === "delivery_seen_seq")) {
@@ -750,11 +840,9 @@ export class NetGatewayDO {
     // at write time — a fanout carries a SCOPE name (`room:ws_annex`) but the
     // relation owner is an OBJECT id (`ws_annex`), so the presence fanout
     // filters on `owner_scope` to stay O(occupants), never scanning every
-    // session_presence row and classifying each in JS. Additive-column
-    // migration for a table created before it (before-data everywhere today;
-    // idempotent). A legacy row's NULL owner_scope simply misses the indexed
-    // filter until the next fanout/pull rewrites it — the same self-heal a
-    // stale mirror row already has.
+    // session_presence row and classifying each in JS. The column addition is
+    // idempotent; schema v2 below then discards legacy unowned rows together
+    // with the high-waters that could suppress their reconstruction.
     const relationColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_relation)"));
     if (!relationColumns.some((column) => column.name === "owner_scope")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
@@ -768,6 +856,12 @@ export class NetGatewayDO {
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
+    // Observation delivery intersects one scope with the bounded sessions
+    // that have a live carrier on this gateway. Keep member as the final key
+    // so that intersection never scans every occupant of a large room.
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope_member ON net_gateway_relation (relation, owner_scope, member)"
+    );
     // The authenticated read/auth query shapes (all O(matching rows), never
     // a table scan): presence-of-a-member (relation, member); the contents
     // membership check and the roster read (relation, owner, member — the
@@ -777,6 +871,34 @@ export class NetGatewayDO {
     );
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_owner_member ON net_gateway_relation (relation, owner, member)"
+    );
+    // Gateway cache schema v2 materializes cell ownership for exact full-pull
+    // replacement. v1 rows cannot be classified safely in SQL, and retaining
+    // their high-water while discarding an unclassified row could suppress
+    // the fanout that repairs it. This is DERIVED cache state, so the one safe
+    // migration is to clear cells, relation mirrors, and both high-waters in
+    // one transaction; the next pull/fanout reconstructs them from authority.
+    // Fresh databases create the v2 table directly and skip the reset.
+    if (gatewayVersion === 1) {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("DELETE FROM net_gateway_cell");
+        state.storage.sql.exec("DELETE FROM net_gateway_relation");
+        state.storage.sql.exec("DELETE FROM net_gateway_scope");
+        state.storage.sql.exec(
+          "UPDATE net_gateway_meta SET body = ? WHERE id = 'schema_version'",
+          JSON.stringify({ v: 2 })
+        );
+      });
+    } else if (gatewayVersion === null) {
+      state.storage.sql.exec(
+        "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+        JSON.stringify({ v: 2 })
+      );
+    } else if (gatewayVersion !== 2) {
+      throw new Error(`unsupported net gateway cache schema version ${JSON.stringify(gatewayVersion)}`);
+    }
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_cell_scope ON net_gateway_cell (owner_scope)"
     );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
@@ -800,6 +922,9 @@ export class NetGatewayDO {
     // TTL-reaped on every mint, and each ticket is deleted on use.
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_ws_ticket (ticket TEXT PRIMARY KEY, session TEXT NOT NULL, actor TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+    );
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_session_close_receipt (session TEXT PRIMARY KEY, actor TEXT NOT NULL)"
     );
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
@@ -878,6 +1003,24 @@ export class NetGatewayDO {
           ms: Date.now() - receiveStarted
         });
         return json({ applied: rows.length === 1 ? applied[0] : applied });
+      }
+      if (request.method === "POST" && url.pathname === "/net/live") {
+        const body = (await request.json()) as LiveFanoutBody | LiveFanoutBatchBody;
+        const deliveries = "deliveries" in body ? body.deliveries : [body];
+        if (
+          !Array.isArray(deliveries)
+          || deliveries.length > LIVE_FANOUT_BATCH_CAP
+          || deliveries.some((delivery) =>
+            delivery === null
+            || typeof delivery !== "object"
+            || typeof delivery.scope !== "string"
+            || !Array.isArray(delivery.observations)
+          )
+        ) {
+          return json({ error: { code: "E_INVARG", message: "invalid live fanout batch" } }, 400);
+        }
+        for (const delivery of deliveries) this.pushLiveObservations(delivery);
+        return json({ delivered: deliveries.length });
       }
       if (request.method === "POST" && url.pathname === "/net/pull") {
         const body = (await request.json()) as { scope: string; destination: string; known?: string[] };
@@ -971,38 +1114,37 @@ export class NetGatewayDO {
       if (raw !== null) {
         const seed = JSON.parse(raw) as SeedRecord;
         const live = (await this.host.rpc(body.destination, "/head")) as { head: ScopeHead };
-        if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash) {
+        // A current-format full seed includes the COMPLETE relation family.
+        // An aged seed without that field cannot safely advance the shared
+        // cell/relation high-water: fall through to the live full closure.
+        if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash && seed.relations !== undefined) {
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
-              this.removeAbsentCatalogDefinitions(view, body.scope, seed.cells);
-              for (const cell of seed.cells) {
-                // Copy #3 provenance: these cells came through KV, not the
-                // authority — mark them honestly (planning treats derived
-                // and seed copies identically; the stamp is provenance).
-                view.install({ ...cell, provenance: "seed" });
-                this.persistCell(view, cell.key);
-              }
-              // CO13: relation rows ride the seed for the same reason they
-              // ride the live closure (see reseedFromScope's upsert note).
-              for (const row of seed.relations ?? []) {
-                this.applyRelationDelta({ op: "add", row });
-              }
+              // Copy #3 provenance: these cells came through KV, not the
+              // authority — mark them honestly (planning treats derived
+              // and seed copies identically; the stamp is provenance).
+              this.replaceScopeCells(view, body.scope, seed.cells, "seed");
+              this.replaceScopeRelations(body.scope, seed.relations ?? []);
+              // The exact replacement and its certificate advance are one
+              // durable action. A crash cannot preserve stale members under
+              // the new high-water.
+              this.advanceSeen(body.scope, seed.head.seq);
             })
           );
-          // Fix 7: the seed IS the state at its head — stale pre-pull
-          // fanout rows must no-op instead of regressing the view.
-          this.advanceSeen(body.scope, seed.head.seq);
+          this.completeHeads.set(body.scope, seed.head);
           return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
         // and self-healing — the live path below rewrites the seed.
-        this.metric({
-          kind: "net_seed_lag",
-          code: "E_SEED_LAG",
-          scope: body.scope,
-          seed_head: seed.head,
-          live_head: live.head
-        });
+        if (live.head.seq !== seed.head.seq || live.head.hash !== seed.head.hash) {
+          this.metric({
+            kind: "net_seed_lag",
+            code: "E_SEED_LAG",
+            scope: body.scope,
+            seed_head: seed.head,
+            live_head: live.head
+          });
+        }
       }
     }
 
@@ -1029,8 +1171,9 @@ export class NetGatewayDO {
    * - planning E_MISSING_STATE (CO2.6 materialization miss) → fetch
    *   exactly the missing cell keys from their owning scopes, re-plan;
    * - stale_head → refetch the head; resubmit the SAME transcript only
-   *   when the base was the whole story (head actually moved AND the
-   *   scope reported no read mismatches) — otherwise re-plan;
+   *   when the base was the whole story, all cell proofs were retained,
+   *   and the scope reported no read mismatches. A complete-head-compacted
+   *   plan pulls the new complete generation and re-plans;
    * - read_version_mismatch → refresh exactly `mismatched_reads`
    *   (mapped through netCellKeyFor) and RE-PLAN: a transcript planned
    *   against stale reads is never resubmitted;
@@ -1198,6 +1341,7 @@ export class NetGatewayDO {
         snapshot_cells: structure.snapshot_cells,
         rpc_ms: structure.rpc_ms,
         rpc_max_ms: structure.rpc_max_ms,
+        rpc_max_phase: structure.rpc_max_phase,
         rpc_depth: structure.rpc_depth,
         queue_ms: structure.queue_ms,
         wall_ms: Date.now() - structure.started
@@ -1239,6 +1383,7 @@ export class NetGatewayDO {
       snapshot_cells: structure.snapshot_cells,
       rpc_ms: structure.rpc_ms,
       rpc_max_ms: structure.rpc_max_ms,
+      rpc_max_phase: structure.rpc_max_phase,
       rpc_depth: structure.rpc_depth,
       queue_ms: structure.queue_ms,
       wall_ms: Date.now() - structure.started
@@ -1263,7 +1408,10 @@ export class NetGatewayDO {
       ...(request.principal?.customer ? { customer: request.principal.customer } : {}),
       ...(request.principal?.actor ? { actor: request.principal.actor } : {}),
       ...(traceId ? { trace_id: traceId } : {}),
-      ...report
+      ...report,
+      // Reuse the stable AE phase axis instead of spending a new blob. For a
+      // turn-level event it denotes the phase paired with rpc_max_ms.
+      phase: report.rpc_max_phase
     });
     // AU8 span tree: root `net.turn` + phase children from the measured
     // report buckets. Adopted contexts follow the caller's sampled flag;
@@ -1326,33 +1474,6 @@ export class NetGatewayDO {
     return request.scopes?.[scope] ?? `scope:${scope}`;
   }
 
-  /**
-   * The catalog scope's lineage keys held by the given store (CO15): the
-   * shared substrate is universally receiver-known in transfers, so the
-   * planner's read closure never reships class chains. An unclassifiable
-   * lineage cell (mid-walk gap during a partial refresh) simply ships —
-   * the known-set is an envelope optimization and must never fail a plan.
-   * Under the legacy override classifier no scope is ever "catalog", so
-   * the set is empty and legacy envelopes are unchanged.
-   *
-   * Called by the planner with the settled PLAN SLICE (blocker #1: the
-   * closure can only reference slice lineage keys, so classifying just
-   * those is equivalent to — and O(view) cheaper than — scanning the
-   * whole resident view per turn).
-   */
-  private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
-    const known = new Set<string>();
-    for (const key of view.keys()) {
-      if (!key.startsWith("object_lineage:")) continue;
-      try {
-        if (classifier.scopeOf(objectOfCellKey(key)) === CATALOG_SCOPE) known.add(key);
-      } catch {
-        // Unclosed walk: leave the key out; the cell ships normally.
-      }
-    }
-    return known;
-  }
-
   private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[], structure: TurnStructure): Promise<TurnResult> {
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
@@ -1369,14 +1490,17 @@ export class NetGatewayDO {
     // By-construction non-convergence detector: per turn, the authority
     // RECEIPT we last refreshed each mismatched key to. Eligible receipts
     // include the owner scope and sequenced head as well as content: using
-    // content alone misclassifies A -> B -> A contention. Seed-phase reads,
-    // activation-state reads, and owner-unknown probes produce no receipt
-    // because their apparent head is not a complete authority generation.
+    // content alone misclassifies A -> B -> A contention. The mutation-complete
+    // authority generation makes seed and activation receipts eligible too;
+    // owner-unknown probes still produce no receipt.
     const refreshedTo = new Map<string, string>();
     // Same detector for compact ordering reads. The key is
     // (authority scope, container, parent), because two container roots in one
     // cross-scope turn both use null.
     const refreshedOrderingTo = new Map<string, string>();
+    // Same detector for replay-page reads, keyed by
+    // (authority scope, space, from, limit) — the exact attested query.
+    const refreshedReplayTo = new Map<string, string>();
     // Owner-computed ordered-children projections fetched this turn, keyed by
     // (container,parent); null names only that container's roots. Seeded with the call target's
     // ordering, then GROWN by the ordered-children repair path as the verb
@@ -1391,6 +1515,12 @@ export class NetGatewayDO {
     // and purged per-parent on an ordering conflict so the next attempt
     // re-fetches the CURRENT slot answer.
     const orderedNeighborsByKey = new Map<string, OrderedNeighborsProjection>();
+    // Owner-served committed replay pages fetched this turn (SL4), keyed
+    // by the exact (space, from, limit) query. Same lifecycle again: grown
+    // by the replay-page repair path, sticky across re-plans, and purged
+    // per-query on a replay conflict so the next attempt re-fetches the
+    // CURRENT page (a committed append moved the window's content).
+    const replayPagesByQuery = new Map<string, ReplayPageProjection>();
     // A cold contents relation can name offline actors whose owner cells are
     // intentionally absent from this gateway. The first presentation probe
     // classifies those cluster roots from the generic host-placement marker;
@@ -1422,27 +1552,40 @@ export class NetGatewayDO {
       const planningOrderedNeighbors = orderedNeighborsByKey.size > 0
         ? [...orderedNeighborsByKey.values()]
         : undefined;
+      const planningReplayPages = replayPagesByQuery.size > 0
+        ? [...replayPagesByQuery.values()].map((page) => ({ space: page.space, from: page.from, limit: page.limit, scope: page.scope, entries: page.entries, version: page.version }))
+        : undefined;
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
       let base: ScopeHead | null = null;
-      // Planning-scope head prefetch (client-shell phase i): fetched
-      // BEFORE planning so the authority's allocation counter reaches
-      // the planner — a create must mint an id fresh at the authority.
+      // Planning-scope head (client-shell phase i): learned from /head or an
+      // exact prior reply and supplied BEFORE planning so the authority's
+      // allocation counter reaches the planner — a create must mint an id
+      // fresh at the retained base and validates that read at submit.
       // Reused as the submit base when the commit scope IS the planning
       // scope (the warm common case), keeping the warm turn at the same
       // sync-RPC count as before; a cross-scope selection re-fetches
       // from its own destination below.
-      let planningHead: Awaited<ReturnType<typeof this.scopeHead>> | null = null;
+      let planningHead: PlanningHead | null = null;
       if (resubmit) {
         planned = resubmit.planned;
         base = resubmit.base;
         resubmit = null;
       } else {
         try {
-          planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
+          planningHead = this.cachedPlanningHead(request.planningScope, request.catalog_epoch);
+          if (planningHead === null) {
+            planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
+            this.rememberPlanningHead(request.planningScope, request.catalog_epoch, planningHead);
+          }
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors);
+          const complete = this.completeHeads.get(request.planningScope);
+          const compactOwnedReads = complete?.seq === planningHead.head.seq &&
+            complete.hash === planningHead.head.hash &&
+            complete.generation !== undefined &&
+            complete.generation === planningHead.head.generation;
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors, planningReplayPages, compactOwnedReads);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             // Ordered-children projection miss: fetch the named parent(s)'
@@ -1510,10 +1653,86 @@ export class NetGatewayDO {
               }
               continue;
             }
+            // Replay-page miss (SL4): fetch the named committed-log window
+            // from its owning authority and re-plan. Handled before the
+            // cell path for the same reason as the ordering branches — its
+            // detail carries `missing_replay_pages`, not `missing`, and
+            // there is no cell to grow from the view. Anti-loop mirrors
+            // the ordering branches: an already-resident re-miss is the
+            // terminal planner-bug shape; a failed fetch is transient and
+            // stays on the bounded attempt loop.
+            const missingReplayPages = Array.isArray(err.detail.missing_replay_pages)
+              ? (err.detail.missing_replay_pages as ReplayPageQuery[]).filter(validReplayPageQuery)
+              : [];
+            if (missingReplayPages.length > 0) {
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingReplayPages.map((q) => `replay:${q.space}@${q.from}+${q.limit}`), elapsed_ms: elapsed() });
+              let allAlreadyResident = true;
+              for (const query of missingReplayPages) {
+                const key = replayPageQueryKey(query);
+                if (replayPagesByQuery.has(key)) continue;
+                allAlreadyResident = false;
+                const page = await this.tryRecovery(trace, () => this.fetchReplayPage(request, classifier, structure, query));
+                if (page === undefined) continue; // fetch failed; recovery_error recorded
+                replayPagesByQuery.set(key, page);
+              }
+              if (allAlreadyResident) {
+                throw nonconvergentRead(
+                  "replay page re-missed while resident (install cannot cure it)",
+                  trace,
+                  { missing_replay_pages: missingReplayPages }
+                );
+              }
+              continue;
+            }
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
-            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
+            const receipts = await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
             for (const key of missing) repairedObjects.add(objectOfCellKey(key));
+            if (receipts) {
+              const stuck = missing.flatMap((key) => {
+                const receipt = receipts.get(key);
+                if (!receipt) return [];
+                const identity = authorityReceiptIdentity(receipt);
+                if (refreshedTo.get(key) !== identity) {
+                  refreshedTo.set(key, identity);
+                  return [];
+                }
+                const object = objectOfCellKey(key);
+                const verbName = key.startsWith(`verb_bytecode:${object}:`)
+                  ? key.slice(`verb_bytecode:${object}:`.length)
+                  : null;
+                const dispatchChain: Array<{ object: string; parent: string | null; has_page: boolean }> = [];
+                if (verbName !== null) {
+                  let cursor: string | null = object;
+                  const seen = new Set<string>();
+                  while (cursor && !seen.has(cursor)) {
+                    seen.add(cursor);
+                    const lineage = view.get(cellKey("object_lineage", cursor))?.value as { parent?: unknown } | undefined;
+                    const parent = typeof lineage?.parent === "string" ? lineage.parent : null;
+                    dispatchChain.push({
+                      object: cursor,
+                      parent,
+                      has_page: view.has(cellKey("verb_bytecode", cursor, verbName))
+                    });
+                    cursor = parent;
+                  }
+                }
+                return [{
+                  key,
+                  authority_scope: receipt.scope,
+                  authority_head: receipt.head,
+                  authority_version: receipt.version,
+                  dispatch_chain: dispatchChain
+                }];
+              });
+              if (stuck.length > 0) {
+                throw nonconvergentRead(
+                  "a sparse planning miss cannot converge: authority returned the same cell state twice but the planner still requested it",
+                  trace,
+                  { stuck, scope: request.planningScope }
+                );
+              }
+            }
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -1583,11 +1802,67 @@ export class NetGatewayDO {
       // itself is unchanged — both are HTTP-body siblings, not sequencer
       // input.
       const relateDestinations = this.relateDestinationsFor(request, classifier, planned, targetScope);
+      const originGateway = this.selfDestination();
       const submitBody = {
         submit,
         rider_destinations: this.riderDestinationsFor(request, classifier, planned),
-        relate_destinations: relateDestinations
+        relate_destinations: relateDestinations,
+        ...(planned.liveAudience !== undefined ? { live_audience: planned.liveAudience } : {}),
+        ...(originGateway ? { origin_gateway: originGateway } : {})
       };
+      // CO7: envelope_bytes is the ACTUAL serialized submit RPC body —
+      // transcript, attestations, and rider/relation routing metadata —
+      // measured here, immediately before the RPC (never a modeled
+      // shape; the scope validates versions/attestations and re-applies
+      // recorded writes, so no read state ships). The ceiling gate lives
+      // on the same measurement: a breach is a plain misplan Error.
+      const envelopeBytes = submitEnvelopeBytes(submitBody);
+      const warm = targetScope === request.planningScope && planned.selection.riders.length === 0;
+      // A large same-owner turn is the one valid reason to materialize a
+      // complete snapshot: on the next plan, the exact base-generation CAS
+      // replaces its thousands of same-scope per-cell reads. This also covers
+      // read verbs transported through a room's sequenced route. Never raise
+      // the CO15 ceiling.
+      if (
+        envelopeBytes > WARM_ENVELOPE_BYTE_LIMIT &&
+        warm &&
+        !planned.ownedReadsCompacted
+      ) {
+        await this.reseedFromScope(view, destination, [], structure);
+        continue;
+      }
+      if (envelopeBytes > WARM_ENVELOPE_BYTE_LIMIT && warm && planned.ownedReadsCompacted) {
+        const attestationCells = Object.values(submit.attestations ?? {})
+          .reduce((count, attestation) => count + attestation.cells.length, 0);
+        // This branch is already a terminal protocol defect. Account for each
+        // sibling independently so the next occurrence identifies the actual
+        // amplification source instead of reporting only transcript bytes.
+        // JSON field sizes are diagnostic (their braces/keys do not add up to
+        // the whole body exactly); the authoritative ceiling above remains the
+        // byte size of the complete serialized submit RPC body.
+        const diagnosticBytes = (value: unknown): number =>
+          new TextEncoder().encode(JSON.stringify(value)).byteLength;
+        const readBuckets = new Map<string, number>();
+        for (const read of submit.transcript.reads) {
+          let owner = "unresolved";
+          try { owner = classifier.scopeOf(read.cell.object); } catch { /* diagnostic only */ }
+          const key = `${read.cell.kind}@${owner}`;
+          readBuckets.set(key, (readBuckets.get(key) ?? 0) + 1);
+        }
+        throw new Error(
+          `oversized compacted warm envelope: ${envelopeBytes} bytes; ` +
+          `wire_reads=${submit.transcript.reads.length} attestation_cells=${attestationCells} ` +
+          `transcript_bytes=${new TextEncoder().encode(JSON.stringify(submit.transcript)).byteLength} ` +
+          `submit_bytes=${diagnosticBytes(submit)} ` +
+          `attestations_bytes=${diagnosticBytes(submit.attestations ?? {})} ` +
+          `rider_destinations_bytes=${diagnosticBytes(submitBody.rider_destinations)} ` +
+          `relate_destinations_bytes=${diagnosticBytes(submitBody.relate_destinations)} ` +
+          `live_audience_bytes=${diagnosticBytes(planned.liveAudience ?? {})} ` +
+          `origin_gateway_bytes=${diagnosticBytes(originGateway ?? "")} ` +
+          `read_buckets=${JSON.stringify(Object.fromEntries(readBuckets))}`
+        );
+      }
+      assertEnvelopeCeiling(envelopeBytes, warm);
       let reply: CommitReply;
       try {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
@@ -1605,6 +1880,12 @@ export class NetGatewayDO {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true, phase: "submit_disambiguate" })) as CommitReply;
       }
       if (reply.status === "accepted") {
+        // Retain the optimistic allocation/head hint only for an exact
+        // head-stable accept. Any authoritative mutation (including a create)
+        // changes the returned head and forces the next turn through /head.
+        if (reply.scope === request.planningScope) {
+          this.reconcilePlanningHead(request.planningScope, request.catalog_epoch, reply.head);
+        }
         // Make an accepted presence transition visible at its room authority
         // before the client can issue a dependent roster read. This delivers
         // the same idempotent fact as the committing scope's durable outbox;
@@ -1654,10 +1935,28 @@ export class NetGatewayDO {
         // output. (`post_state_version` equality is the fallback for a
         // scope that predates the flag — belt and suspenders.)
         const replayed = reply.replayed === true || reply.post_state_version !== submit.post_state_version;
+        const pureDirect =
+          request.call.route === "direct" &&
+          reply.head.seq === submit.base.seq &&
+          reply.head.hash === submit.base.hash &&
+          reply.head.generation === submit.base.generation;
+        if (pureDirect && !replayed && planned.transcript.observations.length > 0) {
+          // The scope excludes this origin shard to avoid a
+          // gateway→scope→same-gateway RPC cycle. Deliver its local session
+          // slice here, after validation returned; other shards receive the
+          // scope's independent best-effort /net/live calls.
+          this.pushLiveObservations({
+            scope: reply.scope,
+            observations: planned.transcript.observations,
+            submitter_turn_id: request.idempotency_key,
+            echo_id: turnEchoId(request.idempotency_key),
+            ...(planned.liveAudience ?? {})
+          });
+        }
         return {
           reply,
           selection: planned.selection,
-          envelopeBytes: planned.envelopeBytes,
+          envelopeBytes,
           attempt,
           trace,
           ...(replayed
@@ -1673,7 +1972,7 @@ export class NetGatewayDO {
       }
       if (!reply.retryable) {
         // Terminal verdict: surface the scope's reply immediately (CO6).
-        return { reply, selection: planned.selection, envelopeBytes: planned.envelopeBytes, attempt, trace };
+        return { reply, selection: planned.selection, envelopeBytes, attempt, trace };
       }
 
       // ---- Retryable verdict: record the round, run the defined recovery.
@@ -1689,15 +1988,29 @@ export class NetGatewayDO {
 
       switch (reply.reason) {
         case "stale_head": {
+          this.forgetPlanningHead(targetScope);
           const live = await this.tryRecovery(trace, () => structure.rpc(() => this.scopeHead(destination), { phase: "stale_head_refresh" }));
           // Phase 5: epoch check OUTSIDE tryRecovery (the M9 pattern) —
           // a genuine epoch disagreement is terminal and must escape the
           // retry loop, while a FAILED head fetch stays on the budget
           // path (recovery_error names it; a later round may converge).
-          if (live !== undefined) this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+          if (live !== undefined) {
+            this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+            this.rememberPlanningHead(targetScope, request.catalog_epoch, live);
+          }
           const fresh = live?.head;
-          const headMoved = fresh !== undefined && (fresh.seq !== submit.base.seq || fresh.hash !== submit.base.hash);
-          if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
+          const headMoved = fresh !== undefined && (
+            fresh.seq !== submit.base.seq ||
+            fresh.hash !== submit.base.hash ||
+            fresh.generation !== submit.base.generation
+          );
+          if (fresh !== undefined && headMoved && planned.ownedReadsCompacted) {
+            // The omitted owner reads were proven only by submit.base's exact
+            // generation. Replacing that base while retaining the computed
+            // writes would bless stale values (lost-update under contention).
+            // Pull the new complete authority generation, then re-execute.
+            await this.tryRecovery(trace, () => this.reseedFromScope(view, destination, [], structure));
+          } else if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
             // The head moved and no reads were reported stale: the
             // transcript is still honest, resubmit it on the new base.
             resubmit = { planned, base: fresh };
@@ -1754,6 +2067,46 @@ export class NetGatewayDO {
               );
             }
             break; // re-plan next round with the refreshed ordering
+          }
+          // SL4: a replay-page conflict — a committed sequenced entry
+          // landed inside an attested window between plan and submit.
+          // Drop the named queries' cached pages so the next attempt
+          // re-fetches the CURRENT page (via the replay-page miss path)
+          // and re-plans against it. Non-convergence mirrors the ordering
+          // detector: the same authority head + page version rejected
+          // twice is a planner bug, named — never ground to E_BUDGET.
+          const replayConflicts = Array.isArray((reply.detail as { replay_conflicts?: unknown } | undefined)?.replay_conflicts)
+            ? ((reply.detail as { replay_conflicts: ReplayConflict[] }).replay_conflicts).filter(validReplayConflict)
+            : [];
+          if (replayConflicts.length > 0) {
+            const stuck: Array<ReplayConflict & { authority_version: string; authority_head: ScopeHead }> = [];
+            for (const conflict of replayConflicts) {
+              const conflictKey = `${conflict.scope}\0${replayPageQueryKey(conflict)}`;
+              const cached = [...replayPagesByQuery.values()].find((page) =>
+                page.scope === conflict.scope && page.space === conflict.space && page.from === conflict.from && page.limit === conflict.limit
+              );
+              if (cached !== undefined && authorityOrderingReceiptEligible(cached.authority_head)) {
+                const receipt = authorityReceiptIdentity({ scope: conflict.scope, head: cached.authority_head, version: cached.version });
+                if (refreshedReplayTo.get(conflictKey) === receipt) {
+                  stuck.push({ ...conflict, authority_version: cached.version, authority_head: cached.authority_head });
+                } else {
+                  refreshedReplayTo.set(conflictKey, receipt);
+                }
+              }
+              for (const [key, page] of replayPagesByQuery) {
+                if (page.scope === conflict.scope && page.space === conflict.space && page.from === conflict.from && page.limit === conflict.limit) {
+                  replayPagesByQuery.delete(key);
+                }
+              }
+            }
+            if (stuck.length > 0) {
+              throw nonconvergentRead(
+                "a replay-page read cannot converge: re-installed the same authority head and page content but the plan re-recorded a mismatching version",
+                trace,
+                { stuck, scope: targetScope }
+              );
+            }
+            break; // re-plan next round with the refreshed page
           }
           // Refresh exactly the named cells (or, for a post_state
           // disagreement naming nothing, reseed the scope's closure)
@@ -1977,12 +2330,17 @@ export class NetGatewayDO {
     const destination = request.cluster_destination ?? `scope:${clusterScope}`;
 
     const now = request.issued_at_ms ?? this.host.now();
-    // Phase 5: the session mint stamps request.catalog_epoch; a cluster
-    // scope at another durable epoch would reject every submit, so fail
-    // fast at the head fetch (same rule as the turn path).
-    const liveHead = await this.scopeHead(destination);
-    this.assertTurnEpoch(liveHead, request.catalog_epoch, clusterScope, []);
-    let base = liveHead.head;
+    // Phase 5: the session mint stamps request.catalog_epoch. Reuse this
+    // gateway's exact accepted cluster-head hint when present; it is only an
+    // optimistic base, and /submit still rejects a stale generation/head.
+    // A miss pays /head and preserves the ordinary fail-fast epoch check.
+    let planningHead = this.cachedPlanningHead(clusterScope, request.catalog_epoch);
+    if (planningHead === null) {
+      planningHead = await this.scopeHead(destination);
+      this.rememberPlanningHead(clusterScope, request.catalog_epoch, planningHead);
+    }
+    this.assertTurnEpoch(planningHead, request.catalog_epoch, clusterScope, []);
+    let base = planningHead.head;
     const actorLineage = view.get(cellKey("object_lineage", request.actor))?.value as { name?: unknown } | undefined;
     // AU3.1 rule-4 backfill: an EXCLUSIVE mint is definitionally an
     // identity-door pool claim, and a pool actor with no valid
@@ -2008,6 +2366,8 @@ export class NetGatewayDO {
       epoch: request.catalog_epoch,
       clusterScope,
       ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
+      ...(request.apikey_id ? { apikeyId: request.apikey_id } : {}),
+      ...(request.roster_visible === false ? { rosterVisible: false } : {}),
       ...(request.exclusive ? { exclusive: true } : {}),
       ...(stampGuestCustomerOf ? { stampGuestCustomerOf: true } : {}),
       ...(request.closing ? { closing: request.closing } : {})
@@ -2036,9 +2396,20 @@ export class NetGatewayDO {
         withSibling ? { submit: bare, relate_destinations: relateDestinations } : bare
       );
       if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
-      base = (await this.scopeHead(destination)).head;
+      planningHead = await this.scopeHead(destination);
+      this.assertTurnEpoch(planningHead, request.catalog_epoch, clusterScope, []);
+      this.rememberPlanningHead(clusterScope, request.catalog_epoch, planningHead);
+      base = planningHead.head;
     }
     if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
+    // Session commits never allocate objects, so the accepted authority head
+    // can advance the cached base while retaining the allocation counter from
+    // the exact prior /head. A concurrent later write merely causes the normal
+    // stale_head repair; the cache is not an authority certificate.
+    this.rememberPlanningHead(clusterScope, request.catalog_epoch, {
+      ...planningHead,
+      head: reply.head
+    });
     let relationExpediteDegraded = false;
     try {
       await this.expediteForeignRelations(reply, relateDestinations, []);
@@ -2055,7 +2426,7 @@ export class NetGatewayDO {
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_session_open_install_degraded", scope: clusterScope, status: "error", error: String(err) });
-      this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch);
+      this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch, clusterScope);
     }
     return {
       reply,
@@ -2088,12 +2459,13 @@ export class NetGatewayDO {
   //     → authenticate, derive the actor's cluster scope (CO15 topology),
   //       session-open through the existing mint machinery, reply
   //       {session, actor, expires_at, scope}.
-  //   POST /net-api/turn {target, verb, args?, session, idempotency_key?}
+  //   POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}
   //     → REQUIRES a valid session (the CO14 Phase-4 rule: client-
   //       originated turns need sessions), validated from the session
-  //       cell in the gateway view; builds a route:"sequenced"
-  //       TurnRequest (the committing scope's authorize revalidates the
-  //       session — the gateway authenticates, scopes authorize) and runs
+  //       cell in the gateway view; defaults to sequenced, while an explicit
+  //       direct route requires direct_callable metadata. The committing
+  //       scope revalidates the session on either route (the gateway
+  //       authenticates, scopes authorize), then runs
   //       the normal /net/turn machinery; the reply is the TurnResult
   //       including item-1 result/observations.
   //   GET /net-api/relation?relation=&owner=   authenticated roster read
@@ -2304,7 +2676,7 @@ export class NetGatewayDO {
         return await this.clientMcp(request);
       }
       if (request.method === "GET" && url.pathname === "/net-api/mcp") {
-        return this.clientMcpEvents(request);
+        return await this.clientMcpEvents(request);
       }
       if (request.method === "DELETE" && url.pathname === "/net-api/mcp") {
         return await this.clientMcpClose(request);
@@ -2325,6 +2697,38 @@ export class NetGatewayDO {
 
       const credential = parseClientCredential(request.headers, null);
       auditCredential = credential.kind === "apikey" ? credential.id : `session:${credential.session}`;
+      // Close is the one route whose successful effect invalidates its own
+      // authentication credential. A response-lost retry therefore cannot
+      // pass ordinary bearer validation. The gateway that minted/routed the
+      // session retains a bounded durable receipt; consume it before the live
+      // bearer gate and return the original semantic success.
+      //
+      // There is one wider dropped-reply window: both bounded internal submit
+      // replies can be lost after authority accepted, so this gateway never
+      // gets to write its receipt. Its derived session cell still binds the
+      // opaque bearer to an actor even though the value is now expired. Let
+      // that exact bearer reach the idempotent close path, which proves the
+      // already-released postcondition and writes the missing receipt. This
+      // grants no use of an expired session beyond destroying itself. Unknown
+      // random session ids still take the normal fail-closed auth path below.
+      if (request.method === "DELETE" && url.pathname === "/net-api/session" && credential.kind === "session") {
+        const closedActor = this.closedSessionActor(credential.session);
+        if (closedActor) {
+          auditActor = closedActor;
+          this.enforceClientRate(closedActor, url.pathname);
+          return json({ closed: true, already: "closed" });
+        }
+        const value = this.ensureView().get(sessionCellKey(credential.session))?.value as {
+          id?: unknown;
+          actor?: unknown;
+        } | undefined;
+        if (value?.id === credential.session && typeof value.actor === "string") {
+          auditActor = value.actor;
+          this.enforceClientRate(value.actor, url.pathname);
+          const identity = await this.catalogIdentity();
+          return await this.clientSessionClose(value.actor, credential.session, identity.epoch);
+        }
+      }
       const identity = await this.catalogIdentity();
       // Two credential classes (client-auth.ts): the apikey resolves its
       // actor from the identity map; a session bearer (minted by login/
@@ -2335,10 +2739,10 @@ export class NetGatewayDO {
       let actor: string;
       let bearerSession: string | null = null;
       if (credential.kind === "session") {
-        actor = this.actorForSessionBearer(credential.session);
+        actor = await this.authorizedActorForSessionBearer(credential.session, identity.map);
         bearerSession = credential.session;
       } else {
-        actor = verifyApiKeyCredential(identity.map, credential).actor;
+        actor = (await this.verifyClientApiKey(identity.map, credential)).actor;
       }
 
       // H4: rate limiting runs AFTER authentication resolves the actor
@@ -2385,7 +2789,9 @@ export class NetGatewayDO {
           );
         }
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-        return await this.clientSession(actor, body, identity.epoch);
+        return await this.clientSession(actor, body, identity.epoch, {
+          ...(credential.kind === "apikey" ? { apiKeyId: credential.id } : {})
+        });
       }
       if (request.method === "POST" && url.pathname === "/net-api/turn") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
@@ -2547,6 +2953,100 @@ export class NetGatewayDO {
     return { map, epoch: cell.stamp.catalog_epoch };
   }
 
+  /** Resolve a self-routing credential from the actor authority's private
+   * verifier index. A small bounded cache amortizes the cross-DO hop; unlike
+   * fanout it has an explicit revocation-staleness ceiling and stores no
+   * enumerable relation state. The authority endpoint performs one indexed
+   * lookup and returns the current mutation-complete head—no actor scan or
+   * whole-scope transfer. Historical ids retain the carried catalog-map
+   * compatibility path. */
+  private async verifyClientApiKey(
+    legacyMap: unknown,
+    credential: ReturnType<typeof parseClientCredential>
+  ): Promise<{ actor: string }> {
+    if (credential.kind !== "apikey") {
+      throw new ClientAuthError("credential is not an apikey", { reason: "unsupported_token_class" });
+    }
+    const routed = parseRoutedApiKeyId(credential.id);
+    if (!routed) return verifyApiKeyCredential(legacyMap, credential);
+    const scope = routedApiKeyScope(credential.id);
+    if (!scope) throw new ClientAuthError("apikey not found or revoked", { reason: "unknown_or_revoked" });
+    const answer = await this.routedApiKeyAuthorityRecord(scope, routed.actor, credential.id);
+    const verified = verifyApiKeyRecord(answer.record, credential);
+    if (verified.actor !== routed.actor) {
+      throw new ClientAuthError("apikey record is malformed", { reason: "malformed_record" });
+    }
+    return verified;
+  }
+
+  /** Bounded O(1) verifier cache shared by initial authentication and
+   * session-bearer revocation checks. Negative rows are cached too, so random
+   * routed ids cannot amplify into unbounded authority traffic. */
+  private readonly routedApiKeyCache = new Map<string, { checkedAt: number; record: unknown }>();
+
+  private credentialTtlMs(): number {
+    const raw = Number(this.env.NET_CREDENTIAL_TTL_MS);
+    return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 30_000) : 1_000;
+  }
+
+  /** Exact O(1) verifier read and receipt-shape validation. Transport
+   * failures are availability errors, never "unknown credential": callers
+   * may retry without mistaking a dead authority for revocation. */
+  private async routedApiKeyAuthorityRecord(
+    scope: string,
+    actor: string,
+    id: string
+  ): Promise<{ record: unknown }> {
+    const cacheKey = `${scope}\0${actor}\0${id}`;
+    const now = this.host.now();
+    const ttl = this.credentialTtlMs();
+    const cached = this.routedApiKeyCache.get(cacheKey);
+    if (cached && ttl > 0 && now >= cached.checkedAt && now - cached.checkedAt <= ttl) {
+      // Refresh insertion order so the fixed-size map is LRU, not FIFO.
+      this.routedApiKeyCache.delete(cacheKey);
+      this.routedApiKeyCache.set(cacheKey, cached);
+      return { record: cached.record };
+    }
+    let answer: {
+      scope?: unknown;
+      actor?: unknown;
+      id?: unknown;
+      head?: unknown;
+      record?: unknown;
+    };
+    try {
+      answer = (await this.host.rpc(`scope:${scope}`, "/credential-record", {
+        actor,
+        id
+      })) as typeof answer;
+    } catch {
+      throw new ClientAuthError(
+        "apikey authority is temporarily unavailable",
+        { reason: "credential_authority_unavailable", retryable: true, scope },
+        "E_RPC_TIMEOUT",
+        503
+      );
+    }
+    if (
+      answer.scope !== scope ||
+      answer.actor !== actor ||
+      answer.id !== id ||
+      !validScopeHead(answer.head)
+    ) {
+      throw new ClientAuthError("apikey authority returned an invalid receipt", {
+        reason: "malformed_authority_receipt"
+      });
+    }
+    this.routedApiKeyCache.delete(cacheKey);
+    while (this.routedApiKeyCache.size >= 1_024) {
+      const oldest = this.routedApiKeyCache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.routedApiKeyCache.delete(oldest);
+    }
+    this.routedApiKeyCache.set(cacheKey, { checkedAt: now, record: answer.record });
+    return { record: answer.record };
+  }
+
   /** Reviewer finding 5: how stale a cached ACTIVE verdict may get
    * before the gateway re-verifies against the catalog authority.
    * Deactivation (the installer's failed-verification compensation, or
@@ -2589,7 +3089,7 @@ export class NetGatewayDO {
             const view = this.ensureView();
             if (fresh) view.install(fresh);
             else view.delete(key);
-            this.persistCell(view, key);
+            this.persistCell(view, key, CATALOG_SCOPE);
           })
         );
         this.activationVerifiedAt = now;
@@ -2654,6 +3154,14 @@ export class NetGatewayDO {
     return typeof name === "string" && name.length > 0 ? name : null;
   }
 
+  /** RPC name by which scopes reach this concrete gateway shard. The
+   * environment value is only a legacy/test override; production derives
+   * the destination from the named Durable Object id. */
+  private selfDestination(): string | undefined {
+    const shard = this.shardName();
+    return this.env.NET_GATEWAY_SELF ?? (shard ? `gateway:${shard}` : undefined);
+  }
+
   /**
    * POST /net-api/login {email, password, ttl_ms?} — the identity door's
    * human half (§8 "humans re-authenticate by password"). Verifies the
@@ -2685,6 +3193,8 @@ export class NetGatewayDO {
   private static readonly DUMMY_PASSWORD_HASH = `pbkdf2-sha256:600000:${"0".repeat(32)}:${"0".repeat(64)}`;
 
   private async clientLogin(body: Record<string, unknown>): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, false);
+    if (rosterRefusal) return rosterRefusal;
     const rawEmail = String(body.email ?? "");
     const password = String(body.password ?? "");
     // V3 finding 7: strict BYTE limits BEFORE the email becomes a
@@ -2776,6 +3286,8 @@ export class NetGatewayDO {
    * first session in one commit at that actor's cluster owner.
    */
   private async clientGuest(body: Record<string, unknown>): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, false);
+    if (rosterRefusal) return rosterRefusal;
     // One shared pre-auth bucket: guest claims are session mints.
     this.enforceClientRate("guest:door", "/net-api/session");
     const ttlMs = clampClientTtl(body.ttl_ms);
@@ -2882,7 +3394,7 @@ export class NetGatewayDO {
           this.state.storage.transactionSync(() => {
             const view = this.ensureView();
             view.install(authoritative);
-            this.persistCell(view, key);
+            this.persistCell(view, key, CATALOG_SCOPE);
           })
         );
         this.guestResetDefinitionRetryAt = 0;
@@ -2914,7 +3426,7 @@ export class NetGatewayDO {
         this.state.storage.transactionSync(() => {
           const view = this.ensureView();
           view.install(fresh);
-          this.persistCell(view, key);
+          this.persistCell(view, key, CATALOG_SCOPE);
         })
       );
       this.guestResetDefinitionRetryAt = 0;
@@ -3128,13 +3640,38 @@ export class NetGatewayDO {
         503
       );
     }
+    // A fresh guest is born present at a FOREIGN room owner. The commit
+    // durably queued the relation deltas, but the accepted response is also
+    // the client's freshness fence: an immediate who/look must see this
+    // session in the room authority's compact roster. Session-open and turn
+    // transitions use the same fence. Omitting it here made a burst of
+    // elastic claims temporarily look like unresolved room contents, which
+    // both returned partial rosters and spent one presentation probe per
+    // guest until the asynchronous outbox caught up.
+    let relationExpediteDegraded = false;
+    if (relateDestinations) {
+      try {
+        await this.expediteForeignRelations(reply, relateDestinations, []);
+      } catch (err) {
+        // Acceptance is already durable and the scope outbox retains the
+        // exact same relation facts. Preserve success, but name the weaker
+        // freshness guarantee just as sessionOpen does.
+        relationExpediteDegraded = true;
+        this.metric({
+          kind: "net_relation_expedite_degraded",
+          scope: reply.scope,
+          status: "error",
+          error: String(err)
+        });
+      }
+    }
     let installDegraded = false;
     try {
       await this.installTouched(this.ensureView(), destination, reply.touched);
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_guest_provision_install_degraded", actor, status: "error", error: String(err) });
-      this.installAcceptedSessionEcho(session, planned.value, reply, epoch);
+      this.installAcceptedSessionEcho(session, planned.value, reply, epoch, planned.clusterScope);
     }
     await this.selfSubscribe(planned.clusterScope);
     await this.selfSubscribe(roomScope);
@@ -3146,7 +3683,8 @@ export class NetGatewayDO {
       scope: planned.clusterScope,
       active_scope: template.initial_room,
       elastic: true,
-      ...(installDegraded ? { install_degraded: true } : {})
+      ...(installDegraded ? { install_degraded: true } : {}),
+      ...(relationExpediteDegraded ? { relation_expedite_degraded: true } : {})
     });
   }
 
@@ -3187,23 +3725,33 @@ export class NetGatewayDO {
     if (verdict === "expired" || verdict === "missing") {
       // Already released (reaped, expired, or never here) — closing is
       // idempotent from the client's view.
+      this.recordSessionCloseReceipt(session, actor);
       return json({ closed: true, already: verdict });
     }
     if (verdict !== "ok") {
       return json({ error: { code: "E_PERM", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 403);
     }
-    const priorValue = cell?.value as { activeScope?: string | null; ephemeralActor?: boolean } | undefined;
+    const priorValue = cell?.value as {
+      activeScope?: string | null;
+      ephemeralActor?: boolean;
+      rosterVisible?: false;
+    } | undefined;
     const prior = priorValue?.activeScope ?? null;
     const opened = await this.sessionOpen({
       session,
       actor,
       ttl_ms: 0, // ignored in closing mode
       catalog_epoch: epoch,
+      ...(priorValue?.rosterVisible === false ? { roster_visible: false } : {}),
       closing: { priorActiveScope: prior, ...(priorValue?.ephemeralActor ? { ephemeralActor: true } : {}) }
     });
     if (opened.reply.status !== "accepted") {
       return json({ error: { code: "E_RETRY", message: "session close did not commit; retry", detail: opened.reply } }, 503);
     }
+    // Record only after authority accepted the close. It is gateway-local
+    // retry evidence, allowing the now-invalid bearer to repeat DELETE if the
+    // edge reply is lost; it is never consulted for ordinary authentication.
+    this.recordSessionCloseReceipt(session, actor);
     return json({
       closed: true,
       ...(opened.install_degraded ? { install_degraded: true } : {}),
@@ -3225,16 +3773,15 @@ export class NetGatewayDO {
       const cell = this.ensureView().get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
       return cell && "value" in cell ? cell.value : undefined;
     };
-    const lineage = (object: string): { parent?: string | null; owner?: string | null } | undefined =>
-      this.ensureView().get(cellKey("object_lineage", object))?.value as { parent?: string | null; owner?: string | null } | undefined;
     // Ownership is serialized into the object_lineage cell (src/net/bridge.ts),
     // not a property_cell — a `property_cell:<obj>:owner` is never emitted, so
     // owner MUST be read from lineage. Reading it via `prop(obj, "owner")` would
     // always resolve nothing and refuse every non-$wiz-owned agent.
-    const ownerOf = (object: string): string | undefined => {
-      const value = lineage(object)?.owner;
-      return typeof value === "string" ? value : undefined;
-    };
+    const lineage = (object: string): { parent?: string | null; owner?: string } | undefined =>
+      this.ensureView().get(cellKey("object_lineage", object))?.value as {
+        parent?: string | null;
+        owner?: string;
+      } | undefined;
     const reachesClass = (object: string, cls: string): boolean => {
       let current: string | null | undefined = object;
       const guard = new Set<string>();
@@ -3264,9 +3811,12 @@ export class NetGatewayDO {
         refuse({ actor: current, account });
       }
       // $agent: recurse up the owner chain (core's rule) — a deactivated
-      // owner disqualifies its agents. $wiz-owned agents authenticate.
+      // owner disqualifies its agents. Ownership is object-lineage metadata,
+      // not a Woo property cell: reading property_cell:<agent>:owner made
+      // every real Net agent fail closed as "owner unresolved".
+      // $wiz-owned agents authenticate.
       if (reachesClass(current, "$agent")) {
-        const owner = ownerOf(current);
+        const owner = lineage(current)?.owner;
         if (owner === "$wiz") return;
         if (typeof owner !== "string" || owner.length === 0) refuse({ actor: current, reason_detail: "agent_owner_unresolved" });
         await this.warmScopes(
@@ -3286,8 +3836,18 @@ export class NetGatewayDO {
     actor: string,
     body: Record<string, unknown>,
     epoch: string,
-    options: { exclusive?: boolean; session?: string; issuedAt?: number; ttlMs?: number } = {}
+    options: {
+      exclusive?: boolean;
+      session?: string;
+      issuedAt?: number;
+      ttlMs?: number;
+      apiKeyId?: string;
+    } = {}
   ): Promise<Response> {
+    const rosterRefusal = this.validateRosterVisibility(body, Boolean(options.apiKeyId));
+    if (rosterRefusal) return rosterRefusal;
+    const requestedRosterVisibility = body.roster_visible;
+    const rosterVisible = requestedRosterVisibility !== false;
     // The mint needs the actor's lineage (cluster-scope derivation) in
     // view; the CO15 `cluster:<actor>` convention names the pull
     // destination without needing lineage first (the planScheduled
@@ -3321,6 +3881,8 @@ export class NetGatewayDO {
       ttl_ms: options.ttlMs ?? clampClientTtl(body.ttl_ms),
       catalog_epoch: epoch,
       active_scope: bornAt,
+      ...(options.apiKeyId ? { apikey_id: options.apiKeyId } : {}),
+      ...(!rosterVisible ? { roster_visible: false } : {}),
       ...(options.issuedAt !== undefined ? { issued_at_ms: options.issuedAt } : {}),
       ...(options.exclusive ? { exclusive: true } : {})
     });
@@ -3358,9 +3920,42 @@ export class NetGatewayDO {
       // present. Exposing the routing fact also keeps canaries from creating
       // artificial same-room transition storms.
       active_scope: bornAt,
+      roster_visible: rosterVisible,
       ...(opened.install_degraded ? { install_degraded: true } : {}),
       ...(opened.relation_expedite_degraded ? { relation_expedite_degraded: true } : {})
     });
+  }
+
+  /** Validate the roster policy before login derivation, guest allocation,
+   * or authority writes. Human door sessions cannot hide themselves; only
+   * an already-authenticated API-key service principal may opt out. */
+  private validateRosterVisibility(body: Record<string, unknown>, allowHidden: boolean): Response | null {
+    const requested = body.roster_visible;
+    if (requested !== undefined && typeof requested !== "boolean") {
+      return json(
+        {
+          error: {
+            code: "E_INVARG",
+            message: "roster_visible must be boolean",
+            detail: { roster_visible: requested }
+          }
+        },
+        400
+      );
+    }
+    if (requested === false && !allowHidden) {
+      return json(
+        {
+          error: {
+            code: "E_PERM",
+            message: "hidden-roster sessions require API-key authentication",
+            detail: { reason: "roster_visibility_requires_apikey" }
+          }
+        },
+        403
+      );
+    }
+    return null;
   }
 
   /** POST /net-api/turn — see the clientApi header. */
@@ -3371,11 +3966,10 @@ export class NetGatewayDO {
     audit?: { credential?: string; trace?: TraceContext }
   ): Promise<Response> {
     // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
-    // gateway refuses session-less turns up front (named). Session
-    // AUTHORIZATION does not depend on the route (sequenced vs direct):
-    // foldSessionEffects records the session read for either, and the
-    // committing scope revalidates it end-to-end. Route is derived from the
-    // planning scope below (cluster -> direct, room -> sequenced).
+    // gateway refuses session-less turns up front (named). Both direct and
+    // sequenced calls carry the session read, so the committing scope still
+    // revalidates it end-to-end. The planning-scope override below forces
+    // direct for a cluster root and keeps the requested route for a room.
     const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
     if (!session) {
       return json(
@@ -3408,6 +4002,15 @@ export class NetGatewayDO {
     if (!target || !verb) {
       return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
     }
+    // The client may request an explicit route; the default is sequenced. The
+    // planning-scope override below tightens this per topology (a cluster root
+    // cannot host an in-world sequencer), while a room preserves the explicit
+    // direct request (metadata-gated by direct_callable further down).
+    const requestedRoute = body.route === undefined ? "sequenced" : body.route;
+    if (requestedRoute !== "direct" && requestedRoute !== "sequenced") {
+      return json({ error: { code: "E_INVARG", message: "turn route must be direct or sequenced" } }, 400);
+    }
+    let route: "direct" | "sequenced" = requestedRoute;
     // Catalog-qualified names are manifest syntax, resolved by the catalog
     // installer before objects reach the runtime. Rejecting one here is also
     // required for key safety: every net cell-key parser treats `:` as a
@@ -3448,33 +4051,37 @@ export class NetGatewayDO {
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
     const planningScope = await this.clientPlanningScope(anchorObject, actor);
-    // One route decision, derived from planningScope and used consistently for
-    // validation, authority prefetch, and the committed call. A private
-    // authority CLUSTER invokes DIRECT: the committing Scope head sequences it,
-    // not an in-world $space replay log (a cluster root is an actor, not a
-    // $space with next_seq/subscribers/presence). A shared ROOM invokes the
-    // in-world sequenced $space:call. This selects the invocation SHAPE only —
-    // world.directCall still enforces direct_callable, so a non-direct-callable
-    // verb in a cluster returns E_DIRECT_DENIED; a cluster is not a substitute
-    // sequencing space. Catalog (or any other classification) is not
-    // client-plannable and is refused, never silently coerced into either route.
-    let route: "direct" | "sequenced";
+    // Planning-scope route override (topology tightens the client's request):
+    // a private authority CLUSTER must invoke DIRECT — the committing Scope head
+    // sequences it, and a cluster root is an actor, not a $space with
+    // next_seq/subscribers/presence, so it cannot host an in-world sequencer. A
+    // shared ROOM keeps the requested route: sequenced by default, but an
+    // explicit direct request is honored (and still metadata-gated by
+    // direct_callable below, and re-enforced by world.directCall). Catalog (or
+    // any other classification) is not client-plannable and is refused, never
+    // silently coerced into either route.
     if (planningScope.startsWith("cluster:")) {
       route = "direct";
-    } else if (planningScope.startsWith("room:")) {
-      route = "sequenced";
-    } else {
+    } else if (!planningScope.startsWith("room:")) {
       return json({ error: { code: "E_INVARG", message: "client turn cannot plan at this scope", detail: { field: "scope", reason: "unplannable_scope", scope: planningScope } } }, 400);
     }
-    // Phase 4: warm the TURN'S TARGET (and its anchor) at the planning
-    // scope. Under targeted cold-open the room's cells no longer arrive
-    // wholesale, and a client-turn target the view never materialized is
-    // exactly the case pull-on-miss cannot route (its owner is not
-    // conventionally derivable from the object id — the Phase-1 smoke
-    // blocker); naming it here pulls its chain from the scope that
-    // anchors it before planning starts.
+    const targetAuthorityScope = this.clientTargetAuthorityScope(target, anchorObject, actor, planningScope);
+    // Phase 4: warm the TURN'S TARGET at its own authority and the anchor
+    // at the planning scope. A room relation may contain a self-hosted
+    // fixture whose cells belong to a cluster scope; treating the room as
+    // the target's authority works only after another request happens to
+    // warm the fixture. The relation's install/fanout-owned member_scope
+    // is the cold routing fact. It grants no permission: normal verb,
+    // presence, read, and committing-scope checks still run below.
+    const targetWarmEntries =
+      targetAuthorityScope === planningScope
+        ? [{ scope: planningScope, objects: [target, anchorObject] }]
+        : [
+            { scope: targetAuthorityScope, objects: [target] },
+            { scope: planningScope, objects: [anchorObject] }
+          ];
     await this.warmScopes(
-      [{ scope: planningScope, objects: [target, anchorObject] }],
+      targetWarmEntries,
       "net_client_pull_miss_failed"
     );
     // `arg_spec.params` is compiler-owned metadata naming the positional
@@ -3494,6 +4101,28 @@ export class NetGatewayDO {
       args
     } as const;
     let page = this.callVerbPage(this.ensureView(), validationCall);
+    // A relation/room closure may have installed only the target's lineage
+    // stub. That is enough to route the object but not enough to authorize a
+    // direct call: missing metadata must still fail closed, while a cold but
+    // valid target gets one bounded owner pull before the decision. Without
+    // this step the first direct call to a previously listed room member is
+    // spuriously E_DIRECT_DENIED forever (warmScopes sees the lineage and
+    // quite correctly avoids re-pulling the whole object).
+    if (route === "direct" && page === null) {
+      try {
+        await this.pullTargeted(targetAuthorityScope, `scope:${targetAuthorityScope}`, [target]);
+        page = this.callVerbPage(this.ensureView(), validationCall);
+      } catch (err) {
+        this.metric({
+          kind: "net_direct_metadata_pull_failed",
+          scope: targetAuthorityScope,
+          target,
+          verb,
+          status: "error",
+          error: String(err)
+        });
+      }
+    }
     // A targeted room backfill can materialize an object's lineage without
     // every definition page. Only suspicious colon-bearing inputs pay for a
     // forced object closure; ordinary turns retain the warm zero-RPC path.
@@ -3502,11 +4131,31 @@ export class NetGatewayDO {
       (Array.isArray(value) ? value : [value]).some((part) => typeof part === "string" && part.includes(":"))
     )) {
       try {
-        await this.pullTargeted(planningScope, `scope:${planningScope}`, [target]);
+        await this.pullTargeted(targetAuthorityScope, `scope:${targetAuthorityScope}`, [target]);
         page = this.callVerbPage(this.ensureView(), validationCall);
       } catch (err) {
-        this.metric({ kind: "net_client_arg_validation_pull_failed", scope: planningScope, status: "error", error: String(err) });
+        this.metric({
+          kind: "net_client_arg_validation_pull_failed",
+          scope: targetAuthorityScope,
+          status: "error",
+          error: String(err)
+        });
       }
+    }
+    // External direct dispatch is metadata-gated at the ingress boundary
+    // (core.md C12.2). Missing metadata fails closed: a sparse gateway must
+    // never turn an unresolved verb into permission to bypass sequencing.
+    if (route === "direct" && page?.direct_callable !== true) {
+      return json(
+        {
+          error: {
+            code: "E_DIRECT_DENIED",
+            message: `verb ${verb} is not externally direct-callable`,
+            detail: { target, verb }
+          }
+        },
+        403
+      );
     }
     const declaredArgs = page?.arg_spec && typeof page.arg_spec === "object" && !Array.isArray(page.arg_spec)
       ? (page.arg_spec as { params?: unknown }).params
@@ -3645,6 +4294,22 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
     }
+    try {
+      const identity = await this.catalogIdentity();
+      const boundActor = await this.authorizedActorForSessionBearer(session, identity.map);
+      if (boundActor !== actor) {
+        throw new ClientAuthError("authenticated actor does not match session", {
+          reason: "actor_mismatch"
+        });
+      }
+    } catch (error) {
+      return json({
+        error: {
+          code: "E_NOSESSION",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }, 401);
+    }
     const rawMetrics = Array.isArray(body.metrics) ? body.metrics : [];
     let accepted = 0;
     let sampled = Math.max(0, rawMetrics.length - MAX_NET_BROWSER_METRICS_BATCH);
@@ -3715,6 +4380,42 @@ export class NetGatewayDO {
     }
   }
 
+  /**
+   * Resolve a cold client target through the bounded structural context the
+   * caller already has. `contents.member_scope` is derived by the authority
+   * classifier when the relation is written, so it is the only exact routing
+   * fact available before the target's lineage is materialized locally.
+   *
+   * This is deliberately not a global lookup and not an authorization rule:
+   * only the active anchor and the actor's inventory are searched, and the
+   * resulting scope merely selects which authority to pull before the normal
+   * planner and permission checks execute.
+   */
+  private clientTargetAuthorityScope(
+    target: string,
+    anchorObject: string,
+    actor: string,
+    planningScope: string
+  ): string {
+    for (const owner of new Set([anchorObject, actor])) {
+      const row = this.relationMembers("contents", owner).find((candidate) => candidate.member === target);
+      if (row?.member_scope) return row.member_scope;
+    }
+    const view = this.ensureView();
+    if (view.has(cellKey("object_lineage", target))) {
+      const classifier = classifierFromLineage(
+        (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+      );
+      try {
+        return classifier.scopeOf(target);
+      } catch {
+        // An incomplete cached lineage chain is not a routing grant. The
+        // planning scope remains the conservative repair-loop fallback.
+      }
+    }
+    return planningScope;
+  }
+
   // ---- /net-api/mcp: the MCP adapter (client-shell phase i) ---------------
   //
   // The agent/plug surface AND the §8 "prove" instrument: the deployed
@@ -3775,20 +4476,27 @@ export class NetGatewayDO {
    * permanent synchronous dependency. Standard clients reconnect after the
    * stream closes, while a not-yet-delivered hint remains pending in the
    * session state and is handed to exactly one later stream. */
-  private clientMcpEvents(request: Request): Response {
+  private async clientMcpEvents(request: Request): Promise<Response> {
     const accept = request.headers.get("accept") ?? "";
     if (!accept.toLowerCase().includes("text/event-stream")) {
       return json({ error: { code: "E_INVARG", message: "MCP GET requires Accept: text/event-stream" } }, 406);
     }
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}` } }, 404);
-    }
-    const actor = (cell?.value as { actor?: unknown }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ error: { code: "E_NOSESSION", message: "session actor is missing" } }, 404);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      const auth = error instanceof ClientAuthError ? error : null;
+      return json(
+        {
+          error: {
+            code: auth?.code ?? "E_NOSESSION",
+            message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+            ...(auth ? { detail: auth.detail } : {})
+          }
+        },
+        auth?.code === "E_NOSESSION" ? 404 : (auth?.status ?? 404)
+      );
     }
     this.enforceClientRate(actor, "/net-api/mcp");
     const state = this.mcpSessionState(session, actor, true);
@@ -3876,10 +4584,15 @@ export class NetGatewayDO {
     // (the only client credential the net surface has).
     const synthetic = new Headers({ "x-woo-api-key": token });
     const credential = parseClientCredential(synthetic, null);
+    if (credential.kind !== "apikey") {
+      throw new ClientAuthError("MCP initialize requires an apikey", {
+        reason: "unsupported_token_class"
+      });
+    }
     const identity = await this.catalogIdentity();
-    const { actor } = verifyApiKeyCredential(identity.map, credential);
+    const { actor } = await this.verifyClientApiKey(identity.map, credential);
     this.enforceClientRate(actor, "/net-api/session"); // the mint bucket (H4 amplifier rule)
-    const opened = await this.clientSession(actor, {}, identity.epoch);
+    const opened = await this.clientSession(actor, {}, identity.epoch, { apiKeyId: credential.id });
     const body = (await opened.json()) as { session?: string };
     if (!opened.ok || typeof body.session !== "string") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
@@ -3901,6 +4614,20 @@ export class NetGatewayDO {
     );
   }
 
+  /** MCP carries the Net session id after initialize and deliberately does
+   * not replay the long-lived API-key secret. Reuse session-bearer validation
+   * and fetch the legacy registry only for an aged, non-self-routing key. */
+  private async mcpSessionActor(session: string): Promise<string> {
+    const value = this.ensureView().get(sessionCellKey(session))?.value as {
+      apikeyId?: unknown;
+    } | undefined;
+    const id = typeof value?.apikeyId === "string" ? value.apikeyId : null;
+    const legacyMap = id && !parseRoutedApiKeyId(id)
+      ? (await this.catalogIdentity()).map
+      : undefined;
+    return await this.authorizedActorForSessionBearer(session, legacyMap);
+  }
+
   /** AU2: adopt the MCP request's traceparent for a tool-invoked turn. */
   private mcpTraceOf(request: Request): TraceContext {
     return adoptOrMintTraceContext(
@@ -3912,14 +4639,20 @@ export class NetGatewayDO {
 
   private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
-    }
-    const actor = (cell?.value as { actor?: unknown }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      const auth = error instanceof ClientAuthError ? error : null;
+      return json({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32000,
+          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
+        }
+      }, 200);
     }
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
@@ -3945,6 +4678,7 @@ export class NetGatewayDO {
         const includeSchema = args.include_schema === true;
         return this.mcpResult(id, {
           scope: page.scope,
+          active_scope: page.activeScope,
           object: page.object,
           query: page.query,
           limit: page.limit,
@@ -3969,10 +4703,30 @@ export class NetGatewayDO {
         candidate.object === object && (candidate.verb === verb || candidate.aliases.includes(verb))
       );
       if (!tool) return this.mcpToolError(id, { code: "E_PERM", message: `tool is not available in this session context: ${object}:${verb}` });
-      return this.mcpInvokeTurn(id, actor, session, tool.object, tool.verb, Array.isArray(args.args) ? args.args : [], this.mcpTraceOf(request));
+      return this.mcpInvokeTurn(
+        id,
+        actor,
+        session,
+        tool.object,
+        tool.verb,
+        Array.isArray(args.args) ? args.args : [],
+        tool.route,
+        this.mcpTraceOf(request)
+      );
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
-    if (dynamic) return this.mcpInvokeTurn(id, actor, session, dynamic.object, dynamic.verb, mcpNamedArgs(dynamic, args), this.mcpTraceOf(request));
+    if (dynamic) {
+      return this.mcpInvokeTurn(
+        id,
+        actor,
+        session,
+        dynamic.object,
+        dynamic.verb,
+        mcpNamedArgs(dynamic, args),
+        dynamic.route,
+        this.mcpTraceOf(request)
+      );
+    }
     return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
   }
 
@@ -3981,14 +4735,20 @@ export class NetGatewayDO {
    * invocation cannot disagree about reachability. */
   private async mcpToolsList(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
-    }
-    const actor = (cell?.value as { actor?: string }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      const auth = error instanceof ClientAuthError ? error : null;
+      return json({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32000,
+          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
+          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
+        }
+      }, 200);
     }
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
@@ -4017,6 +4777,7 @@ export class NetGatewayDO {
     object: string,
     verb: string,
     args: unknown[],
+    route: "direct" | "sequenced",
     trace?: TraceContext
   ): Promise<Response> {
     try {
@@ -4033,7 +4794,7 @@ export class NetGatewayDO {
       }
       const turnResponse = await this.clientTurn(
         actor,
-        { target: object, verb, args, session, idempotency_key: turnId },
+        { target: object, verb, args, route, session, idempotency_key: turnId },
         identity.epoch,
         // AU2 MCP carrier (threaded from mcpToolsCall, which holds the
         // request): an MCP agent framework that emits traceparent joins
@@ -4112,16 +4873,18 @@ export class NetGatewayDO {
     });
   }
 
-  /** Fanout-side feed (called from pushObservations, AFTER the same
-   * server-side submitter echo dedupe the sockets get). Bounded buffer: overflow
-   * drops oldest — at-most-once live delivery, the socket rule. */
-  private mcpEnqueue(session: string, observations: unknown[]): void {
+  /** Fanout-side feed (called after the same server-side submitter echo
+   * dedupe the sockets get). Returns whether an MCP carrier accepted the
+   * observations so no-socket telemetry does not mislabel MCP-only delivery.
+   * Bounded buffer: overflow drops oldest — at-most-once live delivery. */
+  private mcpEnqueue(session: string, observations: unknown[]): boolean {
     const queue = this.mcpQueues.get(session);
-    if (!queue || observations.length === 0) return;
+    if (!queue || observations.length === 0) return false;
     queue.buffer.push(...observations);
     if (queue.buffer.length > MCP_QUEUE_CAP) queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
     const waiters = queue.waiters.splice(0, queue.waiters.length);
     for (const wake of waiters) wake();
+    return true;
   }
 
   /** Lazily reconstruct live MCP transport state after a DO eviction. A
@@ -4284,6 +5047,7 @@ export class NetGatewayDO {
    * scope vocabulary changes presentation only; it never grants reachability. */
   private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
     const scope = mcpToolScope(args.scope);
+    const activeScope = this.mcpActiveScope(actor, session);
     const object = typeof args.object === "string" && args.object ? args.object : null;
     const query = typeof args.query === "string" && args.query.trim() ? args.query.trim() : null;
     const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
@@ -4295,11 +5059,10 @@ export class NetGatewayDO {
     if (scope === "here") {
       selected = new Set();
       commandObjects = new Set();
-      const active = this.mcpActiveScope(actor, session);
-      if (active) {
-        selected.add(active);
-        commandObjects.add(active);
-        for (const id of this.mcpContentsContext(active, actor)) {
+      if (activeScope) {
+        selected.add(activeScope);
+        commandObjects.add(activeScope);
+        for (const id of this.mcpContentsContext(activeScope, actor)) {
           selected.add(id);
           commandObjects.add(id);
         }
@@ -4311,8 +5074,7 @@ export class NetGatewayDO {
     } else if (scope === "space") {
       selected = new Set();
       commandObjects = new Set();
-      const active = this.mcpActiveScope(actor, session);
-      const target = object ?? active;
+      const target = object ?? activeScope;
       if (target && context.has(target)) {
         selected.add(target);
         commandObjects.add(target);
@@ -4335,6 +5097,7 @@ export class NetGatewayDO {
     const next = cursor + tools.length;
     return {
       scope,
+      activeScope,
       object,
       query,
       limit,
@@ -4549,6 +5312,11 @@ export class NetGatewayDO {
           if (page.kind !== "bytecode") continue;
           const argSpec = mcpRecord(page.arg_spec);
           const command = mcpRecord(argSpec.command);
+          // The catalog's command contract is the one routing declaration
+          // shared by shell and MCP clients. Absence stays fail-safe:
+          // mutation tools commonly omit command metadata and must continue
+          // through the sequencer.
+          const route = command.persistence === "live" ? "direct" : "sequenced";
           const commandShaped = Object.keys(command).length > 0;
           const exposed = page.tool_exposed === true || (allowCommandShaped && commandShaped);
           if (!exposed) continue;
@@ -4563,6 +5331,7 @@ export class NetGatewayDO {
           out.push({
             object,
             verb,
+            route,
             aliases,
             description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`,
             inputSchema: input.schema,
@@ -4660,6 +5429,22 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
     }
+    try {
+      const identity = await this.catalogIdentity();
+      const boundActor = await this.authorizedActorForSessionBearer(session, identity.map);
+      if (boundActor !== actor) {
+        throw new ClientAuthError("ticket actor does not match session", {
+          reason: "actor_mismatch"
+        });
+      }
+    } catch (error) {
+      return json({
+        error: {
+          code: "E_NOSESSION",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }, 401);
+    }
     const pair = new PairCtor();
     const server = pair[1] as WebSocket & { serializeAttachment?(value: unknown): void };
     // The attachment survives hibernation; webSocketMessage reads it back
@@ -4739,15 +5524,26 @@ export class NetGatewayDO {
         // session is ALWAYS the socket's own (attachment), so one
         // authenticated socket cannot submit on another session.
         const identity = await this.catalogIdentity();
+        const boundActor = await this.authorizedActorForSessionBearer(att.session, identity.map);
+        if (boundActor !== att.actor) {
+          throw new ClientAuthError("socket actor does not match session", {
+            reason: "actor_mismatch"
+          });
+        }
         const response = await this.clientTurn(att.actor, { ...frame, session: att.session }, identity.epoch);
         const payload = (await response.json()) as Record<string, unknown>;
         send({ type: "turn_result", ...(id !== undefined ? { id } : {}), status: response.status, ...payload });
       } catch (err) {
+        const auth = err instanceof ClientAuthError ? err : null;
         send({
           type: "turn_result",
           ...(id !== undefined ? { id } : {}),
-          status: 500,
-          error: { code: isNetError(err) ? err.code : "E_INTERNAL", message: String(err) }
+          status: auth?.status ?? 500,
+          error: {
+            code: auth?.code ?? (isNetError(err) ? err.code : "E_INTERNAL"),
+            message: auth?.message ?? String(err),
+            ...(auth ? { detail: auth.detail } : {})
+          }
         });
       }
       return;
@@ -4803,25 +5599,75 @@ export class NetGatewayDO {
    *   Phase 4.
    */
   private pushObservations(body: FanoutBody): void {
+    this.pushScopedObservations(body, false);
+  }
+
+  /** Direct observations have no authority sequence and never touch the
+   * gateway cache/high-water. They share only the local presence lookup and
+   * socket/MCP carriers with committed fanout. */
+  private pushLiveObservations(body: LiveFanoutBody): void {
+    this.pushScopedObservations(body, true);
+  }
+
+  private pushScopedObservations(body: FanoutBody | LiveFanoutBody, live: boolean): void {
     // No WS surface (structural fakes / MCP-only runtimes) still feeds
     // the MCP wait queues — delivery has two carriers, one audience.
     const getSockets = this.state.getWebSockets?.bind(this.state);
     if (!Array.isArray(body.observations) || body.observations.length === 0) return;
-    // Phase 2: filter by the materialized owner_scope (indexed) so the scan
-    // is O(occupants of body.scope), NOT O(all mirrored sessions). The
-    // owner→scope classification happened once at write time (ownerScopeFor).
-    // NC8a: member + body in ONE query — the previous per-member body
-    // re-read was an N+1 that scaled fanout SQL with audience size.
-    const rows = sqlRows<{ member: string; body: string | null }>(
-      this.state.storage.sql.exec(
-        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ?",
-        SESSION_PRESENCE_RELATION,
-        body.scope
-      )
-    );
-    // Load-gate evidence (CO10): rows scanned must track occupants, flat as
-    // total off-scope sessions grow.
-    this.metric({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length });
+    const liveBody = live ? body as LiveFanoutBody : null;
+    // A relation mirror describes who is present, not who has a carrier on
+    // THIS gateway. HTTP-only sessions receive their own observations on the
+    // turn reply and cannot consume peer fanout. Snapshot hibernating sockets
+    // once and skip the scope-indexed audience scan entirely when neither
+    // transport exists; a 512-member room with zero sockets must remain O(1)
+    // per inbound fanout on each gateway shard.
+    const sockets = getSockets ? getSockets() : [];
+    if (sockets.length === 0 && this.mcpQueues.size === 0) {
+      this.metric({
+        kind: "net_push_no_carriers",
+        scope: body.scope,
+        route: live ? "live" : "committed",
+        observations: body.observations.length
+      });
+      return;
+    }
+    const attachments = sockets
+      .map((socket) => ({ socket, attachment: this.socketAttachment(socket) }))
+      .filter((entry): entry is { socket: WebSocket; attachment: GatewaySocketAttachment } => entry.attachment !== null);
+    const socketsBySession = new Map<string, WebSocket[]>();
+    for (const { socket, attachment } of attachments) {
+      const tagged = socketsBySession.get(attachment.session) ?? [];
+      tagged.push(socket);
+      socketsBySession.set(attachment.session, tagged);
+    }
+    // Phase 2: intersect the scope-indexed mirror with THIS shard's bounded
+    // carrier sessions. Presence is global authority state; peer observation
+    // delivery is local transport state. Scanning every room occupant because
+    // one local socket exists recreates O(V*N) fanout across gateway shards.
+    // Chunk the IN set below SQLite's conservative bind ceiling; the composite
+    // (relation, owner_scope, member) index makes cost O(local carriers).
+    const carrierSessions = [...new Set([...socketsBySession.keys(), ...this.mcpQueues.keys()])].sort();
+    const rows: Array<{ member: string; body: string | null }> = [];
+    for (let offset = 0; offset < carrierSessions.length; offset += GATEWAY_CARRIER_QUERY_CHUNK) {
+      const chunk = carrierSessions.slice(offset, offset + GATEWAY_CARRIER_QUERY_CHUNK);
+      const placeholders = chunk.map(() => "?").join(",");
+      rows.push(...sqlRows<{ member: string; body: string | null }>(
+        this.state.storage.sql.exec(
+          `SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ? AND member IN (${placeholders})`,
+          SESSION_PRESENCE_RELATION,
+          body.scope,
+          ...chunk
+        )
+      ));
+    }
+    // Load-gate evidence (CO10): rows scanned track local in-scope carriers,
+    // flat as either room population or off-scope sessions grow.
+    this.metric({
+      kind: "net_presence_scan",
+      scope: body.scope,
+      presence_scan_rows: rows.length,
+      carrier_sessions: carrierSessions.length
+    });
     if (rows.length === 0) return;
     // Session -> actor for the directed-observation filter below: the
     // presence row body carries the session's actor (CO13 applier).
@@ -4830,10 +5676,17 @@ export class NetGatewayDO {
       const parsed = row.body ? (JSON.parse(row.body) as { actor?: string }) : null;
       actorOf.set(row.member, typeof parsed?.actor === "string" ? parsed.actor : null);
     }
+    // Compile compact negative audiences once per fanout. Applying an array
+    // scan for every (carrier session × observation) would turn a catalog's
+    // exclusion list into an avoidable O(N*E) delivery cost.
+    const presenceExclusions = (liveBody?.observationAudienceExclusions ?? []).map(
+      (items) => new Set(Array.isArray(items) ? items.filter((item): item is string => typeof item === "string") : [])
+    );
     // NC8a fanout-cost evidence: audience size and frames actually sent —
     // the "fanout cost as audience grows" dashboard series.
     let deliveredMembers = 0;
     let framesSent = 0;
+    let mcpSessions = 0;
     for (const row of rows) {
       if (
         body.submitter_turn_id !== undefined
@@ -4847,30 +5700,56 @@ export class NetGatewayDO {
         body.echo_id !== undefined
         && this.mcpQueues.get(row.member)?.ownEchoIds.has(body.echo_id)
       ) continue;
-      // v2 audience parity (client-shell phase i): a `to:`-directed
-      // observation (looked/who — private views) reaches ONLY the session
-      // whose actor it names; everything else is the room broadcast. The
-      // engine's full audience model stays server-side — this filter only
-      // honors the explicit direction the observation itself carries.
       const actor = actorOf.get(row.member) ?? null;
-      const visible = (body.observations as Array<Record<string, unknown>>).filter(
-        (obs) => typeof obs?.to !== "string" || obs.to === actor
-      );
+      const visible = (body.observations as Array<Record<string, unknown>>).filter((obs, index) => {
+        if (live) {
+          const mode = liveBody?.observationAudienceModes?.[index];
+          if (mode === "presence") {
+            // The indexed query already selected sessions present in this
+            // scope. Re-resolve the audience on every shard: the planning
+            // gateway's enumerated room snapshot is not globally complete.
+            if (actor !== null && presenceExclusions[index]?.has(actor)) return false;
+            return !(
+              (obs.type === "entered" || obs.type === "left" || obs.type === "taken" || obs.type === "dropped")
+              && typeof obs.actor === "string"
+              && obs.actor === actor
+            );
+          }
+          // Explicit recipients retain both forms. A session match is most
+          // precise; actor fallback is safe because rows are already limited
+          // to this scope, so another tab for that actor elsewhere is absent.
+          const sessionAudience = liveBody?.observationSessionAudiences?.[index] ?? liveBody?.audienceSessions;
+          const actorAudience = liveBody?.observationAudiences?.[index] ?? liveBody?.audienceActors;
+          if (mode === "explicit") {
+            if (Array.isArray(sessionAudience) && sessionAudience.includes(row.member)) return true;
+            if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
+            return Array.isArray(sessionAudience) ? false : typeof obs?.to !== "string" || obs.to === actor;
+          }
+          // Compatibility for older live carriers that predate the mode
+          // vector: preserve their session-first filtering contract.
+          if (Array.isArray(sessionAudience)) return sessionAudience.includes(row.member);
+          if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
+        }
+        // Rolling/committed fallback for older carriers: looked/who-style
+        // `to` observations stay private; ordinary observations broadcast to
+        // every session present in this scope.
+        return typeof obs?.to !== "string" || obs.to === actor;
+      });
       if (visible.length === 0) continue;
       deliveredMembers += 1;
       // MCP wait queues ride the SAME audience + submitter dedupe as the
       // sockets (client-shell phase i).
-      this.mcpEnqueue(row.member, visible);
+      if (this.mcpEnqueue(row.member, visible)) mcpSessions += 1;
       const frame = JSON.stringify({
-        type: "observations",
+        type: live ? "live_observations" : "observations",
         scope: body.scope,
-        seq: body.seq,
+        ...(!live && "seq" in body ? { seq: body.seq } : {}),
         // SECURITY: never expose submitter_turn_id here. It is the scope's
         // idempotent-reply replay credential. echo_id is a one-way digest.
         ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
         observations: visible
       });
-      for (const ws of getSockets ? getSockets(row.member) : []) {
+      for (const ws of socketsBySession.get(row.member) ?? []) {
         try {
           ws.send(frame);
           framesSent += 1;
@@ -4882,12 +5761,43 @@ export class NetGatewayDO {
     this.metric({
       kind: "net_push",
       scope: body.scope,
-      seq: body.seq,
+      ...(!live && "seq" in body ? { seq: body.seq } : {}),
+      route: live ? "live" : "committed",
       audience: rows.length,
       delivered_members: deliveredMembers,
       frames: framesSent,
+      mcp_sessions: mcpSessions,
       observations: body.observations.length
     });
+    if (getSockets && deliveredMembers > 0 && framesSent === 0 && mcpSessions === 0) {
+      // An audience with no live carrier is the actionable failure shape,
+      // but scanning the whole shard registry on every healthy push would
+      // violate the occupant-bounded hot path. Pay this diagnostic only on
+      // the anomaly and report counts, never bearer session ids.
+      const attachedSessions = new Set(attachments.map(({ attachment }) => attachment.session));
+      const liveSessionAudience = new Set([
+        ...(liveBody?.audienceSessions ?? []),
+        ...(liveBody?.observationSessionAudiences ?? []).flat()
+      ]);
+      const liveActorAudience = new Set([
+        ...(liveBody?.audienceActors ?? []),
+        ...(liveBody?.observationAudiences ?? []).flat()
+      ]);
+      this.metric({
+        kind: "net_push_socket_miss",
+        scope: body.scope,
+        route: live ? "live" : "committed",
+        presence_rows: rows.length,
+        delivered_members: deliveredMembers,
+        sockets: sockets.length,
+        attached_sessions: attachedSessions.size,
+        presence_socket_matches: rows.filter((row) => attachedSessions.has(row.member)).length,
+        live_session_audience: liveSessionAudience.size,
+        live_actor_audience: liveActorAudience.size,
+        attached_session_audience_matches: attachments.filter(({ attachment }) => liveSessionAudience.has(attachment.session)).length,
+        attached_actor_audience_matches: attachments.filter(({ attachment }) => liveActorAudience.has(attachment.actor)).length
+      });
+    }
   }
 
   /**
@@ -4928,11 +5838,10 @@ export class NetGatewayDO {
    * before registration.
    */
   private async selfSubscribe(scope: string): Promise<void> {
-    const shard = this.shardName();
     // Explicit override wins for fake harnesses and legacy one-shard
     // deployments whose DurableObjectId test label is not its route name.
     // Multi-shard deployments omit it and use the actual idFromName name.
-    const self = this.env.NET_GATEWAY_SELF ?? (shard ? `gateway:${shard}` : undefined);
+    const self = this.selfDestination();
     if (!self || this.selfSubscribed.has(scope)) return;
     this.selfSubscribed.add(scope);
     try {
@@ -5043,7 +5952,58 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       throw new ClientAuthError(`session ${verdict}`, { session_verdict: verdict, reason: "session_bearer_rejected" });
     }
-    return (cell?.value as { actor?: string }).actor as string;
+    return (cell?.value as { actor: string }).actor;
+  }
+
+  /** Keep the base session lookup synchronous: it is also the structural
+   * session primitive used by rehydration tests and callers that do not need
+   * network I/O. Transport authentication adds the key-revocation fence in
+   * this explicit asynchronous layer. */
+  private async authorizedActorForSessionBearer(session: string, legacyMap?: unknown): Promise<string> {
+    const actor = this.actorForSessionBearer(session);
+    const value = this.ensureView().get(sessionCellKey(session))?.value as { apikeyId?: unknown } | undefined;
+    if (typeof value?.apikeyId === "string" && value.apikeyId) {
+      await this.assertSessionApiKeyActive(value.apikeyId, actor, legacyMap);
+    }
+    return actor;
+  }
+
+  /** A session minted from a long-lived key remains subordinate to that key.
+   * Bearer-only transports retain only the public key id, so re-check the
+   * exact current verifier record (or the carried legacy map) without ever
+   * persisting or replaying the secret. */
+  private async assertSessionApiKeyActive(id: string, actor: string, legacyMap?: unknown): Promise<void> {
+    const routed = parseRoutedApiKeyId(id);
+    let record: unknown;
+    if (routed) {
+      const scope = routedApiKeyScope(id);
+      if (!scope || routed.actor !== actor) {
+        throw new ClientAuthError("session source apikey is invalid", {
+          reason: "session_apikey_mismatch"
+        });
+      }
+      record = (await this.routedApiKeyAuthorityRecord(scope, actor, id)).record;
+    } else {
+      const map = legacyMap && typeof legacyMap === "object" && !Array.isArray(legacyMap)
+        ? legacyMap as Record<string, unknown>
+        : {};
+      record = map[id];
+    }
+    const entry =
+      record && typeof record === "object" && !Array.isArray(record)
+        ? record as Record<string, unknown>
+        : null;
+    if (
+      !entry ||
+      entry.actor !== actor ||
+      typeof entry.hash !== "string" ||
+      typeof entry.salt !== "string" ||
+      entry.revoked_at != null
+    ) {
+      throw new ClientAuthError("session source apikey not found or revoked", {
+        reason: "session_apikey_revoked"
+      });
+    }
   }
 
   private callerPresenceScopes(session: string, caller: string): Set<string> {
@@ -5189,6 +6149,32 @@ export class NetGatewayDO {
       ...(row.member_scope !== null ? { member_scope: row.member_scope } : {}),
       ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
     }));
+  }
+
+  /**
+   * Read one exact mirrored relation row. Hot authorization paths must use
+   * this indexed `(relation, owner, member)` lookup instead of enumerating a
+   * room's whole relation family: room occupancy is unbounded in Big World.
+   */
+  private relationMember(
+    relation: string,
+    owner: string,
+    member: string
+  ): { member: string; member_scope?: string; body?: unknown } | undefined {
+    const row = sqlRows<{ member: string; member_scope: string | null; body: string | null }>(
+      this.state.storage.sql.exec(
+        "SELECT member, member_scope, body FROM net_gateway_relation WHERE relation = ? AND owner = ? AND member = ? LIMIT 1",
+        relation,
+        owner,
+        member
+      )
+    )[0];
+    if (!row) return undefined;
+    return {
+      member: row.member,
+      ...(row.member_scope !== null ? { member_scope: row.member_scope } : {}),
+      ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+    };
   }
 
   /**
@@ -5536,6 +6522,47 @@ export class NetGatewayDO {
     };
   }
 
+  /** Fetch ONE committed replay page from the space's owning authority
+   * (sequenced-log.md SL4) — the log analogue of `fetchOrderedChildren`.
+   * The SEMANTIC space id routes through the classifier to the authority
+   * ADDRESS (`scopeOf(space)`); the page's entries keep their semantic
+   * identity so the planning-world `replay` read is lane-identical. The
+   * authority `version` (page content address) is what the plan attests;
+   * a committed append inside the window then rejects the submit stale. */
+  private async fetchReplayPage(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    structure: TurnStructure,
+    query: ReplayPageQuery
+  ): Promise<ReplayPageProjection> {
+    const scope = classifier.scopeOf(query.space);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/replay-page",
+      { space: query.space, from: query.from, limit: query.limit }
+    ), { phase: "replay_page" }) as { scope?: unknown; head?: unknown; space?: unknown; from?: unknown; limit?: unknown; entries?: unknown; version?: unknown };
+    // Full reply validation (Adv-a): a wrong-scope echo, a mutated query
+    // echo, or a versionless reply is a FAILED fetch (retried on the
+    // bounded attempt loop) — never a page the plan attests. Entry count
+    // must respect the requested window, or the attested version would
+    // describe a different query than the one the commit re-derives.
+    if (response.scope !== scope || !validScopeHead(response.head)
+      || response.space !== query.space || response.from !== query.from || response.limit !== query.limit
+      || !validReplayLogPage(response.entries, query)
+      || typeof response.version !== "string" || response.version.length === 0) {
+      throw new Error(`replay-page authority returned a malformed page for ${query.space}@${query.from}+${query.limit} at ${scope}`);
+    }
+    const authorityEntries = response.entries;
+    if (replayPageVersion(authorityEntries) !== response.version) {
+      throw new Error(`replay-page authority returned a content/version mismatch for ${query.space}@${query.from}+${query.limit} at ${scope}`);
+    }
+    // Strip the redundant per-entry space key for the planning shape; the
+    // attested `version` stays the authority's (computed over its own
+    // stored rows), which is also what it re-derives at submit.
+    const entries = authorityEntries.map(({ space: _space, ...entry }) => entry);
+    return { space: query.space, from: query.from, limit: query.limit, scope, entries, version: response.version, authority_head: response.head };
+  }
+
   /** Seed the call target's ordering into the per-turn projection map, once,
    * if the dispatched verb declares `reads_ordered_children`. This is the
    * bounded warm-path optimization: the common case (a verb whose parent IS
@@ -5874,6 +6901,41 @@ export class NetGatewayDO {
     }
   }
 
+  /** Actor bound to a successfully closed session, if its bounded retry
+   * receipt remains resident on this session-routed gateway. */
+  private closedSessionActor(session: string): string | null {
+    const rows = sqlRows<{ actor: string }>(
+      this.state.storage.sql.exec(
+        "SELECT actor FROM net_gateway_session_close_receipt WHERE session = ?",
+        session
+      )
+    );
+    return rows[0]?.actor ?? null;
+  }
+
+  /** Preserve semantic idempotency across the self-invalidating close edge.
+   *
+   * The session authority remains the only writer of session state. This row
+   * merely remembers an accepted outcome on the deterministic gateway route,
+   * just like a reply cache. Once pruned, an ancient replay returns the normal
+   * missing-bearer refusal; no authority fact is reconstructed from it. */
+  private recordSessionCloseReceipt(session: string, actor: string): void {
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_session_close_receipt (session, actor) VALUES (?, ?) ON CONFLICT(session) DO UPDATE SET actor = excluded.actor",
+      session,
+      actor
+    );
+    const count = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_session_close_receipt")
+    )[0];
+    if (count && Number(count.n) > GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_session_close_receipt WHERE rowid NOT IN (SELECT rowid FROM net_gateway_session_close_receipt ORDER BY rowid DESC LIMIT ?)",
+        GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT
+      );
+    }
+  }
+
   /**
    * Catalog ownership is broader than catalog-code immutability: it also
    * contains compatibility identities and any still-anchorless object. Cache
@@ -6005,8 +7067,27 @@ export class NetGatewayDO {
       if (key === null) continue; // contents reads are projection reads (CA4)
       // CO14: session cells classify by the calling actor (sessions.ts
       // classification rule — session ids carry no lineage; their
-      // authority is the actor's cluster). The folded session read of a
-      // room-committed turn attests at the cluster like any rider read.
+      // authority is the actor's cluster). A committing room may instead
+      // prove the read from its owner-sequenced session_presence checkpoint.
+      // Skip the live cluster attestation only when this gateway already
+      // mirrors that exact checkpoint value; the room revalidates its current
+      // row, so a stale/missing mirror can never authorize a turn.
+      if (read.cell.kind === "session") {
+        const value = read.value as { actor?: unknown; activeScope?: unknown } | undefined;
+        const activeScope = typeof value?.activeScope === "string" ? value.activeScope : null;
+        const projected = activeScope === null
+          ? undefined
+          : this.relationMember(SESSION_PRESENCE_RELATION, activeScope, read.cell.object);
+        const projectedValue = (projected?.body as { session?: unknown } | undefined)?.session;
+        if (
+          activeScope !== null
+          && targetScope === `room:${activeScope}`
+          && projectedValue !== undefined
+          && cellVersion(projectedValue) === String(read.version)
+        ) {
+          continue;
+        }
+      }
       const owner =
         read.cell.kind === "session"
           ? classifier.scopeOf(planned.transcript.call.actor)
@@ -6029,6 +7110,18 @@ export class NetGatewayDO {
       orderingsByOwner.set(read.scope, orderings);
       if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
     }
+    // Foreign REPLAY-PAGE reads owner-attest the same way (SL4): the
+    // /net/attest reply reports the owner's CURRENT page version per exact
+    // query, so a committed append inside the window between plan and
+    // attest makes the committing scope reject the stale read.
+    const replaysByOwner = new Map<string, Map<string, ReplayPageQuery>>();
+    for (const read of planned.transcript.replayReads ?? []) {
+      if (read.scope === targetScope) continue; // validated locally
+      const replays = replaysByOwner.get(read.scope) ?? new Map<string, ReplayPageQuery>();
+      replays.set(replayPageQueryKey(read), { space: read.space, from: read.from, limit: read.limit });
+      replaysByOwner.set(read.scope, replays);
+      if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
+    }
     if (byOwner.size === 0) return undefined;
     // NC8b: independent mutable owners attest in parallel. Immutable catalog
     // definitions add no RPC; their active-epoch certificate is folded below.
@@ -6046,16 +7139,21 @@ export class NetGatewayDO {
     const owners = [...byOwner.entries()];
     const attest = async (owner: string, keys: Set<string>) => {
       const orderingParents = orderingsByOwner.get(owner);
+      const replayQueries = replaysByOwner.get(owner);
       const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", {
         keys: [...keys].sort(),
         ...(orderingParents && orderingParents.size > 0
           ? { ordering_parents: [...orderingParents.values()].sort((a, b) => orderedProjectionKey(a.container, a.parent).localeCompare(orderedProjectionKey(b.container, b.parent))) }
+          : {}),
+        ...(replayQueries && replayQueries.size > 0
+          ? { replay_pages: [...replayQueries.values()].sort((a, b) => replayPageQueryKey(a).localeCompare(replayPageQueryKey(b))) }
           : {})
       }) as {
         catalog_epoch?: string;
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
         orderings?: Array<{ container: string; parent: string | null; version: string }>;
+        replays?: Array<{ space: string; from: number; limit: number; version: string }>;
       };
       // Catalog compatibility cells are deliberately not cached, but their
       // authority must still agree with the turn epoch before its versions
@@ -6093,6 +7191,21 @@ export class NetGatewayDO {
           }
         }
       }
+      if (replayQueries && replayQueries.size > 0) {
+        const attestedPages = new Map<string, string>();
+        for (const page of reply.replays ?? []) {
+          if (!validReplayPageQuery(page)
+            || typeof page.version !== "string" || page.version.length === 0) {
+            throw new Error(`attestation from ${owner} returned a malformed replay-page version`);
+          }
+          attestedPages.set(replayPageQueryKey(page), page.version);
+        }
+        for (const query of replayQueries.values()) {
+          if (!attestedPages.has(replayPageQueryKey(query))) {
+            throw new Error(`attestation from ${owner} omitted replay page ${query.space}@${query.from}+${query.limit}`);
+          }
+        }
+      }
       return reply;
     };
     const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
@@ -6101,18 +7214,21 @@ export class NetGatewayDO {
       : await Promise.all(actions.map((action) => action()));
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
-      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }> };
+      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }>; replays?: Array<{ space: string; from: number; limit: number; version: string }> };
       attestations[owner] = {
         owner_head: reply.owner_head,
         cells: reply.cells,
-        ...(reply.orderings && reply.orderings.length > 0 ? { orderings: reply.orderings } : {})
+        ...(reply.orderings && reply.orderings.length > 0 ? { orderings: reply.orderings } : {}),
+        ...(reply.replays && reply.replays.length > 0 ? { replays: reply.replays } : {})
       };
     });
     if (immutableCatalogKeys.size > 0) {
       const certified = this.epochCatalogAttestation(request, view, immutableCatalogKeys);
       const live = attestations[CATALOG_SCOPE];
       attestations[CATALOG_SCOPE] = live
-        ? { owner_head: live.owner_head, cells: [...live.cells, ...certified.cells] }
+        // Merge certified definition cells INTO the live attestation —
+        // preserving any ordering/replay attestations it carries.
+        ? { ...live, cells: [...live.cells, ...certified.cells] }
         : certified;
     }
     return attestations;
@@ -6219,8 +7335,7 @@ export class NetGatewayDO {
 
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
-   * of the transcript hash. Catalog-scope lineage keys ride as the
-   * receiver-known set (CO15: class chains never reship). */
+   * of the transcript hash. */
   private async planOnce(
     request: TurnRequest,
     view: CellStore,
@@ -6229,7 +7344,9 @@ export class NetGatewayDO {
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
     planningOrderedChildren?: readonly PlanningOrderedChildrenProjection[],
-    planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[]
+    planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[],
+    planningReplayPages?: readonly PlanningReplayPageProjection[],
+    compactOwnedReads = false
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -6244,12 +7361,6 @@ export class NetGatewayDO {
       // Repaired objects ride into the seed slice so a re-plan keeps the
       // cells a prior round pulled (see PlanTurnInput.seedObjects).
       ...(seedObjects && seedObjects.size > 0 ? { seedObjects } : {}),
-      // The callback form runs over the settled plan SLICE, not the whole
-      // view — with slicePlanning below this keeps the entire warm turn
-      // (snapshot clone, scratch, closure, catalog classification) at
-      // O(read-set); load:net-dev asserts both plan_cells and
-      // snapshot_cells stay flat as the view grows (blocker #1).
-      receiverKnown: (planStore) => this.catalogKnownKeys(planStore, classifier),
       // Phase 1: the gateway turn path plans against the read-set SLICE
       // (built from the actor/session/target closure via the view's
       // object/session indexes, slice-cloned per attempt, grown on a
@@ -6259,6 +7370,8 @@ export class NetGatewayDO {
       ...(planningRoomRoster ? { planningRoomRoster } : {}),
       ...(planningOrderedChildren && planningOrderedChildren.length > 0 ? { planningOrderedChildren } : {}),
       ...(planningOrderedNeighbors && planningOrderedNeighbors.length > 0 ? { planningOrderedNeighbors } : {}),
+      ...(planningReplayPages && planningReplayPages.length > 0 ? { planningReplayPages } : {}),
+      ...(compactOwnedReads ? { compactOwnedReads: { scope: request.planningScope } } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's
@@ -6274,8 +7387,60 @@ export class NetGatewayDO {
   /** The scope's /head reply, epoch included (Phase 5: the epoch was
    * previously discarded here — the one uniform place every turn path
    * already touches). */
-  private async scopeHead(destination: string): Promise<{ head: ScopeHead; catalog_epoch?: string; object_counter?: number }> {
-    return (await this.host.rpc(destination, "/head")) as { head: ScopeHead; catalog_epoch?: string };
+  private async scopeHead(destination: string): Promise<PlanningHead> {
+    return (await this.host.rpc(destination, "/head")) as PlanningHead;
+  }
+
+  /** Read and LRU-touch one optimistic planning hint. Epoch skew is a miss,
+   * never a reason to let the fail-fast check consume a prior catalog's
+   * derived counter. */
+  private cachedPlanningHead(scope: string, epoch: string): PlanningHead | null {
+    const cached = this.planningHeads.get(scope);
+    if (cached === undefined) return null;
+    if (cached.catalog_epoch !== undefined && cached.catalog_epoch !== epoch) {
+      this.planningHeads.delete(scope);
+      return null;
+    }
+    this.planningHeads.delete(scope);
+    this.planningHeads.set(scope, cached);
+    return cached;
+  }
+
+  private rememberPlanningHead(scope: string, epoch: string, head: PlanningHead): void {
+    const cached = {
+      ...head,
+      // Production /head always carries the epoch. Fixture replies may omit
+      // it; stamp the epoch whose turn validated the reply so it cannot cross
+      // a later catalog activation inside this gateway.
+      catalog_epoch: head.catalog_epoch ?? epoch
+    };
+    this.planningHeads.delete(scope);
+    this.planningHeads.set(scope, cached);
+    while (this.planningHeads.size > PLANNING_HEAD_CACHE_CAP) {
+      const oldest = this.planningHeads.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.planningHeads.delete(oldest);
+    }
+  }
+
+  private forgetPlanningHead(scope: string): void {
+    this.planningHeads.delete(scope);
+  }
+
+  /** A head-stable direct turn preserves the cached allocation floor. Any
+   * changed authority head discards it; the next turn pays /head and learns
+   * the matching counter before it can plan a create. */
+  private reconcilePlanningHead(scope: string, epoch: string, accepted: ScopeHead): void {
+    const cached = this.planningHeads.get(scope);
+    if (
+      cached === undefined
+      || cached.catalog_epoch !== epoch
+      || cached.head.seq !== accepted.seq
+      || cached.head.hash !== accepted.hash
+      || cached.head.generation !== accepted.generation
+    ) {
+      this.forgetPlanningHead(scope);
+    }
   }
 
   /** Phase 5 fail-fast: a turn whose stamp disagrees with the scope's
@@ -6328,21 +7493,23 @@ export class NetGatewayDO {
       structure,
       () => this.host.rpc(destination, "/closure", { keys: touched, known: [] }),
       { mandatory: true, phase: "install_touched" }
-    )) as CellTransfer;
+    )) as CellTransfer & { scope?: string };
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        for (const cell of transfer.cells) {
-          view.install(cell);
-          this.persistCell(view, cell.key);
-          wanted.delete(cell.key);
-        }
+        const installed = this.installTransferredCells(
+          view,
+          transfer.cells,
+          typeof transfer.scope === "string" ? transfer.scope : undefined
+        );
+        for (const key of installed) wanted.delete(key);
         for (const key of wanted) {
           view.delete(key);
           this.persistCell(view, key);
         }
       })
     );
+    if (typeof transfer.scope === "string") this.completeHeads.delete(transfer.scope);
   }
 
   /** A session bearer is unusable unless its minting gateway can authenticate
@@ -6354,7 +7521,8 @@ export class NetGatewayDO {
     session: string,
     value: unknown,
     reply: Extract<CommitReply, { status: "accepted" }>,
-    catalogEpoch: string
+    catalogEpoch: string,
+    clusterScope: string
   ): void {
     const view = this.ensureView();
     const cell = makeCell({
@@ -6369,7 +7537,7 @@ export class NetGatewayDO {
     });
     this.discardViewOnThrow(() => this.state.storage.transactionSync(() => {
       view.install(cell);
-      this.persistCell(view, cell.key);
+      this.persistCell(view, cell.key, clusterScope);
     }));
   }
 
@@ -6450,11 +7618,11 @@ export class NetGatewayDO {
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
         this.state.storage.transactionSync(() => {
-          for (const cell of transfer.cells) {
-            view.install(cell);
-            this.persistCell(view, cell.key);
-            wanted.delete(cell.key);
-          }
+          const sourceScope = typeof (transfer as AuthorityCellTransfer).scope === "string"
+            ? (transfer as AuthorityCellTransfer).scope as string
+            : undefined;
+          const installed = this.installTransferredCells(view, transfer.cells, sourceScope);
+          for (const key of installed) wanted.delete(key);
           for (const key of wanted) {
             view.delete(key);
             this.persistCell(view, key);
@@ -6507,10 +7675,10 @@ export class NetGatewayDO {
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
-              for (const cell of transfer.cells) {
-                view.install(cell);
-                this.persistCell(view, cell.key);
-              }
+              const sourceScope = typeof (transfer as AuthorityCellTransfer).scope === "string"
+                ? (transfer as AuthorityCellTransfer).scope as string
+                : undefined;
+              this.installTransferredCells(view, transfer.cells, sourceScope);
             })
           );
           // A nonempty convention probe only proves ownership when the
@@ -6547,11 +7715,11 @@ export class NetGatewayDO {
    * Phase 4 targeted warming: pull ONLY the named objects' cells (each
    * with its class chain, expanded at the authority) plus the scope's
    * relation rows, and advance the fanout high-water to the returned
-   * head. Advancing is safe for the same reason the full pull's fix-7
-   * advance is: the relation mirror is coherent at that head (the rows
-   * rode along), and a cell this pull did not carry is ABSENT from the
-   * view — absent is never stale; pull-on-miss and read-version checks
-   * own it. This is the client cold-open path: its cost tracks what the
+   * head. Advancing is safe because the returned relation family is
+   * complete and replaces that scope's mirror rows before the advance.
+   * Unrequested cells receive no completeness certificate; pull-on-miss
+   * and read-version checks own them. This is the client cold-open path:
+   * its cost tracks what the
    * session needs (objects' chains + roster), never the scope's size —
    * the Phase-0 `closure` invariant. Empty `objects` = roster-only
    * backfill (the selfSubscribe case).
@@ -6586,19 +7754,19 @@ export class NetGatewayDO {
     advanceSeen: boolean
   ): void {
     const view = this.ensureView();
+    if (advanceSeen && transfer.relations === undefined) {
+      throw new Error(`targeted closure for ${transfer.scope} omitted its complete relation family`);
+    }
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        for (const cell of transfer.cells) {
-          this.invalidateRoomPresentationActor(cell);
-          view.install(cell);
-          this.persistCell(view, cell.key);
+        this.installTransferredCells(view, transfer.cells, transfer.scope, undefined, true);
+        if (advanceSeen) {
+          this.replaceScopeRelations(transfer.scope, transfer.relations ?? []);
+          this.advanceSeen(transfer.scope, transfer.head.seq);
         }
-        for (const row of transfer.relations ?? []) {
-          this.applyRelationDelta({ op: "add", row });
-        }
-        if (advanceSeen) this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
+    if (advanceSeen) this.completeHeads.delete(transfer.scope);
   }
 
   private async reseedFromScope(
@@ -6616,60 +7784,131 @@ export class NetGatewayDO {
       catalog_epoch: string;
       relations?: RelationRow[];
     };
+    if (transfer.relations === undefined) {
+      throw new Error(`full closure for ${transfer.scope} omitted its complete relation family`);
+    }
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        // `known` makes the transfer partial: absence then means "receiver
-        // already knows it", not authoritative deletion. Exact catalog
-        // cleanup is safe only for an unfiltered full closure.
-        if (known.length === 0) this.removeAbsentCatalogDefinitions(view, transfer.scope, transfer.cells);
-        for (const cell of transfer.cells) {
-          view.install(cell);
-          this.persistCell(view, cell.key);
-        }
-        // CO13: the full closure carries the scope's relation rows —
-        // upsert them into the mirror in the same transaction. Required
-        // for coherence with fix 7 below: advancing the high-water
-        // no-ops every earlier relation fanout/refan, so without this
-        // the mirror would silently lose the rows those deliveries
-        // carried. Upsert-only: a mirror row deleted at the authority
-        // while this gateway was unsubscribed lingers until a later
-        // remove delta (seq above the new high-water) heals it — a
-        // fresh shard's mirror is exact, which is the pull-on-miss case
-        // this exists for.
-        for (const row of transfer.relations ?? []) {
-          this.applyRelationDelta({ op: "add", row });
-        }
-        // Fix 7: the closure carries the scope's head — the view now IS
-        // the state at that head, so the fanout high-water advances with
-        // it (same transaction as the install). A stale pre-pull fanout
-        // row then no-ops by seq instead of regressing the fresh view.
+        // `keys: ["*"]` is exact for every cell this scope owns. `known`
+        // only relieves foreign lineage closure; it never filters the scope's
+        // own requested keys, so replacement remains required.
+        this.replaceScopeCells(view, transfer.scope, transfer.cells);
+        this.replaceScopeRelations(transfer.scope, transfer.relations ?? []);
+        // The closure image and its high-water advance are one durable
+        // replacement. A stale pre-pull fanout then no-ops without
+        // preserving any member deleted before this exact head.
         this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
+    if (known.length === 0) this.completeHeads.set(transfer.scope, transfer.head);
     return transfer;
   }
 
-  /** A full catalog closure is authoritative for the complete bootstrap
-   * definition set, not merely an upsert batch. Remove verb and property-
-   * catalog-scoped definition pages absent from that closure before installing
-   * it so an aged/offline gateway cannot resurrect a retired v1 definition
-   * after missing the ordered removal fanout. Runtime-authored definitions on
-   * ordinary objects are not members of the catalog image and retain their
-   * existing upsert posture. */
-  private removeAbsentCatalogDefinitions(view: CellStore, scope: string, cells: readonly Cell[]): void {
-    if (scope !== CATALOG_SCOPE) return;
-    const isDefinition = (cell: Cell): boolean => {
-      if (cell.kind === "verb_bytecode") return true;
-      if (cell.kind !== "property_cell" || !cell.value || typeof cell.value !== "object" || Array.isArray(cell.value)) {
-        return false;
+  /** One classifier over the already-installed transfer image. Building it
+   * after every cell is present lets a child that sorts before its anchor use
+   * the same closed lineage as planning, while the classifier's memo keeps the
+   * ownership materialization proportional to the transferred object graph. */
+  private viewClassifier(view: CellStore): ScopeClassifier {
+    return classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
+  }
+
+  /** Durable owner of one transferred cache cell.
+   *
+   * Normal object and session cells are classified from the transfer's closed
+   * lineage. Source-authoritative cells may use the responding scope as their
+   * fallback (logs have no lineage by definition). A derived rider may NOT use
+   * that fallback: falsely assigning a foreign stale row to the pulled scope
+   * could let a later pull of its real owner certify it. An unclassifiable
+   * derived rider returns null and is discarded as a repairable cache miss. */
+  private transferredCellOwnerScope(
+    cell: Cell,
+    sourceScope: string | undefined,
+    classifier: ScopeClassifier
+  ): string | null {
+    if (cell.kind === "log") {
+      if (sourceScope !== undefined) return sourceScope;
+      throw netError("E_LINEAGE", "transferred log cell has no source scope", { key: cell.key });
+    }
+    const sessionActor = cell.kind === "session"
+      ? (cell.value as { actor?: unknown } | null | undefined)?.actor
+      : undefined;
+    const object = cell.kind === "session"
+      ? (typeof sessionActor === "string" && sessionActor.length > 0 ? sessionActor : null)
+      : cell.object;
+    if (object !== null) {
+      try {
+        return classifier.scopeOf(object);
+      } catch {
+        if (cell.provenance !== "authoritative") return null;
       }
-      const def = (cell.value as { def?: unknown }).def;
-      return Boolean(def && typeof def === "object" && !Array.isArray(def));
-    };
-    const present = new Set(cells.filter(isDefinition).map((cell) => cell.key));
-    for (const key of [...view.keys()]) {
-      const local = view.get(key);
-      if (!local || !local.object.startsWith("$") || !isDefinition(local) || present.has(key)) continue;
+    }
+    if (cell.provenance === "authoritative" && sourceScope !== undefined) return sourceScope;
+    // A scope may carry foreign rider residue whose lineage lives only at its
+    // real owner. Without that lineage this gateway cannot assign an owner
+    // safely. The row is only a derived cache, so dropping it is conservative:
+    // a later read repairs from authority, while retaining it could eventually
+    // let the real owner's complete-head certificate bless a stale value.
+    return null;
+  }
+
+  /** Install and persist one closure/fanout cell family with a non-null,
+   * indexed owner scope. `installedProvenance` changes only the cache copy's
+   * provenance (KV seed); ownership still uses the wire cell so the source's
+   * authoritative marker remains available for the safe fallback above. */
+  private installTransferredCells(
+    view: CellStore,
+    cells: readonly Cell[],
+    sourceScope?: string,
+    installedProvenance?: Cell["provenance"],
+    invalidatePresentation = false
+  ): Set<string> {
+    for (const cell of cells) {
+      if (invalidatePresentation) this.invalidateRoomPresentationActor(cell);
+      view.install(installedProvenance === undefined ? cell : { ...cell, provenance: installedProvenance });
+    }
+    const classifier = this.viewClassifier(view);
+    const installed = new Set<string>();
+    for (const cell of cells) {
+      const ownerScope = this.transferredCellOwnerScope(cell, sourceScope, classifier);
+      if (ownerScope === null) {
+        view.delete(cell.key);
+        this.persistCell(view, cell.key);
+      } else {
+        this.persistCell(view, cell.key, ownerScope);
+        installed.add(cell.key);
+      }
+    }
+    return installed;
+  }
+
+  /** Install one unfiltered scope closure as an EXACT replacement.
+   *
+   * `completeHeads` lets the planner omit every ordinary read whose object
+   * the CO15 classifier assigns to this scope. Therefore the same ownership
+   * rule defines the negative half of the certificate: any locally held cell
+   * assigned to `scope` but absent from the transfer must be deleted before
+   * the certificate is installed. Session cells classify through the actor
+   * named in their value, matching CO14 partitioning; this also prevents an
+   * exact cluster pull from retaining an expired authentication row.
+   *
+   * `owner_scope` is materialized on every cache install, so the negative set
+   * is one indexed query over this scope's rows — never a gateway-wide scan.
+   * Full repair therefore stays O(scope image), the CO11 bound. */
+  private replaceScopeCells(
+    view: CellStore,
+    scope: string,
+    cells: readonly Cell[],
+    installedProvenance?: Cell["provenance"]
+  ): void {
+    const present = this.installTransferredCells(view, cells, scope, installedProvenance);
+    const owned = sqlRows<{ key: string }>(
+      this.state.storage.sql.exec("SELECT key FROM net_gateway_cell WHERE owner_scope = ?", scope)
+    );
+    for (const { key } of owned) {
+      if (present.has(key)) continue;
+      this.invalidateRoomPresentationActorKey(key);
       view.delete(key);
       this.persistCell(view, key);
     }
@@ -6693,6 +7932,7 @@ export class NetGatewayDO {
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
+    const completeBefore = this.completeHeads.get(body.scope);
     // Delivery continuity is per subscriber lane, not per authority head:
     // an authority event can validly produce no row for this destination.
     // Unstamped bodies are accepted for rolling-upgrade compatibility.
@@ -6715,9 +7955,16 @@ export class NetGatewayDO {
           this.deliverySeen.set(body.scope, body.delivery_seq);
         }
         if (advanced) {
+          const classifier = this.viewClassifier(view);
           for (const cell of body.cells) {
             this.invalidateRoomPresentationActor(cell);
-            this.persistCell(view, cell.key);
+            const ownerScope = this.transferredCellOwnerScope(cell, body.scope, classifier);
+            if (ownerScope === null) {
+              view.delete(cell.key);
+              this.persistCell(view, cell.key);
+            } else {
+              this.persistCell(view, cell.key, ownerScope);
+            }
           }
           for (const key of body.removed_cells ?? []) {
             this.invalidateRoomPresentationActorKey(key);
@@ -6728,7 +7975,7 @@ export class NetGatewayDO {
           // mirror never double-applies. applyFanout itself stays
           // cell-only (relation rows are not cells); the shell owns the
           // mirror table.
-          for (const delta of body.relations ?? []) this.applyRelationDelta(delta);
+          for (const delta of body.relations ?? []) this.applyRelationDelta(delta, body.scope);
         }
         // A pull may already have superseded this row's authority state,
         // but receiving it still advances outbox continuity. Persist both
@@ -6748,6 +7995,26 @@ export class NetGatewayDO {
     // excludes the leaver). The seq gate above makes the push
     // at-most-once per socket per turn: redeliveries never reach here.
     if (applied) {
+      // The authority advanced beyond any planning hint retained for this
+      // scope. Invalidate before callbacks can start another turn; a missing
+      // fanout is still safe because /submit validates the retained base,
+      // current reads, and post-state before accepting.
+      this.forgetPlanningHead(body.scope);
+      if (
+        completeBefore &&
+        body.seq === completeBefore.seq + 1 &&
+        typeof body.head_hash === "string" &&
+        body.head_hash.length > 0 &&
+        typeof body.head_generation === "number"
+      ) {
+        this.completeHeads.set(body.scope, {
+          seq: body.seq,
+          hash: body.head_hash,
+          generation: body.head_generation
+        });
+      } else {
+        this.completeHeads.delete(body.scope);
+      }
       // Descriptor freshness follows the same committed/fanout-coherent view
       // as invocation. Run before observation delivery so a movement's new
       // presence row can notify its own session even when echo dedupe suppresses
@@ -6758,10 +8025,27 @@ export class NetGatewayDO {
     return applied;
   }
 
+  /** Replace exactly one scope's relation family before advancing its
+   * fanout high-water. `owner_scope` is materialized from the authoritative
+   * transfer source, so the indexed delete never enumerates other scopes.
+   * The v2 cache migration discarded pre-owner_scope rows and their matching
+   * high-waters, so there is no unindexed legacy residue to scan here. */
+  private replaceScopeRelations(scope: string, rows: readonly RelationRow[]): void {
+    const present = new Set(rows.map((row) => relationKey(row.relation, row.owner, row.member)));
+    const owned = sqlRows<{ key: string }>(
+      this.state.storage.sql.exec("SELECT key FROM net_gateway_relation WHERE owner_scope = ?", scope)
+    );
+    for (const { key } of owned) {
+      if (!present.has(key)) this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+    }
+    for (const row of rows) this.applyRelationDelta({ op: "add", row }, scope);
+  }
+
   /** One relation delta into the mirror table (add = upsert, remove =
    * delete; both idempotent, matching applyRelationDeltas' semantics at
-   * the owning scope). */
-  private applyRelationDelta(delta: RelationDelta): void {
+   * the owning scope). The fanout/closure source is the authoritative owner
+   * scope and is materialized on every row. */
+  private applyRelationDelta(delta: RelationDelta, sourceScope: string): void {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
       this.state.storage.sql.exec(
@@ -6771,7 +8055,7 @@ export class NetGatewayDO {
         delta.row.owner,
         delta.row.member,
         delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null,
-        this.ownerScopeFor(delta.row.owner),
+        sourceScope,
         delta.row.member_scope ?? null
       );
     } else {
@@ -6847,14 +8131,20 @@ export class NetGatewayDO {
     return view;
   }
 
-  /** Write-through for one view cell (installed or deleted). */
-  private persistCell(view: CellStore, key: string): void {
+  /** Write-through for one view cell (installed or deleted). Inserts require
+   * their materialized authority scope: exact full-pull replacement relies on
+   * this index and must never fall back to a gateway-wide classification scan. */
+  private persistCell(view: CellStore, key: string, ownerScope?: string): void {
     const cell = view.get(key);
     if (cell) {
+      if (ownerScope === undefined) {
+        throw netError("E_LINEAGE", "gateway cell insert omitted owner scope", { key });
+      }
       this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_cell (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+        "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope",
         key,
-        JSON.stringify(cell)
+        JSON.stringify(cell),
+        ownerScope
       );
     } else {
       this.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key = ?", key);
@@ -6869,6 +8159,8 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 /** MCP adapter bounds (client-shell phase i). */
 const MCP_QUEUE_CAP = 256;
 const MCP_SESSION_STATE_CAP = 512;
+/** Conservative SQLite bind chunk for scope ∩ local-carrier queries. */
+const GATEWAY_CARRIER_QUERY_CHUNK = 64;
 const MCP_STANDARD_TOOL_PAGE = 128;
 const MCP_DISCOVERY_DEFAULT_PAGE = 64;
 const MCP_DISCOVERY_MAX_PAGE = 256;
@@ -6938,6 +8230,10 @@ type NetMcpToolScope = "active" | "here" | "object" | "space";
 type NetMcpToolDraft = {
   object: string;
   verb: string;
+  /** Transport route derived from catalog command persistence. This stays
+   * internal: clients invoke one capability; the gateway preserves its
+   * declared live/durable semantics. */
+  route: "direct" | "sequenced";
   aliases: string[];
   description: string;
   inputSchema: Record<string, unknown>;
@@ -6948,6 +8244,7 @@ type NetMcpDynamicTool = NetMcpToolDraft & { name: string };
 
 type NetMcpToolPage = {
   scope: NetMcpToolScope;
+  activeScope: string | null;
   object: string | null;
   query: string | null;
   limit: number;

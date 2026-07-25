@@ -21,7 +21,7 @@ import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
 import type { WooValue } from "../../src/core/types";
-import { WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
+import { WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/scope";
 import type { AttemptTraceEntry } from "../../src/net/errors";
 import type { CommitReply } from "../../src/net/scope";
 

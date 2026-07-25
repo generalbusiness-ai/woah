@@ -84,6 +84,7 @@ async function buildDoorHarness(options: {
   renamedGuestResetVerb?: string;
   staleGuestResetDefinition?: boolean;
   unknownGuestResetDefinition?: boolean;
+  gatewayRelateFault?: boolean;
 } = {}) {
   // The OLD world: one human actor bound to an account with a REAL
   // password hash (actor-side binding only — primary_actor is NOT
@@ -189,7 +190,13 @@ async function buildDoorHarness(options: {
   }
   const gwState = netState("door-gateway");
   states.push(gwState);
-  const gateway = new NetGatewayDO(gwState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+  const gateway = new NetGatewayDO(gwState.state, {
+    WOO_INTERNAL_SECRET: SECRET,
+    NET_RESOLVE: resolve,
+    ...(options.gatewayRelateFault
+      ? { WOO_NET_FAULTS: JSON.stringify({ "/relate": { error: "test relation expedite failure" } }) }
+      : {})
+  } as NetGatewayEnv);
 
   const api = async (
     method: string,
@@ -228,12 +235,36 @@ async function buildDoorHarness(options: {
     },
     catalogTailSeqs: () => (scopeStates.get("catalog")!.state.storage.sql
       .exec("SELECT seq FROM net_scope_tail ORDER BY seq") as { toArray(): Array<{ seq: number }> }).toArray(),
+    forgetCloseReceipt: (session: string) => {
+      gwState.state.storage.sql.exec(
+        "DELETE FROM net_gateway_session_close_receipt WHERE session = ?",
+        session
+      );
+    },
     settle: async () => settleStates(states),
     close: async () => closeStates(states)
   };
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
+  it("refuses hidden or malformed social-roster policy at the human door", async () => {
+    const h = await buildDoorHarness();
+    const visible = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(visible.status, JSON.stringify(visible.body)).toBe(200);
+    expect(visible.body).toMatchObject({ roster_visible: true });
+
+    const hidden = await h.api("POST", "/net-api/guest", { body: { roster_visible: false } });
+    expect(hidden.status).toBe(403);
+    expect(hidden.body).toMatchObject({
+      error: { code: "E_PERM", detail: { reason: "roster_visibility_requires_apikey" } }
+    });
+
+    const malformed = await h.api("POST", "/net-api/guest", { body: { roster_visible: "false" } });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body).toMatchObject({ error: { code: "E_INVARG" } });
+    await h.close();
+  });
+
   it("dispatches the template-declared reset verb rather than a worker command literal", async () => {
     const h = await buildDoorHarness({ renamedGuestResetVerb: "restore_pool_identity" });
     const claimed = await h.api("POST", "/net-api/guest", { body: {} });
@@ -649,6 +680,46 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(turn.status, JSON.stringify(turn.body).slice(0, 300)).toBe(200);
     expect((turn.body.reply as { status?: string }).status).toBe("accepted");
 
+    // The elastic claim's accepted response is a room-authority freshness
+    // fence, not merely proof that its actor cluster committed. An immediate
+    // roster read must include every born-present session, including the
+    // just-created foreign-cluster actor.
+    const roster = await h.api("POST", "/net-api/turn", {
+      token: `session:${elastic.body.session as string}`,
+      body: {
+        target: elastic.body.actor,
+        verb: "who_all",
+        args: [""],
+        route: "direct",
+        idempotency_key: "elastic-door-roster"
+      }
+    });
+    expect(roster.status, JSON.stringify(roster.body).slice(0, 500)).toBe(200);
+    const present = new Set(
+      (roster.body.result as Array<{ player?: unknown }>).map((row) => row.player)
+    );
+    expect(present.has(elastic.body.actor)).toBe(true);
+    for (const actor of claimed) expect(present.has(actor), `roster omitted ${actor}`).toBe(true);
+
+    await h.close();
+  }, 30_000);
+
+  it("names a degraded elastic-presence fence without undoing the accepted provision", async () => {
+    const h = await buildDoorHarness({ gatewayRelateFault: true });
+    const pool = h.plan.world.propOrNull("$system", "guest_pool") as string[];
+    for (let i = 0; i < pool.length; i += 1) {
+      const claimed = await h.api("POST", "/net-api/guest", { body: {} });
+      expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    }
+
+    const claimId = `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.a0a72856-a3de-43de-934c-a45e778fc108`;
+    const elastic = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(elastic.status, JSON.stringify(elastic.body)).toBe(200);
+    expect(elastic.body).toMatchObject({
+      elastic: true,
+      relation_expedite_degraded: true
+    });
+
     await h.close();
   }, 30_000);
 
@@ -746,6 +817,23 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     const closed = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
     expect(closed.status, JSON.stringify(closed.body)).toBe(200);
     expect(closed.body.closed).toBe(true);
+    // A close destroys its own bearer. The gateway receipt must therefore
+    // answer a response-lost replay before ordinary live-session auth, or the
+    // operation is not actually idempotent at its public boundary.
+    const closeReplay = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
+    expect(closeReplay.status, JSON.stringify(closeReplay.body)).toBe(200);
+    expect(closeReplay.body).toEqual({ closed: true, already: "closed" });
+
+    // If authority accepted but BOTH bounded internal submit replies were
+    // lost, the gateway never records that receipt. The expired derived cell
+    // still proves which opaque bearer is closing itself; replay must reach
+    // the idempotent postcondition instead of dying at live-bearer auth.
+    h.forgetCloseReceipt(session);
+    const closeAfterLostInternalReplies = await h.api("DELETE", "/net-api/session", {
+      token: `session:${session}`
+    });
+    expect(closeAfterLostInternalReplies.status, JSON.stringify(closeAfterLostInternalReplies.body)).toBe(200);
+    expect(closeAfterLostInternalReplies.body).toMatchObject({ closed: true });
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     // The first-in-pool-order seat is free again — the next claim gets it.

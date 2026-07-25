@@ -38,6 +38,9 @@ export type SerializedSession = {
    * normal expiry after a restart or on a host that received the session
    * via ensureSessionForActor. */
   apikeyId?: string;
+  /** False suppresses this API-key service session from social roster
+   * projections without changing authorization or delivery presence. */
+  rosterVisible?: false;
 };
 
 export type SerializedAuthorityObjectSlice = {

@@ -68,6 +68,10 @@ describe("Net-default local development composition", () => {
     const credential = parseNetDevApiKey("apikey:local-dev:secret");
     const plan = await planNetInstall({ catalogs: ["chat"], graft: netDevCredentialGraft(credential) });
     const session = plan.world.auth(credential.token);
+    const installed = plan.world.getProp("$catalog_registry", "installed_catalogs") as Array<{ alias?: string }>;
+    expect(installed.map((record) => record.alias).sort()).toEqual(["chat", "help"]);
+    expect(plan.world.objects.has("$dispenser_block")).toBe(false);
+    expect(plan.world.objects.has("the_horoscope")).toBe(false);
     expect(session.actor).toMatch(/^guest_/);
     expect(plan.partitions.has(`cluster:${session.actor}`)).toBe(true);
     expect(plan.partitions.has("cluster:$wiz")).toBe(false);

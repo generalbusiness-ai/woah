@@ -3,16 +3,26 @@
 # domains. Keep `routes` absent. Generate a temporary runnable copy by replacing
 # CANARY_HOST_SEED_KV_ID with a newly-created, canary-only KV namespace id.
 name = "woah-net-canary"
-main = "src/worker/index.ts"
+main = "src/worker/net-only-index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# Keep API and websocket routes authoritative when the SPA fallback is warm.
+run_worker_first = true
 
 [observability]
 enabled = true
 head_sampling_rate = 1.0
 
 [vars]
+# The canary must exercise the same public entry and selection as production;
+# otherwise /mcp silently proves a retired or local-only transport.
+WOO_NET_DEFAULT = "on"
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 NET_API_GATEWAY_SHARDS = "8"
 NET_RPC_TIMEOUT_MS = "5000"
@@ -20,18 +30,6 @@ NET_TURN_QUEUE_WAIT_MS = "1500"
 NET_TURN_SCOPE_CONCURRENCY = "12"
 WOO_AE_DATASET = "woo_v1_net_canary"
 CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
-
-[[durable_objects.bindings]]
-name = "WOO"
-class_name = "PersistentObjectDO"
-
-[[durable_objects.bindings]]
-name = "DIRECTORY"
-class_name = "DirectoryDO"
-
-[[durable_objects.bindings]]
-name = "COMMIT_SCOPE"
-class_name = "CommitScopeDO"
 
 [[durable_objects.bindings]]
 name = "SCOPE_NET"
@@ -54,19 +52,7 @@ binding = "METRICS"
 dataset = "woo_v1_net_canary"
 
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["PersistentObjectDO"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["DirectoryDO"]
-
-[[migrations]]
-tag = "cf-do-0006"
-new_sqlite_classes = ["CommitScopeDO"]
-
-[[migrations]]
-tag = "cf-do-0004"
+tag = "net-only-v1"
 new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]
 
 [[migrations]]

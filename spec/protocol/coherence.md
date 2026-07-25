@@ -35,7 +35,7 @@ client (projection consumer + optimistic echo)
    ▼                                   ▼
 GATEWAY  — session edge: auth, planning, derived cache (incl. the MCP
            tool-surface projection), fanout delivery
-   │ envelope = transcript + read-closure (the only shape; CO7)
+   │ envelope = transcript + attestations + routing metadata (the only shape; CO7)
    ▼
 SCOPE    — the authority: one sequencer per commit scope; validates,
            commits, owns the cells anchored to it; durable outbox;
@@ -96,6 +96,18 @@ authority that makes this turn's writes atomic:
 - A write set spanning **two distinct shared scopes** is rejected with
   `E_SCOPE_SPLIT` (CO6) — a named limitation, not a silent commit to the
   planning scope. Lifting it is the CA10 growth path (CO11).
+
+**Sequenced-log ownership.** A Net-planned sequenced transcript preserves
+the semantic sequencing space separately from the selected authority
+address. Its reserved `next_seq` allocation is an ordinary versioned
+read/write pair only when the selected commit scope owns that space; the
+authority appends the final log row in the same transaction. If write-set
+routing selects another scope (the pure-movement case), the planner strips
+the allocation and the turn consumes no room seq and appends no room log
+row. This is the necessary consequence of off-room CA3 atomicity: the system
+does not pretend an asynchronous second commit is one atomic `$space:call`.
+Acts avoid the exception because their projection fold is a room-owned write
+and therefore selects the room authority.
 
 **Rider integrity (amendment, 2026-07-06).** Ride-along writes touch cells
 whose authority is another scope; three rules keep CO2.4 intact across
@@ -180,6 +192,15 @@ non-conforming: it must also read the authority cells on which the decision
 depends. The projection may consequently make a read-only listing briefly
 stale, but cannot authorize a stale mutation.
 
+Sequenced-log replay is another projection read, but not an unvalidated one.
+The sparse planner acquires the exact `(semantic space, from, limit)` page
+from its owner and records its content version in `transcript.replayReads`.
+The committing scope re-derives local pages and checks foreign pages against
+the owner's `/net/attest` response. A changed page rejects
+`read_version_mismatch` with `replay_conflicts`; an unattested foreign page
+rejects terminal `rider_unattested`. The gateway drops and refetches only the
+named page before replanning.
+
 ### CO2.5 Idempotency
 
 A replayed idempotency key returns the recorded reply. A redelivered fanout
@@ -249,6 +270,19 @@ event breaks are part of the boundedness contract: without them, a valid
 chain of submission, owner adoption, relation delivery, and fanout can exceed
 Cloudflare's recursive subrequest-depth limit even though each individual
 drain pass is row-bounded.
+
+Validated direct observations obey the same event break even though their
+delivery is live-only. A scope MUST NOT call a subscriber gateway from the
+`/submit` request lineage: suppressing only the origin gateway is insufficient
+when another subscriber is concurrently submitting to that scope. The scope
+queues live deliveries in bounded volatile memory and arms an immediate alarm;
+the fresh alarm event sends one bounded batch, grouped into at most one RPC per
+destination gateway. The receiver filters and emits every live message
+independently; batching creates neither ordering nor durability. Eviction,
+queue-cap overflow, and delivery failure may lose these observations—as their
+live contract permits—but cap drops and delivery failures MUST be named in
+telemetry. Live delivery never creates an authority sequence or durable outbox
+row.
 
 ### CO2.8 Durable continuations
 
@@ -325,7 +359,8 @@ unchanged:
    an epoch-immutable installed definition is refused independently by the
    catalog authority.
 6. Logical inputs valid and not duplicated.
-7. Read versions match current state (CO2.4).
+7. Cell, ordering, and replay-page read versions match current authority
+   state (CO2.4).
 8. Permission reads and policy checks present in the read set.
 9. Writes authorized per recorded VM frame (and any lease/fence token).
 10. **Applying the transcript's writes to a clone of validated pre-state
@@ -338,8 +373,14 @@ buried in VTN):
 - **Validation is post-state re-derivation, not re-execution.** The scope
   never re-runs verb bytecode; it re-applies recorded writes
   deterministically and constructs authoritative post-state from the
-  transcript's creates/writes/moves and sequenced-log outcome. The submit
-  carries no executor post-state.
+  transcript's creates/writes/moves/recycles and sequenced-log outcome. A
+  recycle replaces every authority cell owned by the object with one
+  `object_tombstone` cell in the same commit, grafts its lineage children to
+  its former parent, displaces its contained live objects to `$nowhere`, and
+  retracts the corresponding contents/ordering relations. The tombstone is
+  the durable distinction between "recycled" and "never existed"; retaining
+  an `object_lineage`, `object_live`, property, or verb cell beside it is an
+  invalid authority image. The submit carries no executor post-state.
 - **Doomed-round short-circuit** is permitted exactly as VTN8 bounds it:
   steps 1–9 are pre-state-only; a rejection they determine
   (`stale_head`, `scope_mismatch`, `permission_denied`, and
@@ -359,6 +400,43 @@ buried in VTN):
   at one hot scope to serialize without an unconditional re-execution loop.
   It does not weaken a true read/write conflict, which still rejects
   `read_version_mismatch`.
+- **Complete-head compaction is an exact-generation CAS, never a rebase.** A
+  gateway that holds the complete owner closure at the submit base may omit
+  ordinary same-owner reads. Installing that closure is replacement, not
+  upsert: in the same durable transaction, the gateway removes every locally
+  held cell classified to that scope but absent from the unfiltered transfer,
+  replaces the scope-owned relation family, and only then advances the fanout
+  high-water. The complete-head certificate is installed only after that
+  transaction succeeds. `known` can relieve foreign lineage closure but does
+  not filter the full request's scope-owned keys, so the receiver still
+  replaces the scope image; conservatively, only a full pull with no receiver
+  assumptions mints the certificate. Keyed and targeted closures are not
+  exact cell-membership images and never replace or certify unrequested
+  cells. Gateways materialize each installed cell's authority scope and index
+  exact replacement by that field, so repairing one scope never enumerates the
+  shard's other cached scopes. A transferred derived rider whose ownership
+  cannot be proven from closed lineage is discarded as a repairable cache
+  miss, never guessed into the responding scope. The gateway cache's v1→v2
+  migration clears derived cells, relation mirrors, and their high-waters
+  together before rebuilding them with materialized ownership; preserving a
+  high-water across that reset could suppress its repairing fanout. The scope
+  accepts a compact proof only when `(seq, hash, generation)` still equals
+  current authority. `generation`
+  advances on every authoritative mutation, including seed and activation
+  writes that deliberately leave `(seq, hash)` unchanged. Session reads and
+  sequenced `next_seq` allocation reads remain explicit. A stale-head refusal
+  invalidates the compact proof: the gateway MUST pull the new complete
+  generation and replan, never attach the old computed transcript to a newer
+  base.
+- **A pure direct read validates but does not commit.** After steps 1–10, a
+  complete direct transcript with no authority writes, projection writes,
+  session transition, or untracked effects returns accepted at the current
+  head without advancing it or recording an idempotency reply. Repeating such
+  a request safely re-reads current authority; concurrent view readers do not
+  manufacture contending scope commits. If that validated transcript emitted
+  live observations, the scope may relay them best-effort to its bounded
+  fanout-role gateway registry, but MUST NOT create a sequence, reply-cache
+  entry, outbox row, authority cell, relation row, or gateway high-water.
 
 If validation fails, no write from the transcript commits; the gateway
 repairs its planning state (per the reply's taxonomy code) and retries the
@@ -372,7 +450,7 @@ gate (CO12) enforces it. Every copy is epoch-stamped (CO8).
 
 | # | Copy | Provenance | Freshness bound | Reseed path |
 |---|---|---|---|---|
-| 1 | Scope authority (ScopeDO SQLite; includes the parked-task/scheduled queue and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
+| 1 | Scope authority (ScopeDO SQLite; includes the committed sequenced log, parked-task/scheduled queue, and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
 | 2 | Gateway cache (GatewayDO SQLite; includes the MCP tool-surface projection, [projection-cache.md PC1](../semantics/projection-cache.md); in-memory views are reads of this copy, not additional copies) | `derived` | stamped `(scope_head, catalog_epoch)` | `E_STALE_EPOCH` → refetch closure from scope |
 | 3 | KV seed | `seed` | stamped epoch; may lag | overwritten on checkpoint; consumers head-check with the scope before trusting |
 | 4 | Browser cache (IDB/localStorage) | `derived` + `echo` overlay | stamped as #2 | epoch mismatch → drop and rehydrate |
@@ -392,7 +470,7 @@ divergence. Tail metrics count by code.
 |---|---|---|
 | `E_STALE_HEAD` | submitted `base` is future, hash-mismatched, or too old/unproved for retained-tail rebase (incl. cold/evicted-scope reseed) | refetch head/closure, retry |
 | `E_STALE_EPOCH` | consumer copy stamped with an old `(scope_head, catalog_epoch)` | reseed that copy, retry |
-| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire read-closure transfer, retry |
+| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6), including an owner-computed ordering or committed replay page | acquire the named cells/projection/page from its authority, retry |
 | `E_READ_VERSION` | read set conflicts with current authority | re-plan against refreshed cells |
 | `E_SCOPE_SPLIT` | write set spans two distinct shared scopes (CO2.3) | terminal; named limitation until CA10 |
 | `E_CATALOG_MUTATION` | ordinary turn attempted to mutate an installed catalog class definition without advancing the epoch | terminal; publish through the catalog install pipeline |
@@ -402,7 +480,7 @@ divergence. Tail metrics count by code.
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
-| `E_NONCONVERGENT_READ` | an eligible recorded read cannot converge: after resolving the owner, the gateway refreshed a mismatched cell (or re-installed an ordering answer) to an authority receipt `(scope, head, content-version)` and re-planned, yet the re-plan still mismatched the exact same receipt — a planner/catalog-verb bug, not contention. Only post-seed (`head.seq > 0`) reads participate, and `$system.net_active_epoch` never participates; failed, owner-unresolved, seed-phase, and activation-state refreshes produce no receipt and cannot trigger this code. Within that eligible set every authoritative mutation advances the sequenced head, distinguishing legitimate content cycles such as A → B → A. | terminal and NAMED; surfaces the offending cell/ordering, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
+| `E_NONCONVERGENT_READ` | an eligible read or sparse-planning miss cannot converge: after resolving the owner, the gateway refreshed a cell (or re-installed an ordering/replay answer) to an authority receipt `(scope, seq, hash, generation, content-version)` and re-planned, yet the re-plan requested or mismatched the exact same receipt. This is a planner/catalog bug, not contention. Every authoritative mutation—including seed and activation—advances `generation`, so legitimate A → B → A cycles produce distinct receipts even when `(seq, hash, content-version)` returns to its prior values. Failed and owner-unresolved refreshes produce no receipt and cannot trigger this code. | terminal and NAMED; surfaces the offending cell/query, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
 | `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
 | `E_SCOPE_RETIRED` | a submit, adopt, seed, or head read targets a scope past its retirement head (CO17) — its anchor root was recycled and the scope's storage reclaimed | terminal; a session repins to a live scope; an outbox sender treats it as terminal-acknowledge (advances high-water, installs nothing); a gateway seed path refuses to re-seed the tombstoned name at the same epoch |
 
@@ -412,17 +490,44 @@ trace where repair rounds occurred.
 
 ## CO7. Envelope and transfer discipline
 
-- **One envelope shape.** A commit submission is the transcript plus its
-  **read-closure** — the actor row, session rows, `read_set` cells, write
-  preimages, and their lineage closure. Nothing scope-wide, no authority
-  slices, no execution capsule, no alternate warm/slim modes. Byte
-  ceilings are enforced by construction and by gate: **< 64 KB** warm
-  same-scope, **< 256 KB** cross-scope. `line_map`/debug info never ships
-  in an envelope or transfer; it is fetched on demand.
+- **One envelope shape.** A commit submission is the transcript plus the
+  owner **attestations** for its foreign-anchored reads (CO2.3) and the
+  post-commit routing metadata the scope shell forwards (rider `/adopt`
+  and relation-owner `/relate` destinations, CA3/CO13). No read state
+  ships: the committing scope validates locally-owned read versions
+  against its own authority cells and foreign reads against their
+  owners' attestations, then re-derives post-state by applying the
+  recorded writes — it never re-executes bytecode, so a shipped read
+  closure would buy nothing. Successful results and planner-only state probes
+  remain gateway-local. Byte-identical reads are one authority proof on the
+  wire regardless of how many times bytecode consulted the cell; differing
+  value/version proofs remain distinct. A complete-head submit may additionally
+  compact same-owner reads under CO4's exact-generation rule. Nothing
+  scope-wide, no authority slices,
+  no execution capsule, no alternate warm/slim modes. Byte ceilings are
+  enforced on the **actual serialized submit body**, measured at the
+  gateway immediately before the submit RPC (never on a modeled shape):
+  **< 64 KB** warm same-scope, **< 256 KB** cross-scope; a breach is a
+  misplan bug surfaced as a plain error, not a repairable divergence.
+  `line_map`/debug info never ships in an envelope or transfer; it is
+  fetched on demand.
 - **Lineage closure is part of the transfer type.** A page transfer that
   does not close over `object_lineage` does not serialize (`E_LINEAGE` is
   an assertion, not an operational error). Dangling parent references are
-  therefore unrepresentable, not merely gated to zero.
+  therefore unrepresentable, not merely gated to zero. An
+  `object_tombstone` is the terminal replacement for an object page, not a
+  live page, and therefore requires no lineage closure. A keyed request for
+  an absent object's lineage returns its tombstone when one exists, so a stale
+  gateway repairs to terminal `E_OBJNF` rather than retrying an unresolvable
+  missing lineage.
+- **Ordered fanout carries deletion as data.** For every touched authority
+  key absent from the accepted post-state, the same `FanoutBody` that carries
+  replacement cells carries the key in `removed_cells`. The receiver applies
+  installs and removals under one per-scope high-water transaction. Rider
+  adoption preserves the same distinction: owner scopes CAS and fan out both
+  replacement cells and removed keys. Dropping absent touched keys from
+  fanout is forbidden because it can certify a stale derived page at a newer
+  head.
 - **State transfer is verifiable cache-fill** (VTN0 claim 5, carried):
   content-addressed, receiver-authorization-filtered, installs into copy
   #2/#4 with `derived` provenance at a stated `source_head`. It never
@@ -446,7 +551,11 @@ scope's durable epoch after a successful reseed — the condition is the
 terminal `E_EPOCH_MISMATCH` (CO6), surfaced with its attempt trace instead
 of grinding the repair budget; reconciliation is the catalog
 install/migration path's job. Idempotent re-seed at the SAME epoch remains
-a success. A present seed `relations` field is the complete initial relation
+a success before committed traffic and advances the authority `generation`;
+activation writes also advance `generation`. These head-stable operator paths
+are therefore visible to complete-head receipts and non-convergence detection
+even though their sequenced `(seq, hash)` is stable. A present seed `relations`
+field is the complete initial relation
 family (including an explicit empty array); omission by a legacy seed request
 preserves existing same-epoch relation rows. This generalizes the E1 discipline
 that landed for v2
@@ -526,9 +635,34 @@ that only runs under `test:full` does not hold the line):
    emitted as the `net_turn_structure` metric so the deployed profile
    emits the evidence CO10 is measured against. The curated
    `tests/worker/net-turn-structure.test.ts` asserts the warm same-scope
-   structure (1 attempt, ≤ 3 sync RPCs — `/head` + `/submit` + the
-   post-accept `installTouched` `/closure` — and 0 reconstructions),
+   structure (1 attempt, ≤ 3 sync RPCs — an optional `/head`, `/submit`,
+   and the post-accept `installTouched` `/closure` — and 0
+   reconstructions),
    cross-checked against a per-destination RPC log.
+
+   A gateway MAY retain the exact planning-scope `/head` reply, including
+   its object-allocation counter, and plan a later turn optimistically
+   against that same base. This is a bounded derived cache, never an
+   authority certificate: `/submit` still applies CO4's bounded
+   retained-head proof and validates every read and the re-derived
+   post-state against current authority. Compacted owner reads continue to
+   require an exact current base. A create reads the allocation cell, so a
+   stale counter conflicts like any other stale read; a base outside the
+   retained tail rejects `stale_head`. A fanout that advances the cached
+   scope invalidates the entry. An accepted turn retains the entry only
+   when its returned head exactly equals the cached base (the cell-touchless
+   direct case); a head-changing commit invalidates it. Thus stale cache
+   state can cost one repair but cannot bless a stale read, allocate from a
+   stale counter, or commit an invalid post-state.
+
+   The substrate session mint/close path MAY advance the same cached cluster
+   base to the exact head returned by its accepted submit. That transcript
+   cannot create objects, so the cached allocation counter is unchanged.
+   A concurrent cluster write is still proved by CO4's bounded retained-head
+   rebase or rejects the optimistic base `stale_head`; on rejection the path
+   fetches and epoch-checks `/head` before retry.
+   This removes a routine close-time RPC without weakening the authority
+   proof.
 4. **Differential gate** (build-time, Plan 002 Phase 2): v2 and `src/net/`
    produce equal committed state and observation streams on the shared
    smoke scenario; divergence is a stop.
@@ -567,11 +701,13 @@ One write path per fact (CO9), concretized:
   definition kind on installed `$` objects at catalog authority. It advances
   the catalog head once, durably appends the tail event, and refans replacements
   plus removed cell keys under the same high-water. An unchanged replay is a
-  no-op. A later full catalog pull also removes local verb/property definition
-  pages on `$` catalog objects that are absent from the authoritative closure,
-  covering gateways that were offline for the fanout. Definition-shaped cells
-  authored at runtime on ordinary objects, as well as ordinary instance
-  property cells, are outside the catalog image and remain untouched.
+  no-op. A later full catalog pull performs the general exact-scope
+  replacement: every locally held catalog-owned cell absent from the
+  authoritative closure is removed, covering gateways that were offline for
+  any cell-removal fanout. Cells classified to another scope or
+  transferred as unclassifiable derived rider residue remain outside that
+  catalog image; the former stay untouched, and the latter are discarded as a
+  repairable cache miss.
   The operator script requires an explicit `$object:verb` or
   `prop:$object:name` allow-list, obtains replacements from the fresh local
   install plan, and permits drops only when a bundled migration declares the
@@ -642,6 +778,12 @@ One write path per fact (CO9), concretized:
   post-accept closure fill installs the exact accepted session value as a
   durable derived echo stamped at the returned authority head. The transcript
   remains the only write path; unrelated touched cells stay repair-on-read.
+  Session close is likewise idempotent at the public retry boundary even
+  though success invalidates its own bearer: after authority accepts the close,
+  the session-routed gateway retains a bounded durable receipt and answers a
+  repeated `DELETE /net-api/session` before ordinary live-bearer validation.
+  The receipt is retry evidence only, never session authority; unknown session
+  ids still fail authentication, and pruning restores that normal refusal.
   Elastic guest sessions additionally carry an `ephemeralActor` lifecycle
   marker. When the last live session is gone, the actor-cluster alarm reaper
   advances one owner head, moves that actor's authoritative live cell to
@@ -684,20 +826,22 @@ One write path per fact (CO9), concretized:
 - **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
   local deltas, or a `/net/relate` refan) under the same per-scope seq
   high-water that gates cells, plus one coherence companion: a closure
-  that advances the high-water carries the scope's relation rows,
-  upserted in the same transaction. That is the FULL closure
-  (`keys: ["*"]` — the repair/reseed state transfer) and, since the
+  that advances the high-water carries the scope's **complete** relation
+  family. The gateway transactionally removes that scope's old rows, installs
+  the returned rows, and only then advances the high-water. That is the FULL
+  closure (`keys: ["*"]` — the repair/reseed state transfer) and, since the
   ready-to-scale Phase 4, the TARGETED cold-open closure
   (`objects: [...], relations: true` — the named objects' class+anchor
   chains, their actors' session cells, and the roster; the client
   cold-open's cost tracks the session's need, never the scope's size).
   Required because a pull supersedes earlier fanout rows by seq —
   without the rows riding the closure, a pull would silently starve the
-  mirror of everything those deliveries carried; a targeted pull's
-  un-copied cells are ABSENT at the receiver, and absent is never stale
-  (pull-on-miss and read-version checks own them). Upsert-only: a row
-  deleted at the authority while the gateway was unsubscribed lingers
-  until a later remove delta heals it; a fresh shard's mirror is exact.
+  mirror of everything those deliveries carried. A targeted pull does not
+  certify or replace unrequested cells; pull-on-miss and read-version checks
+  own their freshness. Relation replacement is nevertheless required because
+  that targeted pull advances the same high-water: a row absent from its
+  complete relation family is deleted before a delayed removal at or below
+  that head can be suppressed.
   `GET /net/relation?relation=&owner=` is the client-read primitive for
   who/contents.
 - **Every gateway that warms the catalog subscribes to catalog fanout.**
@@ -756,8 +900,25 @@ One write path per fact (CO9), concretized:
   authorize then validates semantically. An attested-but-different
   version is NOT an auth verdict: step 7 rejects it retryably
   (`read_version_mismatch`) so a stale view repairs instead of
-  terminal-failing. Ownership witness: the scope holds the cell AND it
-  is not CA3 rider residue. Sessions absent entirely → allowed only for
+  terminal-failing.
+
+  A room authority has one equivalent local proof: its owner-sequenced
+  `session_presence` checkpoint. The row is projected only from the
+  actor-cluster session transition, carries the exact session value, and
+  mint/move/close freshness-fence its add/remove at the room before
+  returning. When (and only when) that row is owned by the committing
+  room, names the submitted session, and its value says
+  `activeScope == room`, the scope MAY validate the session read against
+  the row's content version instead of demanding a live actor-cluster
+  attestation. It still validates actor binding and expiry locally. A
+  different projected version is the same retryable
+  `read_version_mismatch`; an absent row or a commit anywhere other than
+  that active room uses the ordinary CO2.3 owner attestation. Thus close
+  completion removes the proof before returning, and an overdue relation
+  cannot extend a session because expiry is checked from its value.
+
+  Ownership witness: the scope holds the cell AND it is not CA3 rider
+  residue. Sessions absent entirely → allowed only for
   direct-route turns (lane/tooling submits); a sequenced turn must name
   a session, and the Phase-4 client surface requires sessions on all
   client-originated turns (next bullet). Credential authentication
@@ -771,11 +932,23 @@ One write path per fact (CO9), concretized:
   reads, metrics, tickets, and WebSocket upgrades return to that same DO.
   No internal signing rides this path — the gateway
   authenticates the client credential itself: `authorization: Bearer
-  apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
-  catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
-  from the catalog scope), with core's exact salt/hash scheme
-  reimplemented in `src/worker/net/client-auth.ts` (never an engine
-  import); refusals are named 401 `E_NOSESSION` verdicts.
+  apikey:<id>:<secret>` (or `x-woo-api-key`). For an `n1_` id, the public
+  routing hint names the actor's immutable anchor scope and actor. The gateway
+  asks that authority for exactly one row in its authority-private verifier
+  index and the current mutation-complete head. The index is derived from the
+  actor-owned `api_keys` cell, rebuildable from it, and never appears in CO13
+  relations, closure transfer, fanout, gateway mirrors, or public relation
+  reads. The gateway may cache an authority receipt for
+  `NET_CREDENTIAL_TTL_MS` (default 1000ms, hard maximum 30s; zero means exact per request);
+  therefore revocation fences future API-key and bearer-session use within
+  that explicit bound. The cache is fixed-size and includes negative results.
+  Authority unavailability is retryable 503 `E_RPC_TIMEOUT`, including the
+  MCP GET carrier; it must not collapse to 401 unknown/revoked or 404 missing
+  session. Historical ids fall back to the carried, read-only catalog identity
+  cell `property_cell:$system:api_keys`. Both paths use core's exact salt/hash
+  scheme reimplemented in `src/worker/net/client-auth.ts` (never an engine
+  import). A session minted from an API key stores only that public id and
+  rechecks it on bearer-only requests without persisting the secret.
   **Rate limits (wire.md's inbound rule, applied per authenticated
   actor):** every `/net-api` operation — REST request or WS turn frame —
   draws from one token bucket of 50 ops/s sustained, burst 100; the
@@ -786,25 +959,58 @@ One write path per fact (CO9), concretized:
   instead of stranding). Buckets are per-gateway-isolate memory
   (bounded, idle-evicted); eviction degrades to permitting one fresh
   burst, never to blocking a legitimate client.
-  - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
-    view lineage (CO15; convention pull `cluster:<actor>` on miss) and
-    mints through `/net/session-open`'s machinery.
-  - `POST /net-api/turn {target, verb, args?, session, idempotency_key?}`
+  - `POST /net-api/session {ttl_ms?, roster_visible?}` derives the actor's
+    cluster from view lineage (CO15; convention pull `cluster:<actor>` on
+    miss) and mints through `/net/session-open`'s machinery.
+    `roster_visible:false` is accepted only when the request authenticated
+    with an API key; otherwise it refuses HTTP 403 `E_PERM` with
+    `detail.reason:"roster_visibility_requires_apikey"`. It does **not**
+    suppress substrate session presence: the session still has `activeScope`,
+    produces the owner-sequenced `session_presence` row, remains eligible for
+    live observation fanout, and satisfies presence-scoped authorization.
+    Catalog delivery code MUST likewise use presence-mode delivery or
+    `live_audience`, never derive its transport audience from the social
+    roster. A planner's `active_actors` result is a useful local view, not a
+    complete distributed delivery membership proof.
+    The flag suppresses the actor from every actor/session-level social
+    projection: the compact `room_roster` consumed by `who` and presence UI,
+    and catalog properties declared with `presence_projection`. The choice is
+    stored in the session authority cell and carried by each accepted
+    `sessionScopeTransition`, so every materializer derives the same public
+    state. An actor with multiple sessions remains in `room_roster` when any
+    live session is roster-visible. Omission defaults to `true`; a non-boolean
+    value refuses HTTP 400 `E_INVARG`. A successful mint reply includes the
+    resolved `roster_visible` boolean for both API-key and human doors.
+  - `DELETE /net-api/session` is semantically idempotent although its success
+    invalidates its own bearer. The session-routed gateway retains a bounded
+    accepted-close receipt and checks it before live-bearer authentication.
+    If both bounded internal submit replies were lost after authority
+    accepted, that receipt may be absent; the gateway MAY then use its exact
+    derived session value solely to bind the opaque bearer to the actor and
+    reach the same close postcondition. An expired value grants no other
+    operation. Unknown session ids still fail ordinary authentication.
+    Scheduled/disconnected plugs SHOULD request `roster_visible:false` and
+    close the session in a `finally` path. Hidden-roster mode is not session
+    garbage collection: failure to close still leaves authority state,
+    subscriptions, and expiry work behind.
+  - `POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the
-    AUTHENTICATED apikey actor — before planning. **Route is derived from the
-    planning scope, not fixed:** a `room:*` (shared) scope runs the in-world
-    sequenced `$space:call`; a `cluster:*` (private authority) scope runs
-    `direct` — the committing Scope head sequences it, since a cluster root is
-    an actor, not a `$space` replay log with `next_seq`/subscribers/presence. A
-    scope that classifies to neither (e.g. `catalog`) is not client-plannable
-    and is refused. The direct route selects the invocation SHAPE only;
-    `world.directCall` still enforces `direct_callable`, so a non-direct-callable
-    verb in a cluster returns `E_DIRECT_DENIED` — a cluster is not a substitute
-    sequencing space. Session AUTHORIZATION does not depend on the route:
-    `foldSessionEffects` records the session read for either route, and the
-    committing Scope revalidates it end-to-end (the gateway authenticates;
-    scopes authorize). `target`
+    AUTHENTICATED apikey actor — before planning. Omitted `route` defaults to
+    `sequenced`. **The planning scope then tightens the requested route:** a
+    `cluster:*` (private authority) scope is forced to `direct` — the committing
+    Scope head sequences it, since a cluster root is an actor, not a `$space`
+    replay log with `next_seq`/subscribers/presence. A `room:*` (shared) scope
+    keeps the requested route: sequenced by default via the in-world
+    `$space:call`, but an explicit `direct` request is honored. A scope that
+    classifies to neither (e.g. `catalog`) is not client-plannable and is
+    refused. Either way a requested/forced `direct` route is allowed only when
+    the resolved verb declares `direct_callable:true`; unresolved metadata fails
+    closed with `E_DIRECT_DENIED`, and `world.directCall` re-enforces it, so a
+    non-direct-callable verb in a cluster still returns `E_DIRECT_DENIED` — a
+    cluster is not a substitute sequencing space. Either route carries the
+    session read so the committing scope's authorize revalidates end-to-end (the
+    gateway authenticates; scopes authorize). `target`
     is a concrete runtime object id, not a catalog-manifest reference:
     installed-alias forms such as `tasks:the_taskboard` have already
     resolved to their concrete seed id before runtime. A concrete object
@@ -819,13 +1025,17 @@ One write path per fact (CO9), concretized:
     from the view, else the actor itself; the anchor classifies through
     view lineage (CO15 walk; convention pull `room:<anchor>` on miss),
     falling back to the actor's cluster when it cannot classify.
+  - A route:`sequenced` Net turn consumes a semantic-space log seq only when
+    CO2.3 selects that space's authority. Pure movement remains off the room
+    sequencer and is not represented as a room-log entry; any turn emitting
+    a room-owned act necessarily rides at the room and logs atomically.
   - Accepted turn replies carry the planned transcript's `result`,
     `error`, and `observations` (the gateway holds the planned
     transcript; `error` matters because an errored verb still commits
     its complete transcript — without the field an accepted no-op is
-    indistinguishable from success). A replay detected by post-state
-    digest mismatch omits them and marks `replayed: true` (a fresh
-    accept always digest-matches its plan).
+    indistinguishable from success). A scope-confirmed replay of a durable
+    commit omits them and marks `replayed:true`; a pure direct read is not
+    cached and safely returns a newly validated result at the unchanged head.
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
     client reads over the CO13 roster mirror and the view cell probe. Session
     ids are bearer credentials: relation reads expose only actor-level
@@ -885,7 +1095,31 @@ One write path per fact (CO9), concretized:
     a fanout delayed beyond both bounded windows may appear once redundantly.
     Delivery is never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
-    catch-up is deliberately NOT promised in Phase 4.
+    catch-up is deliberately NOT promised in Phase 4. A gateway shard with
+    neither hibernating sockets nor live MCP session state has no peer-delivery
+    carrier and MUST skip the presence-mirror audience scan; HTTP-only callers
+    already receive their own observations on the turn reply. Otherwise the
+    gateway MUST intersect the scope mirror with its bounded local carrier
+    sessions through the `(relation, owner_scope, member)` index. Fanout work
+    therefore scales with local viewers, not every actor present in the room.
+  - **Direct live observation delivery:** an accepted effect-free direct turn
+    uses the same CO13 presence mirror but a separate unsequenced carrier.
+    The validating scope sends `{type:"live_observations", scope, echo_id?,
+    observations}` best-effort to the bounded fanout-role gateway shard
+    registry; the origin gateway delivers its own slice only after the scope
+    replies, avoiding a gateway→scope→origin RPC cycle. The carrier has no
+    `seq`, never enters the durable outbox, never advances a gateway
+    high-water, and a disconnected recipient loses it. Presence-derived
+    audience enumerations are not completeness proofs: every destination
+    shard resolves `presence` mode against its own scope-indexed relation
+    slice. The Net carrier MUST NOT copy the planner's session-audience lists:
+    session ids are bearer credentials and routing them once per observation
+    makes envelope size depend on stale derived session history. It carries the
+    parallel audience-mode vector plus non-secret actor refs for
+    `explicit`/private observations; each destination gateway maps those actors
+    to its own indexed, in-scope carrier sessions. The submitting client gets
+    the full observation on `turn_result`; the shared echo digest suppresses a
+    redundant live frame during rolling failure.
   - **Installed catalog read:** authenticated clients may read the bounded
     `$catalog_registry.installed_catalogs` value through `GET /net-api/catalogs`.
     The response exposes ledger records only, not the property cell definition

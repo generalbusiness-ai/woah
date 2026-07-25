@@ -19,8 +19,12 @@
  * every DO into one world image). Only a deployed canary with guests spread
  * across >=2 real shards exercises it. Pass `--enforce-who` to require
  * conclusive, complete-roster evidence (fails on partial OR inconclusive).
+ * The catalog intentionally caps one roster at 100 actors; larger capacity
+ * runs therefore pass `--skip-who` and use a separate <=100-actor
+ * completeness run.
  */
 
+import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../src/net/client-session-policy";
 import { sessionShardHint } from "../src/net/session-id";
 
 export type CanaryGuest = { actor: string; session: string; elastic: boolean; activeScope: string | null };
@@ -52,8 +56,15 @@ export type WhoCheckSummary = {
   min_seen: number;
   max_missing: number;
   partial: boolean;
-  examples: Array<{ actor: string; shard: string | null; seen: number; missing: string[] }>;
+  examples: Array<{ actor: string; shard: string | null; seen: number; missing: string[]; detail?: string }>;
 };
+
+// A canary is an acceptance gate, so a lost edge reply must become evidence,
+// not an indefinitely hung process that also skips session cleanup. Keep this
+// comfortably above the Worker's 5s internal RPC deadline while still bounding
+// the 512-responder roster phase.
+export const DEFAULT_CANARY_FETCH_TIMEOUT_MS = 30_000;
+let canaryFetchTimeoutMs = DEFAULT_CANARY_FETCH_TIMEOUT_MS;
 
 /** Enforcement requires both a conclusive run and a complete roster. */
 export function whoCheckFailsAcceptance(summary: WhoCheckSummary): boolean {
@@ -101,7 +112,15 @@ export function summarizeWhoCheck(
   for (const responder of responders) {
     if (!responder.reachable) {
       unreachable += 1;
-      if (examples.length < 12) examples.push({ actor: responder.actor, shard: responder.shard, seen: -1, missing: ["UNREACHABLE"] });
+      if (examples.length < 12) {
+        examples.push({
+          actor: responder.actor,
+          shard: responder.shard,
+          seen: -1,
+          missing: ["UNREACHABLE"],
+          detail: responder.haystack.slice(0, 500)
+        });
+      }
       continue;
     }
     responderCount += 1;
@@ -133,9 +152,15 @@ function percentile(values: number[], p: number): number {
   return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)] ?? 0;
 }
 
-async function jsonFetch(url: string, init: RequestInit): Promise<{ response: Response; body: Record<string, unknown>; ms: number }> {
+export async function jsonFetch(
+  url: string,
+  init: RequestInit,
+  timeoutMs = canaryFetchTimeoutMs
+): Promise<{ response: Response; body: Record<string, unknown>; ms: number }> {
   const started = performance.now();
-  const response = await fetch(url, init);
+  const deadline = AbortSignal.timeout(timeoutMs);
+  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  const response = await fetch(url, { ...init, signal });
   const ms = Math.round(performance.now() - started);
   const text = await response.text();
   let body: Record<string, unknown>;
@@ -145,6 +170,79 @@ async function jsonFetch(url: string, init: RequestInit): Promise<{ response: Re
     body = { error: { code: "E_NON_JSON", message: text.slice(0, 500) } };
   }
   return { response, body, ms };
+}
+
+type JsonFetchResult = Awaited<ReturnType<typeof jsonFetch>>;
+type JsonFetcher = (url: string, init: RequestInit) => Promise<JsonFetchResult>;
+
+/**
+ * Bounded, order-preserving async map.
+ *
+ * Large canaries must neither serialize 512 session mints past their TTL nor
+ * dump 1,024 turns into a gateway's deliberate queue-depth refusal. On the
+ * first error, already-started work settles but no new item starts; callers'
+ * finally blocks can therefore clean every resource they recorded.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const concurrency = Math.max(1, Math.min(items.length || 1, Math.floor(limit)));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  let firstError: unknown;
+  const run = async (): Promise<void> => {
+    while (firstError === undefined) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      try {
+        results[index] = await worker(items[index]!, index);
+      } catch (error) {
+        firstError = error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => run()));
+  if (firstError !== undefined) throw firstError;
+  return results;
+}
+
+/**
+ * Claim one deterministic guest across ambiguous transport failures.
+ *
+ * The claim_id is an idempotency bearer: every attempt must replay the exact
+ * body. A platform-lost internal connection can surface either as a rejected
+ * `fetch` or as a 500/502/503/504 edge response after the authority accepted
+ * the claim. Both are ambiguous dropped replies, so retry the same bearer;
+ * deterministic 4xx refusals remain immediate evidence.
+ */
+export async function fetchCanaryGuestClaim(
+  base: string,
+  claimBody: Record<string, unknown>,
+  guestIndex: number,
+  fetcher: JsonFetcher = jsonFetch,
+  retryDelayMs = 250
+): Promise<JsonFetchResult> {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const result = await fetcher(`${base}/net-api/guest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(claimBody)
+      });
+      if (![500, 502, 503, 504].includes(result.response.status) || attempt === 3) return result;
+    } catch (error) {
+      if (attempt === 3) {
+        throw new Error(`guest ${guestIndex} claim transport failed after ${attempt} attempts: ${String(error)}`, {
+          cause: error
+        });
+      }
+    }
+    if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, attempt * retryDelayMs));
+  }
+  throw new Error(`guest ${guestIndex} claim retry loop exhausted`);
 }
 
 /** Drive one `who_all` turn per guest and summarize roster completeness.
@@ -162,22 +260,42 @@ async function runWhoCheck(base: string, guests: CanaryGuest[], run: string): Pr
     return summarizeWhoCheck(guestActors, guestShards, []);
   }
   const responders: WhoRosterInput[] = [];
-  for (const responder of guests) {
-    const { response, body } = await jsonFetch(`${base}/net-api/turn`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer session:${responder.session}` },
-      body: JSON.stringify({ target: responder.actor, verb: "who_all", args: [], idempotency_key: `${run}-who-${responder.actor}` })
-    });
-    const reply = body.reply as { status?: unknown } | undefined;
-    const reachable = response.ok && reply?.status === "accepted";
-    responders.push({
-      actor: responder.actor,
-      shard: sessionShardHint(responder.session),
-      reachable,
-      haystack: reachable
-        ? JSON.stringify({ result: body.result ?? null, observations: body.observations ?? [] })
-        : JSON.stringify({ status: response.status, error: body.error ?? reply ?? null })
-    });
+  for (const [index, responder] of guests.entries()) {
+    try {
+      const { response, body } = await jsonFetch(`${base}/net-api/turn`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer session:${responder.session}` },
+        body: JSON.stringify({
+          target: responder.actor,
+          verb: "who_all",
+          args: [],
+          route: "direct",
+          idempotency_key: `${run}-who-${responder.actor}`
+        })
+      });
+      const reply = body.reply as { status?: unknown } | undefined;
+      const reachable = response.ok && reply?.status === "accepted";
+      responders.push({
+        actor: responder.actor,
+        shard: sessionShardHint(responder.session),
+        reachable,
+        haystack: reachable
+          ? JSON.stringify({ result: body.result ?? null, observations: body.observations ?? [] })
+          : JSON.stringify({ status: response.status, error: body.error ?? reply ?? null })
+      });
+    } catch (error) {
+      // A timed-out roster read is an unreachable responder, not a reason to
+      // lose the remaining cross-shard evidence or skip session cleanup.
+      responders.push({
+        actor: responder.actor,
+        shard: sessionShardHint(responder.session),
+        reachable: false,
+        haystack: JSON.stringify({ error: String(error) })
+      });
+    }
+    if ((index + 1) % 64 === 0 || index + 1 === guests.length) {
+      console.error(`canary progress: who_all ${index + 1}/${guests.length}`);
+    }
   }
   return summarizeWhoCheck(guestActors, guestShards, responders);
 }
@@ -194,8 +312,17 @@ async function main(): Promise<void> {
   const rounds = Math.max(1, Number(value("--rounds", "50")));
   const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
   const roundDelayMs = Math.max(0, Number(value("--round-delay-ms", "0")));
+  const setupSettleMs = Math.max(0, Number(value("--setup-settle-ms", "0")));
+  const claimConcurrency = Math.max(1, Number(value("--claim-concurrency", "16")));
+  const turnConcurrency = Math.max(1, Number(value("--turn-concurrency", "64")));
+  canaryFetchTimeoutMs = Math.max(1_000, Number(value("--fetch-timeout-ms", String(DEFAULT_CANARY_FETCH_TIMEOUT_MS))));
   const room = value("--room", "the_chatroom");
   const enforceWho = args.includes("--enforce-who");
+  const skipWho = args.includes("--skip-who");
+  if (enforceWho && skipWho) throw new Error("--enforce-who and --skip-who are mutually exclusive");
+  if (actors > 100 && !skipWho) {
+    throw new Error("--actors >100 exceeds the catalog's bounded who_all listing; pass --skip-who and run a separate <=100 actor --enforce-who lane");
+  }
   const run = `canary-${Date.now().toString(36)}`;
   const guests: CanaryGuest[] = [];
   const outcomes: Outcome[] = [];
@@ -203,36 +330,33 @@ async function main(): Promise<void> {
   let whoCheck: WhoCheckSummary | null = null;
 
   try {
-    for (let i = 0; i < actors; i += 1) {
+    await mapWithConcurrency(Array.from({ length: actors }, (_, index) => index), claimConcurrency, async (i) => {
       // Keep one claim bearer across transport retries. The edge routes it to
       // one shard and the gateway derives the same actor/session submit, so a
       // timeout after commit cannot leak a second anonymous identity.
       const claimBody = {
-        ttl_ms: 10 * 60_000,
-        claim_id: `g1.${Date.now().toString(36)}.${(10 * 60_000).toString(36)}.${crypto.randomUUID()}`
+        ttl_ms: CLIENT_SESSION_TTL_DEFAULT_MS,
+        claim_id: `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.${crypto.randomUUID()}`
       };
-      let result: Awaited<ReturnType<typeof jsonFetch>> | null = null;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        result = await jsonFetch(`${base}/net-api/guest`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(claimBody)
-        });
-        if (result.response.status !== 503 || attempt === 3) break;
-        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
-      }
-      if (!result) throw new Error(`guest ${i} did not run`);
+      const result = await fetchCanaryGuestClaim(base, claimBody, i);
       const { response, body } = result;
       if (!response.ok || typeof body.actor !== "string" || typeof body.session !== "string") {
         throw new Error(`guest ${i} failed: ${response.status} ${JSON.stringify(body)}`);
       }
-      guests.push({
+      const guest = {
         actor: body.actor,
         session: body.session,
         elastic: body.elastic === true,
         activeScope: typeof body.active_scope === "string" ? body.active_scope : null
-      });
-    }
+      } satisfies CanaryGuest;
+      // Record each accepted resource before the worker resolves so a later
+      // sibling failure cannot hide it from the outer finally cleanup.
+      guests.push(guest);
+      if (guests.length % 64 === 0 || guests.length === actors) {
+        console.error(`canary progress: claimed ${guests.length}/${actors} guests`);
+      }
+      return guest;
+    });
 
     // Establish co-presence: every guest enters the shared room so its session
     // activeScope is that room. The who_all check below is presence-scoped
@@ -241,7 +365,8 @@ async function main(): Promise<void> {
     // guest sitting in its own cluster would correctly see only itself and the
     // completeness assertion would be meaningless. Failures here are recorded
     // like any other turn outcome.
-    const enterBatch = await Promise.all(guestsNeedingEnter(guests, room).map(async (guest, index): Promise<Outcome> => {
+    const enterGuests = guestsNeedingEnter(guests, room);
+    const enterBatch = await mapWithConcurrency(enterGuests, turnConcurrency, async (guest, index): Promise<Outcome> => {
       const started = performance.now();
       try {
         const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
@@ -258,8 +383,17 @@ async function main(): Promise<void> {
       } catch (err) {
         return { phase: "enter", status: 0, ms: Math.round(performance.now() - started), code: "E_FETCH", accepted: false, detail: String(err).slice(0, 1_000) };
       }
-    }));
+    });
     outcomes.push(...enterBatch);
+    console.error(`canary progress: entered ${enterBatch.length}/${enterGuests.length} guests`);
+    // Admission intentionally exercises session mint, presence fencing, and
+    // durable fanout. A warm-capacity measurement may separate that setup
+    // storm from turns explicitly; keep the delay opt-in and report it so a
+    // result can never masquerade as immediate post-admission capacity.
+    if (setupSettleMs > 0) {
+      console.error(`canary progress: settling setup for ${setupSettleMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, setupSettleMs));
+    }
 
     for (let round = 0; round < rounds; round += 1) {
       const requests = guests.flatMap((guest, actorIndex) =>
@@ -270,7 +404,7 @@ async function main(): Promise<void> {
             : { guest, verb: "look", args: [] };
         })
       );
-      const batch = await Promise.all(requests.map(async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
+      const batch = await mapWithConcurrency(requests, turnConcurrency, async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
         const started = performance.now();
         try {
           const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
@@ -283,6 +417,10 @@ async function main(): Promise<void> {
               target: room,
               verb,
               args: turnArgs,
+              // Both load verbs declare live persistence. Exercise their
+              // production route instead of manufacturing contention on the
+              // room's durable sequence allocator.
+              route: "direct",
               idempotency_key: `${run}-${round}-${index}`
             })
           });
@@ -310,8 +448,9 @@ async function main(): Promise<void> {
             detail: `${String(err)}${cause}`.slice(0, 1_000)
           };
         }
-      }));
+      });
       outcomes.push(...batch);
+      console.error(`canary progress: load round ${round + 1}/${rounds} completed (${batch.length} turns)`);
       if (roundDelayMs > 0 && round + 1 < rounds) {
         await new Promise((resolve) => setTimeout(resolve, roundDelayMs));
       }
@@ -322,9 +461,9 @@ async function main(): Promise<void> {
     // check now verifies that completeness (a regression gate) rather than
     // documenting the old connected_players partial view; --enforce-who fails
     // the run on any partial or inconclusive result.
-    whoCheck = await runWhoCheck(base, guests, run);
+    if (!skipWho) whoCheck = await runWhoCheck(base, guests, run);
   } finally {
-    await Promise.all(guests.map(async (guest) => {
+    await mapWithConcurrency(guests, turnConcurrency, async (guest) => {
       let last = { status: 0, detail: "close request did not run" };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
@@ -341,7 +480,7 @@ async function main(): Promise<void> {
         if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
       closeFailures.push({ actor: guest.actor, ...last });
-    }));
+    });
   }
 
   const failures = outcomes.filter((outcome) => !outcome.accepted);
@@ -367,6 +506,9 @@ async function main(): Promise<void> {
     close_failures: closeFailures,
     turns: outcomes.length,
     requests_per_actor: requestsPerActor,
+    claim_concurrency: claimConcurrency,
+    turn_concurrency: turnConcurrency,
+    setup_settle_ms: setupSettleMs,
     round_delay_ms: roundDelayMs,
     phase_outcomes: phaseOutcomes,
     accepted: outcomes.length - failures.length,

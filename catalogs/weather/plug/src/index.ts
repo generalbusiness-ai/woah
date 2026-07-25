@@ -122,6 +122,34 @@ export async function runWeatherTick(
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
   await client.authenticate(env.WOO_APIKEY);
 
+  let tickFailed = false;
+  try {
+    return await runAuthenticatedWeatherTick(client, env, fetchImpl, deps.now);
+  } catch (err) {
+    tickFailed = true;
+    throw err;
+  } finally {
+    try {
+      await client.close();
+    } catch (err) {
+      logEvent({
+        event: "session_close_error",
+        block: env.BLOCK_ID,
+        ...errorBreadcrumb(err)
+      });
+      // Preserve the real tick failure when cleanup also fails; on a
+      // successful tick, a failed close is itself operational failure.
+      if (!tickFailed) throw err;
+    }
+  }
+}
+
+async function runAuthenticatedWeatherTick(
+  client: WooClient,
+  env: WeatherPlugEnv,
+  fetchImpl: typeof fetch,
+  now: (() => number) | undefined
+): Promise<WeatherTickResult> {
   const placeValue = await client.getProperty(env.BLOCK_ID, "place");
   const place = typeof placeValue === "string" && placeValue.trim() ? placeValue : null;
   if (!place) {
@@ -160,7 +188,7 @@ export async function runWeatherTick(
       timezone,
       units,
       fetchImpl,
-      now: deps.now
+      now
     });
   } catch (err) {
     const message = formatLastError(err, place);

@@ -1,7 +1,10 @@
 # Acts kernel: one record, many work surfaces
 
 *Origin: 2026-07-21; compacted after two review rounds the same day.
-Draft design note, not a spec. Defines the content model for "the work"
+Historical design note. The accepted contract is now normative in
+[`spec/semantics/acts.md`](../spec/semantics/acts.md). This note records the
+prototype reasoning and evidence; where wording differs, the spec governs.
+Defines the content model for "the work"
 in a room — schema-validated acts on the sequenced log, work surfaces
 derived as projections — as four contracts plus one thin vertical
 slice (Tasks on `$case`). Rationale, composition model, meta-process,
@@ -9,8 +12,7 @@ and deferred extensions live in the companion note
 [`2026-07-21-acts-composition-vision.md`](2026-07-21-acts-composition-vision.md).*
 
 *Builds on `2026-07-12-case-gravity-unified-model.md` (case = room) and
-`2026-07-12-security-caserooms-design-approach.md`. On acceptance the
-contracts promote into spec (likely `spec/coordination/acts.md`).*
+`2026-07-12-security-caserooms-design-approach.md`.*
 
 *Prototype status (2026-07-21, worktree branch `worktree-acts-kernel`):
 the kernel proof is BUILT and green on the in-memory lane — both core
@@ -21,14 +23,16 @@ seams (`event_schema` builtin; `ts` on `replay()`), the `acts` catalog
 refusals, fail-closed atomicity (a refused fold rolls back the minted
 artifact with the turn — verified), and the rebuild invariant. `npm
 test` green. Implementation findings folded into the sketches below:
-fold input carries the envelope seq (§2.4); `$space` instances own-seed
+fold input carries recorded envelope seq, actor, and composer source (§2.4);
+`$space` instances own-seed
 `features: []`, so the `$acts` feature mounts per instance at
 `:initialize` while a class-level attach satisfies the installer's
 static this-call resolution. RETARGET (user decision, same day): **Outliner replaces
 Tasks as the first real migration target** — user-ready, its net repair
 loop is the model's motivating bug, and the facade note already chose
 it as the client's first adopter; casework keeps the tasks-shaped
-proof, and Tasks migrates second. Split landed: `acts` is the generic
+proof. **Dispenser is now the second consumer and first plug-backed proof;
+Tasks follows.** Split landed: `acts` is the generic
 kernel; `casework` is the temporary proof catalog. Outliner phase 1
 landed (validated guarded emission on the five structural verbs against
 the existing `outline_item_*` schemas; unions/null earned in the shape
@@ -40,14 +44,50 @@ another space's turn — cross-space capture emission is a v1.5 routing
 question). Tier C first data (in-memory): act turn 1.31×/1.20×
 baseline p50/p99 — inside the ≤1.5× proposal; +0.32ms per extra fold
 (~6% vs ~5% target); storage ~224 B/row, 228KB whole-map rewrite at
-1000 rows. Outstanding: outliner tree projection + watermarked
-`list_items` (design question: the `__ordered_edge` relation is already
-substrate-authoritative post-converge, so the projection layer adds the
-completeness watermark and act-derived indexes rather than mirroring
-the tree — resolve against the no-mirror rule), legacy-genesis seeding
-for deployed outlines, client/facade adoption + both-shape tolerance,
-outliner parity/deletion delta, then the Tasks migration, workerd lane,
-E4/E5 gate, cold-case cost.*
+1000 rows. RESOLVED (2026-07-22): the outliner tree question landed as
+a **relation-checkpoint projection** — `$outline_meta` consumes the
+five structural acts, keeps no rows (the `__ordered_edge` relation
+stays the current-state authority; carve-out 3 in §1), and
+`$outliner:tree_view` returns the substrate tree plus the
+`structure_at_seq` checkpoint; undo's `_restore_item` re-emits the
+added act so restores advance it. Legacy genesis is empty by construction:
+deployed relations remain authoritative, the checkpoint begins at 0, and
+the first v3 structural act makes it current. RESOLVED (2026-07-22): Net
+replay reads exact pages from the semantic room's Scope authority; that
+authority durably appends accepted sequenced entries with its seq/ts, and
+pages participate in normal local-or-attested read validation. A fresh
+`$outline_meta` rebuild converges to the live watermark through a sparse
+Net planner, while real workerd proves the same durable page repair over
+SQLite/RPC (26/26). RESOLVED (2026-07-22): Outliner client adoption uses the
+generic semantic-view facade over `tree_view`; full structural parity, legacy
+genesis, stale-read rejection, and deletion accounting are pinned. RESOLVED
+(2026-07-23): Dispenser v1 uses an earned anchored-actor composer form: the
+block owns typed domain verbs while its containing room owns the sequenced log.
+One bounded projection owns queue membership, id allocation, admission
+indexes, and terminal receipts. Order preallocates a room-anchored artifact;
+the plug fills it directly, then sequenced delivery carries only its reference,
+so neither the Act nor the room message copies generated prose. The proof
+covers authenticated Net ingress, same-key dropped-reply
+dedupe plus fresh-key domain receipt recovery, fail-closed artifact rollback,
+SQLite v0 genesis, hard caps, and a fresh projection rebuilding rows, receipt,
+counter, and watermark through the sparse owner-attested Net replay path.
+Outstanding: the Tasks/Kanban migration and E4/E5 gate. Tier C's Outliner read/fanout
+lane is now concrete: real workerd/Net, 1,000 rows, eight principals, three Act
+invalidation waves; warm p50/p95 92/101 ms, 145,485–145,491-byte responses,
+32–36 ms mutation-to-all-seven-peer-push (276–278-byte Act frames), and
+904–928 ms invalidation-to-current wall time (p95 928 ms), inside the declared
+1.5 s / 512 KiB / 5 s pilot budgets. Two generic Net corrections were required
+to make that claim honest: direct semantic reads validate without committing a
+new scope head, and byte-identical repeated cell reads collapse to one wire
+proof. AUTHORITY CLOSURE (2026-07-22): `x`, underscore naming, and
+`direct_callable:false` are dispatch metadata, not privacy. Every internal Acts
+helper and adopted-fact writer is non-`x` and caller-guarded; every projection
+is bound to one `source_space`; authenticated participant and privileged-
+programmer regressions cover fold, capture, detach, hidden-state, and movement
+bypasses. The audit also required one generic moveto correction beyond the two
+planned read seams: container hooks now receive the moving object as `caller`,
+so executable lifecycle callbacks can authenticate substrate dispatch. This
+counts against the original core-change claim. The ordered queue is §7.1.*
 
 ---
 
@@ -65,24 +105,40 @@ that spine. The discipline is one sentence:
 > list, status, order, or assignment directly; no read ever
 > scans-and-recomputes.
 
-Two things remain object-authoritative by design, and projections must
-not mirror them:
+Three things remain object-authoritative by design, and projections
+must not mirror them:
 
 1. **Artifact content** — `$note` name/description/text. Acts reference
    documents; rows never copy their fields.
 2. **Physical location** — the substrate `moveto` relation (the tasks
    lease). Rows never store a holder; reads derive it (§5.2).
+3. **Substrate-owned relations** — e.g. the outliner's
+   `__ordered_edge`, written directly by the domain verbs and read
+   through owner-computed builtins (`object_tree_rows`,
+   `ordered_children`/`ordered_neighbors`). The relation already has
+   exactly one writer per fact; a projection that folded the same acts
+   into its own rows would be the second authority. Projections
+   **checkpoint** such relations (a *relation-checkpoint projection*:
+   watermark + any act-derived indexes the relation can't answer) and
+   never copy them.
 
 Substrate backing: `$sequenced_log` atomic append (SL2), per-entry
 recorded `observations` (`SpaceLogEntry`, src/core/types.ts:579), the
 outer behavior savepoint around sequenced dispatch
 (src/core/world.ts:4594), deterministic replay (SL3), snapshots.
 
-The invariant, per projection:
+The invariant, per projection — scoped to **projection-owned state**
+(`rows` plus auxiliary fold state; NOT the carve-outs above, which the
+fold never writes and a rebuild therefore never reconstructs):
 
 ```
 fold(recorded acts since the projection's seed, in (seq,index) order) == rows
 ```
+
+For a relation-checkpoint projection this reads: rebuilding the
+recorded acts reconstructs the *checkpoint*, not the relation — the
+relation stays the current-state authority, while the act log is the
+semantic/audit authority for acted transitions.
 
 Rebuild input is the **recorded** observations — never re-execution of
 verbs. Verb changes cannot invalidate a projection; only fold changes
@@ -106,7 +162,7 @@ turns every other representation into a fold.
 ```
 { "type": "tasks.claimed",     // namespace.name
   "version": 1,                // schema version, immutable per version
-  "payload": { "task": #123, "holder": #45 } }
+  "payload": { "task": #123 } }
 ```
 
 The **envelope is the log entry**: room, seq, actor, timestamp, verb
@@ -151,12 +207,16 @@ is deliberately deferred until one real migration requires it.
 
 ```
 consumes: [act types]
+source_space  — non-public binding to the one composer
+log_space     — non-public binding to the one sequenced log
 :fold(act)    — deterministic given (projection state, act); sole writer
-                of ALL projection state; O(payload); no foreign reads;
+                of ALL projection state; scans only payload + declared
+                fixed caps; no foreign reads;
                 no wall clock; must update at_seq from act["seq"]
+                accepts only source_space, live or during rebuild
 :view(opts)   — the one authoritative bounded read
                 → { page, at_seq, has_more }
-:rebuild_from(space, from_seq)
+:rebuild_from(log_space, page_budget)
               — operator rebuild: re-folds recorded acts (skipping
                 failed entries), never re-executes verbs; owner/wizard
 rows          — keyed map prop; row_cap (v1 default 1000); overflow
@@ -200,10 +260,15 @@ Contract points sharpened by the prototype review (2026-07-21):
 **Same-anchor, trusted, bounded, fail-closed:**
 
 - *Same-anchor*: the projection lives in the case's anchor cluster, so
-  SL2 atomicity covers fold writes. Enforced at seed.
+  SL2 atomicity covers fold writes. Enforced at seed. Its non-public
+  `source_space` records the one composer; `:act` rejects an unbound or
+  foreign projection before folding.
 - *Trusted*: v1 projections come only from catalog seed. `rows`,
   `consumes`, `row_cap`, and the case's `projections` property use
-  `perms ""`; only catalog-author code can write them. There is no
+  `perms ""`; internal folds and helpers omit public `x` and validate
+  `caller` explicitly. Underscore naming and `direct_callable:false` do not
+  constrain the public sequenced route, and a wizard programmer can bypass
+  permission metadata, so neither substitutes for the guard. There is no
   dynamic attach surface; attach authority, genesis records, and
   blue-green fold replacement are deferred extensions.
 - *Fail-closed*: **any fold failure aborts the entire turn.** The
@@ -231,7 +296,7 @@ on a case, its effective surface is `$case:act`. v1 has no public
 emission surface (actor-namespace `emit_act` is deferred):
 
 ```
-verb :act(type, payload) rx {
+verb :act(type, payload) r {
   /* INTERNAL: not direct-callable, not a command, not tool-exposed.
      Frame-global guards (src/core/dsl-compiler.ts:122); direct routes
      carry seq == -1 (src/core/world.ts:4426), so seq >= 1 proves a
@@ -248,12 +313,17 @@ verb :act(type, payload) rx {
     raise { code: "E_INVARG", message: "unknown act type", value: type };
   }
   this:_validate_payload(d, payload);      /* flat shape check */
-  let act = { "type": type, "version": 1, "payload": payload };
-  /* Folds receive the act plus its envelope seq, injected here (live)
-     or by :rebuild_from (recorded). The observed act body stays free of
-     envelope fields — the log entry is the envelope. */
-  let fold_input = { "type": type, "version": 1, "payload": payload, "seq": seq };
+  let act = { "type": type, "version": 1, "payload": payload, "source": this };
+  /* Folds receive recorded envelope identity, injected identically live
+     and by :rebuild_from. The semantic body stays free of those fields. */
+  let fold_input = {
+    "type": type, "version": 1, "payload": payload,
+    "seq": seq, "actor": actor, "source": this
+  };
   for p in this.projections {
+    if (!valid(p) || !isa(p, $projection) || p.source_space != this) {
+      raise { code: "E_INVARG", message: "projection is not bound to emitting space" };
+    }
     if (type in p.consumes) { p:fold(fold_input); }  /* no catch: fail-closed */
   }
   observe(act);                            /* recorded in this entry */
@@ -378,7 +448,7 @@ machinery; `case.digest`.
     "shape": { "task": "obj", "kind": "str", "labels": "list",
                "obligations": "list" } },
   { "on": "$case", "type": "tasks.claimed",
-    "shape": { "task": "obj", "holder": "obj" } },
+    "shape": { "task": "obj" } },
   { "on": "$case", "type": "tasks.passed",
     "shape": { "task": "obj", "obligation": "str" } },
   { "on": "$case", "type": "tasks.closed",
@@ -440,7 +510,10 @@ enforcement is what makes auxiliary-state eviction (§2.3) safe.
 Fold sketch (illustrative):
 
 ```
-verb :fold(act) rx {
+verb :fold(act) r {
+  if (caller != this.source_space) {
+    raise { code: "E_PERM", message: "projection fold is authority-internal" };
+  }
   let ty = act["type"]; let p = act["payload"];
   if (ty == "tasks.opened") {
     if (length(this.rows) >= this.row_cap) {
@@ -499,7 +572,9 @@ Parity tests:
 
 1. **Rebuild and write authority** — §5.3(2), per projection; direct
    writes to rows or projection configuration are refused even for the
-   owning actor.
+   owning actor. Every projection is bound to one `source_space`; live fold
+   accepts only that composer. Rebuild is source-mediated: the projection may
+   request recorded replay but cannot self-fold or supply fold input.
 2. **Core read seams**: `event_schema()` obeys class/feature precedence
    and returns a defensive copy of the installed shape; `replay()`
    includes the persisted `ts` without changing pagination.
@@ -509,6 +584,12 @@ Parity tests:
    leaves no act observation and no row. A direct refusal creates no
    log entry; a refusal reached through a sequenced call remains as a
    failed entry containing only its error outcome.
+   Authenticated sequenced calls to internal helpers, adopted-fact mutators,
+   and projection folds are also refused without changing artifact state,
+   projection state, sequence, or successful log entries. Repeat under a
+   wizard programmer that bypasses execute metadata to prove the explicit
+   caller guards, not `x`/underscore/direct-callable convention, carry the
+   authority.
 4. **Fail-closed atomicity**: a raising fold (E_QUOTA at row_cap; an
    induced error) aborts the whole turn — the failed call entry remains,
    but it records no act observation, writes no row, and applies **no
@@ -541,7 +622,41 @@ Parity tests:
    external effect occurs without the human approval required by E5.
    (Poisoned-correlation fixtures belong to the v1.5 router gates.)
 
-## 7. Deferred decisions
+## 7. Adoption queue and deferred decisions
+
+### 7.1 Ordered adoption queue
+
+Net replay is complete: a sparse planner repairs from the semantic room's
+durable authority log; the exact Outliner rebuild test and real-workerd
+storage/RPC lane are green. Outliner closure is also complete: the generic
+reactive semantic-view facade now reads `tree_view`, parity is pinned after
+every structural verb, and an upgraded outline with pre-v3 rows is pinned at
+`structure_at_seq: 0` with no minted projection. Deletion accounting is honest:
+the element lost its item hydrator, four generation/scheduling fields, and
+three item-hydration methods, replaced by one shared `WooViewController`; the
+catalog UI file is nevertheless +21 physical lines (146 added/125 removed)
+because it now owns the view declaration/result validator and closes the
+previously missed `note_writers_changed` path. The useful delta is eight
+bespoke lifecycle concepts removed and one shared controller added, not a
+claimed net-LoC reduction.
+
+1. **Dispenser — implemented; release gate pending.** Net-authenticated
+   `:order`, direct `:prepare_artifact`, sequenced `:deliver`, and `:cancel`
+   form the typed surface; fixed Acts stay internal; `$dispenser_queue`
+   replaces the directly-written queue and admission maps; the
+   preallocated/delivered note travels by reference. Proof covers dropped-reply idempotency,
+   legacy genesis, full-state rebuild, deterministic rotating-requester
+   eviction, an absolute queue cap, and zero extra queue writers. The field
+   disposition and non-goals are explicit in
+   [`catalogs/dispenser/DESIGN.md`](../catalogs/dispenser/DESIGN.md).
+   Release it through a separate narrow canary and bake before Tasks.
+2. **Migrate Tasks after the Dispenser bake.** Retire the temporary casework
+   proof through the full field-disposition, parity-golden, client-kanban, and
+   deletion-delta gates in §5.
+3. **Close the remaining release gates.** Run the E4/E5 adversarial lane,
+   cold-case measurement, and workerd Tier C budgets.
+
+### 7.2 Kernel decisions deferred
 
 1. **Shape-language depth**: flat key → type-tag now; when
    optionality/nesting/class-constrained refs are needed, does
@@ -647,14 +762,16 @@ Recorded as stated budgets that set the v1.5 envelope:
 
 ### 8.4 Discipline and decision yield
 
-- **Core-change count.** The design claims exactly two generic read
-  seams (`event_schema`, `ts` on `replay()`). Success = no third core
-  change; any additional core edit is a *discovered seam*, documented
-  with its layering justification, and counts against the "small
-  generic completion" claim.
-- **Deferred decisions get evidence.** The prototype resolves §7(1)
+- **Core-change count.** The design proposed exactly two generic read seams
+  (`event_schema`, `ts` on `replay()`). The prototype required both, then the
+  sequenced-ingress audit found one additional generic authority seam:
+  `enterfunc`/`exitfunc` inherited the initiating verb's receiver as `caller`,
+  so catalog hooks could not distinguish substrate dispatch from a named call.
+  Moveto now supplies the moving object. This third core change is documented
+  in `spec/semantics/moveto.md` and counts against the "exactly two" claim.
+- **Deferred decisions get evidence.** The prototype resolves §7.2(1)
   (where shape validation lives) from experience, and produces the
-  measured cost curve for §7(2).
+  measured cost curve for §7.2(2).
 
 ### 8.5 Falsifiers (outcomes that revise or kill)
 

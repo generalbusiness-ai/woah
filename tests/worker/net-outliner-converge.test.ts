@@ -55,11 +55,18 @@ type TurnBody = {
   attempt: number;
   trace: AttemptTraceEntry[];
   envelopeBytes?: number;
+  replayed?: boolean;
   result?: unknown;
+  error?: { code?: string; message?: string; detail?: unknown };
   observations?: Array<Record<string, unknown>>;
 };
 
-/** Drive any verb over the gateway (eject/undo/list_items etc.). */
+/** Drive any verb over the gateway (eject/undo/list_items etc.).
+ *
+ * Structural Outliner mutations are sequenced in production; only semantic
+ * reads such as `tree_view` request the metadata-gated direct route. The
+ * act-emitting composers REFUSE a direct frame (seq == -1), so this helper
+ * deliberately exercises the mutation route. */
 function verbTurn(
   gateway: NetGatewayDO,
   gatewayEnv: NetGatewayEnv,
@@ -70,16 +77,47 @@ function verbTurn(
 ): Promise<TurnBody> {
   return call<TurnBody>(gateway, gatewayEnv, "/turn", {
     call: {
-      kind: "woo.turn_call.shadow.v1", id: key, route: "direct", scope: ctx.roomScope,
+      // scope is the sequencing SPACE OBJECT (the outliner), matching the
+      // production clientApi shape (`scope: anchorObject`); the room-scope
+      // string travels separately as planningScope.
+      kind: "woo.turn_call.shadow.v1", id: key, route: "sequenced", scope: ctx.theOutline,
       session: ctx.session.id, actor: ctx.actor, target: ctx.theOutline, verb, args
     },
     planningScope: ctx.roomScope, catalog_epoch: ctx.epoch, idempotency_key: key
   });
 }
 
-// The warm-envelope ceiling the planner enforces (plan.ts
-// WARM_ENVELOPE_BYTE_LIMIT). Mirrored here for the scale gate's assertion.
+// The warm-envelope ceiling the gateway enforces on the actual serialized
+// submit RPC body (scope.ts WARM_ENVELOPE_BYTE_LIMIT). Mirrored here for
+// the scale gate's assertion.
 const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
+
+/** Seed a mutation through the SEQUENCED route (world.call). The act-emitting
+ * composers (add / add_item / remove_item) refuse direct-route calls with
+ * "acts require a sequenced turn" since the outliner v3 acts migration, so
+ * in-process world seeding must use the same sequenced path production
+ * traffic does. Returns the directCall-compatible `{op, result}` shape the
+ * seeding assertions read. */
+async function seqCall(
+  world: WooWorld,
+  key: string,
+  sessionId: string,
+  actor: string,
+  target: string,
+  verb: string,
+  args: unknown[]
+): Promise<{ op: string; result?: unknown; error?: unknown }> {
+  const f = await world.call(key, sessionId, target, { actor, target, verb, args: args as never[] });
+  if (f.op === "applied") {
+    const obs = (f as { observations?: Array<Record<string, unknown>> }).observations ?? [];
+    // A refused turn commits as a failed entry whose only observation is the
+    // $error — surface it in the error slot so seed assertions print it.
+    const err = obs.find((o) => o && (o as { type?: unknown }).type === "$error");
+    if (err) return { op: "error", error: err };
+    return { op: "result", result: (f as { result: unknown }).result };
+  }
+  return f as unknown as { op: string; result?: unknown; error?: unknown };
+}
 
 /** A fully bundled net world with an actor placed in the outliner. */
 async function outlinerWorld(): Promise<{ world: WooWorld; theOutline: string; session: { id: string; actor: string }; actor: string; epoch: string }> {
@@ -165,8 +203,10 @@ function addTurn(
     call: {
       kind: "woo.turn_call.shadow.v1",
       id: key,
-      route: "direct",
-      scope: ctx.roomScope,
+      // Sequenced on the outliner object: the production client route/scope
+      // shape (see verbTurn's doc comment).
+      route: "sequenced",
+      scope: ctx.theOutline,
       session: ctx.session.id,
       actor: ctx.actor,
       target: ctx.theOutline,
@@ -219,7 +259,7 @@ describe("outliner add over the net path converges", () => {
 
     const SIBLINGS = 12;
     for (let i = 0; i < SIBLINGS; i += 1) {
-      const r = await world.directCall(`seed-${i}`, actor, theOutline, "add", [`seed ${i}`], { sessionId: session.id });
+      const r = await seqCall(world, `seed-${i}`, session.id, actor, theOutline, "add", [`seed ${i}`]);
       expect(r.op, `seed add ${i}: ${JSON.stringify(r)}`).toBe("result");
     }
 
@@ -248,7 +288,7 @@ describe("outliner add over the net path converges", () => {
     // now commit an add here with a bounded closure.
     const SIBLINGS = 120;
     for (let i = 0; i < SIBLINGS; i += 1) {
-      const r = await world.directCall(`seed-${i}`, actor, theOutline, "add", [`seed ${i}`], { sessionId: session.id });
+      const r = await seqCall(world, `seed-${i}`, session.id, actor, theOutline, "add", [`seed ${i}`]);
       expect(r.op, `seed add ${i}: ${JSON.stringify(r)}`).toBe("result");
     }
 
@@ -295,7 +335,7 @@ describe("outliner add over the net path converges", () => {
 
     const SIBLINGS = 120;
     for (let i = 0; i < SIBLINGS; i += 1) {
-      const r = await world.directCall(`w-seed-${i}`, actor, theOutline, "add", [`seed ${i}`], { sessionId: session.id });
+      const r = await seqCall(world, `w-seed-${i}`, session.id, actor, theOutline, "add", [`seed ${i}`]);
       expect(r.op, `seed add ${i}: ${JSON.stringify(r)}`).toBe("result");
     }
 
@@ -324,7 +364,7 @@ describe("outliner add over the net path converges", () => {
     const SIBLINGS = 120;
     const ids: string[] = [];
     for (let i = 0; i < SIBLINGS; i += 1) {
-      const r = await world.directCall(`r-seed-${i}`, actor, theOutline, "add_item", [`seed ${i}`, null, null], { sessionId: session.id });
+      const r = await seqCall(world, `r-seed-${i}`, session.id, actor, theOutline, "add_item", [`seed ${i}`, null, null]);
       expect(r.op, `seed add_item ${i}: ${JSON.stringify(r)}`).toBe("result");
       ids.push((r as { result: string }).result);
     }
@@ -399,7 +439,7 @@ describe("outliner add over the net path converges", () => {
     const ctx = { theOutline, roomScope, epoch, session, actor };
     // eject_item drives _detach_item, whose kids read uses the FULL
     // ordered_children projection — the children repair branch.
-    const p = ((await world.directCall("r2-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const p = ((await seqCall(world, "r2-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
     world.object(actor).flags.wizard = true;
     let failures = 0;
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
@@ -420,7 +460,7 @@ describe("outliner add over the net path converges", () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
-    const p = ((await world.directCall("r2p-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const p = ((await seqCall(world, "r2p-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
     world.object(actor).flags.wizard = true;
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
       intercept: async (_scope, path) =>
@@ -488,9 +528,9 @@ describe("outliner add over the net path converges", () => {
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
     // Build p at root with two children, in-memory via the real verbs.
-    const p = ((await world.directCall("seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
-    const c1 = ((await world.directCall("seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
-    const c2 = ((await world.directCall("seed-c2", actor, theOutline, "add_item", ["child two", p, null], { sessionId: session.id })) as { result: string }).result;
+    const p = ((await seqCall(world, "seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
+    const c1 = ((await seqCall(world, "seed-c1", session.id, actor, theOutline, "add_item", ["child one", p, null])) as { result: string }).result;
+    const c2 = ((await seqCall(world, "seed-c2", session.id, actor, theOutline, "add_item", ["child two", p, null])) as { result: string }).result;
 
     // eject_item is outliner-owner-or-wizard; grant the actor wizard so the
     // turn is permitted and exercises the pure recycle->_detach projection path
@@ -504,10 +544,14 @@ describe("outliner add over the net path converges", () => {
     expect(eject.attempt, `attempts=${eject.attempt}`).toBeGreaterThan(1);
     // _detach ran to completion (after repair) — it re-homes children THEN
     // emits outline_item_removed, all in one committed transcript. A swallowed
-    // miss aborts _detach before both.
-    const removed = (eject.observations ?? []).find((o) => o.type === "outline_item_removed" && o.item === p);
-    expect(removed, "eject must emit outline_item_removed (detach ran, not swallowed)").toBeTruthy();
-    expect(removed?.reparented_to ?? null).toBeNull(); // p was at root
+    // miss aborts _detach before both. Sequenced on the outliner's own log,
+    // _detach_item takes the guarded ACT branch, so the observation is the
+    // v3 envelope ({type, version, payload}) — not flat fields.
+    const removed = (eject.observations ?? []).find(
+      (o) => o.type === "outline_item_removed" && (o.payload as { item?: unknown } | undefined)?.item === p
+    );
+    expect(removed, "eject must emit the outline_item_removed act (detach ran, not swallowed)").toBeTruthy();
+    expect((removed?.payload as { reparented_to?: unknown } | undefined)?.reparented_to ?? null).toBeNull(); // p was at root
 
     // Concrete proof from the AUTHORITY: the room scope's ordered-children of
     // root now includes c1/c2 (re-homed), each with a valid rank — NOT orphaned
@@ -525,121 +569,129 @@ describe("outliner add over the net path converges", () => {
       roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: p }
     );
     expect(underP.rows.map((r) => r.child), "no orphaned edge to the recycled parent").not.toContain(c1);
+
+    // Lifecycle authority, not just the ordering projection: the accepted
+    // recycle replaces p's complete object page with a tombstone, and the
+    // gateway's next authoritative tree read cannot resurrect the stale row.
+    const pClosure = await call<{ cells: Array<{ key: string }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/closure",
+      { keys: [`object_lineage:${p}`], known: [] }
+    );
+    expect(pClosure.cells.map((cell) => cell.key)).toEqual([`object_tombstone:${p}`]);
+    const view = await verbTurn(gateway, gatewayEnv, ctx, "eject-p-view", "tree_view", []);
+    expect(view.reply.status, JSON.stringify(view.trace)).toBe("accepted");
+    expect((view.result as { items: Array<{ id: string }> }).items.map((item) => item.id)).not.toContain(p);
+
+    // Cold reconstruction at the exact post-delete heads: a new gateway has
+    // no warm omission/filtering state to hide a bad authority image. Full
+    // closures must contain the tombstone and no live p cells, and tree_view
+    // must agree with the warm gateway.
+    const coldGateway = new NetGatewayDO(netState("gateway-outliner-post-recycle"), gatewayEnv);
+    for (const scope of scopeDOs.keys()) {
+      await call(coldGateway, gatewayEnv, "/pull", {
+        scope,
+        destination: `scope:${scope}`
+      });
+    }
+    const coldView = await verbTurn(
+      coldGateway,
+      gatewayEnv,
+      ctx,
+      "eject-p-cold-view",
+      "tree_view",
+      []
+    );
+    expect(coldView.reply.status, JSON.stringify(coldView.trace)).toBe("accepted");
+    expect((coldView.result as { items: Array<{ id: string }> }).items.map((item) => item.id)).not.toContain(p);
   });
 
-  it("cross-outliner moveto repairs BOTH scoped root orderings and completes both hooks", async () => {
+  it("cross-outliner moveto is refused before either scoped ordering changes", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const sourceScope = `room:${theOutline}`;
     const destination = "the_outline_2";
     const destinationScope = `room:${destination}`;
     world.createObject({ id: destination, name: "Outline 2", parent: "$outliner", owner: actor, location: "the_chatroom" });
 
-    // Give the destination a non-empty root ordering. If null-root caches alias
-    // by parent alone, enterfunc will append against the SOURCE roots instead.
     expect((await world.directCall("cross-enter-dest", actor, actor, "moveto", [destination], { sessionId: session.id })).op).toBe("result");
     const destinationRoots: string[] = [];
     for (const text of ["dest one", "dest two", "dest three"]) {
-      const added = await world.directCall(`cross-dest-${text}`, actor, destination, "add_item", [text, null, null], { sessionId: session.id });
+      const added = await seqCall(world, `cross-dest-${text}`, session.id, actor, destination, "add_item", [text, null, null]);
       destinationRoots.push((added as { result: string }).result);
     }
     expect((await world.directCall("cross-enter-source", actor, actor, "moveto", [theOutline], { sessionId: session.id })).op).toBe("result");
 
-    // Move a nested item with one child. Source exitfunc must re-home the child
-    // under the former parent; destination enterfunc must append the item as a
-    // destination root. Both hooks read orderings during one moveto pipeline.
-    const formerParent = ((await world.directCall("cross-parent", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
-    const moving = ((await world.directCall("cross-moving", actor, theOutline, "add_item", ["moving", formerParent, null], { sessionId: session.id })) as { result: string }).result;
-    const child = ((await world.directCall("cross-child", actor, theOutline, "add_item", ["child", moving, null], { sessionId: session.id })) as { result: string }).result;
-    const destinationSession = world.auth("guest:cross-destination-writer");
-    expect((await world.directCall(
-      "cross-place-destination-writer",
-      destinationSession.actor,
-      destinationSession.actor,
-      "moveto",
-      [destination],
-      { sessionId: destinationSession.id }
-    )).op).toBe("result");
+    const formerParent = ((await seqCall(world, "cross-parent", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
+    const moving = ((await seqCall(world, "cross-moving", session.id, actor, theOutline, "add_item", ["moving", formerParent, null])) as { result: string }).result;
+    const child = ((await seqCall(world, "cross-child", session.id, actor, theOutline, "add_item", ["child", moving, null])) as { result: string }).result;
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     const moved = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
       call: {
-        kind: "woo.turn_call.shadow.v1", id: "cross-outliner-move", route: "direct", scope: sourceScope,
+        kind: "woo.turn_call.shadow.v1", id: "cross-outliner-move", route: "sequenced", scope: theOutline,
         session: session.id, actor, target: moving, verb: "moveto", args: [destination]
       },
       planningScope: sourceScope, catalog_epoch: epoch, idempotency_key: "cross-outliner-move"
     });
+    // A domain refusal is itself an accepted, failed sequenced entry. Crucially,
+    // neither lifecycle hook writes a relation or emits a counterfeit Act.
     expect(moved.reply.status, `attempts=${moved.attempt} trace=${JSON.stringify(moved.trace)}`).toBe("accepted");
-    expect(moved.attempt, "hook ordering misses must escape and trigger repair").toBeGreaterThan(1);
-    expect(moved.observations?.some((o) => o.type === "outline_item_removed" && o.item === moving)).toBe(true);
-    expect(moved.observations?.some((o) => o.type === "outline_item_added" && o.item === moving && o.outliner === destination)).toBe(true);
+    expect((moved.observations ?? []).filter((observation) =>
+      String((observation as { type?: unknown }).type ?? "").startsWith("outline_item_")
+    )).toEqual([]);
 
     const sourceDO = scopeDOs.get(sourceScope)!;
-    const formerParentRows = await call<{ rows: Array<{ child: string }> }>(
+    const sourceChildren = await call<{ rows: Array<{ child: string }> }>(
       sourceDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: formerParent }
     );
-    expect(formerParentRows.rows.map((row) => row.child)).toContain(child);
-    expect(formerParentRows.rows.map((row) => row.child)).not.toContain(moving);
+    expect(sourceChildren.rows.map((row) => row.child)).toContain(moving);
+    const movingChildren = await call<{ rows: Array<{ child: string }> }>(
+      sourceDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: moving }
+    );
+    expect(movingChildren.rows.map((row) => row.child)).toContain(child);
 
     const destinationDO = scopeDOs.get(destinationScope)!;
-    expect(destinationDO, `missing destination authority ${destinationScope}`).toBeTruthy();
     const destinationAfter = await call<{ rows: Array<{ child: string }> }>(
       destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: null }
     );
-    expect(destinationAfter.rows.map((row) => row.child)).toEqual([...destinationRoots, moving]);
-
-    // The moved parent keeps its immutable SOURCE anchor, while these existing
-    // children are anchored at the DESTINATION. Ordering authority must follow
-    // the explicit container, not the non-root parent's anchor: otherwise the
-    // second insertion reads an empty source-side subset and rejects index 1.
-    const destinationCtx = {
-      theOutline: destination,
-      roomScope: destinationScope,
-      epoch,
-      session: destinationSession,
-      actor: destinationSession.actor
-    };
-    const nestedFirst = await verbTurn(
-      gateway, gatewayEnv, destinationCtx, "cross-nest-first", "move_item", [destinationRoots[0], moving, 0]
-    );
-    expect(nestedFirst.reply.status, JSON.stringify(nestedFirst.trace)).toBe("accepted");
-    const nestedSecond = await verbTurn(
-      gateway, gatewayEnv, destinationCtx, "cross-nest-second", "move_item", [destinationRoots[1], moving, 1]
-    );
-    expect(nestedSecond.reply.status, JSON.stringify(nestedSecond.trace)).toBe("accepted");
-    const nestedRows = await call<{ rows: Array<{ child: string }> }>(
-      destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: moving }
-    );
-    expect(nestedRows.rows.map((row) => row.child)).toEqual(destinationRoots.slice(0, 2));
+    expect(destinationAfter.rows.map((row) => row.child)).toEqual(destinationRoots);
   });
 
   it("P1.2: net undo of remove_item re-homes captured children under the restored node (miss not swallowed)", async () => {
-    // undo -> _restore_item, whose child restore is
-    //   `try { this:move_item(kid, item, kid_idx, true) } except err {}`.
+    // undo -> _restore_item -> move_item for each captured child. The inverse
+    // deliberately has no recovery catch: a miss or fold failure must escape.
     // move_item reads ordered_children(kid's parent) + ordered_children(new
-    // item) — ABSENT in the sparse gateway plan. A catchable miss would be
-    // swallowed by the `except`, leaving the captured children at root instead
-    // of back under the restored node. The uncatchable miss must escape to the
-    // gateway repair so move_item actually runs.
+    // item) — ABSENT in the sparse gateway plan. The miss must escape to the
+    // gateway repair so move_item actually runs before the turn commits.
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
-    const p = ((await world.directCall("u-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
-    const c1 = ((await world.directCall("u-seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
+    const p = ((await seqCall(world, "u-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
+    const c1 = ((await seqCall(world, "u-seed-c1", session.id, actor, theOutline, "add_item", ["child one", p, null])) as { result: string }).result;
     // remove_item captures p + its direct children and re-homes them to root,
     // and records the _restore_item inverse in the actor's undo slot (in-memory).
-    const rem = await world.directCall("u-remove", actor, theOutline, "remove_item", [p], { sessionId: session.id });
+    const rem = await seqCall(world, "u-remove", session.id, actor, theOutline, "remove_item", [p]);
     expect((rem as { op: string }).op).toBe("result");
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     const undo = await verbTurn(gateway, gatewayEnv, ctx, "undo-restore", "undo", []);
     expect(undo.reply.status, `attempts=${undo.attempt} trace=${JSON.stringify(undo.trace)}`).toBe("accepted");
     expect(undo.attempt, `attempts=${undo.attempt}`).toBeGreaterThan(1); // repair happened
+    // CO7 re-verification: envelopeBytes is now the ACTUAL serialized submit
+    // RPC body (transcript + attestations + routing metadata) measured at the
+    // gateway before the RPC — the deep undo dispatch chain must commit under
+    // the real warm ceiling (the modeled read closure that once tripped it at
+    // ~70.5 KB no longer exists, because no read state ships with a submit).
+    // Measured at 18,855 bytes when this assertion landed.
+    expect(undo.envelopeBytes ?? 0).toBeGreaterThan(0);
+    expect(undo.envelopeBytes ?? 0).toBeLessThanOrEqual(WARM_ENVELOPE_BYTE_LIMIT);
     // _restore_item returns the restored node's (new) id via the undo result.
     const restored = undo.result as string;
     expect(typeof restored).toBe("string");
 
     // Authority proof: the restored node's ordered children now include c1/c2 —
-    // move_item ran after repair (not swallowed, which would strand them at root).
+    // move_item ran after repair; an incomplete inverse cannot commit.
     const roomDO = scopeDOs.get(`room:${theOutline}`)!;
     const kids = await call<{ rows: Array<{ child: string }> }>(
       roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: restored }
@@ -658,10 +710,10 @@ describe("outliner add over the net path converges", () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
-    const p = ((await world.directCall("r1u-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
-    const c1 = ((await world.directCall("r1u-seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
-    const c2 = ((await world.directCall("r1u-seed-c2", actor, theOutline, "add_item", ["child two", p, null], { sessionId: session.id })) as { result: string }).result;
-    const rem = await world.directCall("r1u-remove", actor, theOutline, "remove_item", [p], { sessionId: session.id });
+    const p = ((await seqCall(world, "r1u-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
+    const c1 = ((await seqCall(world, "r1u-seed-c1", session.id, actor, theOutline, "add_item", ["child one", p, null])) as { result: string }).result;
+    const c2 = ((await seqCall(world, "r1u-seed-c2", session.id, actor, theOutline, "add_item", ["child two", p, null])) as { result: string }).result;
+    const rem = await seqCall(world, "r1u-remove", session.id, actor, theOutline, "remove_item", [p]);
     expect((rem as { op: string }).op).toBe("result");
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
@@ -703,7 +755,7 @@ describe("outliner add over the net path converges", () => {
     );
     expect(installed.ok, JSON.stringify(installed)).toBe(true);
     // One pre-existing sibling so the appends land after a real rank.
-    const first = ((await world.directCall("r1d-seed", actor, theOutline, "add_item", ["first", null, null], { sessionId: session.id })) as { result: string }).result;
+    const first = ((await seqCall(world, "r1d-seed", session.id, actor, theOutline, "add_item", ["first", null, null])) as { result: string }).result;
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     const turn = await verbTurn(gateway, gatewayEnv, ctx, "r1d-twice", "add_twice", ["alpha", "beta"]);
@@ -775,7 +827,7 @@ describe("outliner add over the net path converges", () => {
   it("R3: a cross-scope ordering read is owner-attested (a concurrent foreign insert re-plans, never commits stale)", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     // The probed parent item lives in the outline room's scope...
-    const item = ((await world.directCall("r3-seed-item", actor, theOutline, "add_item", ["probe parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const item = ((await seqCall(world, "r3-seed-item", session.id, actor, theOutline, "add_item", ["probe parent", null, null])) as { result: string }).result;
     // ...while the probe object (the turn's write set) lives in the chatroom.
     const chatroom = world.exportWorld().objects.find((o) => o.id === "the_chatroom");
     expect(chatroom, "bundled world has the_chatroom").toBeTruthy();
@@ -835,7 +887,7 @@ describe("outliner add over the net path converges", () => {
     holdAttest = null;   // the writer's turn must not be held
     const write = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
       call: {
-        kind: "woo.turn_call.shadow.v1", id: "r3-write", route: "direct", scope: outlineScope,
+        kind: "woo.turn_call.shadow.v1", id: "r3-write", route: "sequenced", scope: theOutline,
         session: sessionB.id, actor: sessionB.actor, target: theOutline, verb: "add_item", args: ["kid", item, null]
       },
       planningScope: outlineScope, catalog_epoch: epoch, idempotency_key: "r3-write"
@@ -882,6 +934,216 @@ describe("outliner add over the net path converges", () => {
     expect(err).not.toContain("E_BUDGET");
   });
 
+  // ── SL4: the owner-attested replay-page input ─────────────────────────
+  // Sparse planning worlds intentionally omit the sequenced-log tail
+  // (bridge.ts: log:* is never a planning input), so before the replay-page
+  // input every `space:replay(from, limit)` through the net path silently
+  // returned [] — journal read as empty, rebuild_from never converged.
+  // These tests drive real structural acts SEQUENCED through the gateway
+  // (the scope authority appends its durable committed log), then read the
+  // log back through the same gateway: the miss must escape as a
+  // repairable replay-page fetch, entries must surface with their SEMANTIC
+  // space identity and the authority acceptance ts, and the attested page
+  // version must hold the read-integrity discipline.
+
+  /** The casework journal verb verbatim (catalogs/casework §S3): the log IS
+   * the journal. Installed on the outline instance pre-mount so the net
+   * turn exercises the real catalog read shape. */
+  const JOURNAL_SOURCE = "verb :journal(from_seq, limit) rxd {\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"space\": this, \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"actor\": e[\"message\"][\"actor\"], \"verb\": e[\"message\"][\"verb\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}";
+
+  it("SL4: journal over the net path returns committed acts with semantic ids and authority ts", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const installed = installVerb(world, theOutline, "journal", JOURNAL_SOURCE, null);
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+
+    const { gateway, gatewayEnv } = await mountNet(world, epoch);
+    // Drive the structural acts SEQUENCED through the gateway — the scope
+    // authority is the only place these committed entries exist.
+    const ids: string[] = [];
+    for (let i = 1; i <= 3; i += 1) {
+      const turn = await verbTurn(gateway, gatewayEnv, ctx, `sl4-add-${i}`, "add_item", [`entry ${i}`, null, null]);
+      expect(turn.reply.status, `add #${i} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+      ids.push(turn.result as string);
+    }
+
+    const journal = await verbTurn(gateway, gatewayEnv, ctx, "sl4-journal", "journal", [1, 100]);
+    expect(journal.reply.status, `journal reply=${JSON.stringify(journal.reply)} trace=${JSON.stringify(journal.trace)}`).toBe("accepted");
+    // The replay read MISSED on the sparse plan and repaired via one
+    // authority page fetch — never a silent [].
+    expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeGreaterThan(1);
+    expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeLessThanOrEqual(3);
+
+    const rows = journal.result as Array<{
+      space: string; seq: number; ts: number; actor: string; verb: string;
+      type: string; payload: Record<string, unknown>;
+    }>;
+    const added = rows.filter((row) => row.type === "outline_item_added");
+    expect(added.length, `journal rows: ${JSON.stringify(rows)}`).toBe(3);
+    // Envelope seq/ts: the three adds are this fresh scope's first
+    // sequenced commits, and ts is the authority acceptance time (CO2.5).
+    expect(added.map((row) => row.seq)).toEqual([1, 2, 3]);
+    for (const row of added) expect(row.ts, `entry ts must be the authority acceptance time: ${JSON.stringify(row)}`).toBeGreaterThan(0);
+    // Authority identity belongs to the journal envelope, never the payload.
+    for (const row of added) {
+      expect(row.space, JSON.stringify(row)).toBe(theOutline);
+      expect(row.actor, JSON.stringify(row)).toBe(actor);
+      expect(row.verb, JSON.stringify(row)).toBe("add_item");
+      expect(row.payload).not.toHaveProperty("outliner");
+      expect(row.payload).not.toHaveProperty("actor");
+    }
+    expect(added.map((row) => row.payload.item)).toEqual(ids);
+  });
+
+  it("SL4/Adv-a: replay-page bounds and authority content/version mismatches fail closed", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const installed = installVerb(world, theOutline, "journal", JOURNAL_SOURCE, null);
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+
+    let corrupted = 0;
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch, {
+      intercept: async (_scope, path, _request, real) => {
+        if (path !== "/net/replay-page") return null;
+        const response = await real();
+        const body = (await response.json()) as { entries: Array<Record<string, unknown>> } & Record<string, unknown>;
+        if (body.entries.length > 0) {
+          body.entries[0] = { ...body.entries[0], ts: Number(body.entries[0].ts) + 1 };
+          corrupted += 1; // keep the old version: gateway must recompute and refuse
+        }
+        return jsonResponse(body);
+      }
+    });
+    const roomDO = scopeDOs.get(roomScope)!;
+    const env = { WOO_INTERNAL_SECRET: SECRET };
+    await expect(call(roomDO, env, "/replay-page", { space: theOutline, from: 1.5, limit: 10 }))
+      .rejects.toThrow(/E_INVARG/);
+    await expect(call(roomDO, env, "/replay-page", { space: theOutline, from: 1, limit: 1001 }))
+      .rejects.toThrow(/E_INVARG/);
+    await expect(call(roomDO, env, "/replay-page", { space: "the_chatroom", from: 1, limit: 10 }))
+      .rejects.toThrow(/foreign space/);
+    await expect(call(roomDO, env, "/attest", {
+      keys: [],
+      replay_pages: [{ space: "the_chatroom", from: 1, limit: 10 }]
+    })).rejects.toThrow(/foreign space/);
+
+    const add = await verbTurn(gateway, gatewayEnv, ctx, "sl4-adva-add", "add_item", ["entry", null, null]);
+    expect(add.reply.status, JSON.stringify(add.trace)).toBe("accepted");
+    const err = await verbTurn(gateway, gatewayEnv, ctx, "sl4-adva-journal", "journal", [1, 100]).then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    expect(corrupted, "the corrupting replay-page interceptor fired").toBeGreaterThan(0);
+    expect(err).toContain("E_BUDGET");
+  });
+
+  it("SL4: a fresh $outline_meta rebuild_from over the net path converges to the live watermark", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    // A FRESH watermark projection, room-anchored so it commits at the
+    // outline's scope. Its at_seq starts at the class default 0; only
+    // rebuild_from (reading the authoritative committed log through the
+    // net path) can walk it to the live watermark.
+    const metaId = "meta_rebuild";
+    world.createObject({ id: metaId, name: "rebuild meta", parent: "$outline_meta", owner: actor, location: theOutline, anchor: theOutline });
+    world.setProp(metaId, "source_space", theOutline);
+    world.setProp(metaId, "log_space", theOutline);
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    for (let i = 1; i <= 4; i += 1) {
+      const turn = await verbTurn(gateway, gatewayEnv, ctx, `sl4-rb-add-${i}`, "add_item", [`row ${i}`, null, null]);
+      expect(turn.reply.status, `add #${i} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+    }
+    // The LIVE watermark: the bundled outline_meta folds each structural
+    // act as it commits; tree_view surfaces its at_seq.
+    const view = await verbTurn(gateway, gatewayEnv, ctx, "sl4-rb-view", "tree_view", []);
+    expect(view.reply.status, JSON.stringify(view.trace)).toBe("accepted");
+    const liveWatermark = (view.result as { structure_at_seq: number }).structure_at_seq;
+    expect(liveWatermark, "acts folded live").toBeGreaterThan(0);
+
+    // Rebuild the fresh projection from the recorded acts, page by page,
+    // through the gateway (owner/wizard gate: the actor owns metaId).
+    let result: { at_seq: number; scanned_seq: number; done: boolean } | undefined;
+    let firstAttempts = 0;
+    for (let round = 1; round <= 5 && (result === undefined || !result.done); round += 1) {
+      const rebuild = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1", id: `sl4-rebuild-${round}`, route: "sequenced", scope: theOutline,
+          session: session.id, actor, target: metaId, verb: "rebuild_from", args: [theOutline, 100]
+        },
+        planningScope: roomScope, catalog_epoch: epoch, idempotency_key: `sl4-rebuild-${round}`
+      });
+      expect(rebuild.reply.status, `rebuild round ${round} trace=${JSON.stringify(rebuild.trace)}`).toBe("accepted");
+      if (round === 1) firstAttempts = rebuild.attempt;
+      result = rebuild.result as { at_seq: number; scanned_seq: number; done: boolean };
+    }
+    // The first round's replay read repaired through the authority page
+    // fetch (the log is never resident in the sparse plan).
+    expect(firstAttempts, "rebuild must repair via the replay-page fetch").toBeGreaterThan(1);
+    expect(result?.done, JSON.stringify(result)).toBe(true);
+    // CONVERGED: the fresh projection's watermark equals the live one.
+    expect(result?.at_seq, `rebuild ${JSON.stringify(result)} vs live ${liveWatermark}`).toBe(liveWatermark);
+
+    // Authority proof: the committed at_seq cell at the room scope agrees.
+    const roomDO = scopeDOs.get(roomScope)!;
+    const attested = await call<{ cells: Array<{ key: string; version: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/attest", { keys: [`property_cell:${metaId}:at_seq`] }
+    );
+    expect(attested.cells[0]?.version, "rebuild committed a real at_seq cell").not.toBe("absent");
+  });
+
+  it("SL4/R3: a cross-scope replay read is owner-attested and validated at the committing scope", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const outlineScope = `room:${theOutline}`;
+    const chatScope = "room:the_chatroom";
+    // The probe writes at the chatroom (its commit scope) while reading the
+    // OUTLINE's committed log — a foreign replay read that must carry the
+    // owner's page attestation or reject terminal rider_unattested.
+    world.createObject({ id: "probe_log_thing", name: "Probe Log Thing", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    world.createObject({ id: "probe_log_slate", name: "Probe Log Slate", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    const installed = installVerb(
+      world,
+      "probe_log_thing",
+      "probe_log",
+      `verb :probe_log(log_space, slate) rxd {\n  let entries = log_space:replay(1, 50);\n  slate.probe_seen = length(entries);\n  return length(entries);\n}`,
+      null
+    );
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+    // The probing actor sits in the chatroom; a second guest stays in the
+    // outline to commit the entries the probe will read.
+    expect((await world.directCall("sl4-r3-move", actor, actor, "moveto", ["the_chatroom"], { sessionId: session.id })).op).toBe("result");
+    const writer = world.auth("guest:sl4-r3-writer");
+    expect((await world.directCall("sl4-r3-place", writer.actor, writer.actor, "moveto", [theOutline], { sessionId: writer.id })).op).toBe("result");
+
+    const { gateway, gatewayEnv } = await mountNet(world, epoch);
+    for (let i = 1; i <= 2; i += 1) {
+      const add = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1", id: `sl4-r3-add-${i}`, route: "sequenced", scope: theOutline,
+          session: writer.id, actor: writer.actor, target: theOutline, verb: "add_item", args: [`foreign ${i}`, null, null]
+        },
+        planningScope: outlineScope, catalog_epoch: epoch, idempotency_key: `sl4-r3-add-${i}`
+      });
+      expect(add.reply.status, `writer add #${i} trace=${JSON.stringify(add.trace)}`).toBe("accepted");
+    }
+
+    const probe = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1", id: "sl4-r3-probe", route: "direct", scope: chatScope,
+        session: session.id, actor, target: "probe_log_thing", verb: "probe_log", args: [theOutline, "probe_log_slate"]
+      },
+      planningScope: chatScope, catalog_epoch: epoch, idempotency_key: "sl4-r3-probe"
+    });
+    // Accepted — meaning the chatroom commit validated the foreign replay
+    // read against the outline owner's attestation (a missing one is a
+    // terminal rider_unattested reject, which would fail here loudly).
+    expect(probe.reply.status, `probe trace=${JSON.stringify(probe.trace)}`).toBe("accepted");
+    expect(probe.result, "probe read the outline's committed entries").toBe(2);
+  });
+
   it("does not misclassify repeated ordering content at a later authority head", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
@@ -920,4 +1182,242 @@ describe("outliner add over the net path converges", () => {
     expect(orderingFetch).toBeGreaterThan(1);
   });
 
+});
+
+describe("Dispenser anchored-actor Acts over the Net path", () => {
+  it("orders and delivers through authenticated room sequencing, with dropped-reply replay", async () => {
+    const plan = await planNetInstall();
+    const world = plan.world;
+    const block = world.exportWorld().objects.find((object) => object.parent === "$horoscope_block");
+    if (!block) throw new Error("no $horoscope_block instance seeded");
+    const logSpace = world.object(block.id).location;
+    if (!logSpace) throw new Error("seeded horoscope block is not anchored");
+    // Saturate the shipped queue boundary below without cooldown noise.
+    world.setProp(block.id, "rate_limit_seconds", 0);
+    world.setProp(block.id, "block_cooldown_seconds", 0);
+    world.setProp(block.id, "max_pending_orders", 50);
+    world.setProp(block.id, "max_request_chars", 200);
+
+    // Requester and plug are distinct authenticated principals. Both mutate
+    // the block through the containing room's sequenced log; the block actor
+    // never receives a raw Act-emission surface.
+    const requester = world.auth("guest:net-dispenser-requester");
+    const placed = await world.directCall("net-dispenser-place", requester.actor, requester.actor, "moveto", [logSpace], {
+      sessionId: requester.id
+    });
+    expect(placed.op).toBe("result");
+    const key = world.createApiKey("$wiz", block.id, "net-dispenser-plug");
+    const plug = world.auth(`apikey:${key.id}:${key.secret}`);
+    // Keep a pristine, unattached projection in the room scope. Live Acts do
+    // not fold it; only the later Net rebuild may populate it.
+    const rebuiltQueue = world.createRuntimeObject("$dispenser_queue", block.id, logSpace, {
+      progr: "$wiz",
+      location: logSpace,
+      name: "net rebuilt dispenser queue"
+    });
+    world.setProp(rebuiltQueue, "source_space", block.id);
+    world.setProp(rebuiltQueue, "log_space", logSpace);
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, plan.epoch);
+    const planningScope = `room:${logSpace}`;
+    const turn = (
+      id: string,
+      session: { id: string; actor: string },
+      verb: string,
+      args: unknown[],
+      idempotencyKey = id,
+      route: "direct" | "sequenced" = "sequenced"
+    ) =>
+      call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1",
+          id,
+          route,
+          scope: logSpace,
+          session: session.id,
+          actor: session.actor,
+          target: block.id,
+          verb,
+          args
+        },
+        planningScope,
+        catalog_epoch: plan.epoch,
+        idempotency_key: idempotencyKey
+      });
+
+    const ordered = await turn("net-dispenser-order", requester, "order", ["scorpio"]);
+    expect(ordered.reply.status, JSON.stringify(ordered.trace)).toBe("accepted");
+    expect(ordered.attempt).toBeLessThanOrEqual(3);
+    const orderId = (ordered.result as { order_id: string }).order_id;
+    expect(orderId).toBe("ord_1");
+    expect(ordered.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "dispenser.ordered",
+          source: block.id,
+          payload: {
+            order_id: orderId,
+            request: "scorpio",
+            artifact: expect.any(String)
+          }
+        })
+      ])
+    );
+    const artifact = (
+      ordered.observations?.find((observation) => observation.type === "dispenser.ordered") as
+        | { payload?: { artifact?: string } }
+        | undefined
+    )?.payload?.artifact;
+    expect(artifact).toBeTruthy();
+
+    const prepared = await turn(
+      "net-dispenser-prepare",
+      plug,
+      "prepare_artifact",
+      [orderId, "Horoscope: Scorpio", "One durable body.", "A test horoscope."],
+      "net-dispenser-prepare",
+      "direct"
+    );
+    expect(prepared.reply.status, JSON.stringify(prepared.trace)).toBe("accepted");
+    expect(prepared.result).toMatchObject({ prepared: true, duplicate: false, note: artifact });
+
+    const stableKey = `plug:deliver:${block.id}:${orderId}`;
+    const delivered = await turn(
+      "net-dispenser-deliver",
+      plug,
+      "deliver",
+      [orderId, artifact],
+      stableKey
+    );
+    expect(delivered.reply.status, JSON.stringify(delivered.trace)).toBe("accepted");
+    const note = (delivered.result as { note: string }).note;
+    expect(note).toBeTruthy();
+    expect(delivered.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "dispenser.delivered",
+          source: block.id,
+          payload: { order_id: orderId, note }
+        })
+      ])
+    );
+    expect(delivered.observations?.some((observation) => observation.type === "note_edited")).toBe(false);
+    expect(JSON.stringify(delivered.observations)).not.toContain("One durable body.");
+
+    // Generated prose crossed only the direct artifact-authority turn. The
+    // room's durable sequenced transcript therefore contains the bounded
+    // request and the artifact ref, but never the generated body.
+    const roomDO = scopeDOs.get(planningScope)!;
+    const replay = await call<{ entries: Array<{ seq: number; message: { verb: string; args: unknown[] } }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/replay-page",
+      { space: logSpace, from: 1, limit: 10 }
+    );
+    expect(replay.entries.map((entry) => entry.message.verb)).toEqual(["order", "deliver"]);
+    expect(replay.entries[1]?.message.args).toEqual([orderId, artifact]);
+    expect(JSON.stringify(replay.entries)).not.toContain("One durable body.");
+    const deliveryActSeq = replay.entries[1]!.seq;
+
+    // Simulate the plug losing the HTTP reply and retrying with the same
+    // transport key. The scope returns its recorded acceptance and the
+    // gateway marks it replayed, but deliberately omits the freshly planned
+    // verb result: it cannot prove that output was the one returned by the
+    // original execution. The unchanged head proves no second domain turn
+    // or note was created. A later fresh-key retry is handled by the bounded
+    // Dispenser receipt and returns the original artifact with duplicate:true.
+    const transportReplay = await turn(
+      "net-dispenser-deliver-retry-frame",
+      plug,
+      "deliver",
+      [orderId, artifact],
+      stableKey
+    );
+    expect(transportReplay.reply.status).toBe("accepted");
+    expect(transportReplay.replayed).toBe(true);
+    expect(transportReplay.result).toBeUndefined();
+    expect(transportReplay.reply.head).toEqual(delivered.reply.head);
+
+    const domainReplay = await turn(
+      "net-dispenser-deliver-domain-retry",
+      plug,
+      "deliver",
+      [orderId, artifact]
+    );
+    expect(domainReplay.reply.status).toBe("accepted");
+    expect(domainReplay.result).toMatchObject({ delivered: true, duplicate: true, note });
+
+    // Rebuild the unattached projection from the room's committed log through
+    // the sparse Net planner. This proves the anchored-actor composer/log
+    // split reconstructs meaningful state, not just a watermark.
+    const rebuilt = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "net-dispenser-rebuild",
+        route: "sequenced",
+        scope: logSpace,
+        session: plug.id,
+        actor: plug.actor,
+        target: rebuiltQueue,
+        verb: "rebuild_from",
+        args: [logSpace, 100]
+      },
+      planningScope,
+      catalog_epoch: plan.epoch,
+      idempotency_key: "net-dispenser-rebuild"
+    });
+    expect(rebuilt.reply.status, JSON.stringify(rebuilt.trace)).toBe("accepted");
+    expect(rebuilt.attempt, "rebuild must fetch its owner-attested replay page").toBeGreaterThan(1);
+    // A direct artifact write advances the scope authority head but does not
+    // consume a semantic log sequence. Projection watermarks use the latter.
+    expect(rebuilt.result).toMatchObject({ done: true, at_seq: deliveryActSeq });
+
+    const state = await call<{ cells: Array<{ key: string; value: { value: unknown } }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/closure",
+      {
+        keys: [
+          `property_cell:${rebuiltQueue}:rows`,
+          `property_cell:${rebuiltQueue}:receipts`,
+          `property_cell:${rebuiltQueue}:next_order_seq`,
+          `property_cell:${rebuiltQueue}:at_seq`
+        ],
+        known: []
+      }
+    );
+    const values = Object.fromEntries(state.cells.map((cell) => [cell.key, cell.value.value]));
+    expect(values[`property_cell:${rebuiltQueue}:rows`]).toEqual({});
+    expect(values[`property_cell:${rebuiltQueue}:receipts`]).toMatchObject({
+      [orderId]: { state: "delivered", order_id: orderId, requester: requester.actor, note }
+    });
+    expect(values[`property_cell:${rebuiltQueue}:next_order_seq`]).toBe(2);
+    expect(values[`property_cell:${rebuiltQueue}:at_seq`]).toBe(deliveryActSeq);
+
+    // The projection currently writes bounded maps as whole property cells.
+    // Exercise the complete shipped queue and terminal-receipt boundaries on
+    // the real Net planner so "bounded" also means every legal mutation fits
+    // the 64 KiB warm-envelope contract.
+    const pendingIds: string[] = [];
+    let maxEnvelopeBytes = 0;
+    const maxRequest = "x".repeat(200);
+    for (let i = 0; i < 50; i += 1) {
+      const saturated = await turn(`net-dispenser-saturate-${i}`, requester, "order", [maxRequest]);
+      expect(saturated.reply.status, JSON.stringify(saturated.trace)).toBe("accepted");
+      expect(saturated.envelopeBytes).toBeLessThan(64 * 1024);
+      maxEnvelopeBytes = Math.max(maxEnvelopeBytes, saturated.envelopeBytes ?? 0);
+      pendingIds.push((saturated.result as { order_id: string }).order_id);
+    }
+    const overflow = await turn("net-dispenser-saturate-overflow", requester, "order", [maxRequest]);
+    expect(overflow.reply.status).toBe("accepted");
+    expect(overflow.error, JSON.stringify(overflow)).toMatchObject({ code: "E_QUEUE_FULL" });
+
+    for (const pendingId of pendingIds) {
+      const canceled = await turn(`net-dispenser-cancel-${pendingId}`, requester, "cancel", [pendingId]);
+      expect(canceled.reply.status, JSON.stringify(canceled.trace)).toBe("accepted");
+      expect(canceled.envelopeBytes).toBeLessThan(64 * 1024);
+      maxEnvelopeBytes = Math.max(maxEnvelopeBytes, canceled.envelopeBytes ?? 0);
+    }
+    expect(maxEnvelopeBytes).toBeGreaterThan(0);
+  });
 });

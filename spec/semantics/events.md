@@ -95,7 +95,9 @@ A direct-call result carries two optional fields alongside `observations`:
     audience_actors:        [actor, ...],     // union of all per-observation audiences
     observation_audiences:  [[actor, ...], ...], // one entry per observation, parallel array
     audience_sessions:     [session, ...],
-    observation_session_audiences: [[session, ...], ...]
+    observation_session_audiences: [[session, ...], ...],
+    observation_audience_exclusions: [[actor, ...], ...],
+    observation_audience_modes: ["presence" | "explicit", ...]
   }
   ```
 
@@ -104,7 +106,31 @@ session-scoped transports filter by session first; this is what keeps two tabs
 for the same actor in different spaces from receiving each other's room events.
 If only actor fields are present, transports filter by actor. If absent, a
 transport falls back to the original presence-based filter ("push to anyone with
-presence in the audience space").
+presence in the audience space"). The optional parallel mode vector makes this
+safe under sharded planning: `presence` says the enumerated identities are only
+the emitting runtime's local snapshot, so each destination shard resolves the
+observation against its own sessions present in the audience space. `explicit`
+says the observation named recipients (for example `_audience_override`,
+`looked`, `who`, `told`, or `text`), so the enumerated actor/session hints are
+the filter. A relay MUST NOT treat a `presence` enumeration as globally
+complete; that would silently omit occupants on other gateway shards.
+`observation_audience_exclusions` is a parallel negative actor set used only
+for `presence` entries. Unlike a positive presence enumeration, a compact
+exclusion remains complete across shards: each relay resolves its own local
+sessions and then removes sessions belonging to those actors.
+
+Catalog code requests this behavior with the internal
+`_audience_exclude: [actor, ...]` observation field. The runtime translates it
+into the parallel routing hint above and removes it from the delivered
+observation. `_audience_exclude` does not make an observation explicit; it
+means “the otherwise-selected audience minus these actors.” For an already
+explicit observation the runtime folds the exclusion into the exact positive
+enumeration; for a presence observation it carries the parallel negative set.
+The latter is the appropriate shape for public room output whose named
+recipient receives a separate private rendering. These internal audience
+fields affect live delivery only; sequenced `applied` frames use their
+committed frame audience and ignore both `_audience_exclude` and
+`_audience_override`.
 
 **How the audience is computed.** For each observation:
 

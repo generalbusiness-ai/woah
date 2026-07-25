@@ -1,10 +1,11 @@
 ---
 name: outliner
-version: 2.0.0
+version: 3.0.1
 spec_version: v1
 license: MIT
 description: Shared hierarchical text outliner. Items are first-class $outline_item < $note objects whose parent + sibling order live in ONE room-owned `__ordered_edge` { parent, rank } cell (a fractional-rank ordered-edge index — the sole structural authority; no per-item position or renumber). The outliner is an $outliner < $room that scopes the tree and carries per-actor focus and single-level undo. Chat commands are 'add', 'hide <item>', 'focus [<item>]'.
 depends:
+  - @local:acts
   - @local:chat
   - @local:note
 keywords:

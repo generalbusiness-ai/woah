@@ -170,4 +170,21 @@ describe("serializedFromCells (the inverse)", () => {
     expect(() => serializedFromCells([{ kind: "log", object: "the_room", value: [] }]))
       .toThrow(/log cells do not bridge/);
   });
+
+  it("reconstructs tombstones without reviving an object page", () => {
+    const rebuilt = serializedFromCells([
+      { kind: "object_tombstone", object: "#gone", value: { recycled: true } }
+    ]);
+    expect(rebuilt.objects).toEqual([]);
+    expect(rebuilt.tombstones).toEqual(["#gone"]);
+
+    expect(() => serializedFromCells([
+      { kind: "object_tombstone", object: "#gone", value: { recycled: true } },
+      {
+        kind: "object_lineage",
+        object: "#gone",
+        value: { parent: null, owner: "#actor", name: "ghost", anchor: null, flags: {} }
+      }
+    ])).toThrow(/tombstoned objects retain live object cells/);
+  });
 });

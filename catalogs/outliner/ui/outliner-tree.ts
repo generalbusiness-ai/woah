@@ -10,7 +10,9 @@ import {
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
-  type WooContext
+  type WooContext,
+  type WooViewRegistry,
+  WooViewController
 } from "../../../src/client/framework";
 
 // Per-(actor, outliner) localStorage display cache (see readDisplayTextCache):
@@ -101,12 +103,32 @@ export type OutlinerData = {
   roster: OutlinerRosterRow[];
 };
 
+export type OutlinerTreeView = {
+  items: OutlinerItem[];
+  structure_at_seq: number;
+};
+
 // Component-local UI state lives on the element itself (collapse, edit,
 // show-hidden). The server is the source of truth for everything in
 // OutlinerData; whenever it changes, the element re-renders.
 export class WooOutlinerTreeElement extends HTMLElement {
-  woo?: WooContext;
-  subject?: string;
+  private _woo?: WooContext;
+  private _subject = "";
+
+  get woo(): WooContext | undefined { return this._woo; }
+  set woo(value: WooContext | undefined) {
+    this._woo = value;
+    this.tree.bind(value);
+  }
+
+  get subject(): string { return this._subject; }
+  set subject(value: string | undefined) {
+    const next = value ?? "";
+    if (next === this._subject) return;
+    this._subject = next;
+    this.resetHydrationIfSubjectChanged(next);
+    this.tree.bind(this._woo);
+  }
 
   private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null, roster: [] };
   private companionVisible = false;
@@ -132,18 +154,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private dragSourceId: string | null = null;
   private hydrateAttempted = false;
   private bound = false;
-  private itemHydrationSubject = "";
-  // Generic projection is deliberately incomplete: an empty or partial
-  // neighborhood does not prove the outline itself is empty or partial. Every
-  // mounted subject therefore performs one coalesced authoritative list read.
-  // Accepted structural observations advance this revision, invalidating an
-  // older in-flight read before requesting the post-mutation tree.
-  private itemHydrationRevision = 0;
-  private itemRefreshScheduled = false;
-  // Once list_items lands, its parent/index rows outrank the unversioned
-  // observation overlay. Live structural observations update this model too;
-  // an older catalogState stamp must not overwrite either source on render.
-  private itemStructureAuthoritative = false;
+  private hydrationSubject = "";
   private rosterHydrationRevision = 0;
   private rosterAuthoritative = false;
   private rosterRetryAttempt = 0;
@@ -151,33 +162,11 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // Content signature of the item text last written to the localStorage display
   // cache; guards against rewriting unchanged text on every SPA render.
   private lastCachedTextSignature = "";
-  private readonly itemHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
-    // A revision identifies stale results, but a persistent permission or
-    // missing-object failure belongs to the outliner read surface itself.
-    // Keep its backoff across observation-driven revision invalidations.
-    retryKey: (subject) => subject,
-    read: async (subject) => {
-      if (!this.woo) return [];
-      // Whole-tree display hydration is read-only. Route to the authoritative
-      // server read instead of the browser local-execution path, which otherwise
-      // pays an execution-cache rebuild + state-transfer repair storm for a
-      // completeness check. See notes/2026-06-09-note-content-hydration.md.
-      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", [], { serverRead: true }));
-      if (!items) throw new Error("list_items did not return outline rows");
-      return items;
-    },
-    apply: (items, subject, signature) => {
-      if (this.subject !== subject || this.itemHydrationSignature() !== signature) return;
-      this.itemStructureAuthoritative = true;
-      this.model = { ...this.model, items };
-      if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
-        this.selectedId = null;
-        this.addingChild = false;
-      }
-      this.cacheKnownItemText();
-      this.render();
-    }
-  });
+  private readonly tree = new WooViewController<OutlinerTreeView>(
+    this,
+    () => this._woo && this._subject ? { view: "outliner.tree", subject: this._subject } : null,
+    () => this.applyTreeViewSnapshot()
+  );
   private readonly rosterHydrator = new CoalescedViewHydrator<OutlinerRosterRow[]>({
     read: async (subject) => {
       if (!this.woo) return [];
@@ -234,8 +223,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     this.render();
     // The host flips this only after movement into the outliner has settled.
     // Hydrate then, not during the earlier cold projection mount, so the roster
-    // cannot be memoized as empty just before the actor enters.
-    if (next) this.requestRosterFromServer();
+    // cannot be memoized as empty just before the actor enters. The tree read
+    // has the same boundary: a cold pre-presence read can fail or observe an
+    // incomplete gateway image, so presence must advance its view generation.
+    if (next) {
+      this.tree.refresh();
+      this.requestRosterFromServer();
+    }
     else this.clearRosterRetry();
   }
 
@@ -260,6 +254,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // genuinely empty outliner doesn't loop hydrate → applied-frame →
     // rerender → connectedCallback → hydrate when the SPA preserves the
     // element across renders.
+    this.tree.connected();
     if (!this.hydrateAttempted && this.subject && this.woo) {
       this.hydrate().catch(() => undefined);
     }
@@ -270,6 +265,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // The app shell may preserve and reattach this element. Keep successful
     // view memoization, but never leave a detached roster watchdog running.
     this.clearRosterRetry();
+    this.tree.disconnected();
   }
 
   async hydrate(): Promise<void> {
@@ -296,7 +292,25 @@ export class WooOutlinerTreeElement extends HTMLElement {
     };
     this.cacheKnownItemText();
     this.render();
-    this.requestItemsFromList();
+    this.applyTreeViewSnapshot();
+  }
+
+  private applyTreeViewSnapshot(): void {
+    const snapshot = this.tree.snapshot;
+    // Projection remains the immediate paint. Only an authoritative tree_view
+    // result may replace the whole collection; a partial seed cannot prove that
+    // absent rows are absent.
+    if (snapshot.completeness !== "complete" || snapshot.freshness !== "current" || !snapshot.data || !this.subject) return;
+    // The facade value is shared across subscribers; DOM-local optimistic
+    // reducers must never mutate its item objects in place.
+    const items = snapshot.data.items.map((item) => ({ ...item, writers: [...item.writers] }));
+    this.model = { ...this.model, items };
+    if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
+      this.selectedId = null;
+      this.addingChild = false;
+    }
+    this.cacheKnownItemText();
+    this.render();
   }
 
   // Persist whatever item text the component currently knows (observations,
@@ -321,7 +335,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     writeOutlinerTextCache(this.woo?.actor, this.subject, map);
   }
 
-  applyObservation(observation: Record<string, unknown>): void {
+  applyObservation(observation: Record<string, unknown>, envelopeSpace = ""): void {
     // Keep this DOM-local reducer aligned with the projection reducer in
     // registerWooObservationHandlers; accepted frames use both paths.
     const type = String(observation.type ?? "");
@@ -333,7 +347,18 @@ export class WooOutlinerTreeElement extends HTMLElement {
       }
       return;
     }
-    const outlinerId = String(observation.outliner ?? observation.source ?? "");
+    if (type === "note_writers_changed") {
+      const item = this.model.items.find((candidate) => candidate.id === String(observation.note ?? ""));
+      if (item && Array.isArray(observation.writers)) {
+        item.writers = observation.writers.filter((writer): writer is string => typeof writer === "string");
+        this.render();
+      }
+      return;
+    }
+    // Concise v3 Acts take their outliner from the committed carrier. The
+    // optional fallback keeps this DOM-local reducer usable for both framework
+    // delivery and legacy flat observations.
+    const outlinerId = String(actField(observation, "outliner") ?? observation.source ?? envelopeSpace);
     if (!this.subject || outlinerId !== this.subject) return;
     if (type === "outliner_entered" || type === "outliner_left") {
       this.applyPresenceObservation(type, observation);
@@ -341,44 +366,46 @@ export class WooOutlinerTreeElement extends HTMLElement {
       return;
     }
     if (type === "outline_item_added") {
-      const id = String(observation.item ?? "");
+      const id = String(actField(observation, "item") ?? "");
       if (!id) return;
+      // Structural Acts do not duplicate note prose or envelope identity.
+      // note_edited was reduced earlier in the same frame, so use projection
+      // state when the legacy flat event did not carry these fields.
+      const projected = this.woo?.observe(id);
+      const projectedText = projected?.props?.text;
+      const text = actField(observation, "text") ?? projectedText;
+      const owner = actField(observation, "actor") ?? projected?.owner;
       this.upsertItem({
         id,
         name: id,
-        text: typeof observation.text === "string" ? observation.text : "",
-        parent_id: outlinerParent(observation.parent_id),
-        index: outlinerIndex(observation.index, this.model.items.length),
+        text: typeof text === "string" ? text : "",
+        parent_id: outlinerParent(actField(observation, "parent_id")),
+        index: outlinerIndex(actField(observation, "index"), this.model.items.length),
         hidden: false,
-        owner: String(observation.actor ?? ""),
+        owner: typeof owner === "string" ? owner : "",
         writers: [],
         has_children: false
       });
-      this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_removed") {
-      this.removeItem(String(observation.item ?? ""), outlinerParent(observation.reparented_to));
-      this.refreshItemsAfterMutation();
+      this.removeItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "reparented_to")));
       return;
     }
     if (type === "outline_item_moved") {
-      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.to_parent), outlinerIndex(observation.to_index, this.model.items.length));
-      this.refreshItemsAfterMutation();
+      this.moveItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "to_parent")), outlinerIndex(actField(observation, "to_index"), this.model.items.length));
       return;
     }
     if (type === "outline_item_reordered") {
-      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.parent_id), outlinerIndex(observation.to_index, this.model.items.length));
-      this.refreshItemsAfterMutation();
+      this.moveItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "parent_id")), outlinerIndex(actField(observation, "to_index"), this.model.items.length));
       return;
     }
     if (type === "outline_item_hidden") {
-      const item = this.model.items.find((candidate) => candidate.id === String(observation.item ?? ""));
+      const item = this.model.items.find((candidate) => candidate.id === String(actField(observation, "item") ?? ""));
       if (item) {
-        item.hidden = Boolean(observation.hidden);
+        item.hidden = Boolean(actField(observation, "hidden"));
         this.render();
       }
-      this.refreshItemsAfterMutation();
       return;
     }
   }
@@ -386,7 +413,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private itemsFromProjection(): OutlinerItem[] {
     if (!this.woo || !this.subject) return this.model.items;
     const rows = this.woo.neighborhood.refs
-      .map((ref) => this.outlinerItemFromProjection(ref))
+      .map((ref) => projectedOutlinerItem(this.woo!, this.subject, ref))
       .filter((item): item is ProjectedOutlinerItem => item !== null);
     const projectedItems = rows.map(({
       textKnown: _textKnown,
@@ -414,7 +441,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
         const previous = byId.get(row.id);
         const projectionCarriesDisplayText = textKnown && row.text !== "";
         const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
-        const keepAuthoritativeStructure = this.itemStructureAuthoritative && previous !== undefined;
+        const keepAuthoritativeStructure = this.tree.snapshot.completeness === "complete" && previous !== undefined;
         const parent_id = keepAuthoritativeStructure
           ? previous.parent_id
           : parentKnown ? row.parent_id : previous?.parent_id ?? row.parent_id;
@@ -439,45 +466,17 @@ export class WooOutlinerTreeElement extends HTMLElement {
     return result.map((item) => (item.text === "" && cache[item.id]) ? { ...item, text: cache[item.id] } : item);
   }
 
-  private itemHydrationSignature(): string {
-    return `tree:${this.itemHydrationRevision}`;
-  }
-
   private rosterHydrationSignature(): string {
     return `roster:${this.rosterHydrationRevision}`;
   }
 
   private resetHydrationIfSubjectChanged(subject: string): void {
-    if (!subject || this.itemHydrationSubject === subject) return;
-    this.itemHydrationSubject = subject;
-    this.itemHydrationRevision = 0;
-    this.itemStructureAuthoritative = false;
+    if (!subject || subject === this.hydrationSubject) return;
+    this.hydrationSubject = subject;
     this.rosterHydrationRevision = 0;
     this.rosterAuthoritative = false;
     this.clearRosterRetry();
-    this.itemHydrator.reset();
     this.rosterHydrator.reset();
-  }
-
-  private requestItemsFromList(): void {
-    if (!this.woo || !this.subject) return;
-    this.itemHydrator.ensure(this.subject, this.itemHydrationSignature());
-  }
-
-  private refreshItemsAfterMutation(): void {
-    this.itemHydrationRevision += 1;
-    // Drop the completed prior revision and invalidate any older in-flight
-    // result. This also bounds the hydrator's memoized keys for a long-lived,
-    // frequently edited outline.
-    this.itemHydrator.invalidate();
-    // A committed frame can contain several structural observations. Apply
-    // all DOM-local mutations now, then verify their final tree with one read.
-    if (this.itemRefreshScheduled) return;
-    this.itemRefreshScheduled = true;
-    queueMicrotask(() => {
-      this.itemRefreshScheduled = false;
-      this.requestItemsFromList();
-    });
   }
 
   private requestRosterFromServer(): void {
@@ -524,51 +523,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
       this.rosterRetryTimer = null;
     }
     this.rosterRetryAttempt = 0;
-  }
-
-  private outlinerItemFromProjection(ref: string): ProjectedOutlinerItem | null {
-    const projected = this.woo?.observe(ref);
-    if (!projected || projected.location !== this.subject) return null;
-    const props = projected.props ?? {};
-    const ancestors = Array.isArray(projected.ancestors) ? projected.ancestors.map(String) : [];
-    const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item");
-    if (!looksLikeOutlineItem) return null;
-    const textKnown = typeof props.text === "string";
-    // Structural observations arrive before the generic projection necessarily
-    // contains the room-owned __ordered_edge. Keep their parent/index in
-    // catalog-owned client projection state rather than reviving the retired
-    // v1 `parent` / `position` properties on the object.
-    const projectedTree = projected.catalogState?.outliner_tree;
-    const tree = projectedTree && typeof projectedTree === "object" && !Array.isArray(projectedTree)
-      ? projectedTree as { parent_id?: unknown; index?: unknown }
-      : null;
-    const treeHasParent = tree !== null && Object.prototype.hasOwnProperty.call(tree, "parent_id");
-    const treeHasIndex = tree !== null && Object.prototype.hasOwnProperty.call(tree, "index");
-    // Structural parent lives in the room-owned edge cell `__ordered_edge`
-    // ({ parent, rank }); the rank is not an index, so this degraded
-    // single-item projection places at the front (0) until the authoritative
-    // list_items hydration supplies the real derived index.
-    const edge = props.__ordered_edge;
-    const edgeRecord = edge && typeof edge === "object" && !Array.isArray(edge)
-      ? edge as { parent?: unknown }
-      : null;
-    const edgeHasParent = edgeRecord !== null && Object.prototype.hasOwnProperty.call(edgeRecord, "parent");
-    const parentKnown = treeHasParent || edgeHasParent;
-    const parent = treeHasParent ? tree?.parent_id : edgeRecord?.parent;
-    return {
-      id: projected.id,
-      name: typeof projected.name === "string" ? projected.name : projected.id,
-      text: textKnown ? props.text as string : "",
-      parent_id: outlinerParent(parent),
-      index: treeHasIndex ? outlinerIndex(tree?.index, 0) : 0,
-      hidden: props.hidden === true,
-      owner: typeof projected.owner === "string" ? projected.owner : "",
-      writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],
-      has_children: false,
-      textKnown,
-      parentKnown,
-      indexKnown: treeHasIndex
-    };
   }
 
   private rosterFromProjection(): OutlinerRosterRow[] {
@@ -1137,6 +1091,38 @@ export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-outliner-tree", WooOutlinerTreeElement);
 }
 
+const OUTLINER_TREE_INVALIDATIONS = [
+  "outline_item_added",
+  "outline_item_removed",
+  "outline_item_moved",
+  "outline_item_reordered",
+  "outline_item_hidden",
+  "note_edited",
+  "note_writers_changed"
+] as const;
+
+export function registerWooViews(registry: WooViewRegistry): void {
+  registry.view<OutlinerTreeView>({
+    id: "outliner.tree",
+    seed: ({ woo, subject }) => ({
+      items: orderedOutlinerItems(woo.neighborhood.refs
+        .map((ref) => projectedOutlinerItem(woo, subject, ref))
+        .filter((item): item is ProjectedOutlinerItem => item !== null)
+        .map(({ textKnown: _textKnown, parentKnown: _parentKnown, indexKnown: _indexKnown, ...item }) => item)),
+      structure_at_seq: 0
+    }),
+    read: ({ woo, subject }) => woo.directCall(subject, "tree_view", [], { serverRead: true }),
+    parse: normalizeOutlinerTreeView,
+    invalidateOn: OUTLINER_TREE_INVALIDATIONS,
+    affects: ({ observation, delivered, projection, subject }) => {
+      const outliner = String(actField(observation, "outliner") ?? observation.source ?? delivered.space ?? "");
+      if (outliner === subject) return true;
+      const note = String(observation.note ?? "");
+      return note !== "" && (delivered.space === subject || projection.observe(note)?.location === subject);
+    }
+  });
+}
+
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {
   const STRUCTURAL_TYPES = [
     "outline_item_added",
@@ -1147,6 +1133,7 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
     "outline_focus_changed",
     "outline_undone",
     "note_edited",
+    "note_writers_changed",
     // Presence changes re-hydrate so the right-side aside (room_roster) stays
     // in sync. Hydrate already fans this out to every mounted tree.
     "outliner_entered",
@@ -1165,53 +1152,66 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       // Keep these projection patches aligned with applyObservation above;
       // optimistic frames use only this path and accepted frames use both.
       const type = String(envelope.observation.type ?? "");
-      const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
+      const outlinerId = String(actField(envelope.observation, "outliner") ?? envelope.observation.source ?? envelope.delivered.space ?? "");
       if (type === "outline_item_added") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id && outlinerId) {
-          draft.patchObject(id, {
+          const actor = actField(envelope.observation, "actor");
+          const text = actField(envelope.observation, "text");
+          const objectFields: Record<string, unknown> = {
             name: id,
-            owner: typeof envelope.observation.actor === "string" ? envelope.observation.actor : undefined,
             parent: "$outline_item",
             location: outlinerId
-          });
-          draft.patchObjectProps(id, {
-            text: typeof envelope.observation.text === "string" ? envelope.observation.text : "",
-            hidden: false
-          });
+          };
+          if (typeof actor === "string") objectFields.owner = actor;
+          draft.patchObject(id, objectFields);
+          const props: Record<string, unknown> = { hidden: false };
+          if (typeof text === "string") props.text = text;
+          draft.patchObjectProps(id, props);
           draft.patchCatalogState(id, "outliner_tree", {
-            parent_id: outlinerParent(envelope.observation.parent_id),
-            index: outlinerIndex(envelope.observation.index, 0)
+            parent_id: outlinerParent(actField(envelope.observation, "parent_id")),
+            index: outlinerIndex(actField(envelope.observation, "index"), 0)
           });
         }
       } else if (type === "outline_item_removed") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchObject(id, { location: null });
       } else if (type === "outline_item_moved") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchCatalogState(id, "outliner_tree", {
-          parent_id: outlinerParent(envelope.observation.to_parent),
-          index: outlinerIndex(envelope.observation.to_index, 0)
+          parent_id: outlinerParent(actField(envelope.observation, "to_parent")),
+          index: outlinerIndex(actField(envelope.observation, "to_index"), 0)
         });
       } else if (type === "outline_item_reordered") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchCatalogState(id, "outliner_tree", {
-          parent_id: outlinerParent(envelope.observation.parent_id),
-          index: outlinerIndex(envelope.observation.to_index, 0)
+          parent_id: outlinerParent(actField(envelope.observation, "parent_id")),
+          index: outlinerIndex(actField(envelope.observation, "to_index"), 0)
         });
       } else if (type === "outline_item_hidden") {
-        const id = String(envelope.observation.item ?? "");
-        if (id) draft.patchObjectProps(id, { hidden: Boolean(envelope.observation.hidden) });
+        const id = String(actField(envelope.observation, "item") ?? "");
+        if (id) draft.patchObjectProps(id, { hidden: Boolean(actField(envelope.observation, "hidden")) });
       }
       // Optimistic frames are represented by projection patches so failure can
       // roll them back. DOM-local model edits are reserved for accepted frames.
       if (envelope.delivered.optimistic === true) return;
       if (!outlinerId) return;
       for (const el of document.querySelectorAll<WooOutlinerTreeElement>(`woo-outliner-tree`)) {
-        if (el.subject === outlinerId) el.applyObservation(envelope.observation);
+        if (el.subject === outlinerId) el.applyObservation(envelope.observation, outlinerId);
       }
     }
   });
+}
+
+// Dual-shape field read for the five structural events. v3 emits concise Acts
+// ({type, version, payload: {...structural fields...}}); pre-v3 definitions emit
+// flat observations that also carry actor/outliner/text. Both remain readable
+// during rolling upgrades. Contract: catalogs/outliner/migration-v2-to-v3.json.
+function actField(observation: Record<string, unknown>, key: string): unknown {
+  const payload = observation.payload;
+  return payload !== null && typeof payload === "object" && key in payload
+    ? (payload as Record<string, unknown>)[key]
+    : observation[key];
 }
 
 function outlinerParent(value: unknown): string | null {
@@ -1221,6 +1221,57 @@ function outlinerParent(value: unknown): string | null {
 function outlinerIndex(value: unknown, fallback: number): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : fallback;
+}
+
+function projectedOutlinerItem(woo: WooContext, subject: string, ref: string): ProjectedOutlinerItem | null {
+  const projected = woo.observe(ref);
+  if (!projected || projected.location !== subject) return null;
+  const props = projected.props ?? {};
+  const ancestors = Array.isArray(projected.ancestors) ? projected.ancestors.map(String) : [];
+  if (projected.parent !== "$outline_item" && !ancestors.includes("$outline_item")) return null;
+  const textKnown = typeof props.text === "string";
+  // Structural observations arrive before generic projection necessarily has
+  // the room-owned edge. Their derived parent/index live in catalogState;
+  // __ordered_edge supplies only parent because a fractional rank is not an
+  // array index.
+  const projectedTree = projected.catalogState?.outliner_tree;
+  const tree = projectedTree && typeof projectedTree === "object" && !Array.isArray(projectedTree)
+    ? projectedTree as { parent_id?: unknown; index?: unknown }
+    : null;
+  const treeHasParent = tree !== null && Object.prototype.hasOwnProperty.call(tree, "parent_id");
+  const treeHasIndex = tree !== null && Object.prototype.hasOwnProperty.call(tree, "index");
+  const edge = props.__ordered_edge;
+  const edgeRecord = edge && typeof edge === "object" && !Array.isArray(edge)
+    ? edge as { parent?: unknown }
+    : null;
+  const edgeHasParent = edgeRecord !== null && Object.prototype.hasOwnProperty.call(edgeRecord, "parent");
+  const parent = treeHasParent ? tree?.parent_id : edgeRecord?.parent;
+  return {
+    id: projected.id,
+    name: typeof projected.name === "string" ? projected.name : projected.id,
+    text: textKnown ? props.text as string : "",
+    parent_id: outlinerParent(parent),
+    index: treeHasIndex ? outlinerIndex(tree?.index, 0) : 0,
+    hidden: props.hidden === true,
+    owner: typeof projected.owner === "string" ? projected.owner : "",
+    writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],
+    has_children: false,
+    textKnown,
+    parentKnown: treeHasParent || edgeHasParent,
+    indexKnown: treeHasIndex
+  };
+}
+
+function normalizeOutlinerTreeView(value: unknown): OutlinerTreeView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("tree_view did not return an object");
+  const record = value as Record<string, unknown>;
+  const items = normalizeOutlinerItems(record.items);
+  if (!items) throw new Error("tree_view did not return outline rows");
+  const structureAtSeq = record.structure_at_seq;
+  if (typeof structureAtSeq !== "number" || !Number.isSafeInteger(structureAtSeq) || structureAtSeq < 0) {
+    throw new Error("tree_view returned an invalid structure_at_seq");
+  }
+  return { items, structure_at_seq: structureAtSeq };
 }
 
 function normalizeOutlinerItems(value: unknown): OutlinerItem[] | null {
@@ -1287,17 +1338,22 @@ function orderedOutlinerItems(items: OutlinerItem[]): OutlinerItem[] {
   }
   for (const list of byParent.values()) list.sort((left, right) => left.index - right.index || left.id.localeCompare(right.id));
   const ordered: OutlinerItem[] = [];
+  const orderedIds = new Set<string>();
   const visit = (parent: string | null) => {
     const siblings = byParent.get(parent) ?? [];
     siblings.forEach((item, index) => {
       const children = byParent.get(item.id) ?? [];
       ordered.push({ ...item, index, has_children: children.length > 0 });
+      orderedIds.add(item.id);
       visit(item.id);
     });
   };
   visit(null);
   for (const item of items) {
-    if (!ordered.some((candidate) => candidate.id === item.id)) ordered.push({ ...item, has_children: false });
+    if (!orderedIds.has(item.id)) {
+      ordered.push({ ...item, has_children: false });
+      orderedIds.add(item.id);
+    }
   }
   return ordered;
 }

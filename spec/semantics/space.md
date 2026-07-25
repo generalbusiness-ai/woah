@@ -41,7 +41,10 @@ materialized actor or session rows. Catalog `room_roster()` verbs adapt the
 compact rows to the stable presentation shape without dereferencing actor
 clusters. Authoritative local runtimes, which hold the complete session table,
 may derive the same compact rows locally. Live delivery remains a separate,
-stricter contract and only targets live sessions.
+stricter contract and only targets live sessions. Catalog delivery behavior
+MUST NOT use `room_roster()` as an audience: API-key service sessions may be
+deliberately absent from that social projection while remaining eligible for
+delivery.
 
 ---
 

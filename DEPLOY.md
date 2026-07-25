@@ -410,10 +410,19 @@ dataset (`woo_v1_net_canary`).
 npx wrangler kv namespace create HOST_SEED_KV   # copy the id into a working copy
 # 2. Deploy the standalone canary (never --env)
 npx wrangler deploy -c wrangler.net-canary.template.toml
-# 3. Install a world, drive load, read the percentile gate from AE
-npm run install:net-dev        # (or the deployed install path)
-npm run load:net-canary        # add --enforce-who to gate on the who_all check
-npm run metrics:net-ae         # global-weighted p99 gate, per-shard diagnostics
+# 3. Install a world with two canary-only API keys, drive the deployed MCP
+#    walkthrough, then load and read the percentile gate from AE.
+WOO_INTERNAL_SECRET=... \
+WOO_CANARY_ALICE_APIKEY=apikey:... \
+WOO_CANARY_BOB_APIKEY=apikey:... \
+  npm run install:net-canary -- --base-url https://woah-net-canary.<account>.workers.dev
+WOO_SMOKE_ALICE_APIKEY="$WOO_CANARY_ALICE_APIKEY" \
+WOO_SMOKE_BOB_APIKEY="$WOO_CANARY_BOB_APIKEY" \
+  npm run smoke:walkthrough -- --base=https://woah-net-canary.<account>.workers.dev
+npm run load:net-canary -- \
+  --base-url https://woah-net-canary.<account>.workers.dev --enforce-who
+CF_ACCOUNT_ID=... CF_ANALYTICS_TOKEN=... npm run metrics:net-ae -- \
+  --dataset woo_v1_net_canary --from <ISO_START> --min-turns 500
 # 4. Tear down
 npx wrangler delete -c wrangler.net-canary.template.toml   # + delete the KV
 ```

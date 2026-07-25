@@ -33,6 +33,7 @@
         "subject": "$dubspace",
         "view": "default",
         "layout": "space-workspace",
+        "navigation": { "tab": "dubspace", "label": "Dubspace", "aliases": ["dubspace"], "host_attribute": "data-dubspace-workspace" },
         "hydration": {
           "module": "dubspace-ui",
           "id": "controls"
@@ -93,6 +94,9 @@
         "module": "dubspace-ui",
         "types": ["dubspace_entered", "dubspace_left", "dubspace_activity"]
       }
+    ],
+    "world_snapshot_adapters": [
+      { "module": "dubspace-ui" }
     ]
   },
   "classes": [

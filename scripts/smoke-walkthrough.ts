@@ -24,7 +24,12 @@
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { httpTransport, SmokeSession } from "./smoke/session";
-import { runSmokeWalkthrough, type SmokeSessionPair, type StepContext } from "./smoke/scenario";
+import {
+  ensureInChatroom,
+  runSmokeWalkthrough,
+  type SmokeSessionPair,
+  type StepContext
+} from "./smoke/scenario";
 
 type StepResult = { name: string; ok: boolean; ms: number; detail?: string };
 type SessionPair = SmokeSessionPair & { generation: number };
@@ -130,17 +135,21 @@ async function openSessionPair(generation: number): Promise<SessionPair> {
   const suffix = generation === 0 ? "" : `-recovery-${generation}`;
   let alice: SmokeSession | null = null;
   let bob: SmokeSession | null = null;
+  const tokens = smokeMcpTokens();
   try {
     alice = await SmokeSession.open(transport, {
-      token: `guest:walkthrough-alice-${runId}${suffix}`,
+      token: tokens.alice,
       label: `alice${suffix}`,
       clientName: `smoke-walkthrough/${runId}/alice${suffix}`
     });
     bob = await SmokeSession.open(transport, {
-      token: `guest:walkthrough-bob-${runId}${suffix}`,
+      token: tokens.bob,
       label: `bob${suffix}`,
       clientName: `smoke-walkthrough/${runId}/bob${suffix}`
     });
+    if (alice.actor === bob.actor) {
+      throw new Error(`deployed walkthrough requires two distinct actors; both API keys resolved to ${alice.actor}`);
+    }
     return { alice, bob, generation };
   } catch (err) {
     await Promise.allSettled([alice?.close(), bob?.close()]);
@@ -153,8 +162,8 @@ async function closeSessionPair(pair: SessionPair | null): Promise<void> {
   await Promise.allSettled([pair.alice.close(), pair.bob.close()]);
 }
 
-// Replace both sessions after a failed step and re-enter the chatroom so the
-// next step starts from a known room. Mutates `pair` in place — the scenario
+// Replace both sessions after a failed step and re-establish the chatroom so
+// the next step starts from a known room. Mutates `pair` in place — the scenario
 // holds the same reference and reads the new sessions on its next step.
 async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<void> {
   const nextGeneration = pair.generation + 1;
@@ -165,12 +174,29 @@ async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<
   pair.bob = next.bob;
   pair.generation = nextGeneration;
   try {
-    await pair.alice.call("the_chatroom", "enter", []);
-    await pair.bob.call("the_chatroom", "enter", []);
+    await ensureInChatroom(pair.alice);
+    await ensureInChatroom(pair.bob);
   } catch (err) {
     await closeSessionPair(pair);
     throw err;
   }
+}
+
+/** Net MCP deliberately accepts API keys only. Requiring two explicit keys
+ * keeps the deployed smoke on that one authentication path and prevents a
+ * same-actor run from masquerading as cross-actor convergence. */
+export function smokeMcpTokens(
+  env: Partial<Pick<NodeJS.ProcessEnv, "WOO_SMOKE_ALICE_APIKEY" | "WOO_SMOKE_BOB_APIKEY">> = process.env
+): { alice: string; bob: string } {
+  const alice = env.WOO_SMOKE_ALICE_APIKEY?.trim() ?? "";
+  const bob = env.WOO_SMOKE_BOB_APIKEY?.trim() ?? "";
+  if (!alice || !bob) {
+    throw new Error("WOO_SMOKE_ALICE_APIKEY and WOO_SMOKE_BOB_APIKEY are required for the deployed Net MCP walkthrough");
+  }
+  if (!alice.startsWith("apikey:") || !bob.startsWith("apikey:")) {
+    throw new Error("deployed Net MCP walkthrough credentials must use apikey:<id>:<secret>");
+  }
+  return { alice, bob };
 }
 
 // Step-level watchdog. Even with a per-RPC deadline, a step that loops over many

@@ -45,6 +45,9 @@ import { applyTranscript, type EffectTranscript, type TranscriptWrite } from "./
  * header shape rule). Task-vocabulary mapping: created_at → `started`,
  * expires_at → `expiresAt`, scope → `activeScope`. */
 export type SessionCellValue = SerializedSession & {
+  /** False keeps authorization presence intact while excluding this session
+   * from actor-level social roster projections. Omission means visible. */
+  rosterVisible?: false;
   /** The actor was provisioned only for this anonymous session. Once no live
    * session remains, the owner reaper retires its physical room placement. */
   ephemeralActor?: boolean;
@@ -112,6 +115,14 @@ export type MintSessionInput = {
   activeScope?: string | null;
   /** Display identity for the compact room-roster projection. */
   actorName?: string;
+  /** Long-lived credential that authenticated this mint, when any. Keeping
+   * the public id in the session cell lets bearer-only transports (MCP and
+   * browser sessions) re-check revocation without retaining the secret. */
+  apikeyId?: string;
+  /** API-key service sessions may retain authorization presence without
+   * presenting their actor as a social room occupant. Only false is stored;
+   * omission is the compact/default visible form. */
+  rosterVisible?: boolean;
   /** Identity-door guest claim: stamp the transcript exclusiveMint so
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
@@ -184,6 +195,8 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     started: input.now,
     expiresAt: input.closing ? input.now + 250 : input.now + input.ttl_ms,
     activeScope: input.closing ? null : (input.activeScope ?? null),
+    ...(!input.closing && input.apikeyId ? { apikeyId: input.apikeyId } : {}),
+    ...(!input.closing && input.rosterVisible === false ? { rosterVisible: false as const } : {}),
     ...(input.closing?.ephemeralActor
       ? {
           ephemeralActor: true,
@@ -210,12 +223,22 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
             session: input.session,
             actor: input.actor,
             ...(input.actorName ? { actorName: input.actorName } : {}),
+            ...(input.rosterVisible === false ? { rosterVisible: false as const } : {}),
             from: input.closing.priorActiveScope,
             to: null
           }
         }
       : input.activeScope && !input.closing
-        ? { sessionScopeTransition: { session: input.session, actor: input.actor, ...(input.actorName ? { actorName: input.actorName } : {}), from: null, to: input.activeScope } }
+        ? {
+            sessionScopeTransition: {
+              session: input.session,
+              actor: input.actor,
+              ...(input.actorName ? { actorName: input.actorName } : {}),
+              ...(input.rosterVisible === false ? { rosterVisible: false as const } : {}),
+              from: null,
+              to: input.activeScope
+            }
+          }
         : {}),
     ...(input.exclusive ? { exclusiveMint: true } : {}),
     ...(input.closing ? { sessionClose: true } : {}),
@@ -291,6 +314,11 @@ export type SessionAuthDeps = {
   ownsSession(session: string): boolean;
   /** The scope's own authoritative cell for a session it owns. */
   readSession(session: string): Pick<Cell, "value"> | undefined;
+  /** Exact session value carried by this ROOM scope's owner-sequenced
+   * session_presence checkpoint. It is a local authorization projection,
+   * not a second session writer; absent for non-room scopes and sessions
+   * not currently present here. */
+  readProjectedSession?(session: string): Pick<Cell, "value" | "version"> | undefined;
   now(): number;
   /** The scope's own session cells bound to an actor (the exclusiveMint
    * occupancy witness). Optional for callers that never see exclusive
@@ -323,22 +351,24 @@ export type SessionAuthDeps = {
  *    authoritative value (presence, expiry, actor binding).
  * 3. **Foreign session** — the CO2.3 composition (session cells are just
  *    cells): require a session READ plus an owner attestation covering
- *    it. Attested version == read version proves the read VALUE is the
- *    owner's current value (content addressing — header note); validate
- *    that value. Attested version != read version is NOT an auth verdict:
- *    return and let CO4 step 7 reject `read_version_mismatch` (retryable
- *    repair) — a stale view must never terminal-reject as unauthorized.
- *    No read or no attestation → refused (`session_unattested`): the
- *    submitter skipped the protocol, not a repairable state.
+ *    it, OR the committing room's exact owner-sequenced session_presence
+ *    checkpoint. The proof version == read version proves the read VALUE is
+ *    current (content addressing — header note); validate that value.
+ *    A different proof version is NOT an auth verdict: return it and let CO4
+ *    step 7 reject `read_version_mismatch` (retryable repair) — a stale view
+ *    must never terminal-reject as unauthorized. No read and no proof →
+ *    refused (`session_unattested`): the submitter skipped the protocol, not
+ *    a repairable state.
  */
-export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDeps): void {
+export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDeps): ReadonlyMap<string, string> {
   const transcript = submit.transcript;
+  const projectedReads = new Map<string, string>();
   const sessionReads = transcript.reads.filter((read) => read.cell.kind === "session");
   const ids = new Set<string>(sessionReads.map((read) => read.cell.object));
   if (typeof transcript.session === "string" && transcript.session.length > 0) ids.add(transcript.session);
 
   if (ids.size === 0) {
-    if (transcript.route === "direct") return;
+    if (transcript.route === "direct") return projectedReads;
     throw new SessionAuthError("sequenced turn names no session", {
       session_verdict: "session_required",
       route: transcript.route
@@ -406,6 +436,21 @@ export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDe
     }
     const read = sessionReads.find((r) => r.cell.object === id);
     const attestedVersion = attested.get(sessionCellKey(id));
+    // A live owner attestation is the fallback when the gateway cannot prove
+    // that its room checkpoint mirror is exact. Prefer it when present; a
+    // lagging room relation must not mask a fresher owner proof.
+    const projected = attestedVersion === undefined ? deps.readProjectedSession?.(id) : undefined;
+    if (projected !== undefined) {
+      if (!read) refuse(id, "session_unattested", { has_read: false, has_projection: true });
+      // The room checkpoint is current authority for presence and carries the
+      // actor-cluster's exact session value. Validate its semantics even when
+      // the gateway read is stale; step 7 compares the two versions and emits
+      // retryable read_version_mismatch.
+      const verdict = validateSessionCell(projected, now, transcript.call.actor);
+      if (verdict !== "ok") refuse(id, verdict, { source: "room_presence_projection" });
+      projectedReads.set(sessionCellKey(id), projected.version);
+      continue;
+    }
     if (!read || attestedVersion === undefined) {
       refuse(id, "session_unattested", { has_read: Boolean(read), has_attestation: attestedVersion !== undefined });
       continue;
@@ -418,4 +463,5 @@ export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDe
     const verdict = validateSessionCell({ value: read.value }, now, transcript.call.actor);
     if (verdict !== "ok") refuse(id, verdict, { source: "attested_read" });
   }
+  return projectedReads;
 }

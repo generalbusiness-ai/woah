@@ -137,6 +137,7 @@ const BUILTINS = new Set([
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join", "str_split",
   "listinsert", "object_tree_rows", "rank_between",
   "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "has_surface", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms", "caller_perms",
+  "event_schema",
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",

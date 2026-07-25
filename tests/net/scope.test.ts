@@ -7,6 +7,7 @@ import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
+import { replayPageVersion } from "../../src/net/replay-pages";
 
 const SCOPE = "the_room";
 const EPOCH = "cat1";
@@ -109,7 +110,8 @@ describe("commit acceptance (CO4)", () => {
     // a dedicated operator op, never a seed.
     seq.operatorActivationWrite(null);
     expect(seq.store.get("property_cell:$system:net_active_epoch")?.value).toEqual({ value: null });
-    expect(seq.head()).toEqual(headAfterCommit);
+    expect(seq.head()).toMatchObject({ seq: headAfterCommit.seq, hash: headAfterCommit.hash });
+    expect(seq.head().generation).toBe((headAfterCommit.generation ?? 0) + 1);
   });
 
   it("preserves seeded relations when a legacy same-epoch re-seed omits the relation field", () => {
@@ -169,6 +171,46 @@ describe("commit acceptance (CO4)", () => {
     const replay2 = seq.submit(submit);
     expect(replay2.status === "accepted" && replay2.replayed).toBe(true);
     expect(replay2.head).toEqual(first.head);
+  });
+
+  it("validates pure direct reads without advancing or caching the authority head", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "stable" } }]);
+    const cell = seq.store.get("property_cell:#thing:n");
+    const read = transcript({
+      route: "direct",
+      seq: -1,
+      reads: [{
+        cell: { kind: "prop", object: "#thing", name: "n" },
+        version: cell?.version,
+        value: "stable" as never
+      }]
+    });
+    const before = seq.head();
+    const first = seq.submit(submitFor(seq, read, "pure-read"));
+    const second = seq.submit(submitFor(seq, read, "pure-read"));
+
+    expect(first).toMatchObject({ status: "accepted", head: before, touched: [] });
+    expect(second).toMatchObject({ status: "accepted", head: before, touched: [] });
+    expect(first.status === "accepted" && first.replayed).toBeUndefined();
+    expect(second.status === "accepted" && second.replayed).toBeUndefined();
+    expect(seq.head()).toEqual(before);
+  });
+
+  it("refuses complete-head compaction across a head-stable activation generation", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const compacted = {
+      ...submitFor(seq, transcript({ route: "direct", seq: -1 }), "compacted-before-activation"),
+      owned_reads_compacted: true as const
+    };
+    const before = seq.head();
+    seq.operatorActivationWrite(null);
+    expect(seq.head()).toMatchObject({ seq: before.seq, hash: before.hash });
+    expect(seq.head().generation).toBe((before.generation ?? before.seq) + 1);
+
+    const reply = seq.submit(compacted);
+    expect(reply.status).toBe("rejected");
+    expect(reply.status === "rejected" && reply.reason).toBe("stale_head");
   });
 
   it("rebases independent turns from the same retained head", () => {
@@ -377,6 +419,57 @@ describe("rider read attestation (CO2.3)", () => {
     // consulted when `owns` is wired.
     const submit = { ...submitFor(seq, riderReadTranscript(version), "k1"), attestations: attestationAt("some-other-version") };
     expect(seq.submit(submit).status).toBe("accepted");
+  });
+});
+
+describe("replay-page read attestation (SL4/CO2.4)", () => {
+  const foreignRead = { space: "other_room", from: 1, limit: 100, scope: "room:other_room", version: "page-v1" };
+
+  function replayReadTranscript(read = foreignRead): EffectTranscript {
+    return transcript({ writes: [propWrite("v1")], replayReads: [read] });
+  }
+
+  it("requires a foreign page attestation and rejects a changed version retryably", () => {
+    const missingOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const missing = missingOwner.submit(submitFor(missingOwner, replayReadTranscript(), "replay-missing"));
+    expect(missing).toMatchObject({ status: "rejected", reason: "rider_unattested", retryable: false });
+
+    const staleOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const stale = staleOwner.submit({
+      ...submitFor(staleOwner, replayReadTranscript(), "replay-stale"),
+      attestations: {
+        [foreignRead.scope]: {
+          owner_head: { seq: 3, hash: "owner-h3" },
+          cells: [],
+          replays: [{ space: foreignRead.space, from: foreignRead.from, limit: foreignRead.limit, version: "page-v2" }]
+        }
+      }
+    });
+    expect(stale).toMatchObject({
+      status: "rejected",
+      reason: "read_version_mismatch",
+      retryable: true,
+      detail: { replay_conflicts: [{ scope: foreignRead.scope, space: foreignRead.space, from: 1, limit: 100 }] }
+    });
+  });
+
+  it("accepts matching foreign and locally re-derived empty page versions", () => {
+    const foreignOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const foreign = foreignOwner.submit({
+      ...submitFor(foreignOwner, replayReadTranscript(), "replay-foreign-ok"),
+      attestations: {
+        [foreignRead.scope]: {
+          owner_head: { seq: 3, hash: "owner-h3" },
+          cells: [],
+          replays: [{ space: foreignRead.space, from: 1, limit: 100, version: foreignRead.version }]
+        }
+      }
+    });
+    expect(foreign.status).toBe("accepted");
+
+    const localOwner = new ScopeSequencer(SCOPE, EPOCH);
+    const localRead = { space: SCOPE, from: 1, limit: 100, scope: SCOPE, version: replayPageVersion([]) };
+    expect(localOwner.submit(submitFor(localOwner, replayReadTranscript(localRead), "replay-local-ok")).status).toBe("accepted");
   });
 });
 

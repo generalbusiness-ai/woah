@@ -26,7 +26,22 @@
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
-import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "./relations";
+import {
+  applyRelationDeltas,
+  deriveRelationDeltas,
+  rebuildContentsRelation,
+  relationKey,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow
+} from "./relations";
+import {
+  ACTOR_API_KEYS_PROPERTY,
+  apiKeyVerifierKey,
+  apiKeyVerifierRowsForActor,
+  rebuildApiKeyVerifierIndex,
+  type ApiKeyVerifierRow
+} from "./api-key-index";
 import {
   ORDERED_EDGE_RELATION,
   orderedChildrenForContainer,
@@ -42,14 +57,19 @@ import {
   type ScopeAttribution
 } from "./attribution";
 import type { TraceContext } from "./trace";
+import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
-import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
+import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
 
 export type ScopeHead = {
   seq: number;
   /** Rolling digest: hash(prev.hash, seq, transcript.hash). */
   hash: string;
+  /** Monotonic authority generation. Unlike `seq`, this also advances for
+   * head-stable seed and activation writes, closing ABA for complete reads. */
+  generation?: number;
 };
 
 export type OperatorDefinitionRepair = {
@@ -58,6 +78,36 @@ export type OperatorDefinitionRepair = {
   cells: Cell[];
   removed: string[];
 };
+
+export type OperatorCredentialEnsure = {
+  status: "applied" | "empty";
+  head: ScopeHead;
+  cell: Cell;
+  verifier: ApiKeyVerifierRow;
+};
+
+/** CO7/CO10 envelope byte ceilings. Enforced by the gateway on the ACTUAL
+ * serialized submit RPC body ({submit, rider/relation destinations}),
+ * measured immediately before the submit RPC — never on a modeled shape. */
+export const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
+export const CROSS_SCOPE_ENVELOPE_BYTE_LIMIT = 256 * 1024;
+
+/** UTF-8 byte size of a submit RPC body as serialized on the wire. */
+export function submitEnvelopeBytes(body: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(body)).byteLength;
+}
+
+/** CO7 ceiling gate. A breach is a plain Error (misplan bug — the planner
+ * built an envelope the protocol refuses; fix the plan, never raise the
+ * ceiling), not a NetError the repair loop could grind on. */
+export function assertEnvelopeCeiling(envelopeBytes: number, warm: boolean): void {
+  const limit = warm ? WARM_ENVELOPE_BYTE_LIMIT : CROSS_SCOPE_ENVELOPE_BYTE_LIMIT;
+  if (envelopeBytes > limit) {
+    throw new Error(
+      `oversized ${warm ? "warm" : "cross-scope"} envelope: ${envelopeBytes} bytes > ${limit} (misplan bug — shrink the transcript, do not raise the ceiling)`
+    );
+  }
+}
 
 export type CommitSubmit = {
   kind: "woo.net.commit_submit.v1";
@@ -71,6 +121,9 @@ export type CommitSubmit = {
    * the scope re-derives and compares (CO4 step 10). */
   post_state_version: string;
   stamp: EpochStamp;
+  /** Same-scope reads were replaced by the exact complete base generation.
+   * Such a submit may not use retained-head rebasing. */
+  owned_reads_compacted?: true;
   /** CO2.3 rider integrity (rule 1): owner attestations for the
    * transcript's FOREIGN-anchored reads, keyed by owning scope. The
    * gateway fetches these at plan time (`POST /net/attest` — one async
@@ -86,6 +139,11 @@ export type CommitSubmit = {
      * at the same /net/attest freshness point as the cell versions, so a
      * foreign ordering read validates exactly like a foreign cell read. */
     orderings?: Array<{ container: string; parent: string | null; version: string }>;
+    /** The owner's CURRENT replay-page version per attested `(space, from,
+     * limit)` query (sequenced-log.md SL4), taken at the same /net/attest
+     * freshness point — a foreign committed-log read validates exactly
+     * like a foreign cell or ordering read. */
+    replays?: Array<{ space: string; from: number; limit: number; version: string }>;
   }>;
 };
 
@@ -165,8 +223,10 @@ export type ScheduledTurn = {
 
 export type ScopeSequencerOptions = {
   /** Step 1: envelope/actor/session authority. Default accepts (in-process
-   * trust); Phase-3 hosts inject the real check. Throw NetError to refuse. */
-  authorize?: (submit: CommitSubmit) => void;
+   * trust); Phase-3 hosts inject the real check. Throw NetError to refuse.
+   * The returned versions are foreign reads proved by a projection this
+   * scope owns; step 7 compares them exactly like owner attestations. */
+  authorize?: (submit: CommitSubmit) => ReadonlyMap<string, string> | void;
   /** Step 9: per-write authority. Default requires each authority-cell
    * write to name its recording VM frame (`writer`), per CO3: never the
    * union of verb owners. */
@@ -194,6 +254,10 @@ export type ScopeSequencerOptions = {
   catalogMutationForbidden?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
+  /** Clock for the committed-log acceptance timestamp (CO2.5: accepted
+   * frames carry the authority's acceptance time). Default Date.now; the
+   * DO shell injects host.now so tests and workerd agree on the source. */
+  now?: () => number;
   /** H2a: reply-cache bound — the TOTAL number of recorded replies the
    * cache holds (default REPLY_CACHE_CAP). Within-window replies (still
    * covered by the recovery tail) are never pruned but DO count toward
@@ -230,6 +294,9 @@ export class ScopeSequencer {
   private attribution: ScopeAttribution | null = null;
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relationRows = new Map<string, RelationRow>();
+  /** Private O(1) authentication index derived from actor api_keys cells.
+   * This is not relation state and has no transfer/fanout/public surface. */
+  private readonly apiKeyVerifiers = new Map<string, ApiKeyVerifierRow>();
   /** CO13 ordered-edge relation buckets, maintained in (rank, child) order
    * when rows change. Relation rows are keyed by member, so the reverse map
    * lets an overwrite/reparent remove the old bucket entry before adding the
@@ -237,13 +304,19 @@ export class ScopeSequencer {
    * in a room scope. */
   private readonly orderedRelationsByProjection = new Map<string, OrderedChildRow[]>();
   private readonly orderedRelationLocationByKey = new Map<string, { projection: string; child: string; rank: string }>();
+  /** Committed sequenced-log rows for DURABLE-LESS sequencers only (unit
+   * tests / in-process fixtures): space → (seq → entry). With a durable
+   * store the log is never held in memory — it is the one row family
+   * besides `scheduled` that can outgrow the live cell set without bound,
+   * so pages are read from the store on demand (scope-store.ts). */
+  private readonly memoryLogRows = new Map<string, Map<number, ReplayLogEntry>>();
   private readonly options: Required<Pick<ScopeSequencerOptions, "tailLimit">> & ScopeSequencerOptions;
 
   constructor(scope: string, catalogEpoch: string, options: ScopeSequencerOptions = {}) {
     this.scope = scope;
     this.catalogEpoch = catalogEpoch;
     this.store = new CellStore("authority");
-    this.headState = { seq: 0, hash: cellVersion(["genesis", scope]) };
+    this.headState = { seq: 0, hash: cellVersion(["genesis", scope]), generation: 0 };
     this.options = { tailLimit: options.tailLimit ?? 256, ...options };
 
     // Hydrate from the durable store (cold start / post-eviction). The
@@ -275,7 +348,7 @@ export class ScopeSequencer {
             runtime_epoch: catalogEpoch
           });
         }
-        this.headState = meta.head;
+        this.headState = { ...meta.head, generation: meta.head.generation ?? meta.head.seq };
         this.attribution = meta.attribution ?? null;
       }
       for (const cell of durable.readCells()) this.store.install(cell);
@@ -288,6 +361,9 @@ export class ScopeSequencer {
       // delegate). The in-memory map serves only durable-less
       // sequencers.
       for (const row of durable.readRelations()) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
+      for (const row of durable.readApiKeyVerifiers()) {
+        this.apiKeyVerifiers.set(apiKeyVerifierKey(row.actor, row.id), row);
+      }
       this.syncOrderedRelationIndex(this.relationRows.keys());
     }
   }
@@ -365,6 +441,10 @@ export class ScopeSequencer {
       });
     }
     this.nextObjectCounter = null; // re-derive over the seeded store
+    this.headState = {
+      ...this.headState,
+      generation: (this.headState.generation ?? this.headState.seq) + 1
+    };
     // Same-epoch idempotent re-seed may re-stamp (same pipeline, same
     // value); an omitted field on a re-seed preserves the prior stamp
     // (legacy-caller posture, mirroring the relations rule below).
@@ -373,6 +453,11 @@ export class ScopeSequencer {
     for (const cell of cells) {
       seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
     }
+    // Seed carries the complete authority cell image, so rebuild the private
+    // verifier index directly from it. The index never rides the public
+    // `relations` argument.
+    this.apiKeyVerifiers.clear();
+    for (const [key, row] of rebuildApiKeyVerifierIndex(seeded)) this.apiKeyVerifiers.set(key, row);
     // A present relation field is the COMPLETE initial family and replaces a
     // partial first attempt. Legacy seed callers omitted the field entirely;
     // omission must preserve their already-seeded rows, not silently mean an
@@ -392,6 +477,10 @@ export class ScopeSequencer {
           for (const row of durable.readRelations()) durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
           for (const [key, row] of this.relationRows) durable.writeRelation(key, row);
         }
+        for (const row of durable.readApiKeyVerifiers()) {
+          durable.deleteApiKeyVerifier(apiKeyVerifierKey(row.actor, row.id));
+        }
+        for (const [key, row] of this.apiKeyVerifiers) durable.writeApiKeyVerifier(key, row);
         // Meta is written on seed too, so a seeded-but-never-committed
         // scope still hydrates with its head and epoch.
         durable.writeMeta(this.metaRow());
@@ -406,10 +495,14 @@ export class ScopeSequencer {
    * scope has committed turns (deactivation happens post-verification,
    * which is post-mint on the carried actor's cluster... and epoch
    * bumps at the CATALOG scope, whose head never advances by client
-   * turns). Durable like a seed write; the head is untouched (the cell's
-   * own content-address version is what consumers check).
+   * turns). Durable like a seed write; sequenced `(seq, hash)` stays stable
+   * while the mutation-complete authority generation advances.
    */
   operatorActivationWrite(activeEpoch: string | null): void {
+    this.headState = {
+      ...this.headState,
+      generation: (this.headState.generation ?? this.headState.seq) + 1
+    };
     const committed = this.store.commit({
       kind: "property_cell",
       object: "$system",
@@ -454,7 +547,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: priorHead.seq + 1,
-      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker])
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker]),
+      generation: (priorHead.generation ?? priorHead.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
     const committed = changed.map((cell) => this.store.commit({
@@ -489,6 +583,130 @@ export class ScopeSequencer {
     return { status: "applied", head: this.headState, cells: committed, removed };
   }
 
+  /** Internal-signed bootstrap of one actor-owned API-key verifier.
+   *
+   * The operator generates the id, secret, and salt locally and sends only the
+   * non-replayable verifier record here. Exact replay is empty success;
+   * disagreement at an existing id is a collision. The actor cell, private
+   * verifier index, head, and recovery tail advance in one transaction.
+   */
+  operatorEnsureCredential(
+    actor: string,
+    id: string,
+    record: Record<string, unknown>
+  ): OperatorCredentialEnsure {
+    const routed = parseRoutedApiKeyId(id);
+    const routedScope = routedApiKeyScope(id);
+    const recordKeys = Object.keys(record).sort();
+    const closedRecord =
+      recordKeys.length === 5 &&
+      recordKeys.every((key) => ["actor", "created_at", "hash", "label", "salt"].includes(key));
+    if (
+      !routed ||
+      routed.actor !== actor ||
+      routedScope !== this.scope ||
+      !closedRecord ||
+      record.actor !== actor ||
+      typeof record.hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(record.hash) ||
+      typeof record.salt !== "string" ||
+      !/^[0-9a-f]{32}$/.test(record.salt) ||
+      !Number.isSafeInteger(record.created_at) ||
+      Number(record.created_at) < 0 ||
+      (record.label !== null &&
+        (typeof record.label !== "string" || new TextEncoder().encode(record.label).byteLength > 256))
+    ) {
+      throw netError("E_INVARG", "credential ensure record or routing hint is invalid", {
+        actor,
+        id,
+        scope: this.scope
+      });
+    }
+    if (!this.store.has(cellKey("object_lineage", actor))) {
+      throw netError("E_MISSING_STATE", "credential actor is not authoritative at this scope", {
+        actor,
+        scope: this.scope
+      });
+    }
+    if (this.options.scopeOf && this.options.scopeOf(actor) !== this.scope) {
+      throw netError("E_INVARG", "credential actor belongs to a different authority scope", {
+        actor,
+        scope: this.scope,
+        actual: this.options.scopeOf(actor)
+      });
+    }
+
+    const key = cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY);
+    const priorCell = this.store.get(key);
+    const priorPayload =
+      priorCell?.value && typeof priorCell.value === "object" && !Array.isArray(priorCell.value)
+        ? priorCell.value as { value?: unknown; def?: unknown }
+        : {};
+    const priorMap =
+      priorPayload.value && typeof priorPayload.value === "object" && !Array.isArray(priorPayload.value)
+        ? priorPayload.value as Record<string, unknown>
+        : {};
+    const existing = priorMap[id];
+    if (existing !== undefined && cellVersion(existing) !== cellVersion(record)) {
+      throw netError("E_INVARG", "credential id is already bound to a different verifier", {
+        actor,
+        id
+      });
+    }
+    const verifier: ApiKeyVerifierRow = { actor, id, record };
+    const verifierId = apiKeyVerifierKey(actor, id);
+    const existingVerifier = this.apiKeyVerifiers.get(verifierId);
+    if (existing !== undefined && existingVerifier && cellVersion(existingVerifier) === cellVersion(verifier)) {
+      if (!priorCell) throw netError("E_MISSING_STATE", "credential record exists without its authority cell", { actor, id });
+      return { status: "empty", head: this.headState, cell: priorCell, verifier };
+    }
+
+    const marker = `operator_credential_ensure:${cellVersion({ actor, id, record })}`;
+    const priorHead = this.headState;
+    const nextHead: ScopeHead = {
+      seq: priorHead.seq + 1,
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker]),
+      generation: (priorHead.generation ?? priorHead.seq) + 1
+    };
+    const nextStamp: EpochStamp = {
+      scope_head: `${nextHead.seq}:${nextHead.hash}`,
+      catalog_epoch: this.catalogEpoch
+    };
+    const cell = this.store.commit({
+      kind: "property_cell",
+      object: actor,
+      name: ACTOR_API_KEYS_PROPERTY,
+      value: {
+        ...("def" in priorPayload ? { def: priorPayload.def } : {}),
+        value: { ...priorMap, [id]: record }
+      },
+      stamp: nextStamp
+    });
+    this.apiKeyVerifiers.set(verifierId, verifier);
+    this.headState = nextHead;
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: [cell.key],
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        durable.writeCell(cell);
+        durable.writeApiKeyVerifier(verifierId, verifier);
+        durable.writeMeta(this.metaRow());
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
+    return { status: "applied", head: this.headState, cell, verifier };
+  }
+
   /**
    * CO4 validation order. Steps 1–9 are pre-state-only; the doomed-round
    * short-circuit is honored implicitly by ordering (stale head / scope /
@@ -512,8 +730,9 @@ export class ScopeSequencer {
     // so an unauthorized refusal names its verdict (expired / missing /
     // actor_mismatch / session_unattested / session_required) instead of
     // burying it in prose.
+    let locallyProvedReads: ReadonlyMap<string, string> = new Map();
     try {
-      this.options.authorize?.(submit);
+      locallyProvedReads = this.options.authorize?.(submit) ?? locallyProvedReads;
     } catch (err) {
       const structured =
         err && typeof err === "object" && "detail" in err && err.detail && typeof err.detail === "object"
@@ -588,6 +807,20 @@ export class ScopeSequencer {
       return this.reject(submit, "incomplete_transcript", { reasons: submit.transcript.incompleteReasons });
     }
 
+    // SL1/CO2.3: new net-planned sequenced transcripts preserve their
+    // semantic space explicitly. When this scope owns that space, the
+    // reserved next_seq allocation must be exactly one honest pre-state
+    // read plus one `seq + 1` write. The write bypasses ordinary VM-frame
+    // authority because it is sequencer bookkeeping, so this structural
+    // check is its equivalent authority proof. A commit away from the
+    // space (CA3 pure movement) must carry no allocation at all. Transcripts
+    // without `space` are the rolling-upgrade/legacy shape and retain the
+    // old out-of-band sequencer behavior.
+    const allocationError = this.sequencedAllocationError(submit.transcript);
+    if (allocationError !== null) {
+      return this.reject(submit, "write_unauthorized", { sequenced_allocation: allocationError });
+    }
+
     // Step 5 / CO15: the durable owner independently enforces the premise
     // behind exact-epoch catalog certificates. This check uses authoritative
     // pre-state through the shell-provided predicate, so a stale or modified
@@ -604,6 +837,12 @@ export class ScopeSequencer {
         keys.push(key);
         catalogMutationKeys.set(write.cell.object, keys);
       }
+      for (const recycle of submit.transcript.recycles ?? []) {
+        if (!this.options.catalogMutationForbidden(recycle.object)) continue;
+        const keys = catalogMutationKeys.get(recycle.object) ?? [];
+        keys.push(cellKey("object_tombstone", recycle.object));
+        catalogMutationKeys.set(recycle.object, keys);
+      }
     }
     if (catalogMutationKeys.size > 0) {
       const objects = [...catalogMutationKeys.keys()].sort();
@@ -619,7 +858,10 @@ export class ScopeSequencer {
     // versions and post-state are still validated below, so independent
     // concurrent turns serialize without retries while true conflicts do
     // not. Old tail rows lack hash proofs by design and fail closed.
-    if (!this.baseIsCurrentOrRetained(submit.base)) {
+    if (
+      (submit.owned_reads_compacted === true && !this.baseIsExactCurrent(submit.base)) ||
+      (submit.owned_reads_compacted !== true && !this.baseIsCurrentOrRetained(submit.base))
+    ) {
       return this.reject(submit, "stale_head", { base: submit.base, head: this.headState });
     }
 
@@ -651,11 +893,11 @@ export class ScopeSequencer {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
       if (this.options.owns && !this.options.owns(read.cell.object) && !createdHere.has(read.cell.object)) {
-        const attestedVersion = attested.get(key);
-        if (attestedVersion === undefined) {
-          // A rider read nobody attested is a protocol violation by the
-          // submitter (the gateway attests every foreign read at plan
-          // time), not a stale-view condition — terminal, named (the
+        const provedVersion = locallyProvedReads.get(key) ?? attested.get(key);
+        if (provedVersion === undefined) {
+          // A rider read with neither an owner attestation nor a local
+          // projection proof is a protocol violation by the submitter,
+          // not a stale-view condition — terminal, named (the
           // pre-amendment behavior silently skipped these reads, which
           // is the CO2.4 gap this closes; notes/2026-07-06-rider-read-
           // integrity.md).
@@ -664,7 +906,7 @@ export class ScopeSequencer {
         // Attested-vs-planned mismatch repairs exactly like an owned
         // stale read: the gateway refreshes the cell (from its owner,
         // via the anchors routing), re-attests, and re-plans.
-        if (attestedVersion !== String(read.version)) mismatched.set(key, read.cell);
+        if (provedVersion !== String(read.version)) mismatched.set(key, read.cell);
         continue;
       }
       const current = this.store.get(key)?.version ?? "absent";
@@ -672,6 +914,16 @@ export class ScopeSequencer {
     }
     if (mismatched.size > 0) {
       return this.reject(submit, "read_version_mismatch", {}, [...mismatched.values()]);
+    }
+
+    // The allocation's version has now passed the normal retryable CAS
+    // check. Only at this point compare its claimed logical value with the
+    // authority value: doing this before step 7 would turn an ordinary
+    // concurrent allocation into a terminal write_unauthorized refusal
+    // instead of the expected refresh/replan.
+    const allocationValueError = this.sequencedAllocationAuthorityValueError(submit.transcript);
+    if (allocationValueError !== null) {
+      return this.reject(submit, "write_unauthorized", { sequenced_allocation: allocationValueError });
     }
 
     // Step 7b (P1.1): validate ordering projection reads. Each names a
@@ -713,6 +965,72 @@ export class ScopeSequencer {
       return this.reject(submit, "read_version_mismatch", { ordering_conflicts: orderingConflicts });
     }
 
+    // A tombstone is terminal authority, not an absent object page. A stale
+    // gateway may still submit a write/create/move planned from old lineage;
+    // reject it as the lifecycle read conflict it is so the repair path pulls
+    // the tombstone and replans to E_OBJNF. Recycles themselves must execute
+    // at the object's owner and against a live lineage page.
+    const lifecycleObjects = new Set<string>();
+    for (const write of submit.transcript.writes) lifecycleObjects.add(write.cell.object);
+    for (const create of submit.transcript.creates ?? []) lifecycleObjects.add(create.object);
+    for (const move of submit.transcript.moves ?? []) lifecycleObjects.add(move.object);
+    for (const recycle of submit.transcript.recycles ?? []) lifecycleObjects.add(recycle.object);
+    for (const object of lifecycleObjects) {
+      if (!this.store.has(cellKey("object_tombstone", object))) continue;
+      return this.reject(submit, "read_version_mismatch", { tombstoned_object: object }, [
+        { kind: "lifecycle", object } as TranscriptCell
+      ]);
+    }
+    for (const recycle of submit.transcript.recycles ?? []) {
+      if (
+        (this.options.owns && !this.options.owns(recycle.object)) ||
+        !this.store.has(cellKey("object_lineage", recycle.object))
+      ) {
+        return this.reject(submit, "write_unauthorized", {
+          recycle: recycle.object,
+          reason: "recycle target is not a live object owned by this scope"
+        });
+      }
+    }
+
+    // Step 7c (sequenced-log.md SL4): validate replay-page reads exactly
+    // like ordering reads. An entry THIS scope owns re-derives its page
+    // from the durable committed log — an append landing inside the window
+    // between plan and submit changes the page's content version and the
+    // stale read rejects retryable (the gateway re-fetches the page and
+    // re-plans). A FOREIGN entry validates against the owner's `replays`
+    // attestation carried by the submit; one with no attestation is a
+    // submitter protocol violation (terminal rider_unattested, the R3
+    // mirror). Validation runs BEFORE this turn's own log append below, so
+    // a sequenced turn reading its own space's log never self-invalidates.
+    const attestedReplays = new Map<string, string>();
+    for (const [owner, entry] of Object.entries(submit.attestations ?? {})) {
+      for (const page of entry.replays ?? []) {
+        attestedReplays.set(`${owner}\0${page.space}\0${page.from}\0${page.limit}`, page.version);
+      }
+    }
+    const replayConflicts: Array<{ scope: string; space: string; from: number; limit: number }> = [];
+    for (const read of submit.transcript.replayReads ?? []) {
+      if (read.scope !== this.scope) {
+        const attested = attestedReplays.get(`${read.scope}\0${read.space}\0${read.from}\0${read.limit}`);
+        if (attested === undefined) {
+          return this.reject(submit, "rider_unattested", {
+            replay_space: read.space,
+            replay_scope: read.scope
+          });
+        }
+        if (attested !== read.version) replayConflicts.push({ scope: read.scope, space: read.space, from: read.from, limit: read.limit });
+        continue;
+      }
+      const current = replayPageVersion(this.replayPage(read.space, read.from, read.limit));
+      if (current !== read.version) replayConflicts.push({ scope: read.scope, space: read.space, from: read.from, limit: read.limit });
+    }
+    if (replayConflicts.length > 0) {
+      // Retryable: the gateway drops its cached pages for the named
+      // queries, re-fetches, and re-plans (the ordering-conflict shape).
+      return this.reject(submit, "read_version_mismatch", { replay_conflicts: replayConflicts });
+    }
+
     // Step 9: per-write authority (recorded VM frame, never owner union).
     const writesAuthorized = this.options.writeAuthorized
       ? this.options.writeAuthorized(submit)
@@ -731,7 +1049,10 @@ export class ScopeSequencer {
     // engine's own has()-skip rule), so the loop converges instead of
     // silently overwriting an object the planner never saw.
     for (const create of submit.transcript.creates ?? []) {
-      if (this.store.get(cellKey("object_lineage", create.object)) !== undefined) {
+      if (
+        this.store.get(cellKey("object_lineage", create.object)) !== undefined ||
+        this.store.get(cellKey("object_tombstone", create.object)) !== undefined
+      ) {
         return this.reject(submit, "read_version_mismatch", { create_collision: create.object }, [
           // "lifecycle" is the transcript kind that keys object_lineage
           // (netCellKeyFor) — the refresh then pulls the existing
@@ -751,7 +1072,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
 
@@ -762,6 +1084,30 @@ export class ScopeSequencer {
         derived: applied.postStateVersion,
         submitted: submit.post_state_version
       });
+    }
+
+    // A complete direct transcript with no durable or projection effects is
+    // an authority-validated read, not a commit. Returning it at the current
+    // head avoids turning V concurrent semantic-view refreshes into V writes
+    // that contend on an otherwise unchanged scope. Do not cache the reply:
+    // a transport retry may safely re-read newer authority, and the gateway
+    // owns the successful result (the scope never receives it on the wire).
+    const pureDirectRead =
+      submit.transcript.route === "direct" &&
+      applied.touched.length === 0 &&
+      applied.projectionWrites.length === 0 &&
+      (submit.transcript.projectionWrites?.length ?? 0) === 0 &&
+      submit.transcript.sessionScopeTransition === undefined &&
+      submit.transcript.untrackedEffects.length === 0;
+    if (pureDirectRead) {
+      return {
+        kind: "woo.net.commit_reply.v1",
+        status: "accepted",
+        scope: this.scope,
+        head: this.headState,
+        touched: [],
+        post_state_version: applied.postStateVersion
+      };
     }
 
     // Accept: adopt the applied clone as authority, advance head, record
@@ -791,11 +1137,53 @@ export class ScopeSequencer {
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
+    // Committed sequenced log (sequenced-log.md SL1/SL4): every accepted
+    // SEQUENCED transcript that consumed this space's seq appends one
+    // durable entry under its SEMANTIC
+    // space id and space-log seq — the row `$space:replay(from, limit)`
+    // pages read through /net/replay-page. `ts` is minted HERE, once, as
+    // the authority acceptance time (CO2.5), so page content versions are
+    // stable across re-reads. Failed turns append with applied_ok: false
+    // (a refused verb still consumed its seq); direct-route commits and
+    // adoption never log. The idempotent-replay early return above means
+    // this runs at most once per turn.
+    const logEntry = this.committedLogEntry(submit.transcript);
+    if (logEntry && !this.options.durable) {
+      const rows = this.memoryLogRows.get(logEntry.space) ?? new Map<number, ReplayLogEntry>();
+      rows.set(logEntry.seq, logEntry);
+      this.memoryLogRows.set(logEntry.space, rows);
+    }
+
+    // Re-index actor-owned verifier maps inside the authority transaction.
+    // This state is intentionally absent from CommitReply: it is neither a
+    // public relation delta nor gateway fanout material.
+    const changedVerifierKeys = new Set<string>();
+    const credentialActors = new Set(
+      submit.transcript.writes
+        .filter((write) =>
+          write.cell.kind === "prop" &&
+          write.cell.name === ACTOR_API_KEYS_PROPERTY &&
+          write.cell.object !== "$system"
+        )
+        .map((write) => write.cell.object)
+    );
+    for (const actor of credentialActors) {
+      if (this.options.scopeOf && this.options.scopeOf(actor) !== this.scope) continue;
+      const cell = applied.post.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY));
+      for (const key of this.replaceApiKeyVerifiersForActor(actor, cell?.value)) changedVerifierKeys.add(key);
+    }
+
     // CO13: derive relation deltas from the accepted transcript — the
     // single write path for contents/presence rows. Local rows apply here
     // (durably, in the same transaction below); foreign rows ride the
     // reply for the shell's /net/relate delivery.
-    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf, applied.post);
+    const derived = deriveRelationDeltas(
+      submit.transcript,
+      applied,
+      this.scope,
+      this.options.scopeOf,
+      applied.post
+    );
     const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
     this.syncOrderedRelationIndex(changedRelationKeys);
     const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
@@ -831,11 +1219,17 @@ export class ScopeSequencer {
         durable.writeReply(submit.idempotency_key, reply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        if (logEntry) durable.appendLogEntry(logEntry);
         for (const key of prunedReplies) durable.deleteReply(key);
         for (const key of changedRelationKeys) {
           const row = this.relationRows.get(key);
           if (row) durable.writeRelation(key, row);
           else durable.deleteRelation(key);
+        }
+        for (const key of changedVerifierKeys) {
+          const row = this.apiKeyVerifiers.get(key);
+          if (row) durable.writeApiKeyVerifier(key, row);
+          else durable.deleteApiKeyVerifier(key);
         }
       });
     }
@@ -858,11 +1252,13 @@ export class ScopeSequencer {
    *   read there is no stale read to launder (the design-C allowance).
    *   Conflicts never block the applied cells.
    * - A non-empty applied set is ONE owner commit: the head advances
-   *   once for the batch, the applied cells commit through the store
+   *   once for the batch, replacement cells and removals commit through
+   *   the store
    *   with the NEW head stamp (authoritative provenance — this IS an
    *   owner-ordered event, so observers and catch-up see a real
    *   owner-head advance with CO8-correct stamps), a tail entry is
-   *   appended, and the durable write-through covers cells + meta + tail
+   *   appended, and the durable write-through covers cells/removals +
+   *   meta + tail
    *   in one transaction exactly like submit's accept path.
    * - Adoption does NOT rerun ordinary CO4 validation: the writes were already
    *   validated at the committing scope against this owner's plan-time
@@ -875,7 +1271,13 @@ export class ScopeSequencer {
    *   (NetScopeDO), which is why this method must be called exactly once
    *   per adoption fact.
    */
-  adopt(input: { from_scope: string; seq: number; cells: Cell[]; priors: Record<string, string> }): {
+  adopt(input: {
+    from_scope: string;
+    seq: number;
+    cells: Cell[];
+    removed?: string[];
+    priors: Record<string, string>;
+  }): {
     status: "applied" | "empty" | "rejected";
     head: ScopeHead;
     applied: string[];
@@ -891,6 +1293,13 @@ export class ScopeSequencer {
         const keys = catalogMutationKeys.get(cell.object) ?? [];
         keys.push(cell.key);
         catalogMutationKeys.set(cell.object, keys);
+      }
+      for (const key of input.removed ?? []) {
+        const object = key.split(":")[1] ?? "";
+        if (!object || !this.options.catalogMutationForbidden(object)) continue;
+        const keys = catalogMutationKeys.get(object) ?? [];
+        keys.push(key);
+        catalogMutationKeys.set(object, keys);
       }
     }
     if (catalogMutationKeys.size > 0) {
@@ -909,6 +1318,7 @@ export class ScopeSequencer {
     }
 
     const accepted: Cell[] = [];
+    const acceptedRemovals: string[] = [];
     const conflicts: Array<{ key: string; ours: string; theirs: string }> = [];
     for (const cell of input.cells) {
       const ours = this.store.get(cell.key)?.version ?? "absent";
@@ -919,7 +1329,18 @@ export class ScopeSequencer {
       }
       accepted.push(cell);
     }
-    if (accepted.length === 0) {
+    for (const key of input.removed ?? []) {
+      const ours = this.store.get(key)?.version ?? "absent";
+      const prior = input.priors[key];
+      if (prior !== undefined && prior !== ours) {
+        conflicts.push({ key, ours, theirs: "absent" });
+        continue;
+      }
+      // Deleting an already-absent key is an idempotent no-op, not an owner
+      // event. The sender high-water still advances in the shell.
+      if (ours !== "absent") acceptedRemovals.push(key);
+    }
+    if (accepted.length === 0 && acceptedRemovals.length === 0) {
       // Nothing applied: the head does not advance (an all-conflict
       // adoption changes no owner state, so minting an owner event for
       // it would fan out a no-op), but the conflicts still surface for
@@ -936,7 +1357,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
     const appliedKeys: string[] = [];
@@ -954,7 +1376,30 @@ export class ScopeSequencer {
       });
       appliedKeys.push(committed.key);
     }
+    for (const key of acceptedRemovals) {
+      this.store.delete(key);
+      appliedKeys.push(key);
+    }
     appliedKeys.sort();
+    const changedVerifierKeys = new Set<string>();
+    const credentialActors = new Set<string>();
+    for (const cell of accepted) {
+      if (
+        cell.kind === "property_cell" &&
+        cell.name === ACTOR_API_KEYS_PROPERTY &&
+        cell.object !== "$system"
+      ) credentialActors.add(cell.object);
+    }
+    const credentialSuffix = `:${ACTOR_API_KEYS_PROPERTY}`;
+    for (const key of acceptedRemovals) {
+      if (!key.startsWith("property_cell:") || !key.endsWith(credentialSuffix)) continue;
+      const actor = key.slice("property_cell:".length, -credentialSuffix.length);
+      if (actor && actor !== "$system") credentialActors.add(actor);
+    }
+    for (const actor of credentialActors) {
+      const cell = this.store.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY));
+      for (const key of this.replaceApiKeyVerifiersForActor(actor, cell?.value)) changedVerifierKeys.add(key);
+    }
     this.headState = nextHead;
     const tailEntry: TailEntry = {
       seq: nextHead.seq,
@@ -976,10 +1421,16 @@ export class ScopeSequencer {
         for (const key of appliedKeys) {
           const cell = this.store.get(key);
           if (cell) durable.writeCell(cell);
+          else durable.deleteCell(key);
         }
         durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        for (const key of changedVerifierKeys) {
+          const row = this.apiKeyVerifiers.get(key);
+          if (row) durable.writeApiKeyVerifier(key, row);
+          else durable.deleteApiKeyVerifier(key);
+        }
       });
     }
     return { status: "applied", head: this.headState, applied: appliedKeys, conflicts };
@@ -991,12 +1442,141 @@ export class ScopeSequencer {
     return this.relationRows;
   }
 
+  /** Exact authority-private lookup used only by the signed credential
+   * endpoint. Returning the record, rather than the index row, keeps actor/id
+   * routing metadata out of the verifier shape. */
+  apiKeyVerifier(actor: string, id: string): Record<string, unknown> | null {
+    return this.apiKeyVerifiers.get(apiKeyVerifierKey(actor, id))?.record ?? null;
+  }
+
+  private replaceApiKeyVerifiersForActor(actor: string, value: unknown): string[] {
+    const desired = apiKeyVerifierRowsForActor(actor, value);
+    const changed = new Set<string>();
+    for (const [key, row] of [...this.apiKeyVerifiers]) {
+      if (row.actor !== actor || desired.has(key)) continue;
+      this.apiKeyVerifiers.delete(key);
+      changed.add(key);
+    }
+    for (const [key, row] of desired) {
+      const existing = this.apiKeyVerifiers.get(key);
+      if (existing && cellVersion(existing) === cellVersion(row)) continue;
+      this.apiKeyVerifiers.set(key, row);
+      changed.add(key);
+    }
+    return [...changed].sort();
+  }
+
   /** Owner-complete ordering for exactly one `(container, parent)` bucket.
    * Local authored cells and foreign relation projections are both already
    * write-time indexed; the merge is O(children-of-parent). */
   orderedChildren(container: string, parent: string | null): OrderedChildRow[] {
     const projected = this.orderedRelationsByProjection.get(orderedProjectionKey(container, parent)) ?? [];
     return orderedChildrenForContainer(this.store, projected, container, parent);
+  }
+
+  /**
+   * One committed replay page of a space this authority owns
+   * (sequenced-log.md SL2 window semantics: entries with `seq >= from`,
+   * at most `limit`, in seq order). `space` is the SEMANTIC space id.
+   * Served from the durable log family on demand — never hydrated — or
+   * from the in-memory rows on a durable-less test sequencer. A space
+   * with no committed entries (or one this scope does not own) yields
+   * the empty page, whose version is still well-defined and attestable.
+   */
+  replayPage(space: string, from: number, limit: number): ReplayLogEntry[] {
+    const durable = this.options.durable;
+    if (durable) return durable.readLogPage(space, from, limit);
+    const rows = this.memoryLogRows.get(space);
+    if (!rows) return [];
+    return [...rows.values()]
+      .filter((entry) => entry.seq >= from)
+      .sort((a, b) => a.seq - b.seq)
+      .slice(0, limit)
+      .map((entry) => structuredClone(entry));
+  }
+
+  /** Validate the explicit SL1 allocation carried by the new net transcript
+   * shape. See the submit call site for the compatibility boundary. */
+  private sequencedAllocationError(transcript: EffectTranscript): string | null {
+    if (transcript.route !== "sequenced" || transcript.space === undefined) return null;
+    const space = transcript.space;
+    const writes = transcript.writes.filter((write) => isSequencedAllocationCell(transcript, write.cell));
+    // Omitting `owns` means a single-scope authority (the same convention
+    // step 7 uses for ordinary reads), so it owns every object in its store
+    // even when the transport scope name differs from the semantic space id.
+    // Multi-scope hosts always provide the predicate and therefore still
+    // reject/strip allocations committed away from the room owner.
+    const ownedHere = this.options.owns ? this.options.owns(space) : true;
+    if (!ownedHere) return writes.length === 0 ? null : "foreign commit carried the space allocation";
+    if (!Number.isInteger(transcript.seq) || transcript.seq < 1) return "seq must be a positive integer";
+    if (writes.length !== 1) return `expected one next_seq write, got ${writes.length}`;
+    const write = writes[0];
+    if (write.op !== "set" || write.value !== transcript.seq + 1) return "next_seq write must set seq + 1";
+    // submitTranscript re-versions READS against the authority view, while
+    // write.prior/next retain the ephemeral world's local counters. The
+    // serialized authority CAS is therefore the read version, not equality
+    // between those two version domains.
+    const matchingReads = transcript.reads.filter((read) =>
+      isSequencedAllocationCell(transcript, read.cell)
+      && read.value === transcript.seq
+      && read.version !== undefined
+    );
+    return matchingReads.length === 1 ? null : `expected one matching next_seq pre-read, got ${matchingReads.length}`;
+  }
+
+  /** After the allocation read's version passes step 7, prove its claimed
+   * logical value is the authority's actual allocator value. This closes the
+   * forged-value/current-version gap without relabelling honest concurrency
+   * as a terminal refusal. */
+  private sequencedAllocationAuthorityValueError(transcript: EffectTranscript): string | null {
+    if (transcript.route !== "sequenced" || transcript.space === undefined) return null;
+    const write = transcript.writes.find((candidate) => isSequencedAllocationCell(transcript, candidate.cell));
+    if (!write) return null; // legitimate off-space CA3 commit
+    const current = this.store.get(netCellKeyFor(write.cell) ?? "");
+    const currentPayload = current?.value as { value?: unknown } | undefined;
+    // A never-used space may inherit `$sequenced_log.next_seq == 1` and
+    // therefore have no instance property cell yet. The first accepted Net
+    // turn materializes it; every later allocation reads the stored value.
+    const authorityNextSeq = current === undefined ? 1 : currentPayload?.value;
+    return authorityNextSeq === transcript.seq ? null : "seq must equal the authority next_seq value";
+  }
+
+  /** The committed-log row an accepted transcript appends, or null for
+   * routes that never log (direct commits, adoption, session mints). The
+   * SEMANTIC space rides in `transcript.space` (preserved by the planner
+   * when it retargets `scope` at this authority's address); an engine-
+   * shaped transcript without the field logs under its `scope`, which IS
+   * the semantic space there. */
+  private committedLogEntry(transcript: EffectTranscript): ReplayLogEntry | null {
+    if (transcript.route !== "sequenced") return null;
+    const space = transcript.space ?? transcript.scope;
+    if (typeof space !== "string" || space.length === 0 || typeof transcript.seq !== "number") return null;
+    // Only a turn that actually CONSUMED a seq here logs: the planner keeps
+    // the space's `next_seq` allocation write exactly when the commit scope
+    // owns the space (plan.ts stripUnownedSequencedAllocation), so this
+    // guard both prevents a foreign scope from minting rows for a space it
+    // does not own and keeps the (space, seq) key collision-free — a
+    // CA3 pure-movement turn commits at the actor's cluster with the
+    // allocation stripped and appends nothing.
+    const consumedSeq = transcript.writes.some(
+      (write) => write.cell.kind === "prop" && write.cell.object === space && write.cell.name === "next_seq"
+    );
+    if (!consumedSeq) return null;
+    return {
+      space,
+      seq: transcript.seq,
+      ts: (this.options.now ?? Date.now)(),
+      actor: transcript.call.actor,
+      message: structuredClone({
+        actor: transcript.call.actor,
+        target: transcript.call.target,
+        verb: transcript.call.verb,
+        args: transcript.call.args
+      }),
+      observations: structuredClone(transcript.observations) as unknown[],
+      applied_ok: transcript.error === undefined,
+      ...(transcript.error !== undefined ? { error: structuredClone(transcript.error) } : {})
+    };
   }
 
   /**
@@ -1077,7 +1657,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     for (const key of deletedKeys) this.store.delete(key);
     this.headState = nextHead;
@@ -1186,7 +1767,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     this.headState = nextHead;
     const tailEntry: TailEntry = {
@@ -1256,8 +1838,9 @@ export class ScopeSequencer {
     return lo;
   }
 
-  /** CO13 bounded repair: recompute the locally knowable contents relation
-   * from authority live cells. Presence and ordered-edge rows are preserved:
+  /** CO13 bounded repair: recompute locally knowable contents relations and
+   * the separate authority-private credential index from authority cells.
+   * Presence and ordered-edge rows are preserved:
    * their defining cells may live at foreign immutable anchors, so they repair
    * only through their single transcript-derivation + `/net/relate` path.
    * Replaces contents rows in memory and durably.
@@ -1269,8 +1852,9 @@ export class ScopeSequencer {
    * scope's row family — the CO9 dual-write this module exists to
    * prevent. Single-scope contents rebuilds keep everything. */
   rebuildRelations(): void {
+    const cells = [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c));
     const rebuilt = rebuildContentsRelation(
-      [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)),
+      cells,
       this.scope
     );
     if (this.options.scopeOf) {
@@ -1282,13 +1866,21 @@ export class ScopeSequencer {
       if (row.relation === "contents" && !rebuilt.has(key)) this.relationRows.delete(key);
     }
     for (const [key, row] of rebuilt) this.relationRows.set(key, row);
+    this.apiKeyVerifiers.clear();
+    for (const [key, row] of rebuildApiKeyVerifierIndex(cells)) this.apiKeyVerifiers.set(key, row);
     const durable = this.options.durable;
     if (durable) {
       durable.transaction(() => {
         for (const row of durable.readRelations()) {
-          if (row.relation === "contents") durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          if (row.relation === "contents") {
+            durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          }
         }
         for (const [key, row] of rebuilt) durable.writeRelation(key, row);
+        for (const row of durable.readApiKeyVerifiers()) {
+          durable.deleteApiKeyVerifier(apiKeyVerifierKey(row.actor, row.id));
+        }
+        for (const [key, row] of this.apiKeyVerifiers) durable.writeApiKeyVerifier(key, row);
       });
     }
   }
@@ -1425,7 +2017,13 @@ export class ScopeSequencer {
    * after rollout. Missing optional fields on aged rows are intentionally
    * not inferred: unverifiable history takes the stale-head repair path. */
   private baseIsCurrentOrRetained(base: ScopeHead): boolean {
-    if (base.seq === this.headState.seq) return base.hash === this.headState.hash;
+    if (base.seq === this.headState.seq) {
+      return base.hash === this.headState.hash && (
+        base.generation === undefined ||
+        this.headState.generation === undefined ||
+        base.generation === this.headState.generation
+      );
+    }
     if (base.seq < 0 || base.seq > this.headState.seq) return false;
     for (let i = this.tail.length - 1; i >= 0; i -= 1) {
       const entry = this.tail[i];
@@ -1434,6 +2032,17 @@ export class ScopeSequencer {
       if (entry.seq < base.seq) break;
     }
     return false;
+  }
+
+  /** Exact generation equality is stronger than ordinary rolling-upgrade
+   * head compatibility: complete-read compaction depends on seed/activation
+   * mutations being visible even while `(seq, hash)` stays unchanged. */
+  private baseIsExactCurrent(base: ScopeHead): boolean {
+    return base.seq === this.headState.seq &&
+      base.hash === this.headState.hash &&
+      base.generation !== undefined &&
+      this.headState.generation !== undefined &&
+      base.generation === this.headState.generation;
   }
 
   private reject(submit: CommitSubmit, reason: RejectReason, detail: Record<string, unknown>, mismatched?: TranscriptCell[]): CommitReply {

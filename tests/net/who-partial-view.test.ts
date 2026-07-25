@@ -1,11 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  fetchCanaryGuestClaim,
   guestsNeedingEnter,
+  jsonFetch,
+  mapWithConcurrency,
   summarizeWhoCheck,
   whoCheckFailsAcceptance,
   type CanaryGuest,
   type WhoRosterInput
 } from "../../scripts/net-canary-load";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // Unit coverage for the pure partial-view summary used by the deployed-canary
 // who_all check (net-cutover layering item 6). The LIVE partial view is a
@@ -90,5 +97,81 @@ describe("deployed canary room setup", () => {
       { actor: "unknown", session: "s_3", elastic: false, activeScope: null }
     ];
     expect(guestsNeedingEnter(guests, "the_chatroom").map((guest) => guest.actor)).toEqual(["elsewhere", "unknown"]);
+  });
+});
+
+describe("deployed canary request deadline", () => {
+  it("turns a lost reply into a bounded rejection so cleanup can continue", async () => {
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    })));
+
+    await expect(jsonFetch("https://canary.invalid/net-api/turn", { method: "POST" }, 10))
+      .rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("replays the same guest claim after a lost reply", async () => {
+    const claim = { ttl_ms: 60_000, claim_id: "stable-claim" };
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new DOMException("reply lost", "TimeoutError"))
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 200 }),
+        body: { actor: "guest_net_retry", session: "s_retry" },
+        ms: 1
+      });
+
+    const result = await fetchCanaryGuestClaim("https://canary.invalid", claim, 17, fetcher, 0);
+    expect(result.body).toMatchObject({ actor: "guest_net_retry", session: "s_retry" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
+  });
+
+  it("replays the same guest claim after a transient edge 5xx", async () => {
+    const claim = { ttl_ms: 60_000, claim_id: "stable-claim-edge-5xx" };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 500 }),
+        body: { error: { code: "E_INTERNAL", message: "Network connection lost." } },
+        ms: 1
+      })
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 200 }),
+        body: { actor: "guest_net_retry_5xx", session: "s_retry_5xx" },
+        ms: 1
+      });
+
+    const result = await fetchCanaryGuestClaim("https://canary.invalid", claim, 18, fetcher, 0);
+    expect(result.body).toMatchObject({ actor: "guest_net_retry_5xx", session: "s_retry_5xx" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
+  });
+});
+
+describe("deployed canary concurrency bounds", () => {
+  it("preserves result order without exceeding the requested in-flight limit", async () => {
+    let active = 0;
+    let peak = 0;
+    const results = await mapWithConcurrency([3, 1, 2, 0], 2, async (delay, index) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      active -= 1;
+      return `result-${index}`;
+    });
+
+    expect(peak).toBe(2);
+    expect(results).toEqual(["result-0", "result-1", "result-2", "result-3"]);
+  });
+
+  it("stops scheduling new work after the first failure and settles started work", async () => {
+    const started: number[] = [];
+    await expect(mapWithConcurrency([0, 1, 2, 3], 2, async (item) => {
+      started.push(item);
+      if (item === 1) throw new Error("stop");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return item;
+    })).rejects.toThrow("stop");
+
+    expect(started).toEqual([0, 1]);
   });
 });

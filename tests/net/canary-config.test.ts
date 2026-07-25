@@ -12,6 +12,16 @@ describe("net canary deployment isolation", () => {
     expect(config).not.toMatch(/^\[env\.canary\]$/m);
   });
 
+  it("runs the same Net-only public surface as production", () => {
+    expect(config).toContain('main = "src/worker/net-only-index.ts"');
+    expect(config).toContain('WOO_NET_DEFAULT = "on"');
+    expect(config).toContain("run_worker_first = true");
+    expect(config).toContain('class_name = "NetScopeDO"');
+    expect(config).toContain('class_name = "NetGatewayDO"');
+    expect(config).toContain('class_name = "NetAuditDO"');
+    expect(config).not.toMatch(/class_name = "(?:PersistentObjectDO|DirectoryDO|CommitScopeDO)"/);
+  });
+
   it("cannot deploy accidentally with a shared KV and writes a dedicated AE dataset", () => {
     expect(config).toContain('id = "CANARY_HOST_SEED_KV_ID"');
     expect(config).toContain('dataset = "woo_v1_net_canary"');

@@ -7,7 +7,8 @@ import {
   type ObservationRegistry,
   type WooComponentRegistry,
   type WooContext,
-  type WooViewHydrationRegistry
+  type WooViewHydrationRegistry,
+  type WooWorldSnapshotAdapterRegistry
 } from "../../../src/client/framework";
 import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "./model";
 import { dubspaceControlsHydration } from "./net-hydration";
@@ -306,6 +307,28 @@ export function registerWooComponents(registry: WooComponentRegistry): void {
 
 export function registerWooViewHydrations(registry: WooViewHydrationRegistry): void {
   registry.define("controls", dubspaceControlsHydration);
+}
+
+/** v2 whole-world responses carried controls under `world.dubspace`. Keep that
+ * compatibility shape in its owning catalog while old deployments age out. */
+export function registerWooWorldSnapshotAdapters(registry: WooWorldSnapshotAdapterRegistry): void {
+  registry.adapt((world) => {
+    const controls = (world as any)?.dubspace;
+    if (!controls || typeof controls !== "object" || Array.isArray(controls)) return [];
+    return Object.entries(controls).flatMap(([subject, raw]) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+      const value = raw as Record<string, unknown>;
+      return [{
+        subject,
+        fields: Object.fromEntries(["name", "owner", "parent", "ancestors", "features", "aliases", "description", "location"]
+          .filter((key) => value[key] !== undefined)
+          .map((key) => [key, value[key]])),
+        props: value.props && typeof value.props === "object" && !Array.isArray(value.props)
+          ? value.props as Record<string, unknown>
+          : undefined
+      }];
+    });
+  });
 }
 
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {

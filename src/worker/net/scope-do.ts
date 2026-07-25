@@ -38,13 +38,20 @@
  *                           planner gateway for scheduled-turn execution
  *                           (CO16) — it receives /net/plan-scheduled,
  *                           never fanout
- *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
+ *       effect-free direct submits may also carry live audience hints.
+ *                           After authority validation the scope relays their
+ *                           observations to fanout-role gateway shards from
+ *                           a fresh alarm event via best-effort /net/live
+ *                           calls; no durable row or authority seq is created.
+ *       POST /net/adopt     {from_scope, seq, cells, removed_cells?,
+ *                            prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
  *                           commit (CO2.3): per-cell prior-version CAS,
  *                           head advances once per applied batch, and
- *                           the adopted cells fan out to this scope's
- *                           own subscribers; idempotent by (from_scope,
- *                           seq). The catalog owner terminally acknowledges
+ *                           the adopted replacements and removals fan out
+ *                           to this scope's own subscribers; idempotent by
+ *                           (from_scope, seq). The catalog owner terminally
+ *                           acknowledges
  *                           but never installs marked definition riders
  *                           (CO15's authority enforcement).
  *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
@@ -88,14 +95,30 @@ import { mintSpanId, spanSampled } from "../../net/spans";
 import { normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { exportSpans } from "./span-export";
 import type { Cell } from "../../net/cells";
-import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
+import { cellKey, cellVersion, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
+import {
+  LIVE_FANOUT_BATCH_CAP,
+  type LiveAudience,
+  type LiveFanoutBatchBody,
+  type LiveFanoutBody
+} from "../../net/live";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
-import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "../../net/relations";
+import {
+  observationsForRelationOwners,
+  relationKey,
+  roomRosterRows,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow
+} from "../../net/relations";
+import type { ApiKeyVerifierRow } from "../../net/api-key-index";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
+import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -191,6 +214,12 @@ function sqlRows<T>(cursor: unknown): T[] {
   return (cursor as { toArray(): T[] }).toArray();
 }
 
+/** `<kind>:<object>[:<name>]` → object. Runtime object ids reserve `:` as
+ * the cell-key delimiter (the same wire invariant gateway-do uses). */
+function objectOfCellKey(key: string): string {
+  return key.split(":")[1] ?? "";
+}
+
 /**
  * DO-SQLite ScopeStore: five row families, five tables, JSON bodies.
  * Everything is synchronous (the DO SQLite API is sync); `transaction`
@@ -249,6 +278,19 @@ export class SqliteScopeStore implements ScopeStore {
     this.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_net_scope_scheduled_due ON net_scope_scheduled (due_at)");
     // Sixth row family (CO13): derived relation rows this scope owns.
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Authority-private credential index. These rows are not CO13 relations:
+    // no closure transfer, subscriber fanout, or gateway mirror can see them.
+    this.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_api_key_verifier (key TEXT PRIMARY KEY, body TEXT NOT NULL)"
+    );
+    // Seventh row family (sequenced-log.md SL1/SL4): the committed
+    // sequenced log, keyed by (SEMANTIC space id, space-log seq). Appended
+    // inside the accept transaction; paged on demand off the primary key —
+    // never hydrated wholesale (it outgrows the live cell set without
+    // bound, the scheduled-family precedent).
+    this.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_log (space TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (space, seq))"
+    );
   }
 
   transaction<T>(fn: () => T): T {
@@ -420,11 +462,56 @@ export class SqliteScopeStore implements ScopeStore {
   deleteRelation(key: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_relation WHERE key = ?", key);
   }
+
+  readApiKeyVerifiers(): ApiKeyVerifierRow[] {
+    return sqlRows<{ body: string }>(
+      this.storage.sql.exec("SELECT body FROM net_scope_api_key_verifier")
+    ).map((row) => JSON.parse(row.body) as ApiKeyVerifierRow);
+  }
+
+  writeApiKeyVerifier(key: string, row: ApiKeyVerifierRow): void {
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_api_key_verifier (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+      key,
+      JSON.stringify(row)
+    );
+  }
+
+  deleteApiKeyVerifier(key: string): void {
+    this.storage.sql.exec("DELETE FROM net_scope_api_key_verifier WHERE key = ?", key);
+  }
+
+  appendLogEntry(entry: ReplayLogEntry): void {
+    // The accept transaction also records the reply, so idempotent retries
+    // return before append. A duplicate (space, seq) here is therefore a
+    // broken allocator, not an upsert opportunity; let SQLite abort the
+    // transaction instead of overwriting history.
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_log (space, seq, body) VALUES (?, ?, ?)",
+      entry.space,
+      entry.seq,
+      JSON.stringify(entry)
+    );
+  }
+
+  readLogPage(space: string, from: number, limit: number): ReplayLogEntry[] {
+    // SL2 window semantics off the primary-key index: O(page), never
+    // O(log). `limit` is validated at the endpoint (1..1000).
+    return sqlRows<{ body: string }>(
+      this.storage.sql.exec(
+        "SELECT body FROM net_scope_log WHERE space = ? AND seq >= ? ORDER BY seq ASC LIMIT ?",
+        space,
+        from,
+        limit
+      )
+    ).map((row) => JSON.parse(row.body) as ReplayLogEntry);
+  }
 }
 
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
-/** H2b: the session-reaper wake (a third key into the single storage
+const LIVE_ALARM_KEY = "live";
+/** H2b: the session-reaper wake (another key into the single storage
  * alarm — WorkerdHost keeps the earliest across keys). */
 const SESSION_ALARM_KEY = "session-reap";
 
@@ -461,6 +548,12 @@ const OUTBOX_ROWS_PER_LANE = 4;
  * which clamps to "now" while due work remains — resumes the drain on a
  * fresh invocation budget. */
 const OUTBOX_PASSES_PER_DRAIN = 1;
+/** Live-only delivery is deliberately memory-bounded and alarm-batched.
+ * Eight gateway shards make ordinary publishes ≤7 rows after origin
+ * suppression; these bounds absorb a burst without granting unbounded
+ * lifetime state or one alarm invocation unbounded subrequests. */
+const LIVE_DELIVERY_QUEUE_CAP = 1_024;
+const LIVE_DELIVERY_BATCH = LIVE_FANOUT_BATCH_CAP;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */
@@ -510,6 +603,13 @@ export class NetScopeDO {
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
   private outboxAlarmArmed = false;
+  /** Lossy direct-observation deliveries waiting for a FRESH alarm event.
+   * A /submit lineage must never call any gateway: excluding only its
+   * origin still forms a cycle when another gateway is concurrently
+   * submitting to this scope. This queue is intentionally in-memory
+   * because direct observations are live-only; eviction may drop them. */
+  private readonly pendingLiveDeliveries: Array<{ destination: string; body: LiveFanoutBody }> = [];
+  private liveAlarmArmed = false;
   /** In-memory mirror of the rider residue ledger (net_scope_rider_cache),
    * hydrated lazily and appended on insert — `owns` consults it per read
    * (CO14 session witness), so a per-call SQL scan would be a hot-path
@@ -735,10 +835,18 @@ export class NetScopeDO {
         // {submit, rider_destinations, relate_destinations} sibling shape.
         const raw = (await request.json()) as
           | CommitSubmit
-          | { submit: CommitSubmit; rider_destinations?: RiderDestinations; relate_destinations?: RelateDestinations };
+          | {
+              submit: CommitSubmit;
+              rider_destinations?: RiderDestinations;
+              relate_destinations?: RelateDestinations;
+              live_audience?: LiveAudience;
+              origin_gateway?: string;
+            };
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
         const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
+        const liveAudience = "submit" in raw ? raw.live_audience : undefined;
+        const originGateway = "submit" in raw ? raw.origin_gateway : undefined;
         // Hydrate from durable identity ONLY (no scope hint): a submit
         // naming another scope must reach the SEQUENCER's step-2 check
         // and reject with the NAMED terminal `scope_mismatch` — the
@@ -796,6 +904,20 @@ export class NetScopeDO {
           this.relateScopeHints.clear();
           this.catalogRiderObjects.clear();
         }
+        const freshAcceptance = reply.status === "accepted" && reply.replayed !== true;
+        const authorityAdvanced = freshAcceptance && reply.head.seq === headBefore + 1;
+        // A validated effect-free direct turn deliberately leaves authority at
+        // the same head. Its observations still need a carrier: publish them
+        // best-effort to the bounded gateway-shard registry, without creating
+        // a fake seq or durable outbox row.
+        if (
+          freshAcceptance &&
+          !authorityAdvanced &&
+          submit.transcript.route === "direct" &&
+          submit.transcript.observations.length > 0
+        ) {
+          this.publishLive(seq.scope, submit, liveAudience, originGateway);
+        }
         // Never begin fanout in the gateway -> scope submit lineage. Even a
         // waitUntil task starts executing immediately; calling the submitting
         // gateway before this response leaves the scope creates a platform
@@ -822,7 +944,7 @@ export class NetScopeDO {
           base_lag: baseLag,
           // A cached idempotent reply can also carry an old base; only a
           // fresh acceptance represents authority-side rebasing.
-          rebased: reply.status === "accepted" && reply.replayed !== true && baseLag > 0,
+          rebased: authorityAdvanced && baseLag > 0,
           outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
           ms: Date.now() - submitStarted
         });
@@ -839,7 +961,7 @@ export class NetScopeDO {
         if (spanTrace && spanSampled(spanTrace)) {
           const parsed = parseTraceparent(spanTrace.traceparent);
           if (parsed) {
-            const freshCommit = reply.status === "accepted" && reply.replayed !== true;
+            const freshCommit = authorityAdvanced;
             exportSpans(
               this.env,
               this.host,
@@ -884,6 +1006,16 @@ export class NetScopeDO {
           body.destination,
           role
         );
+        // Subscription loss presents as a healthy authority commit with no
+        // peer push. Name the bounded gateway-shard registration here so a
+        // workerd/deployed trace can distinguish missing subscription from a
+        // later outbox or socket-delivery failure.
+        this.metric({
+          kind: "net_scope_subscribed",
+          scope: this.store.readMeta()?.scope ?? "unseeded",
+          destination: body.destination,
+          role
+        });
         // A newly registered planner must pick up rows parked while no
         // planner existed (rearmAlarm deliberately never arms for
         // overdue rows): arm an immediate wake so the durable alarm()
@@ -903,6 +1035,7 @@ export class NetScopeDO {
           from_scope: string;
           seq: number;
           cells: Cell[];
+          removed_cells?: string[];
           prior_versions?: Record<string, string>;
           principal?: unknown;
           trace?: unknown;
@@ -945,13 +1078,36 @@ export class NetScopeDO {
         // parent the same way — an ordering with no edges attests the
         // empty-rows version, the ordering analogue of "absent". Read-only:
         // no state changes, no head movement.
-        const body = (await request.json()) as { keys: string[]; ordering_parents?: Array<{ container?: unknown; parent?: unknown }> };
+        const body = (await request.json()) as {
+          keys: string[];
+          ordering_parents?: Array<{ container?: unknown; parent?: unknown }>;
+          replay_pages?: Array<{ space?: unknown; from?: unknown; limit?: unknown }>;
+        };
         const seq = this.ensureSequencer();
         const orderingParents = Array.isArray(body.ordering_parents) ? body.ordering_parents : [];
         for (const ordering of orderingParents) {
           if (typeof ordering?.container !== "string" || !ordering.container
             || (ordering.parent !== null && !(typeof ordering.parent === "string" && ordering.parent))) {
             throw netError("E_INVARG", "attest ordering_parents entries require container plus parent (nonempty ref or null)", { ordering });
+          }
+        }
+        // Replay-page attestation (SL4): the current content version of each
+        // named committed-log window, at the same freshness point as the
+        // cell/ordering versions. An empty page attests the empty-page
+        // version — the log analogue of "absent".
+        const replayPages = Array.isArray(body.replay_pages) ? body.replay_pages : [];
+        for (const page of replayPages) {
+          if (typeof page?.space !== "string" || !page.space
+            || typeof page.from !== "number" || typeof page.limit !== "number"
+            || !validReplayPageBounds(page.from, page.limit)) {
+            throw netError("E_INVARG", "attest replay_pages entries require space plus SL2-legal from/limit", { page });
+          }
+          // Never authenticate an empty page for a space this DO does not
+          // own. Ownership is the same lineage witness supplied to the
+          // sequencer below; answering from the wrong scope would turn a
+          // routing bug into a silently truncated journal.
+          if (!seq.store.has(cellKey("object_lineage", page.space))) {
+            throw netError("E_INVARG", "scope cannot attest a replay page for a foreign space", { space: page.space });
           }
         }
         return json({
@@ -964,6 +1120,14 @@ export class NetScopeDO {
                 container: ordering.container as string,
                 parent: ordering.parent as string | null,
                 version: orderedChildrenVersion(seq.orderedChildren(ordering.container as string, ordering.parent as string | null))
+              })) }
+            : {}),
+          ...(replayPages.length > 0
+            ? { replays: replayPages.map((page) => ({
+                space: page.space as string,
+                from: page.from as number,
+                limit: page.limit as number,
+                version: replayPageVersion(seq.replayPage(page.space as string, page.from as number, page.limit as number))
               })) }
             : {})
         });
@@ -1051,6 +1215,80 @@ export class NetScopeDO {
         });
         return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, ...answer, version: orderedChildrenVersion(rows) });
       }
+      if (request.method === "POST" && url.pathname === "/net/replay-page") {
+        // Owner-served committed replay page (sequenced-log.md SL4): one
+        // bounded window of this authority's durable sequenced log, in the
+        // native replay shape. `space` is the SEMANTIC space id (the
+        // gateway routed here by the authority ADDRESS — scopeOf(space));
+        // entries keep that semantic identity so planning-world reads stay
+        // lane-identical. Strict field validation (Adv-a): malformed
+        // bounds are a structured refusal, never a silently-different
+        // window — the exact (space, from, limit) query is the attested
+        // identity, so coercion here would attest a page the plan never
+        // asked for. `version` is the page's content address; the plan
+        // attests it and this scope re-derives it at submit (step 7c), so
+        // an append inside the window between plan and submit makes the
+        // read stale. Committed rows only, by construction: entries are
+        // appended inside the accept transaction and never before.
+        const body = (await request.json()) as { space?: unknown; from?: unknown; limit?: unknown };
+        if (typeof body.space !== "string" || !body.space) {
+          throw netError("E_INVARG", "replay-page requires a nonempty semantic space ref", { space: body.space ?? null });
+        }
+        if (typeof body.from !== "number" || typeof body.limit !== "number" || !validReplayPageBounds(body.from, body.limit)) {
+          // SL2 range policy, surfaced as the structured refusal the net
+          // taxonomy carries (E_INVARG, like the ordering endpoints).
+          throw netError("E_INVARG", "replay-page requires integer from >= 1 and limit in 1..1000", {
+            from: body.from ?? null,
+            limit: body.limit ?? null
+          });
+        }
+        const seq = this.ensureSequencer();
+        if (!seq.store.has(cellKey("object_lineage", body.space))) {
+          throw netError("E_INVARG", "scope cannot serve a replay page for a foreign space", { space: body.space });
+        }
+        const entries = seq.replayPage(body.space, body.from, body.limit);
+        return json({
+          scope: seq.scope,
+          head: seq.head(),
+          space: body.space,
+          from: body.from,
+          limit: body.limit,
+          entries,
+          version: replayPageVersion(entries)
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/net/credential-record") {
+        // Authentication is an authority decision, not an eventually
+        // consistent fanout-cache decision. Serve exactly one indexed
+        // actor-owned verifier with the current mutation-complete head; this
+        // is O(1) and lets a committed revocation take effect on the next
+        // request without transferring the actor's whole cluster.
+        const body = (await request.json()) as { actor?: unknown; id?: unknown };
+        if (typeof body.actor !== "string" || !body.actor || typeof body.id !== "string" || !body.id) {
+          throw netError("E_INVARG", "credential-record requires actor and id");
+        }
+        const routed = parseRoutedApiKeyId(body.id);
+        const seq = this.ensureSequencer();
+        if (
+          !routed ||
+          routed.actor !== body.actor ||
+          routedApiKeyScope(body.id) !== seq.scope ||
+          !seq.store.has(cellKey("object_lineage", body.actor))
+        ) {
+          throw netError("E_INVARG", "credential-record is routed to the wrong authority", {
+            actor: body.actor,
+            scope: seq.scope
+          });
+        }
+        const record = seq.apiKeyVerifier(body.actor, body.id);
+        return json({
+          scope: seq.scope,
+          head: seq.head(),
+          actor: body.actor,
+          id: body.id,
+          record
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
           keys: string[];
@@ -1114,6 +1352,38 @@ export class NetScopeDO {
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });
       }
+      if (request.method === "POST" && url.pathname === "/net/ensure-credential") {
+        const body = (await request.json()) as {
+          actor?: unknown;
+          id?: unknown;
+          record?: unknown;
+        };
+        if (
+          typeof body.actor !== "string" ||
+          typeof body.id !== "string" ||
+          !body.record ||
+          typeof body.record !== "object" ||
+          Array.isArray(body.record)
+        ) {
+          throw netError("E_INVARG", "credential ensure requires actor, id, and verifier record");
+        }
+        const seq = this.ensureSequencer();
+        const ensured = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          return seq.operatorEnsureCredential(
+            body.actor as string,
+            body.id as string,
+            body.record as Record<string, unknown>
+          );
+        }));
+        return json({
+          ok: true,
+          scope: seq.scope,
+          status: ensured.status,
+          head: ensured.head,
+          actor: body.actor,
+          id: body.id
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/repair-relations") {
         const body = (await request.json()) as { relations?: RelationRow[] };
         const rows = Array.isArray(body.relations) ? body.relations : [];
@@ -1150,6 +1420,8 @@ export class NetScopeDO {
             const repairBody: FanoutBody = {
               scope: seq.scope,
               seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
               cells: [],
               observations: [],
               relations: applied
@@ -1224,6 +1496,8 @@ export class NetScopeDO {
             const defsBody: FanoutBody = {
               scope: seq.scope,
               seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
               cells: result.cells,
               removed_cells: result.removed,
               observations: []
@@ -1351,6 +1625,12 @@ export class NetScopeDO {
    * outbox retries.
    */
   async alarm(): Promise<void> {
+    // CO2.7's request-lineage break applies to lossy live fanout too.
+    // Clear this lifetime's key before draining; publishes that interleave
+    // while RPCs are awaited re-arm it for the remaining batch.
+    this.liveAlarmArmed = false;
+    this.host.setAlarm(LIVE_ALARM_KEY, null, async () => {});
+    await this.drainPendingLive();
     // Outbox liveness (fix 4a): a QUIET scope must still retry failed
     // deliveries — this alarm is the retry engine when no request ever
     // arrives to trigger drain-on-reactivation. The drain's own finally
@@ -1483,6 +1763,8 @@ export class NetScopeDO {
           const reapBody: FanoutBody = {
             scope: seq.scope,
             seq: reap.head.seq,
+            head_hash: reap.head.hash,
+            head_generation: reap.head.generation,
             cells: retiredCells,
             observations: [],
             relations: reap.localRemovals
@@ -1627,6 +1909,9 @@ export class NetScopeDO {
     }
     const seq: ScopeSequencer = new ScopeSequencer(resolvedScope, resolvedEpoch, {
       durable: this.store,
+      // Committed-log acceptance timestamps (CO2.5) come from the host
+      // clock, so tests with a fixture clock and workerd agree.
+      now: () => this.host.now(),
       // CO4 step 1 (CO14): validate the submit's session story — every
       // session read plus the transcript's session field — from this
       // authority's own cells when owned, else via the CO2.3 attestation
@@ -1637,6 +1922,28 @@ export class NetScopeDO {
         authorizeSessionSubmit(submit, {
           ownsSession: (id) => this.ownsSessionCell(seq, id),
           readSession: (id) => seq.store.get(cellKey("session", id)),
+          // A room's session_presence family is its owner-sequenced
+          // checkpoint of actor-cluster session transitions. The row carries
+          // the exact session value and is freshness-fenced on mint/move/close,
+          // so this scope can prove a present session read without calling the
+          // actor cluster again on every room turn.
+          readProjectedSession: (id) => {
+            if (!resolvedScope.startsWith("room:")) return undefined;
+            const room = resolvedScope.slice("room:".length);
+            const row = seq.relations().get(relationKey(SESSION_PRESENCE_RELATION, room, id));
+            const body = row?.body as { actor?: unknown; session?: unknown } | undefined;
+            const value = body?.session as { id?: unknown; actor?: unknown; activeScope?: unknown } | undefined;
+            if (
+              !value
+              || value.id !== id
+              || typeof value.actor !== "string"
+              || body?.actor !== value.actor
+              || value.activeScope !== room
+            ) {
+              return undefined;
+            }
+            return { value, version: cellVersion(value) };
+          },
           now: () => this.host.now(),
           // Identity-door exclusiveMint occupancy witness: this cluster's
           // session cells for the actor (the store index). No residue
@@ -1665,7 +1972,10 @@ export class NetScopeDO {
       // in a CA3 commit is a cache of the owner's fact; claiming
       // ownership of it would let this scope validate reads against a
       // stale copy — the ownsSessionCell helper excludes the ledger).
-      owns: (object) => seq.store.has(cellKey("object_lineage", object)) || this.ownsSessionCell(seq, object),
+      owns: (object) =>
+        seq.store.has(cellKey("object_lineage", object)) ||
+        seq.store.has(cellKey("object_tombstone", object)) ||
+        this.ownsSessionCell(seq, object),
       // CO13 relation-owner classification: the gateway's per-submit
       // relate_destinations hints (anchor topology is gateway knowledge —
       // the same rule as rider_destinations); an unhinted owner is local.
@@ -1728,6 +2038,17 @@ export class NetScopeDO {
     const wantAll = keys.length === 1 && keys[0] === "*";
     const cells = new Map<string, Cell>();
     const requested = wantAll ? [...store.keys()] : [...keys];
+    if (!wantAll) {
+      // A keyed repair asks for the lineage page the reader used to know.
+      // After recycle that key is absent by design; returning the terminal
+      // replacement distinguishes deletion from a transient miss.
+      for (const key of keys) {
+        if (!key.startsWith("object_lineage:") || store.has(key)) continue;
+        const object = key.slice("object_lineage:".length);
+        const tombstone = cellKey("object_tombstone", object);
+        if (store.has(tombstone)) requested.push(tombstone);
+      }
+    }
     // Objects mode: fixed-point over each object's PARENT chain (verb
     // pages and property defs up the class chain — inherited dispatch
     // resolves at the receiver without a per-cell miss→pull round each)
@@ -1827,8 +2148,9 @@ export class NetScopeDO {
     // starve the mirror of every roster row the superseded fanout
     // carried. Phase 4: `withRelations` extends the same guarantee to a
     // TARGETED pull (the client cold-open backfill), so advancing the
-    // high-water on it is equally safe — the roster is coherent at the
-    // returned head, and un-pulled cells are absent, not stale. A plain
+    // high-water on it is equally safe — the returned relation family is
+    // complete and replaces that scope's mirror before the advance.
+    // Unrequested cells receive no completeness certificate. A plain
     // keyed closure (refreshCells repair) still skips them: it never
     // advances the high-water. Sorted for a deterministic transfer.
     const relations =
@@ -1956,7 +2278,8 @@ export class NetScopeDO {
    * (lineage-closed touched closure + the transcript's observations +
    * the commit's LOCAL relation deltas, so subscriber gateways learn
    * rosters push-fashion — CO13), a /net/adopt row per rider scope
-   * carrying only the cells anchored to it, and a /net/relate row per
+   * carrying only the replacement/removal keys anchored to it, and a
+   * /net/relate row per
    * foreign relation-owner scope carrying its deltas — the gateway's
    * rider_destinations/relate_destinations name those objects/scopes,
    * because anchor topology is gateway knowledge the sequencer never
@@ -1996,10 +2319,14 @@ export class NetScopeDO {
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
+      const removed = reply.touched.filter((key) => !seq.store.has(key));
       const base: FanoutBody = {
         scope: seq.scope,
         seq: reply.head.seq,
+        head_hash: reply.head.hash,
+        head_generation: reply.head.generation,
         cells,
+        ...(removed.length > 0 ? { removed_cells: removed } : {}),
         observations,
         // The raw idempotency key is trusted-internal only: receiving
         // gateways need it to identify the submitting session, while peers
@@ -2050,7 +2377,10 @@ export class NetScopeDO {
       const cells = reply.touched
         .map((key) => seq.store.get(key))
         .filter((cell): cell is Cell => cell !== undefined && objects.has(cell.object));
-      if (cells.length === 0) continue;
+      const removed = reply.touched.filter(
+        (key) => !seq.store.has(key) && objects.has(objectOfCellKey(key))
+      );
+      if (cells.length === 0 && removed.length === 0) continue;
       // The rider scope anchors these objects, so it definitionally holds
       // their lineage — declare receiver-known rather than reshipping
       // (serializeTransfer still asserts the closure is complete).
@@ -2067,10 +2397,15 @@ export class NetScopeDO {
         const prior = riderPriors.get(cell.key);
         if (prior !== undefined) priorVersions[cell.key] = prior;
       }
+      for (const key of removed) {
+        const prior = riderPriors.get(key);
+        if (prior !== undefined) priorVersions[key] = prior;
+      }
       const adoptBody: AdoptOutboxBody = {
         scope: seq.scope,
         seq: reply.head.seq,
         cells: transfer.cells,
+        ...(removed.length > 0 ? { removed_cells: removed } : {}),
         // Observations fan out to subscribers; adoption is cell-only.
         observations: [],
         prior_versions: priorVersions,
@@ -2090,6 +2425,10 @@ export class NetScopeDO {
         );
         this.riderCacheMemo?.add(cell.key);
       }
+      for (const key of removed) {
+        this.state.storage.sql.exec("DELETE FROM net_scope_rider_cache WHERE key = ?", key);
+        this.riderCacheMemo?.delete(key);
+      }
     }
   }
 
@@ -2098,8 +2437,10 @@ export class NetScopeDO {
    * in this scope's store rides along; lineage this scope does not hold
    * (foreign-anchored rider objects — the owner's concern, reached via
    * /net/adopt) is declared receiver-known rather than fabricated. A
-   * touched key absent from the store (deleted at this authority) ships
-   * nothing — FanoutBody carries installs only (applyFanout semantics).
+   * touched key absent from the store is carried separately in
+   * FanoutBody.removed_cells by the caller. Keeping installs and removals
+   * distinct lets one ordered body replace a whole live object page with a
+   * lineage-free tombstone.
    */
   private fanoutCells(seq: ScopeSequencer, touched: string[]): Cell[] {
     const cells = new Map<string, Cell>();
@@ -2163,6 +2504,96 @@ export class NetScopeDO {
       const body: AuditOutboxBody = { scope, seq, cells: [], observations: [], audit_records: records };
       this.persistOutboxRow("/audit", destination, body, { idSuffix });
     }
+  }
+
+  /** Publish one validated direct turn without converting it into authority.
+   * Subscriber count is bounded by gateway shard count (CA13.1.2). Deliveries
+   * cross an immediate alarm event before calling gateways: a waitUntil task
+   * inherits /submit's request lineage and can form scope↔gateway cycles under
+   * cross-shard concurrency. Failure or eviction loss is acceptable for this
+   * explicitly live-only carrier, but remains bounded and named. */
+  private publishLive(
+    scope: string,
+    submit: CommitSubmit,
+    audience?: LiveAudience,
+    originGateway?: string
+  ): void {
+    const registered = sqlRows<{ destination: string }>(
+      this.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'fanout' ORDER BY destination"
+      )
+    );
+    // The origin gateway is still awaiting this submit reply. Calling it from
+    // a waitUntil task starts immediately and creates a platform RPC cycle;
+    // the origin delivers its local slice after this response instead.
+    const subscribers = registered.filter(({ destination }) => destination !== originGateway);
+    const body: LiveFanoutBody = {
+      scope,
+      observations: submit.transcript.observations,
+      submitter_turn_id: submit.idempotency_key,
+      echo_id: turnEchoId(submit.idempotency_key),
+      ...(audience ?? {})
+    };
+    this.metric({
+      kind: "net_scope_live_publish",
+      scope,
+      subscribers: subscribers.length,
+      registered_subscribers: registered.length,
+      observations: body.observations.length
+    });
+    const available = Math.max(0, LIVE_DELIVERY_QUEUE_CAP - this.pendingLiveDeliveries.length);
+    for (const { destination } of subscribers.slice(0, available)) {
+      this.pendingLiveDeliveries.push({ destination, body });
+    }
+    const dropped = Math.max(0, subscribers.length - available);
+    if (dropped > 0) {
+      this.metric({
+        kind: "net_scope_live_delivery_dropped",
+        scope,
+        status: "error",
+        reason: "queue_cap",
+        dropped,
+        queue_cap: LIVE_DELIVERY_QUEUE_CAP
+      });
+    }
+    if (this.pendingLiveDeliveries.length > 0) this.armLiveAlarm();
+  }
+
+  /** Drain one bounded live batch from a fresh alarm invocation. Unlike the
+   * durable outbox there is no retry: live observations are best effort, and
+   * retaining failures would quietly turn them into durable messages. */
+  private async drainPendingLive(): Promise<void> {
+    const batch = this.pendingLiveDeliveries.splice(0, LIVE_DELIVERY_BATCH);
+    const byDestination = new Map<string, LiveFanoutBody[]>();
+    for (const { destination, body } of batch) {
+      const deliveries = byDestination.get(destination) ?? [];
+      deliveries.push(body);
+      byDestination.set(destination, deliveries);
+    }
+    const destinations = [...byDestination];
+    const settled = await Promise.allSettled(
+      destinations.map(([destination, deliveries]) =>
+        this.host.rpc(destination, "/live", { deliveries } satisfies LiveFanoutBatchBody)
+      )
+    );
+    settled.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      const delivery = destinations[index];
+      this.metric({
+        kind: "net_scope_live_delivery_failed",
+        scope: delivery?.[1][0]?.scope ?? "unknown",
+        destination: delivery?.[0] ?? "unknown",
+        status: "error",
+        error: String(result.reason)
+      });
+    });
+    if (this.pendingLiveDeliveries.length > 0) this.armLiveAlarm();
+  }
+
+  private armLiveAlarm(): void {
+    if (this.liveAlarmArmed) return;
+    this.liveAlarmArmed = true;
+    this.host.setAlarm(LIVE_ALARM_KEY, this.host.now(), async () => {});
   }
 
   private persistOutboxRow(
@@ -2443,6 +2874,9 @@ export class NetScopeDO {
                 from_scope: adoptBody.scope,
                 seq: adoptBody.seq,
                 cells: adoptBody.cells,
+                ...(adoptBody.removed_cells !== undefined
+                  ? { removed_cells: adoptBody.removed_cells }
+                  : {}),
                 // The pre-commit observations for the owner's CAS (fix 1).
                 ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {}),
                 // AU3.2/AU2/AU1: attribution + citation ride to the owner
@@ -2795,6 +3229,7 @@ export class NetScopeDO {
     from_scope: string;
     seq: number;
     cells: Cell[];
+    removed_cells?: string[];
     prior_versions?: Record<string, string>;
     principal?: unknown;
     trace?: unknown;
@@ -2817,6 +3252,7 @@ export class NetScopeDO {
         from_scope: body.from_scope,
         seq: body.seq,
         cells: body.cells,
+        removed: body.removed_cells,
         priors: body.prior_versions ?? {}
       });
       if (result.status === "rejected") {
@@ -2857,10 +3293,14 @@ export class NetScopeDO {
         if (subscribers.length > 0) {
           // Shared payload: stringify once, splice delivery_seq per
           // subscriber (see withDeliverySeq).
+          const removed = result.applied.filter((key) => !seq.store.has(key));
           const adoptFanBody: FanoutBody = {
             scope: seq.scope,
             seq: result.head.seq,
+            head_hash: result.head.hash,
+            head_generation: result.head.generation,
             cells: this.fanoutCells(seq, result.applied),
+            ...(removed.length > 0 ? { removed_cells: removed } : {}),
             observations: []
           };
           const adoptFanText = JSON.stringify(adoptFanBody);
@@ -2887,7 +3327,10 @@ export class NetScopeDO {
             carriedCause && typeof carriedCause.scope === "string" && typeof carriedCause.seq === "number"
               ? { scope: carriedCause.scope, seq: carriedCause.seq }
               : { scope: body.from_scope, seq: body.seq },
-          subjects: [...new Set(body.cells.map((cell) => cell.object))].sort(),
+          subjects: [...new Set([
+            ...body.cells.map((cell) => cell.object),
+            ...(body.removed_cells ?? []).map(objectOfCellKey)
+          ])].sort(),
           now: this.host.now()
         });
         if (adoptionRecord !== null) {
@@ -2961,6 +3404,8 @@ export class NetScopeDO {
         const refanBody: FanoutBody = {
           scope: seq.scope,
           seq: result.head.seq,
+          head_hash: result.head.hash,
+          head_generation: result.head.generation,
           cells: [],
           // Phase i: the room-addressed announcements that rode with
           // the presence delta refan under THIS scope's head seq, so

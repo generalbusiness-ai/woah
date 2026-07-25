@@ -80,13 +80,13 @@ export async function runSmokeWalkthrough(
     log: options.log
   };
 
-  // Both guests start in the_chatroom on the demo world. `:enter` is
-  // defensively idempotent; an actor already there receives no observation.
+  // API-key actors persist between deployed runs. Establish the common start
+  // room whether this is their first run or they already occupy the chatroom.
   await step("enter:chatroom (alice)", async (ctx) => {
-    await pair.alice.call("the_chatroom", "enter", [], ctx.signal);
+    await ensureInChatroom(pair.alice, ctx.signal);
   });
   await step("enter:chatroom (bob)", async (ctx) => {
-    await pair.bob.call("the_chatroom", "enter", [], ctx.signal);
+    await ensureInChatroom(pair.bob, ctx.signal);
   });
   await drain(pair.alice, cfg);
   await drain(pair.bob, cfg);
@@ -391,6 +391,7 @@ export async function runSmokeWalkthrough(
     }
   });
 
+  let outlineAnchor: string | null = null;
   await step("outliner:add_item reaches peer", async (ctx) => {
     const { alice, bob } = pair;
     await bob.moveTo("the_outline", ctx.signal);
@@ -398,7 +399,156 @@ export async function runSmokeWalkthrough(
     await drain(bob, cfg, ctx.signal);
     const text = `outline-${runId}`;
     await alice.call("the_outline", "add_item", [text], ctx.signal);
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, waitMs, ctx.signal, cfg);
+    // v3 deliberately keeps prose on the $outline_item artifact. The Act is
+    // the concise structural fact that tells peers WHICH artifact changed;
+    // tree_view is the authoritative read that supplies its current content.
+    const added = await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_added",
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    const payload = added.payload;
+    if (added.version !== 1 || !isRecord(payload)) {
+      throw new Error(`expected v1 outline_item_added Act; got ${JSON.stringify(added).slice(0, 600)}`);
+    }
+    const payloadKeys = Object.keys(payload).sort();
+    const expectedKeys = ["index", "item", "parent_id"];
+    if (JSON.stringify(payloadKeys) !== JSON.stringify(expectedKeys) ||
+        typeof payload.item !== "string" ||
+        (payload.parent_id !== null && typeof payload.parent_id !== "string") ||
+        !Number.isSafeInteger(payload.index)) {
+      throw new Error(`expected concise outline_item_added payload; got ${JSON.stringify(payload).slice(0, 600)}`);
+    }
+    await waitForOutlinerArtifact(bob, payload.item, text, waitMs, ctx.signal);
+    outlineAnchor = payload.item;
+  });
+
+  // The bake criterion is the whole structural vocabulary, not add alone.
+  // Drive every composer through one actor and pin the peer's authoritative
+  // tree after each Act; undo-remove intentionally restores a new artifact id.
+  await step("outliner: reorder, move, hide, remove, and undo converge", async (ctx) => {
+    const { alice, bob } = pair;
+    const anchor = outlineAnchor;
+    if (!anchor) throw new Error("outliner lifecycle requires the preceding add_item artifact");
+
+    const text = `outline-lifecycle-${runId}`;
+    await alice.call("the_outline", "add_item", [text], ctx.signal);
+    const added = await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_added" && isRecord(obs.payload) && typeof obs.payload.item === "string",
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    const item = added.payload.item as string;
+    await waitForOutlinerArtifact(bob, item, text, waitMs, ctx.signal);
+
+    await alice.call("the_outline", "reorder_item", [item, 0], ctx.signal);
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_reordered" && isRecord(obs.payload) &&
+        obs.payload.item === item && obs.payload.to_index === 0,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerState(
+      bob,
+      (items) => items.some((row) => row.id === item && row.parent_id === null && row.index === 0),
+      `${item} reordered to root index 0`,
+      waitMs,
+      ctx.signal
+    );
+
+    await alice.call("the_outline", "move_item", [item, anchor, 0], ctx.signal);
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_moved" && isRecord(obs.payload) &&
+        obs.payload.item === item && obs.payload.to_parent === anchor && obs.payload.to_index === 0,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerState(
+      bob,
+      (items) => items.some((row) => row.id === item && row.parent_id === anchor && row.index === 0),
+      `${item} moved under ${anchor}`,
+      waitMs,
+      ctx.signal
+    );
+
+    await alice.call("the_outline", "hide", [item, true], ctx.signal);
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_hidden" && isRecord(obs.payload) &&
+        obs.payload.item === item && obs.payload.hidden === true,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerState(
+      bob,
+      (items) => items.some((row) => row.id === item && row.hidden === true),
+      `${item} hidden`,
+      waitMs,
+      ctx.signal
+    );
+
+    await alice.call("the_outline", "undo", [], ctx.signal);
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_hidden" && isRecord(obs.payload) &&
+        obs.payload.item === item && obs.payload.hidden === false,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerState(
+      bob,
+      (items) => items.some((row) => row.id === item && row.hidden === false),
+      `${item} unhidden by undo`,
+      waitMs,
+      ctx.signal
+    );
+
+    await alice.call("the_outline", "remove_item", [item], ctx.signal);
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_removed" && isRecord(obs.payload) && obs.payload.item === item,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerState(
+      bob,
+      (items) => items.every((row) => row.id !== item),
+      `${item} absent after remove`,
+      waitMs,
+      ctx.signal
+    );
+
+    const restored = await alice.call("the_outline", "undo", [], ctx.signal);
+    if (typeof restored !== "string") {
+      throw new Error(`remove undo should return the restored artifact id; got ${JSON.stringify(restored)}`);
+    }
+    await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_added" && isRecord(obs.payload) &&
+        obs.payload.item === restored && obs.payload.parent_id === anchor,
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    await waitForOutlinerArtifact(bob, restored, text, waitMs, ctx.signal);
+    await waitForOutlinerState(
+      bob,
+      (items) => items.some((row) => row.id === restored && row.parent_id === anchor),
+      `${restored} restored under ${anchor}`,
+      waitMs,
+      ctx.signal
+    );
   });
 
   // Taskboard navigation: chatroom -> southeast -> the_deck -> south toward
@@ -420,6 +570,53 @@ export async function runSmokeWalkthrough(
       obs.source === "the_taskboard",
     waitMs, ctx.signal, cfg);
   });
+}
+
+/** Put one persistent smoke actor in the chatroom and establish the driver's
+ * room cursor. API-key actors retain their physical location between runs, and
+ * the contextual MCP surface intentionally exposes only their current room.
+ * Read its explicit `active_scope`, then walk the demo graph home;
+ * this makes repeated and recovery runs state-independent without bypassing
+ * the same public movement verbs that clients use. */
+export async function ensureInChatroom(
+  session: SmokeSession,
+  signal?: AbortSignal
+): Promise<void> {
+  const listed = await session.callTool(
+    "woo_list_reachable_tools",
+    { scope: "all", limit: 200 },
+    { signal }
+  );
+  const page = isRecord(listed) &&
+    isRecord(listed.result) &&
+    isRecord(listed.result.structuredContent) &&
+    isRecord(listed.result.structuredContent.result)
+    ? listed.result.structuredContent.result
+    : null;
+  if (!page || typeof page.active_scope !== "string") {
+    throw new Error(
+      `cannot establish ${session.label} current room from reachable tools; ` +
+      `active_scope=${JSON.stringify(page?.active_scope ?? null)}`
+    );
+  }
+  session.currentRoom = page.active_scope;
+
+  for (let hop = 0; hop < 4 && session.currentRoom !== "the_chatroom"; hop += 1) {
+    const room = session.currentRoom;
+    const exit =
+      room === "the_taskboard" ? "out" :
+      room === "the_garden" ? "north" :
+      room === "the_deck" || room === "the_hot_tub" ? "west" :
+      room === "the_outline" || room === "the_pinboard" || room === "the_dubspace" ? "out" :
+      null;
+    if (!exit) {
+      throw new Error(`cannot route ${session.label} from ${room} to the_chatroom`);
+    }
+    await session.call(room, "go", [exit], signal);
+  }
+  if (session.currentRoom !== "the_chatroom") {
+    throw new Error(`failed to route ${session.label} to the_chatroom; at=${session.currentRoom}`);
+  }
 }
 
 async function walkSouthToTaskboard(session: SmokeSession, signal?: AbortSignal): Promise<void> {
@@ -489,6 +686,78 @@ async function waitFor(
   }
   const suffix = seen.length ? `; saw ${seen.slice(-12).join("; ")}` : "; saw no observations";
   throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation${suffix}`);
+}
+
+// An Act proves that a structural mutation committed, but its concise payload
+// intentionally does not duplicate note prose. Follow the artifact reference
+// through the consumer's authoritative tree read; polling covers the bounded
+// interval in which live Act fanout can arrive just before the refreshed scope
+// image is visible at that gateway.
+async function waitForOutlinerArtifact(
+  session: SmokeSession,
+  item: string,
+  expectedText: string,
+  totalTimeoutMs: number,
+  signal?: AbortSignal
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastView = "no tree_view result";
+  while (Date.now() - startedAt < totalTimeoutMs) {
+    throwIfAborted(signal);
+    const view = await session.call("the_outline", "tree_view", [], signal);
+    if (!isRecord(view) || !Array.isArray(view.items)) {
+      throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
+    }
+    const row = view.items.find((candidate: unknown) => isRecord(candidate) && candidate.id === item);
+    if (isRecord(row) && row.text === expectedText) return;
+    lastView = JSON.stringify(view).slice(0, 1000);
+    const remaining = totalTimeoutMs - (Date.now() - startedAt);
+    if (remaining > 0) await abortableDelay(Math.min(100, remaining), signal);
+  }
+  throw new Error(
+    `timeout after ${totalTimeoutMs}ms waiting for tree_view artifact ${item} ` +
+    `with text ${JSON.stringify(expectedText)}; last view=${lastView}`
+  );
+}
+
+async function waitForOutlinerState(
+  session: SmokeSession,
+  matches: (items: Array<Record<string, any>>) => boolean,
+  expected: string,
+  totalTimeoutMs: number,
+  signal?: AbortSignal
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastView = "no tree_view result";
+  while (Date.now() - startedAt < totalTimeoutMs) {
+    throwIfAborted(signal);
+    const view = await session.call("the_outline", "tree_view", [], signal);
+    if (!isRecord(view) || !Array.isArray(view.items)) {
+      throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
+    }
+    const items = view.items.filter(isRecord);
+    if (matches(items)) return;
+    lastView = JSON.stringify(view).slice(0, 1000);
+    const remaining = totalTimeoutMs - (Date.now() - startedAt);
+    if (remaining > 0) await abortableDelay(Math.min(100, remaining), signal);
+  }
+  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for tree_view state ${expected}; last view=${lastView}`);
+}
+
+async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

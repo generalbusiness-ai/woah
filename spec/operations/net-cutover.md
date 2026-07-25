@@ -53,7 +53,10 @@ FRESH ──seed──▶ INSTALLING(epoch) ──verify──▶ ACTIVE(epoch)
 refuses `E_SEED_COMMITTED` once a scope has committed turns (a
 same-epoch re-seed would silently reset authoritative state under an
 unchanged head), while activation legitimately changes around
-verification traffic.
+verification traffic. Seed and activation leave the sequenced `(seq, hash)`
+stable but each advances the mutation-complete authority `generation`; a
+complete-head cache therefore cannot mistake either operation for unchanged
+authority.
 
 Activation writes are CAS'd (`expected_active_epoch`): a replayed or
 reordered activation within the signature skew window is refused
@@ -340,7 +343,7 @@ item; what remains is exactly what the workerd lanes cannot prove
   one compact roster value (`POST /net/room-roster`). The gateway fetches that
   value directly before a roster-reading turn and installs it only in the
   ephemeral planning world; no per-occupant actor/session authority cells
-  enter the turn's read closure. This is deliberately computed from the one
+  enter the turn's read set. This is deliberately computed from the one
   relation family rather than persisted as a second roster authority. The
   result is one O(N)-byte RPC and O(1) planning inputs, with no per-occupant
   RPC. Chat's `$room:room_roster` adapts this generic value to the stable

@@ -263,6 +263,79 @@ describe("lane-batched /net/fanout receive (2026-07-22 gateway occupancy)", () =
 });
 
 describe("CO13 relations over the DO shells", () => {
+  it("an empty full closure removes stale presence before suppressing its delayed removal", async () => {
+    const scope = "room:exact_room";
+    const gatewayState = netState("gateway-relations-full-replacement");
+    const closureStub: NetStub = {
+      fetch: async (request) => {
+        expect(new URL(request.url).pathname).toBe("/net/closure");
+        return new Response(JSON.stringify({
+          kind: "woo.net.cell_transfer.v1",
+          cells: [],
+          assumes_known: [],
+          scope,
+          head: { seq: 2, hash: "exact-head-2", generation: 2 },
+          catalog_epoch: EPOCH,
+          relations: []
+        }), { headers: { "content-type": "application/json" } });
+      }
+    };
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${scope}`) return closureStub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const row = {
+      relation: "session_presence",
+      owner: "exact_room",
+      member: "departed-session",
+      body: { actor: "departed-actor" }
+    };
+
+    // The shard saw the add but missed the authority's seq-2 removal.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", {
+      scope,
+      seq: 1,
+      cells: [],
+      relations: [{ op: "add", row }],
+      observations: []
+    })).applied).toBe(true);
+    expect((await call<RelationRead>(
+      gateway,
+      gatewayEnv,
+      "/relation?relation=session_presence&owner=exact_room"
+    )).members).toEqual([{ member: "departed-session", body: { actor: "departed-actor" } }]);
+
+    // The exact head-2 closure has an explicitly empty relation family.
+    // Replacement must delete the phantom before seen advances to 2.
+    await call(gateway, gatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
+    expect((await call<RelationRead>(
+      gateway,
+      gatewayEnv,
+      "/relation?relation=session_presence&owner=exact_room"
+    )).members).toEqual([]);
+
+    // Delivery of the matching removal is now intentionally suppressed by
+    // the high-water. It is harmless because replacement already removed it.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", {
+      scope,
+      seq: 2,
+      cells: [],
+      relations: [{ op: "remove", row }],
+      observations: []
+    })).applied).toBe(false);
+    expect((await call<RelationRead>(
+      gateway,
+      gatewayEnv,
+      "/relation?relation=session_presence&owner=exact_room"
+    )).members).toEqual([]);
+
+    gatewayState.close();
+  });
+
   it("a cross-scope move delivers /net/relate to the owner, which applies and refans to its subscriber gateway; redelivery no-ops", async () => {
     const scopeEnvBase = { WOO_INTERNAL_SECRET: SECRET };
 

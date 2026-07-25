@@ -6,6 +6,7 @@ import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
+import { cellKey } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -209,6 +210,15 @@ describe("net install end-to-end (fake-DO lane)", () => {
       "exit_deck_south",
       "exit_deck_west"
     ]);
+    // A self-hosted room fixture is present through the deck's relation but
+    // authoritative at its own cluster. A genuinely cold gateway must use
+    // the relation's member_scope; pulling the target from room:the_deck
+    // loops on missing lineage until E_BUDGET.
+    const coldView = (gateway as unknown as { ensureView(): { has(key: string): boolean } }).ensureView();
+    expect(coldView.has(cellKey("object_lineage", "the_horoscope"))).toBe(false);
+    const coldFixture = await turn("the_horoscope", "status", ["ord_missing"]);
+    expect(coldFixture.result).toEqual({ state: "unknown", order_id: "ord_missing" });
+    expect(coldView.has(cellKey("object_lineage", "the_horoscope"))).toBe(true);
     const east = await turn("the_deck", "east");
     expect(east.attempt).toBe(1);
     expect(east.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });

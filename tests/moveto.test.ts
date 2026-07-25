@@ -22,8 +22,16 @@ describe("moveto", () => {
     const container = world.createAuthoredObject(auth.actor, { parent: "$thing", name: "Tracker" });
     definePropertyVersionedAs(world, auth.actor, container, "events", [], "rw", null, "list");
     installVerbAs(world, auth.actor, container, "acceptable", `verb :acceptable(obj) rxd { this.events = this.events + ["acceptable"]; return true; }`, null);
-    installVerbAs(world, auth.actor, container, "enterfunc", `verb :enterfunc(obj) rx { this.events = this.events + ["enterfunc"]; return true; }`, null);
-    installVerbAs(world, auth.actor, container, "exitfunc", `verb :exitfunc(obj) rx { this.events = this.events + ["exitfunc"]; return true; }`, null);
+    installVerbAs(world, auth.actor, container, "enterfunc", `verb :enterfunc(obj) rx {
+  if (caller != obj) { raise { code: "E_PERM", message: "bad lifecycle caller" }; }
+  this.events = this.events + ["enterfunc"];
+  return true;
+}`, null);
+    installVerbAs(world, auth.actor, container, "exitfunc", `verb :exitfunc(obj) rx {
+  if (caller != obj) { raise { code: "E_PERM", message: "bad lifecycle caller" }; }
+  this.events = this.events + ["exitfunc"];
+  return true;
+}`, null);
     const item = world.createAuthoredObject(auth.actor, { parent: "$thing", name: "Pebble", location: container });
     // createAuthoredObject is the trusted-authoring path; it does not fire
     // enterfunc, so container.events is still []. The first observed hook
@@ -31,7 +39,11 @@ describe("moveto", () => {
     const target = world.createAuthoredObject(auth.actor, { parent: "$thing", name: "Bowl" });
     definePropertyVersionedAs(world, auth.actor, target, "events", [], "rw", null, "list");
     installVerbAs(world, auth.actor, target, "acceptable", `verb :acceptable(obj) rxd { this.events = this.events + ["acceptable"]; return true; }`, null);
-    installVerbAs(world, auth.actor, target, "enterfunc", `verb :enterfunc(obj) rx { this.events = this.events + ["enterfunc"]; return true; }`, null);
+    installVerbAs(world, auth.actor, target, "enterfunc", `verb :enterfunc(obj) rx {
+  if (caller != obj) { raise { code: "E_PERM", message: "bad lifecycle caller" }; }
+  this.events = this.events + ["enterfunc"];
+  return true;
+}`, null);
 
     const result = await world.directCall("moveto-chain", auth.actor, auth.actor, "do_move", [item, target]);
     expect(result.op).toBe("result");

@@ -114,7 +114,10 @@ To install a catalog from outside this repo, the canonical path is
 the GitHub-tap-then-install model in
 [`../../spec/discovery/catalogs.md`](../../spec/discovery/catalogs.md).
 You publish your catalog to a Git repo, register a tap, and install.
-This is the path third-party catalogs take.
+This is the path third-party catalogs take. Runtime catalog install and
+update execute arbitrary shared class code, so they are wizard-only and
+audited; a normal programmer can author and publish the catalog, but an
+operator must approve its installation into a world.
 
 ## Versioning and migrations
 

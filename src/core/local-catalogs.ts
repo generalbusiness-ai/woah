@@ -26,6 +26,32 @@ export type LocalCatalogStatus = CatalogManifestStatus & {
 
 const LOCAL_CATALOGS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.manifest] as const));
 const LOCAL_CATALOG_MIGRATIONS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.migrations] as const));
+
+// Load-time shape gate for bundled migration manifests. The boot-upgrade
+// picker reads `from_version`/`to_version` off every migration; a file
+// authored with the wrong keys (e.g. `{from, to, operations}`) used to
+// surface only as `undefined.split` deep inside versionPatternMatches on a
+// deployed world. Fail HERE, at module load, naming the catalog and file —
+// the build gates (catalog:index, guard-catalog-migrations) enforce the same
+// contract earlier, this is the last line of defense.
+for (const entry of BUNDLED_CATALOGS) {
+  entry.migrations.forEach((migration, index) => {
+    const file = entry.migration_paths[index] ?? `migrations[${index}]`;
+    const record = migration as unknown as Record<string, unknown>;
+    const bad =
+      !migration || typeof migration !== "object" ||
+      typeof record.from_version !== "string" ||
+      typeof record.to_version !== "string" ||
+      typeof record.spec_version !== "string" ||
+      !Array.isArray(record.steps);
+    if (bad) {
+      throw new Error(
+        `bundled catalog "${entry.manifest.name}" migration ${file} is malformed: ` +
+        `expected {from_version, to_version, spec_version, steps[]}, found keys [${Object.keys(record ?? {}).join(", ")}]`
+      );
+    }
+  });
+}
 const LOCAL_CATALOG_SOURCE_MIGRATION = "2026-04-30-source-catalog-verbs";
 const LOCAL_CATALOG_PLACEMENT_MIGRATION = "2026-04-30-catalog-placement-metadata";
 const LOCAL_CATALOG_CHAT_COCKATOO_MIGRATION = "2026-04-30-chat-cockatoo";
@@ -313,9 +339,21 @@ export function installLocalCatalogs(
   // previous major. Without this step, an existing world keeps the old
   // surface (e.g. v0 forecast_hours) but flips its registry to the new
   // version, which is the worst of both worlds.
-  runLocalCatalogVersionMigrations(world, repairNames, report);
-  const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
-  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, report);
+  const blocked = runLocalCatalogVersionMigrations(world, repairNames, report);
+  // Fail-closed (the net-install activation rule): a missing or failed
+  // major-version migration aborts HERE, before any boot migration or
+  // schema sync mutates the world — an install plan must never do schema
+  // work on a world it already knows it cannot migrate.
+  if (failures.length > 0) {
+    throw new Error(`catalog install failed closed: ${JSON.stringify(failures)}`);
+  }
+  // Warn-only boot: blocked catalogs are excluded from every later repair
+  // phase, so their old definitions and data stay untouched for operator
+  // attention (§CT5.4.1) — a schema sync would otherwise install the new
+  // definitions without the major's data rewrites.
+  const repairableNames = blocked.size > 0 ? repairNames.filter((name) => !blocked.has(name)) : repairNames;
+  const covered = runLocalCatalogMigrations(world, repairableNames, cleanInstalled);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairableNames, covered, report);
   if (failures.length > 0) {
     throw new Error(`catalog install failed closed: ${JSON.stringify(failures)}`);
   }
@@ -1428,7 +1466,15 @@ function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string
 // found, or the matching one was already applied, this is a no-op.
 type CatalogInstallFailureReport = (event: string, detail: Record<string, unknown>) => void;
 
-function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[], report: CatalogInstallFailureReport): void {
+/** Returns the BLOCKED catalog set: catalogs whose required major-version
+ * migration is missing or failed. A blocked catalog must be excluded from
+ * every later boot repair phase (one-shot boot migrations and the drift
+ * schema sync) — running them anyway would install the new definitions
+ * WITHOUT the major's data rewrites, leaving the worst of both worlds
+ * (spec/discovery/catalogs.md §CT5.4.1). The world keeps its old
+ * definitions, data, and recorded version for operator attention. */
+function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[], report: CatalogInstallFailureReport): Set<string> {
+  const blocked = new Set<string>();
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name);
@@ -1437,8 +1483,20 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
     const currentVersion = installedLocalCatalogVersion(world, name);
     if (!currentVersion || currentVersion === manifest.version) continue;
     if (!isVersionLessThan(currentVersion, manifest.version)) continue;
-    const migration = pickMatchingMigration(migrations, currentVersion, manifest.version);
-    if (!migration) continue;
+    const migration = composeMigrationChain(migrations, currentVersion, manifest.version);
+    if (!migration) {
+      // Minor/patch drift within one major needs no migration file (the
+      // guard only requires major edges) — the auto schema sync covers it.
+      // A MAJOR jump with no covering migration (single or composed chain)
+      // is a packaging defect: the world would be schema-synced to the new
+      // definitions WITHOUT its data rewrites. Report it loudly AND block
+      // the catalog from every later repair phase.
+      if (majorVersionOf(currentVersion) !== majorVersionOf(manifest.version)) {
+        report("woo.local_catalog_version_migration_missing", { catalog: name, from: currentVersion, to: manifest.version });
+        blocked.add(name);
+      }
+      continue;
+    }
     try {
       updateCatalogManifest(world, manifest, {
         tap: "@local",
@@ -1450,8 +1508,14 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
       });
     } catch (err) {
       report("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
+      // A failed major migration leaves the same hazard as a missing one:
+      // schema-syncing now would flip definitions without the data
+      // rewrites. Block; the migration is idempotent, so the next boot
+      // (or the operator) can re-run it safely.
+      blocked.add(name);
     }
   }
+  return blocked;
 }
 
 function installedLocalCatalogVersion(world: WooWorld, name: string): string | null {
@@ -1483,6 +1547,81 @@ function pickMatchingMigration(
     }
   }
   return null;
+}
+
+/** Compose bundled migrations into one manifest covering (fromVersion ->
+ * toVersion).
+ *
+ * The guard convention (scripts/guard-catalog-migrations.mjs) ships one file
+ * per MAJOR edge — `migration-v(N-1)-to-vN.json` — but local boot applies a
+ * SINGLE migration for the full installed→bundled jump. A world installed at
+ * v1 booting into a v3 bundle therefore needs v1→v2 and v2→v3 chained, or it
+ * would match nothing and be schema-synced without its data rewrites.
+ *
+ * A direct single-file match wins (the common one-major upgrade, and the only
+ * way a wildcard `to_version` like weather's "1.x.x" can terminate). Otherwise
+ * walk adjacent edges: follow the migration whose `from_version` pattern
+ * matches the cursor, advance the cursor to that migration's `to_version`
+ * (wildcard minor/patch resolve to 0 — the next edge's `from_version` is a
+ * major-wide pattern by the same convention), and stop when an edge's
+ * `to_version` covers the target. A conventional edge ending at `N.0.0`
+ * also covers a later bundled `N.y.z`: the edge performs the major data
+ * rewrite and the same update installs the target patch definitions. The
+ * composed manifest broadens only that final edge to `N.x.x` so the ordinary
+ * migration validator can check the actual target. The composed manifest
+ * concatenates the steps in order; each step is idempotent by the migration contract
+ * (spec/discovery/catalogs.md §CT14), so a chain re-run after partial failure
+ * is safe. Returns null when no chain connects (caller decides how loudly to
+ * complain). */
+function composeMigrationChain(
+  migrations: readonly CatalogMigrationManifest[],
+  fromVersion: string,
+  toVersion: string
+): CatalogMigrationManifest | null {
+  const direct = pickMatchingMigration(migrations, fromVersion, toVersion);
+  if (direct) return direct;
+  const chain: CatalogMigrationManifest[] = [];
+  const used = new Set<CatalogMigrationManifest>();
+  let cursor = fromVersion;
+  // Each hop consumes one distinct migration, so the walk is bounded by the
+  // file count; `used` also breaks any accidental version-pattern cycle.
+  for (let hop = 0; hop < migrations.length; hop++) {
+    const next = migrations.find((m) => !used.has(m) && versionPatternMatches(m.from_version, cursor)) ?? null;
+    if (!next) return null;
+    used.add(next);
+    chain.push(next);
+    if (migrationEdgeReachesTarget(next.to_version, toVersion)) {
+      // Chain complete. spec_versions must agree for validateCatalogMigration
+      // (it checks the composed value against the manifest); a mixed chain is
+      // unmergeable, and the shape guards make it a build error anyway.
+      if (chain.some((m) => m.spec_version !== chain[0].spec_version)) return null;
+      return {
+        from_version: chain[0].from_version,
+        to_version: versionPatternMatches(next.to_version, toVersion)
+          ? next.to_version
+          : `${majorVersionOf(toVersion)}.x.x`,
+        spec_version: chain[0].spec_version,
+        steps: chain.flatMap((m) => m.steps)
+      };
+    }
+    cursor = next.to_version.split(".").map((part) => (part === "x" ? "0" : part)).join(".");
+  }
+  return null;
+}
+
+/** A per-major migration normally lands on N.0.0. Later N.y.z bundles still
+ * need that same edge when upgrading from N-1: patch/minor schema drift does
+ * not require another data migration, but it must not make the major chain
+ * appear missing. Never let a future edge cover an older target. */
+function migrationEdgeReachesTarget(edgeToVersion: string, targetVersion: string): boolean {
+  if (versionPatternMatches(edgeToVersion, targetVersion)) return true;
+  if (edgeToVersion.includes("x")) return false;
+  return majorVersionOf(edgeToVersion) === majorVersionOf(targetVersion)
+    && !isVersionLessThan(targetVersion, edgeToVersion);
+}
+
+function majorVersionOf(version: string): number {
+  return Number(version.split(/[+-]/)[0].split(".")[0]) || 0;
 }
 
 function versionPatternMatches(pattern: string, version: string): boolean {

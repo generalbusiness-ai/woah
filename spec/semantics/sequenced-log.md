@@ -76,6 +76,34 @@ The body-level `space?` field on calls ([rest.md §R6](../protocol/rest.md#r6-ve
 
 SSE event ids (`<log-id>:<seq>`) likewise reference `$sequenced_log` descendants generally. Single-log resume per [rest.md §R8](../protocol/rest.md#r8-stream-sse) works for any subclass.
 
+### Net authority pages
+
+The Net sparse planning image does not contain sequenced-log rows. A native
+`replay(from, limit)` therefore reads one exact owner-served page identified
+by the **semantic** log object and its bounds: `(space, from, limit)`. A
+missing page aborts planning with the internal, uncatchable
+`E_NEED_REPLAY_PAGE`; the gateway fetches at most 1000 committed rows from
+the space's authority, installs them only in the ephemeral planning image,
+and replans. Returning an empty local tail is non-conforming because it would
+make journals and projection rebuilds silently incomplete.
+
+The page carries a content version. The transcript records
+`replayReads: [{space, from, limit, scope, version}]`; the committing scope
+re-derives pages it owns and validates foreign pages against a fresh owner
+attestation. An append that changes the requested window rejects
+`read_version_mismatch`, after which the gateway refetches that page. The
+authority address (`room:<space>`) is routing metadata only: stored entries,
+replay results, act guards, and projection rebuilds always use the semantic
+space id.
+
+On Net, the explicit `next_seq` allocation is a versioned read/write pair in
+the transcript and the committed log row is appended in the same authority
+transaction. Per [coherence.md §CO2.3](../protocol/coherence.md#co23-commit-scope-by-write-set-with-ride-along),
+a turn that commits away from the semantic space (notably pure movement)
+does not consume that space's seq or append to its log. An act-emitting turn
+writes room-owned projection state, so ride-along selects the room authority
+and preserves the atomic act/log/fold contract.
+
 ---
 
 ## SL5. The v1 reference subclass: `$space`

@@ -1,27 +1,10 @@
 import "./styles.css";
-import chatManifest from "../../catalogs/chat/manifest.json";
-import demoworldManifest from "../../catalogs/demoworld/manifest.json";
-import dispenserManifest from "../../catalogs/dispenser/manifest.json";
-import dubspaceManifest from "../../catalogs/dubspace/manifest.json";
-import noteManifest from "../../catalogs/note/manifest.json";
-import outlinerManifest from "../../catalogs/outliner/manifest.json";
-import pinboardManifest from "../../catalogs/pinboard/manifest.json";
-import tasksManifest from "../../catalogs/tasks/manifest.json";
-import weatherManifest from "../../catalogs/weather/manifest.json";
-import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
-import * as demoworldUiModule from "../../catalogs/demoworld/ui/demoworld-chat";
-import * as dispenserUiModule from "../../catalogs/dispenser/ui/dispenser-chat";
-import * as dubspaceUiModule from "../../catalogs/dubspace/ui/dubspace-workspace";
-import * as noteUiModule from "../../catalogs/note/ui/note-chat";
-import * as outlinerUiModule from "../../catalogs/outliner/ui/outliner-tree";
-import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
-import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
-import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
+import { BUNDLED_CATALOG_UI } from "../generated/bundled-catalog-ui";
 import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "../../catalogs/dubspace/ui/model";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type ResolvedFrame, type WooContext, type WooElement, type WooViewHydrationContext } from "./framework";
-import { isPinboardObservation } from "./pinboard-observation";
+import { isPinboardObservation } from "../../catalogs/pinboard/ui/pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, resolveOptionalRoomContents, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
@@ -121,6 +104,8 @@ type ToolTabDefinition = {
   catalogAlias: string;
   frameComponent: string;
   seedCatalogAlias: string;
+  seedRef: string;
+  seedMountRoom: string | null;
   classRef: string;
   emptyTitle: string;
   emptyMessage: string;
@@ -131,20 +116,10 @@ type ToolTabDefinition = {
   leave?: (done?: () => void) => void;
 };
 
-function bundledSeedRef(manifest: any, classRef: string): string {
-  return String(manifest?.seed_hooks?.find((hook: any) => hook?.kind === "create_instance" && hook?.class === classRef)?.as ?? "");
-}
-
 function bundledSeedRefs(manifest: any, classRef: string): string[] {
   return (manifest?.seed_hooks ?? [])
     .filter((hook: any) => hook?.kind === "create_instance" && hook?.class === classRef && typeof hook.as === "string")
     .map((hook: any) => String(hook.as));
-}
-
-function bundledSeedMountRoom(manifest: any, classRef: string): string | null {
-  const seed = manifest?.seed_hooks?.find((hook: any) => hook?.kind === "create_instance" && hook?.class === classRef);
-  const mountRoom = seed?.properties?.mount_room;
-  return typeof mountRoom === "string" && mountRoom ? mountRoom : null;
 }
 
 type RenderFocusSnapshot = {
@@ -178,6 +153,12 @@ type PinboardViewportPresence = PinNoteBox & {
   scale: number;
   at: number;
 };
+
+function bundledManifest(alias: string): any {
+  return BUNDLED_CATALOG_UI.find((entry) => entry.alias === alias)?.manifest;
+}
+
+const dubspaceManifest = bundledManifest("dubspace");
 
 type PinboardMapModel = {
   minX: number;
@@ -230,96 +211,68 @@ const toolReturnRooms = new Map<string, string>();
 // Distinguish a successfully inspected unmounted tool (Tasks: Chat should remain
 // in the task room) from a mounted tool whose parent metadata is merely missing.
 const resolvedToolMountMetadata = new Set<string>();
-// Demo tool seeds live in demoworld's manifest now (the
-// demoworld-dependency-inversion). Read from demoworld so the SPA can route
-// to them on first load. Tasks still self-seeds its board with no location
-// coupling, so it reads from its own manifest.
-const bundledToolSeeds = {
-  dubspace: bundledSeedRef(demoworldManifest, "$dubspace"),
-  pinboard: bundledSeedRef(demoworldManifest, "$pinboard"),
-  outliner: bundledSeedRef(demoworldManifest, "$outliner"),
-  tasks: bundledSeedRef(tasksManifest, "$task_registry")
-} as const;
-// Bundled navigation metadata is part of the same seed contract that supplies
-// each toolbar destination. Reading it locally avoids spending a Net cell read
-// on immutable install-time defaults; a projected live value still wins below
-// when a tool has subsequently been remounted.
-const bundledToolMountRooms = {
-  dubspace: bundledSeedMountRoom(demoworldManifest, "$dubspace"),
-  pinboard: bundledSeedMountRoom(demoworldManifest, "$pinboard"),
-  outliner: bundledSeedMountRoom(demoworldManifest, "$outliner"),
-  tasks: bundledSeedMountRoom(tasksManifest, "$task_registry")
-} as const;
-const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
-  {
-    tab: "dubspace",
-    label: "Dubspace",
-    viewAliases: ["dubspace"],
-    catalogAlias: "dubspace",
-    frameComponent: "dubspace.workspace",
-    seedCatalogAlias: "dubspace",
-    classRef: "$dubspace",
-    emptyTitle: "Dubspace",
-    emptyMessage: "No dubspace UI is registered for this space.",
-    elementSelector: "[data-dubspace-workspace]",
-    elementTagAttrs: (subject) => `data-dubspace-workspace data-dubspace-space="${escapeHtml(subject)}"`,
-    mount: () => bindDubspace(),
-    enter: () => enterDubspace()
-  },
-  {
-    tab: "pinboard",
-    label: "Pinboard",
-    viewAliases: ["pinboard"],
-    catalogAlias: "pinboard",
-    frameComponent: "pinboard.board",
-    seedCatalogAlias: "pinboard",
-    classRef: "$pinboard",
-    emptyTitle: "Pinboard",
-    emptyMessage: "No pinboard UI is registered for this board.",
-    elementSelector: "[data-pinboard-board]",
-    elementTagAttrs: (subject) => `data-pinboard-board data-pinboard-space="${escapeHtml(subject)}"`,
-    mount: () => bindPinboard(),
-    enter: () => enterPinboard()
-  },
-  {
-    tab: "tasks",
-    label: "Tasks",
-    viewAliases: ["tasks", "kanban"],
-    catalogAlias: "tasks",
-    frameComponent: "tasks.kanban",
-    seedCatalogAlias: "tasks",
-    classRef: "$task_registry",
-    emptyTitle: "Tasks",
-    emptyMessage: "No tasks UI is registered for this registry.",
-    elementSelector: "[data-tasks-board]",
-    elementTagAttrs: (subject) => `data-tasks-board data-tasks-registry="${escapeHtml(subject)}"`,
-    mount: () => bindTasks(),
-    enter: () => enterTasks()
-  },
-  {
-    tab: "outliner",
-    label: "Outliner",
-    viewAliases: ["outliner", "outline"],
-    catalogAlias: "outliner",
-    frameComponent: "outliner.tree",
-    seedCatalogAlias: "demoworld",
-    classRef: "$outliner",
-    emptyTitle: "Outliner",
-    emptyMessage: "No outliner UI is registered.",
-    elementSelector: "[data-outliner-tree]",
-    elementTagAttrs: (subject) => `data-outliner-tree data-outliner-subject="${escapeHtml(subject)}"`,
-    mount: () => bindOutliner(),
-    enter: () => enterOutliner()
-  }
-];
-const TOOL_TABS = TOOL_TAB_DEFINITIONS.map((definition) => definition.tab);
-const bundledCatalogManifests: Record<string, any> = {
-  dubspace: dubspaceManifest,
-  pinboard: pinboardManifest,
-  outliner: outlinerManifest,
-  tasks: tasksManifest,
-  demoworld: demoworldManifest
+const TOOL_HOST_BEHAVIORS: Record<ToolTab, Pick<ToolTabDefinition, "mount" | "enter">> = {
+  dubspace: { mount: bindDubspace, enter: enterDubspace },
+  pinboard: { mount: bindPinboard, enter: enterPinboard },
+  tasks: { mount: bindTasks, enter: enterTasks },
+  outliner: { mount: bindOutliner, enter: enterOutliner }
 };
+
+function isSupportedToolTab(value: string): value is ToolTab {
+  return Object.prototype.hasOwnProperty.call(TOOL_HOST_BEHAVIORS, value);
+}
+
+function bundledSeedDeclaration(classRef: string): { alias: string; hook: any } | undefined {
+  for (const entry of BUNDLED_CATALOG_UI) {
+    const hook = ((entry.manifest as any).seed_hooks ?? [])
+      .find((candidate: any) => candidate?.kind === "create_instance" && candidate?.class === classRef);
+    if (hook) return { alias: entry.alias, hook };
+  }
+  return undefined;
+}
+
+/** Discover bundled navigation from frame/component/seed declarations. The
+ * shell retains only interaction adapters; catalog identities and presentation
+ * no longer have a second hand-maintained table here. */
+function discoverBundledToolDefinitions(): ToolTabDefinition[] {
+  return BUNDLED_CATALOG_UI.flatMap((entry) => {
+    const manifest = entry.manifest as any;
+    return (manifest.ui?.frames ?? []).flatMap((frame: any) => {
+      const navigation = frame?.navigation;
+      if (frame?.layout !== "space-workspace" || !navigation || !isSupportedToolTab(String(navigation.tab ?? ""))) return [];
+      const tab = String(navigation.tab) as ToolTab;
+      const mainNode = Array.isArray(frame?.regions?.main) ? frame.regions.main[0] : undefined;
+      const frameComponent = String(mainNode?.component ?? "");
+      const component = (manifest.ui?.components ?? []).find((candidate: any) => candidate?.id === frameComponent);
+      if (!component) throw new Error(`navigation frame ${entry.alias}:${String(frame.id ?? tab)} has no main component`);
+      const seed = bundledSeedDeclaration(String(frame.subject ?? ""));
+      const requestedHostAttribute = String(navigation.host_attribute ?? "").trim();
+      const hostAttribute = /^data-[a-z0-9-]+$/.test(requestedHostAttribute) ? requestedHostAttribute : "";
+      return [{
+        tab,
+        label: String(navigation.label ?? tab),
+        viewAliases: Array.isArray(navigation.aliases) ? navigation.aliases.map(String) : [tab],
+        catalogAlias: entry.alias,
+        frameComponent,
+        seedCatalogAlias: seed?.alias ?? entry.alias,
+        seedRef: String(seed?.hook?.as ?? ""),
+        seedMountRoom: typeof seed?.hook?.properties?.mount_room === "string" ? seed.hook.properties.mount_room : null,
+        classRef: String(frame.subject ?? ""),
+        emptyTitle: String(navigation.label ?? tab),
+        emptyMessage: `No ${String(navigation.label ?? tab)} UI is registered for this object.`,
+        elementSelector: `[data-tool-workspace="${tab}"]`,
+        elementTagAttrs: (subject: string) => [hostAttribute, `data-tool-subject="${escapeHtml(subject)}"`].filter(Boolean).join(" "),
+        ...TOOL_HOST_BEHAVIORS[tab]
+      }];
+    });
+  });
+}
+
+const TOOL_TAB_DEFINITIONS = discoverBundledToolDefinitions();
+const TOOL_TABS = TOOL_TAB_DEFINITIONS.map((definition) => definition.tab);
+const bundledCatalogManifests: Record<string, any> = Object.fromEntries(
+  BUNDLED_CATALOG_UI.map((entry) => [entry.alias, entry.manifest])
+);
 const sessionKey = "woo.session";
 const usernameKey = "woo.username";
 const authMethodKey = "woo.authMethod";
@@ -341,7 +294,7 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 const pendingNetworkTurns = new Set<string>();
 const pendingToolEnters = new Set<string>();
 const pendingToolEnterTimers = new Map<string, number>();
-const pendingToolMoveRetryTimers = new Map<string, number>();
+const pendingToolEnterRetryTimers = new Map<string, number>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
@@ -548,18 +501,18 @@ function clearPendingToolEnter(space: string) {
   const timer = pendingToolEnterTimers.get(space);
   if (timer !== undefined) window.clearTimeout(timer);
   pendingToolEnterTimers.delete(space);
-  const retryTimer = pendingToolMoveRetryTimers.get(space);
+  const retryTimer = pendingToolEnterRetryTimers.get(space);
   if (retryTimer !== undefined) window.clearTimeout(retryTimer);
-  pendingToolMoveRetryTimers.delete(space);
+  pendingToolEnterRetryTimers.delete(space);
 }
 
 function clearPendingToolEnters(options: { render?: boolean } = {}) {
-  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0 && pendingToolMoveRetryTimers.size === 0) return;
+  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0 && pendingToolEnterRetryTimers.size === 0) return;
   for (const timer of pendingToolEnterTimers.values()) window.clearTimeout(timer);
-  for (const timer of pendingToolMoveRetryTimers.values()) window.clearTimeout(timer);
+  for (const timer of pendingToolEnterRetryTimers.values()) window.clearTimeout(timer);
   pendingToolEnters.clear();
   pendingToolEnterTimers.clear();
-  pendingToolMoveRetryTimers.clear();
+  pendingToolEnterRetryTimers.clear();
   if (options.render) render();
 }
 
@@ -833,13 +786,13 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
     });
 }
 
-async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void) {
+async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void, route: "direct" | "sequenced" = "sequenced") {
   if (!netFeed) {
     onError?.(new Error("net feed not connected"));
     return;
   }
   try {
-    const outcome = await netFeed.turn({ target, verb, args });
+    const outcome = await netFeed.turn({ target, verb, args, route });
     if (outcome.status !== "accepted" || outcome.error !== undefined) {
       onError?.(outcome.error ?? outcome.raw);
       return;
@@ -861,8 +814,8 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
       return;
     }
     try {
-      const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text] });
-      const plan = planned.result as { target?: unknown; verb?: unknown; args?: unknown } | null;
+      const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text], route: "direct" });
+      const plan = planned.result as { target?: unknown; verb?: unknown; args?: unknown; route?: unknown } | null;
       if (planned.status !== "accepted" || !plan || typeof plan !== "object" || typeof plan.verb !== "string") {
         onError?.(planned.error ?? planned.raw);
         return;
@@ -872,7 +825,8 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
         plan.verb,
         Array.isArray(plan.args) ? plan.args : [],
         onResult,
-        onError
+        onError,
+        plan.route === "sequenced" ? "sequenced" : "direct"
       );
     } catch (err) {
       onError?.(err);
@@ -2113,7 +2067,12 @@ async function refreshNetRoomProjection(): Promise<void> {
     // its presence-authorized cells arrive. Keep the readable room/roster and
     // omit that stale optional row instead of discarding the whole projection.
     const contents = await resolveOptionalRoomContents(contentRows, roster, (id) =>
-      fetchNetObjectSummary(id, ["description", "aliases", "features"])
+      // A room relation can contain dozens of objects. Hydrate only the
+      // lineage/live identity needed to list and route them; components fetch
+      // their explicitly declared fields through ProjectionFieldFiller when
+      // they become visible. Eagerly reading three optional properties here
+      // multiplied one bounded relation into a rate-limit-sized startup burst.
+      fetchNetObjectSummary(id)
     );
     const here = {
       id: room,
@@ -2857,7 +2816,7 @@ function toolSpace(tab: ToolTab): string {
   if (route?.view && definition.viewAliases.includes(route.view) && route.objectId) return route.objectId;
   if (state.routedSubjects[tab]) return state.routedSubjects[tab] ?? "";
   const scoped = scopedToolSubject(tab);
-  return scoped || activeInstalledCatalogSeed(definition.seedCatalogAlias, bundledToolSeeds[tab]);
+  return scoped || activeInstalledCatalogSeed(definition.seedCatalogAlias, definition.seedRef);
 }
 
 function dubspaceSpace() {
@@ -2933,11 +2892,11 @@ async function prepareToolNavigation(tab: AppTab): Promise<void> {
   if (isToolTab(tab)) {
     const definition = toolDefinition(tab);
     const bundledSubject = definition
-      ? activeInstalledCatalogSeed(definition.seedCatalogAlias, bundledToolSeeds[tab])
+      ? activeInstalledCatalogSeed(definition.seedCatalogAlias, definition.seedRef)
       : "";
     if (subject === bundledSubject) {
       resolvedToolMountMetadata.add(subject);
-      const bundledParentRoom = bundledToolMountRooms[tab];
+      const bundledParentRoom = definition?.seedMountRoom;
       if (bundledParentRoom && bundledParentRoom !== subject) {
         toolReturnRooms.set(subject, bundledParentRoom);
       }
@@ -3025,7 +2984,7 @@ function v2Turn(input: V2TurnInput): string {
   // no frame lifecycle to settle an optimistic entry against.
   if (netMode()) {
     const netId = input.id ?? crypto.randomUUID();
-    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError);
+    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError, input.route);
     return netId;
   }
   const id = input.id ?? crypto.randomUUID();
@@ -3126,7 +3085,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
       void netTurn(target || space, verb, args, resolve, (error: any) => {
         onError?.(error);
         reject(error);
-      });
+      }, "sequenced");
     });
   }
   const id = crypto.randomUUID();
@@ -3184,7 +3143,7 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
 
 function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
   if (netMode()) {
-    void netTurn(target || activeChatRoom() || "", verb, args, onResult, onError);
+    void netTurn(target || activeChatRoom() || "", verb, args, onResult, onError, "direct");
     return null;
   }
   const persistence = verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";
@@ -3770,18 +3729,7 @@ async function ensureScopedProjectionReady() {
 }
 
 function installBundledCatalogUi() {
-  const bundled = [
-    { alias: "chat", manifest: chatManifest, objects: { "$space": "$space", "$chatroom": "$chatroom" }, modules: { "chat-ui": chatUiModule } },
-    { alias: "note", manifest: noteManifest, objects: {}, modules: { "note-chat": noteUiModule } },
-    { alias: "dispenser", manifest: dispenserManifest, objects: {}, modules: { "dispenser-chat": dispenserUiModule } },
-    { alias: "demoworld", manifest: demoworldManifest, objects: {}, modules: { "demoworld-chat": demoworldUiModule } },
-    { alias: "dubspace", manifest: dubspaceManifest, objects: { "$dubspace": "$dubspace" }, modules: { "dubspace-ui": dubspaceUiModule } },
-    { alias: "pinboard", manifest: pinboardManifest, objects: { "$pinboard": "$pinboard" }, modules: { "pinboard-ui": pinboardUiModule } },
-    { alias: "outliner", manifest: outlinerManifest, objects: { "$outliner": "$outliner" }, modules: { "outliner-ui": outlinerUiModule } },
-    { alias: "tasks", manifest: tasksManifest, objects: { "$task_registry": "$task_registry" }, modules: { "tasks-ui": tasksUiModule } },
-    { alias: "weather", manifest: weatherManifest, objects: { "$weather_block": "$weather_block" }, modules: { "weather-ui": weatherUiModule } }
-  ] as const;
-  for (const item of bundled) {
+  for (const item of BUNDLED_CATALOG_UI) {
     const uiManifest = (item.manifest as any).ui;
     if (!uiManifest) continue;
     // Bundled-catalog mode registers statically imported source. Installed remote
@@ -3790,7 +3738,10 @@ function installBundledCatalogUi() {
     const diagnostics = ui.catalogUi.installCatalogUi({
       alias: item.alias,
       catalog: item.alias,
-      objects: item.objects,
+      objects: Object.fromEntries(((item.manifest as any).classes ?? [])
+        .map((cls: any) => String(cls?.local_name ?? ""))
+        .filter(Boolean)
+        .map((localName: string) => [localName, localName])),
       ui: uiManifest
     } satisfies CatalogUiPackage);
     if (diagnostics.length > 0) throw new Error(`bundled ${item.alias} UI manifest is invalid: ${diagnostics.join("; ")}`);
@@ -4783,7 +4734,7 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
   const frameId = `chat:${subject || "room"}`;
   ui.frames.ensureFrame(frameId, subject, "default");
   const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...v2ProjectionObjectRefs(subject), ...uiProjectionObjectRefs(subject), ...(state.actor ? [state.actor] : [])].filter(Boolean));
-  return {
+  const context: WooContext = {
     actor: state.actor ?? null,
     frame: {
       id: frameId,
@@ -4807,8 +4758,10 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
     directCall: (target, verb, args = [], options) => new Promise((resolve, reject) => {
       direct(target, verb, args, resolve, reject, options);
     }),
+    view: (request) => ui.view(state.actor, context, request),
     emit: (action) => ui.frames.emit(action)
   };
+  return context;
 }
 
 function v2ProjectionObjectRefs(scope: string): string[] {
@@ -5970,15 +5923,15 @@ type RoomToolLifecycleOptions = {
 
 type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route">;
 
-function scheduleToolMoveRetry(options: ToolMoveOptions) {
+function scheduleToolEnterRetry(options: RoomToolLifecycleOptions, resume: () => void) {
   const { tab, space } = options;
   if (!space || !state.actor) return;
-  if (pendingToolMoveRetryTimers.has(space)) return;
+  if (pendingToolEnterRetryTimers.has(space)) return;
   beginPendingToolEnter(space);
   if (state.tab === tab) render();
   const startedAt = performance.now();
   const retry = () => {
-    pendingToolMoveRetryTimers.delete(space);
+    pendingToolEnterRetryTimers.delete(space);
     const isPresent = options.isPresent ?? (() => actorPresentInSpace(space));
     if (state.tab !== tab) {
       clearPendingToolEnter(space);
@@ -5997,12 +5950,12 @@ function scheduleToolMoveRetry(options: ToolMoveOptions) {
       return;
     }
     if (state.actor && options.canSend()) {
-      moveActorToToolSpace(options, { retrying: true });
+      resume();
       return;
     }
-    pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+    pendingToolEnterRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
   };
-  pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+  pendingToolEnterRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
 }
 
 function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying?: boolean } = {}) {
@@ -6015,7 +5968,7 @@ function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying
     return;
   }
   if (!canSend()) {
-    scheduleToolMoveRetry(options);
+    scheduleToolEnterRetry(options, () => moveActorToToolSpace(options, { retrying: true }));
     return;
   }
   if (!retryOptions.retrying && pendingToolEnters.has(space)) {
@@ -6054,18 +6007,26 @@ function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying
   }
 }
 
-function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
+function enterRoomToolSpace(options: RoomToolLifecycleOptions, retryOptions: { retrying?: boolean } = {}) {
   const { tab, space, canSend, route = "direct" } = options;
   // Room-like tool mutating verbs pass the substrate's presence gate on
   // $space, so the SPA must move the actor into the tool room before it exposes
   // the companion chat and mutation controls. Keep this shared so new tools do
   // not drift into bespoke chat/presence semantics.
-  if (!space || !canSend()) return;
-  if ((options.isPresent ?? (() => actorPresentInSpace(space)))() || pendingToolEnters.has(space)) {
+  if (!space || !state.actor) return;
+  if ((options.isPresent ?? (() => actorPresentInSpace(space)))()) {
     options.onAlreadyPresent?.();
     requestSpaceChatFocus(space);
     return;
   }
+  // The shell renders before Net's socket becomes writable. Preserve an early
+  // navigation click exactly as move-based tools do; silently dropping it
+  // leaves the workspace visible but never establishes its authority/presence.
+  if (!canSend()) {
+    scheduleToolEnterRetry(options, () => enterRoomToolSpace(options, { retrying: true }));
+    return;
+  }
+  if (!retryOptions.retrying && pendingToolEnters.has(space)) return;
   beginPendingToolEnter(space);
   if (state.tab === tab) render();
   const turnId = v2Turn({
@@ -6097,7 +6058,10 @@ function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
 }
 
 function enterTasks() {
-  enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser });
+  // $room:enter is a sequenced durable command. Sending it through Net's
+  // direct plane can return without committing the actor's presence, leaving
+  // the board mounted but its companion/presence authority unopened.
+  enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser, route: "sequenced" });
 }
 
 function enterOutliner() {

@@ -43,7 +43,9 @@ export class WooClient {
 
   async authenticate(token: string): Promise<WooSession> {
     this.token = token;
-    const body = await this.requestJson("POST", "/net-api/session", {});
+    // A scheduled appliance needs ordinary Net presence for authorization
+    // and fanout, but it is not a person in the room's social roster.
+    const body = await this.requestJson("POST", "/net-api/session", { roster_visible: false });
     this.session = {
       actor: String(body.actor),
       session: String(body.session),
@@ -51,6 +53,16 @@ export class WooClient {
       tokenClass: "apikey"
     };
     return this.session;
+  }
+
+  /** Release the authority session even when a tick fails. Hidden-roster
+   * sessions are still real Net state and must not linger until expiry. */
+  async close(): Promise<void> {
+    if (!this.session) return;
+    const session = this.session.session;
+    await this.requestJson("DELETE", "/net-api/session", { session });
+    this.session = null;
+    this.token = null;
   }
 
   async getProperty(target: string, name: string): Promise<unknown> {

@@ -25,7 +25,7 @@
  * touching the pipeline (plan risk R5).
  */
 import { netError } from "./errors";
-import { netCellKeyFor, type EffectTranscript } from "./transcript";
+import { isSequencedAllocationCell, netCellKeyFor, type EffectTranscript } from "./transcript";
 
 export type ScopeClassifier = {
   /** The scope that owns an object's authority cells (its anchor/home). */
@@ -49,6 +49,14 @@ export function selectCommitScope(
   const written = new Set<string>();
   for (const write of transcript.writes) {
     if (netCellKeyFor(write.cell) === null) continue; // contents → projection, not authority (CA4)
+    // The sequenced seq allocation (the space's reserved `next_seq`) is
+    // sequencer BOOKKEEPING, not a verb effect: counting it would drag
+    // every sequenced turn onto the room sequencer, defeating CA3 pure
+    // movement. Selection ignores it; the planner then KEEPS it only when
+    // the selected scope owns the space (where it applies and serializes)
+    // and STRIPS it otherwise (an off-space commit consumes no seq) —
+    // plan.ts stripUnownedSequencedAllocation.
+    if (isSequencedAllocationCell(transcript, write.cell)) continue;
     if (write.cell.kind === "session") {
       // CO14: a transcript's session cells are the CALLING session's (the
       // mint and the plan-time fold are the only producers — sessions.ts

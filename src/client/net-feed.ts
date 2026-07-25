@@ -28,16 +28,17 @@ import { turnEchoId } from "../net/turn-echo";
  * them minimally because src/client must not import src/worker):
  *
  *   POST /net-api/session {ttl_ms?}            → {session, actor, expires_at, scope}
- *   POST /net-api/turn {target,verb,args,session,idempotency_key} → TurnResult
+ *   POST /net-api/turn {target,verb,args,route?,session,idempotency_key} → TurnResult
  *   GET  /net-api/cell?key=                    → {key, cell}
  *   GET  /net-api/relation?relation=&owner=    → {relation, owner, members}
  *   POST /net-api/browser-metrics              → {ok, accepted, sampled}
  *   POST /net-api/ws-ticket {session}          → {ticket, expires_at}  (B3)
  *   GET  /net-api/ws?ticket=                   → WebSocket upgrade
- *     client→server frames: {type:"turn", id, target, verb, args, idempotency_key}
+ *     client→server frames: {type:"turn", id, route?, target, verb, args, idempotency_key}
  *                           {type:"ping", id?}
  *     server→client frames: {type:"turn_result", id, status, ...TurnResult|{error}}
  *                           {type:"observations", scope, seq, echo_id?, observations}
+ *                           {type:"live_observations", scope, echo_id?, observations}
  *                           {type:"pong", id} / {type:"error", id?, error}
  *   Errors everywhere: {error:{code, message, detail?}} — surfaced here
  *   as NetFeedError.
@@ -46,7 +47,8 @@ import { turnEchoId } from "../net/turn-echo";
  *   - The submitting session receives its own turn's observations ON THE
  *     TURN REPLY (source:"self"); the gateway skips its sockets when the
  *     same turn's fanout arrives.
- *   - {type:"observations"} frames are peer traffic (source:"peer").
+ *   - {type:"observations"} frames are committed peer traffic
+ *     (source:"peer").
  *     Frames are per-scope ordered at the source (outbox FIFO lanes), so
  *     a frame at seq ≤ the scope's high-water is a redelivery — dropped.
  *   - Defensive self-echo guard: the gateway's echo dedupe is a bounded
@@ -158,7 +160,7 @@ export type NetFeedState = {
 
 /** One observation, as the feed emits it to subscribers.
  * source:"self" — from our own turn's reply (already committed);
- * source:"peer" — from a fanout {type:"observations"} frame. */
+ * source:"peer" — from a committed or live observation frame. */
 export type NetFeedObservationEvent = {
   source: "self" | "peer";
   /** The committing scope (reply.scope for self, frame.scope for peer). */
@@ -482,11 +484,12 @@ export class NetFeed {
    * the outcome resolves, and the turn's observations emit to
    * subscribers as source:"self".
    */
-  async turn(input: { target: string; verb: string; args?: unknown[] }): Promise<NetTurnOutcome> {
+  async turn(input: { target: string; verb: string; args?: unknown[]; route?: "direct" | "sequenced" }): Promise<NetTurnOutcome> {
     if (!this.session) throw new NetFeedError("E_NOSESSION", "open() the feed before submitting turns", 0);
     const turnId = randomTurnId();
     const echoId = turnEchoId(turnId);
     const args = input.args ?? [];
+    const route = input.route ?? "sequenced";
     this.pending.set(turnId, {
       turn_id: turnId,
       target: input.target,
@@ -500,13 +503,13 @@ export class NetFeed {
     try {
       let body: Record<string, unknown>;
       if (this.connection === "open" && this.socket) {
-        const overWs = await this.turnOverSocket(turnId, input.target, input.verb, args);
+        const overWs = await this.turnOverSocket(turnId, route, input.target, input.verb, args);
         body =
           overWs === WS_INTERRUPTED
-            ? await this.turnOverRest(turnId, input.target, input.verb, args)
+            ? await this.turnOverRest(turnId, route, input.target, input.verb, args)
             : overWs;
       } else {
-        body = await this.turnOverRest(turnId, input.target, input.verb, args);
+        body = await this.turnOverRest(turnId, route, input.target, input.verb, args);
       }
       const outcome = this.settleTurn(turnId, echoId, body);
       settled = true;
@@ -528,6 +531,7 @@ export class NetFeed {
   /** Send the turn frame and await its correlated turn_result. */
   private turnOverSocket(
     turnId: string,
+    route: "direct" | "sequenced",
     target: string,
     verb: string,
     args: unknown[]
@@ -557,7 +561,7 @@ export class NetFeed {
       }, this.wsTurnTimeoutMs);
       try {
         socket.send(
-          JSON.stringify({ type: "turn", id: turnId, target, verb, args, idempotency_key: turnId })
+          JSON.stringify({ type: "turn", id: turnId, route, target, verb, args, idempotency_key: turnId })
         );
       } catch {
         this.wsInFlight.delete(turnId);
@@ -568,12 +572,13 @@ export class NetFeed {
 
   private async turnOverRest(
     turnId: string,
+    route: "direct" | "sequenced",
     target: string,
     verb: string,
     args: unknown[]
   ): Promise<Record<string, unknown>> {
     try {
-      return await this.postTurn(turnId, target, verb, args);
+      return await this.postTurn(turnId, route, target, verb, args);
     } catch (err) {
       // M10: the session expired under an in-flight REST turn. Re-mint
       // once and retry with the SAME idempotency key — CO2.5 makes the
@@ -582,7 +587,7 @@ export class NetFeed {
       // past the streak cap throws terminally, surfacing to the caller.
       if (err instanceof NetFeedError && err.code === "E_NOSESSION") {
         await this.remintSession();
-        return await this.postTurn(turnId, target, verb, args);
+        return await this.postTurn(turnId, route, target, verb, args);
       }
       throw err;
     }
@@ -592,6 +597,7 @@ export class NetFeed {
    * a single re-mint+retry on E_NOSESSION). */
   private async postTurn(
     turnId: string,
+    route: "direct" | "sequenced",
     target: string,
     verb: string,
     args: unknown[]
@@ -600,6 +606,7 @@ export class NetFeed {
       target,
       verb,
       args,
+      route,
       session: this.session,
       idempotency_key: turnId
     })) as Record<string, unknown>;
@@ -941,6 +948,10 @@ export class NetFeed {
     }
     if (frame.type === "observations") {
       this.handleObservationsFrame(frame);
+      return;
+    }
+    if (frame.type === "live_observations") {
+      this.handleLiveObservationsFrame(frame);
     }
   }
 
@@ -974,6 +985,25 @@ export class NetFeed {
     }
     this.readCache.clear();
     for (const observation of observations) this.emitObservation({ source: "peer", scope, seq, observation });
+  }
+
+  /** Live direct observations intentionally have no seq/high-water. They are
+   * lossy peer signals: dedupe only by the submitting turn's safe echo token,
+   * then deliver with seq:null so consumers cannot mistake them for authority. */
+  private handleLiveObservationsFrame(frame: Record<string, unknown>): void {
+    const scope = typeof frame.scope === "string" ? frame.scope : "";
+    if (!scope) return;
+    const echoId = typeof frame.echo_id === "string" && frame.echo_id ? frame.echo_id : null;
+    if (echoId && (this.settledEchoIds.has(echoId) || this.pendingEchoToTurn.has(echoId))) return;
+    const observations = Array.isArray(frame.observations)
+      ? (frame.observations.filter(
+          (item) => item && typeof item === "object" && !Array.isArray(item)
+        ) as Record<string, unknown>[])
+      : [];
+    this.readCache.clear();
+    for (const observation of observations) {
+      this.emitObservation({ source: "peer", scope, seq: null, observation });
+    }
   }
 
   // ---- Shared internals ----------------------------------------------------

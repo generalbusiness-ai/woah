@@ -2,37 +2,16 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const root = process.cwd();
-const checkedRoots = ["src/core", "src/mcp"];
+const checkedRoots = ["src/core", "src/mcp", "src/net", "src/worker", "src/client"];
 const skippedDirs = new Set(["node_modules", "dist", ".git", "src/generated"]);
+const baselinePath = join(root, "scripts", "guard-layering-baseline.json");
 
-// These substrate identifiers are architectural roots or compiler/runtime
-// placeholders, not catalog-level object names.
+// These names are substrate identities or compiler/runtime placeholders. They
+// are architectural vocabulary rather than knowledge of an installed catalog.
 const allowedRefs = new Set(["$wiz", "$system", "$nowhere", "$catalog_registry", "$catalog", "$error", "$me", "$verb"]);
-
-// Existing files still carry catalog-object knowledge that predates this guard.
-// Keep the exemptions narrow so new v2 code cannot add fresh object-name
-// dependencies while that legacy debt is migrated out of core/MCP code.
-const legacyDebtFiles = new Set([
-  "src/core/bootstrap.ts",
-  "src/core/catalog-installer.ts",
-  "src/core/catalog-taps.ts",
-  "src/core/dsl-compiler.ts",
-  "src/core/local-catalogs.ts",
-  "src/core/protocol.ts",
-  "src/core/repository.ts",
-  "src/core/tiny-vm.ts",
-  "src/core/types.ts",
-  "src/core/world.ts"
-]);
-
 const objectRefPattern = /\$[A-Za-z_][A-Za-z0-9_]*/g;
-const hits = [];
-
-// The classic v2 MCP gateway (src/mcp/gateway.ts) is retired. Its
-// transport/catalog-coupling checks are removed with it; the net MCP surface in
-// src/worker/net/gateway-do.ts reads deterministic movement rules from verb
-// metadata by construction (see reads_room_presence / host_placement).
-const forbiddenTransportCatalogCouplings = [];
+const observed = new Map();
+const violations = [];
 
 function normalize(path) {
   return relative(root, path).split(sep).join("/");
@@ -47,34 +26,59 @@ function walk(path) {
     return;
   }
   if (!/\.ts$/.test(path)) return;
-  if (legacyDebtFiles.has(rel)) return;
 
-  const text = readFileSync(path, "utf8");
-  const lines = text.split(/\r?\n/);
-  for (const [index, line] of lines.entries()) {
+  const source = readFileSync(path, "utf8");
+  for (const [index, line] of source.split(/\r?\n/).entries()) {
     objectRefPattern.lastIndex = 0;
     for (const match of line.matchAll(objectRefPattern)) {
       const ref = match[0];
-      if (!allowedRefs.has(ref)) hits.push(`${rel}:${index + 1}: ${ref}: ${line.trim()}`);
+      if (allowedRefs.has(ref)) continue;
+      const key = `${rel}\0${ref}`;
+      observed.set(key, {
+        file: rel,
+        ref,
+        count: (observed.get(key)?.count ?? 0) + 1,
+        firstLine: observed.get(key)?.firstLine ?? index + 1,
+        snippet: observed.get(key)?.snippet ?? line.trim()
+      });
     }
   }
 }
 
 for (const dir of checkedRoots) walk(join(root, dir));
 
-for (const { file, snippet, reason } of forbiddenTransportCatalogCouplings) {
-  const text = readFileSync(join(root, file), "utf8");
-  const index = text.indexOf(snippet);
-  if (index === -1) continue;
-  const line = text.slice(0, index).split(/\r?\n/).length;
-  hits.push(`${file}:${line}: ${snippet}: ${reason}`);
+const baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
+const expected = new Map();
+for (const [file, refs] of Object.entries(baseline)) {
+  for (const [ref, count] of Object.entries(refs)) {
+    expected.set(`${file}\0${ref}`, { file, ref, count });
+  }
 }
 
-if (hits.length > 0) {
-  console.error("Catalog object literals and catalog-specific transport couplings must not leak into new core/MCP implementation files:");
-  for (const hit of hits) console.error(`  ${hit}`);
+// The baseline is an exact per-file/per-reference occurrence budget. It
+// replaces whole-file exemptions: adding even one use of an already tolerated
+// name fails, while removing debt requires deleting its stale budget now.
+for (const [key, hit] of observed) {
+  const budget = expected.get(key);
+  if (!budget) {
+    violations.push(`${hit.file}:${hit.firstLine}: new ${hit.ref}: ${hit.snippet}`);
+  } else if (hit.count !== budget.count) {
+    violations.push(`${hit.file}:${hit.firstLine}: ${hit.ref} occurs ${hit.count} times; baseline is ${budget.count}`);
+  }
+}
+for (const [key, budget] of expected) {
+  if (!observed.has(key)) violations.push(`${budget.file}: stale baseline for ${budget.ref}; remove the ${budget.count}-occurrence budget`);
+}
+
+if (violations.length > 0) {
+  console.error("Catalog object literals leaked across the substrate/client layering boundary.");
+  console.error("The exact legacy baseline may only shrink; move catalog behavior into its catalog module.");
   console.error("");
+  for (const violation of violations) console.error(`  ${violation}`);
+  console.error("");
+  console.error(`Audited roots: ${checkedRoots.join(", ")}`);
   console.error(`Allowed substrate refs: ${Array.from(allowedRefs).sort().join(", ")}`);
-  console.error("Legacy debt exemptions are listed in scripts/guard-layering.mjs and should shrink over time.");
   process.exit(1);
 }
+
+console.log(`layering: ok (${checkedRoots.length} roots, ${observed.size} exact legacy budgets)`);

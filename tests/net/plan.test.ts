@@ -7,15 +7,24 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, storeCells } from "../../src/net/bridge";
-import { CellStore } from "../../src/net/cells";
-import { planTurn, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
+import { CellStore, cellVersion } from "../../src/net/cells";
+import { planTurn, type PlanTurnResult } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
-import { ScopeSequencer } from "../../src/net/scope";
+import { assertEnvelopeCeiling, ScopeSequencer, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/scope";
 import { netCellKeyFor } from "../../src/net/transcript";
 import type { ShadowTurnCall } from "../../src/net/bridge";
 
 const SCOPE = "home";
 const EPOCH = "cat1";
+
+/** The bytes a warm gateway submit of this plan would put on the wire:
+ * the CO7 envelope is the ACTUAL serialized submit RPC body ({submit,
+ * rider/relation destinations} — gateway-do's submitBody), measured with
+ * the same helper the gateway enforces the ceiling on. Warm turns carry
+ * empty destination maps. */
+function warmSubmitBytes(plan: PlanTurnResult): number {
+  return submitEnvelopeBytes({ submit: plan.submit, rider_destinations: {}, relate_destinations: {} });
+}
 
 // Phase-2 fixed assignment: every object anchors to the one shared scope
 // the test sequencer owns (route.ts selection still runs for real).
@@ -45,11 +54,22 @@ function harness(tag: string) {
     null
   );
   expect(installed.ok).toBe(true);
+  expect(installVerb(
+    world,
+    "plan_box",
+    "read_twice",
+    `verb :read_twice() rxd {
+      let first = this.counter;
+      let second = this.counter;
+      return first + second;
+    }`,
+    null
+  ).ok).toBe(true);
 
   const seq = new ScopeSequencer(SCOPE, EPOCH);
   seq.seed(cellsFromSerialized(world.exportWorld()));
 
-  const call = (id: string): ShadowTurnCall => ({
+  const call = (id: string, verb = "bump"): ShadowTurnCall => ({
     kind: "woo.turn_call.shadow.v1",
     id,
     route: "direct",
@@ -57,7 +77,7 @@ function harness(tag: string) {
     session: session.id,
     actor,
     target: "plan_box",
-    verb: "bump",
+    verb,
     args: []
   });
   return { seq, call, actor, session };
@@ -94,9 +114,9 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
       if (netCellKeyFor(read.cell) === null) continue;
       expect(read.version === "absent" || typeof read.version === "string").toBe(true);
     }
-    // CO7 warm envelope stays under the ceiling and is accounted.
-    expect(plan.envelopeBytes).toBeGreaterThan(0);
-    expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    // CO7: the actual serialized submit body stays under the warm ceiling.
+    expect(warmSubmitBytes(plan)).toBeGreaterThan(0);
+    expect(warmSubmitBytes(plan)).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
 
     const reply = seq.submit(plan.submit);
     expect(reply.status).toBe("accepted");
@@ -105,6 +125,26 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
     expect(reply.post_state_version).toBe(plan.submit.post_state_version);
     // Authority holds the {value, def} payload the planner predicted.
     expect(seq.store.get("property_cell:plan_box:counter")?.value).toMatchObject({ value: 1 });
+  });
+
+  it("keeps successful results gateway-local and deduplicates exact wire-read proofs", async () => {
+    const { seq, call } = harness("wire-proof");
+    const plan = await planTurn({
+      call: call("wire-proof-1", "read_twice"),
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "wire-proof-1",
+      stamp: seq.stamp()
+    });
+
+    expect(plan.transcript.result).toBe(0);
+    expect(plan.submit.transcript.result).toBeUndefined();
+    const fullIdentities = plan.transcript.reads.map((read) => cellVersion(read));
+    const wireIdentities = plan.submit.transcript.reads.map((read) => cellVersion(read));
+    expect(new Set(fullIdentities).size).toBeLessThan(fullIdentities.length);
+    expect(wireIdentities).toEqual([...new Set(fullIdentities)]);
   });
 });
 
@@ -157,7 +197,7 @@ describe("compact room-roster planning", () => {
       expect.objectContaining({ player: "guest_0", name: "Guest 0" }),
       expect.objectContaining({ player: "guest_29", name: "Guest 29" })
     ]));
-    expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(warmSubmitBytes(plan)).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     expect(plan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
 
     // The chat catalog adapter used by enter/who/look preserves its stable
@@ -187,8 +227,106 @@ describe("compact room-roster planning", () => {
       expect.objectContaining({ id: "guest_0", name: "Guest 0", presence: "awake" }),
       expect.objectContaining({ id: "guest_29", name: "Guest 29", presence: "awake" })
     ]));
-    expect(roomRosterPlan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(warmSubmitBytes(roomRosterPlan)).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     expect(roomRosterPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
+
+    // `look_at` must render the names already carried by the compact owner
+    // projection. Re-dereferencing each row's actor id would restore one
+    // foreign-cluster proof per occupant and turn an O(1)-RPC room read into
+    // an unbounded cross-authority fan-out.
+    const lookPlan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-chat-look-30",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: room,
+        verb: "look",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-chat-look-30",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+    expect(lookPlan.transcript.error).toBeUndefined();
+    expect(
+      String(lookPlan.transcript.observations.find((observation) => observation.type === "looked")?.text ?? "")
+    ).toContain("Guest 29");
+    expect(lookPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
+  });
+
+  it("keeps reusable-actor session history out of the Net live carrier", async () => {
+    const world = createWorld();
+    const primary = world.auth("guest:compact-live-audience");
+    const room = world.object(primary.actor).location ?? "$nowhere";
+    const now = Date.now();
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      player: index === 0 ? primary.actor : `remote_${index}`,
+      name: `Remote ${index}`,
+      connected: true,
+      connected_at: now - 5_000,
+      connected_seconds: 5,
+      idle_seconds: 0,
+      last_login_at: now - 5_000,
+      location: room,
+      location_name: room,
+      presence: "awake"
+    }));
+    // Reusable pool actors acquire multiple short-lived sessions over time.
+    // Model a gateway whose derived view has not yet received every owner
+    // deletion: the executor may enumerate those exact local sessions, but
+    // the Net carrier must route by actor rather than repeating bearer ids
+    // for every tell_lines/who observation.
+    for (let index = 0; index < 40; index += 1) {
+      world.ensureSessionForActor(
+        `s_net-api-7_${index.toString(16).padStart(32, "0")}`,
+        primary.actor,
+        "guest",
+        now + 600_000,
+        room
+      );
+    }
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-live-audience",
+        route: "direct",
+        scope: SCOPE,
+        session: primary.id,
+        actor: primary.actor,
+        target: primary.actor,
+        verb: "who_all",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-live-audience",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+
+    expect(plan.liveAudience?.audienceSessions).toBeUndefined();
+    expect(plan.liveAudience?.observationSessionAudiences).toBeUndefined();
+    expect(plan.liveAudience?.observationAudienceModes).toContain("explicit");
+    expect(plan.liveAudience?.observationAudiences?.flat()).toEqual(
+      expect.arrayContaining([primary.actor])
+    );
+    expect(submitEnvelopeBytes({
+      submit: plan.submit,
+      rider_destinations: {},
+      relate_destinations: {},
+      live_audience: plan.liveAudience
+    })).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
   });
 
   it.each([
@@ -391,6 +529,53 @@ describe("compact room-roster planning", () => {
       (read.cell.name === "description" || read.cell.name === "home")
     )).toBe(false);
   });
+
+  it("carries hidden-roster policy through a move without a same-turn social echo", async () => {
+    const world = createWorld();
+    world.createObject({ id: "home", name: "Home", parent: "$room", owner: "$wiz" });
+    const session = world.auth("guest:hidden-planner");
+    session.rosterVisible = false;
+    await world.directCall("hidden-enter-setup", session.actor, "the_chatroom", "leave", [], { sessionId: session.id });
+    const destination = "the_chatroom";
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const movementClassifier: ScopeClassifier = {
+      scopeOf: (object) => object === session.actor ? `cluster:${session.actor}` : SCOPE,
+      isShared: (scope) => scope === SCOPE
+    };
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "hidden-enter",
+        route: "sequenced",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: destination,
+        verb: "enter",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier: movementClassifier,
+      base: seq.head(),
+      idempotencyKey: "hidden-enter",
+      stamp: seq.stamp(),
+      slicePlanning: true,
+      planningRoomRoster: { room: destination, rows: [] }
+    });
+
+    expect(plan.transcript.sessionScopeTransition).toMatchObject({
+      session: session.id,
+      actor: session.actor,
+      rosterVisible: false,
+      to: destination
+    });
+    expect(plan.transcript.result).toMatchObject({ room: destination, roster: [] });
+    expect(plan.transcript.writes.find(
+      (write) => write.cell.kind === "session" && write.cell.object === session.id
+    )?.value).toMatchObject({ rosterVisible: false, activeScope: destination });
+  });
 });
 
 describe("slice-based planning (Phase 1 — the spine)", () => {
@@ -545,13 +730,14 @@ describe("the mini repair loop (CO2.4 + CO6 E_READ_VERSION semantics)", () => {
 });
 
 describe("envelope byte gates (CO7/CO10)", () => {
-  it("an oversized warm read-closure is a plain misplan Error, not a NetError", async () => {
+  it("an oversized warm submit body trips the ceiling gate as a plain misplan Error, not a NetError", async () => {
     const world = createWorld();
     const session = world.auth("guest:plan-bytes");
     const actor = session.actor;
     world.createObject({ id: "blob_box", name: "Blob Box", parent: "$thing", owner: actor });
-    // A single property page bigger than the warm ceiling: any read
-    // closure carrying it must trip the plan-time gate.
+    // A single property value bigger than the warm ceiling: the recorded
+    // read (transcript reads carry values) makes the ACTUAL submit body
+    // oversized, and the gateway-side gate must refuse it.
     world.defineProperty("blob_box", {
       name: "blob",
       defaultValue: "x".repeat(WARM_ENVELOPE_BYTE_LIMIT + 1024),
@@ -566,7 +752,10 @@ describe("envelope byte gates (CO7/CO10)", () => {
     seq.seed(cellsFromSerialized(world.exportWorld()));
     const view = derivedViewOf(seq.store);
 
-    await expect(planTurn({
+    // Planning itself succeeds — the planner no longer models envelope
+    // bytes; the ceiling is enforced on the real serialized submit body
+    // (the same measurement + gate the gateway runs before its RPC).
+    const plan = await planTurn({
       call: {
         kind: "woo.turn_call.shadow.v1",
         id: "plan-bytes-1",
@@ -584,7 +773,12 @@ describe("envelope byte gates (CO7/CO10)", () => {
       base: seq.head(),
       idempotencyKey: "kb",
       stamp: seq.stamp()
-    })).rejects.toThrow(/oversized warm envelope/);
+    });
+    const bytes = warmSubmitBytes(plan);
+    expect(bytes).toBeGreaterThan(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(() => assertEnvelopeCeiling(bytes, true)).toThrow(/oversized warm envelope/);
+    // Cross-scope ceiling is looser but still bounded.
+    expect(() => assertEnvelopeCeiling(bytes, false)).not.toThrow();
   });
 });
 

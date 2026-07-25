@@ -220,10 +220,10 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     version: 1,
     transcript: "tracked",
     deterministic: true,
-    reads: ["$system.api_keys", "target actor existence", "target actor ancestry", "actor wizard authority"],
-    writes: ["$system.api_keys", "$system.wizard_actions"],
+    reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "actor wizard authority"],
+    writes: ["target actor api_keys"],
     emits: [],
-    note: "Wizard-authority minting: records the authoritative api_keys insertion and audit append in the transcript. The minted secret is derived from randomness recorded by the host as a logical input — replay produces the same record."
+    note: "Wizard-authority minting: the target actor cluster owns the verifier record; the accepted authenticated transcript is the issuance audit. Cleartext is returned once and never stored."
   },
   create_api_key_for_owner: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -231,8 +231,8 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     version: 1,
     transcript: "tracked",
     deterministic: true,
-    reads: ["$system.api_keys", "target actor existence", "target actor ancestry", "target actor ownership", "actor wizard authority"],
-    writes: ["$system.api_keys", "$system.wizard_actions"],
+    reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "target actor ownership", "actor wizard authority"],
+    writes: ["target actor api_keys"],
     emits: [],
     note: "Owner-mint path used by block mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
   },
@@ -245,7 +245,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$system.api_keys"],
     writes: [],
     emits: [],
-    note: "API key listing is read-only and returns redacted metadata only."
+    note: "Historical global-registry compatibility listing is read-only and returns redacted metadata only; actor-owned authorities are not globally enumerable."
   },
   list_api_keys_for_owner: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -253,10 +253,10 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     version: 1,
     transcript: "tracked",
     deterministic: true,
-    reads: ["$system.api_keys", "actor ownership"],
+    reads: ["explicit target actor api_keys", "target actor existence and ancestry", "actor ownership"],
     writes: [],
     emits: [],
-    note: "Owner-scoped API key listing is read-only and returns redacted metadata only."
+    note: "Bounded actor-authority listing is read-only and returns redacted metadata only; the target is an explicit argument, never inferred from the caller frame."
   },
   revoke_api_key: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -264,8 +264,8 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     version: 1,
     transcript: "tracked",
     deterministic: true,
-    reads: ["$system.api_keys", "actor ownership", "local sessions"],
-    writes: ["$system.api_keys.revoked_at", "local sessions"],
+    reads: ["routed actor api_keys or legacy $system.api_keys", "actor ownership", "local sessions"],
+    writes: ["routed actor api_keys.revoked_at or legacy $system.api_keys.revoked_at", "local sessions"],
     emits: [],
     note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
   },
@@ -445,6 +445,17 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     writes: [],
     emits: [],
     note: "Focus-list reads are deterministic actor-local property reads."
+  },
+  replay: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "replay",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["owner-attested committed replay page (transcript.replayReads)"],
+    writes: [],
+    emits: [],
+    note: "The sequenced-log read wrapper (sequenced-log.md SL2/SL4) is transcript-safe on the sparse planning path because it resolves ONLY to an owner-served committed page installed for the exact (space, from, limit) query — attested in replayReads and re-derived by the owning scope at commit — and misses uncatchably (E_NEED_REPLAY_PAGE) otherwise. A complete local runtime reads its own durable log, which is equally deterministic pre-commit."
   }
 };
 

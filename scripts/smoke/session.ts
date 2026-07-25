@@ -66,14 +66,12 @@ export class SmokeSession {
     const sessionId = response.headers.get("mcp-session-id");
     if (!sessionId) throw new Error("MCP initialize response missing mcp-session-id");
     // Drain (and confirm parse of) the initialize envelope before emitting
-    // notifications/initialized, mirroring the SDK handshake order.
-    await parseMcpResponse(response);
-
-    // The actor id is not in the initialize response shape; resolve it from the
-    // dynamic tool list, where every actor-control tool is prefixed `${id}:`.
-    // The reachability gate guarantees `${actor}:focus_list` (and friends) are
-    // always present, so this resolver is stable.
-    const probing = new SmokeSession(transport, sessionId, "", options.label, rpcTimeoutMs);
+    // notifications/initialized, mirroring the SDK handshake order. Net names
+    // the authenticated actor in its instructions; unlike the old classic
+    // surface, it deliberately does not advertise native actor-control verbs
+    // as dynamic tools.
+    const initialized = await parseMcpResponse(response);
+    const instructionActor = actorFromInitialize(initialized);
     const notified = await fetchMcp(transport, rpcTimeoutMs, {
       method: "POST",
       headers: { "mcp-session-id": sessionId },
@@ -82,6 +80,14 @@ export class SmokeSession {
     if (notified.status !== 202) {
       throw new Error(`notifications/initialized expected 202, got ${notified.status}`);
     }
+    if (instructionActor) {
+      return new SmokeSession(transport, sessionId, instructionActor, options.label, rpcTimeoutMs);
+    }
+
+    // Compatibility fallback for older deployed workers whose initialize
+    // envelope omitted identity: discover a classic guest actor from its
+    // control tools. Net must never depend on this path.
+    const probing = new SmokeSession(transport, sessionId, "", options.label, rpcTimeoutMs);
     const tools = await probing.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 });
     const list = (tools as any)?.result?.structuredContent?.result?.tools ?? [];
     const selfTool = list.find((tool: any) =>
@@ -155,6 +161,14 @@ export class SmokeSession {
       signal
     }).catch(() => undefined);
   }
+}
+
+function actorFromInitialize(body: unknown): string | null {
+  if (!isRecord(body) || !isRecord(body.result) || typeof body.result.instructions !== "string") {
+    return null;
+  }
+  const match = /^You are woo actor ([^\s.]+)\./.exec(body.result.instructions);
+  return match?.[1] ?? null;
 }
 
 const TOOL_SPACE_EXIT_ALIASES: Record<string, string> = {
