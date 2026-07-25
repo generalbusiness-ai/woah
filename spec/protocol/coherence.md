@@ -963,15 +963,24 @@ One write path per fact (CO9), concretized:
     cluster from view lineage (CO15; convention pull `cluster:<actor>` on
     miss) and mints through `/net/session-open`'s machinery.
     `roster_visible:false` is accepted only when the request authenticated
-    with an API key. It does **not** suppress session presence: the session
-    still has `activeScope`, produces the owner-sequenced
-    `session_presence` row, receives room fanout, and satisfies
-    presence-scoped authorization. It suppresses only the actor-level social
-    roster projection consumed by `who` and presence UI. The choice is stored
-    in the session authority cell, so every gateway derives the same public
-    roster and an actor with multiple sessions remains visible when any live
-    session is roster-visible. Omission defaults to `true`; a non-boolean
-    value refuses HTTP 400 `E_INVARG`.
+    with an API key; otherwise it refuses HTTP 403 `E_PERM` with
+    `detail.reason:"roster_visibility_requires_apikey"`. It does **not**
+    suppress substrate session presence: the session still has `activeScope`,
+    produces the owner-sequenced `session_presence` row, remains eligible for
+    live observation fanout, and satisfies presence-scoped authorization.
+    Catalog delivery code MUST likewise use presence-mode delivery or
+    `live_audience`, never derive its transport audience from the social
+    roster. A planner's `active_actors` result is a useful local view, not a
+    complete distributed delivery membership proof.
+    The flag suppresses the actor from every actor/session-level social
+    projection: the compact `room_roster` consumed by `who` and presence UI,
+    and catalog properties declared with `presence_projection`. The choice is
+    stored in the session authority cell and carried by each accepted
+    `sessionScopeTransition`, so every materializer derives the same public
+    state. An actor with multiple sessions remains in `room_roster` when any
+    live session is roster-visible. Omission defaults to `true`; a non-boolean
+    value refuses HTTP 400 `E_INVARG`. A successful mint reply includes the
+    resolved `roster_visible` boolean for both API-key and human doors.
   - `DELETE /net-api/session` is semantically idempotent although its success
     invalidates its own bearer. The session-routed gateway retains a bounded
     accepted-close receipt and checks it before live-bearer authentication.

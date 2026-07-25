@@ -52,7 +52,7 @@ export type TurnRecorderEvent =
   // `object_move`: it is recorded even when the actor's physical location does
   // not change (a no-op enter while already in the room), and it drives the live
   // presence projections + session-row materialization. See cell-authority CA8.
-  | { kind: "session_scope"; session: string; actor: ObjRef; from: ObjRef | null; to: ObjRef | null }
+  | { kind: "session_scope"; session: string; actor: ObjRef; from: ObjRef | null; to: ObjRef | null; rosterVisible?: false }
   | { kind: "projection_write"; write: RecordedProjectionWrite }
   | { kind: "observe"; observation: Observation }
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }

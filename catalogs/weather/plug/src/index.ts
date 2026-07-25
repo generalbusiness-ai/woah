@@ -132,14 +132,14 @@ export async function runWeatherTick(
     try {
       await client.close();
     } catch (err) {
-      // Preserve the real tick failure when cleanup also fails; on a
-      // successful tick, a failed close is itself operational failure.
-      if (!tickFailed) throw err;
       logEvent({
         event: "session_close_error",
         block: env.BLOCK_ID,
         ...errorBreadcrumb(err)
       });
+      // Preserve the real tick failure when cleanup also fails; on a
+      // successful tick, a failed close is itself operational failure.
+      if (!tickFailed) throw err;
     }
   }
 }

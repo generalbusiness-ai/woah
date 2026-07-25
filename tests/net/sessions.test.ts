@@ -179,6 +179,7 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
     expect(submit.transcript.sessionScopeTransition).toMatchObject({
       actor: "#actor",
       session: "s-hidden",
+      rosterVisible: false,
       from: null,
       to: "room:r1"
     });
@@ -275,9 +276,15 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
       base: seq.head(),
       epoch: EPOCH,
       clusterScope: "cluster:#actor",
+      rosterVisible: false,
       closing: { priorActiveScope: "room:r1", ephemeralActor: true }
     });
     expect(submit.transcript.sessionClose).toBe(true);
+    expect(submit.transcript.sessionScopeTransition).toMatchObject({
+      rosterVisible: false,
+      from: "room:r1",
+      to: null
+    });
     expect(value.expiresAt).toBeLessThan(NOW);
     expect(value.ephemeralActor).toBe(true);
     expect(value.retireFromScope).toBe("room:r1");

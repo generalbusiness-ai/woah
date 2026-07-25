@@ -140,6 +140,10 @@ export type DirectLiveAudience = {
   observationAudiences?: ObjRef[][];
   audienceSessions?: string[];
   observationSessionAudiences?: string[][];
+  /** Actor exclusions for presence-mode observations. Unlike a planner's
+   * positive presence enumeration, this compact routing constraint remains
+   * complete when each gateway resolves its own local presence slice. */
+  observationAudienceExclusions?: ObjRef[][];
   /** Presence-derived lists are local snapshots, not complete cross-shard
    * enumerations. Relays use this parallel mode vector to resolve those
    * observations against each destination shard's own presence slice. */
@@ -614,6 +618,9 @@ export type Session = {
    * "apikey". Lets revokeApiKey close live sessions whose credential was
    * just revoked, instead of leaving them usable until expiry. */
   apikeyId?: string;
+  /** False suppresses only social roster projections. The session remains a
+   * live active-scope delivery and authorization principal. */
+  rosterVisible?: false;
   /** Wall-clock ms when this session was explicitly closed by reapSession.
    * In-memory only — not persisted, because a closed session is deleted from
    * storage immediately. Set before the session is removed from world.sessions

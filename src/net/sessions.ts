@@ -223,12 +223,22 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
             session: input.session,
             actor: input.actor,
             ...(input.actorName ? { actorName: input.actorName } : {}),
+            ...(input.rosterVisible === false ? { rosterVisible: false as const } : {}),
             from: input.closing.priorActiveScope,
             to: null
           }
         }
       : input.activeScope && !input.closing
-        ? { sessionScopeTransition: { session: input.session, actor: input.actor, ...(input.actorName ? { actorName: input.actorName } : {}), from: null, to: input.activeScope } }
+        ? {
+            sessionScopeTransition: {
+              session: input.session,
+              actor: input.actor,
+              ...(input.actorName ? { actorName: input.actorName } : {}),
+              ...(input.rosterVisible === false ? { rosterVisible: false as const } : {}),
+              from: null,
+              to: input.activeScope
+            }
+          }
         : {}),
     ...(input.exclusive ? { exclusiveMint: true } : {}),
     ...(input.closing ? { sessionClose: true } : {}),

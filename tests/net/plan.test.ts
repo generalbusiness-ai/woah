@@ -529,6 +529,53 @@ describe("compact room-roster planning", () => {
       (read.cell.name === "description" || read.cell.name === "home")
     )).toBe(false);
   });
+
+  it("carries hidden-roster policy through a move without a same-turn social echo", async () => {
+    const world = createWorld();
+    world.createObject({ id: "home", name: "Home", parent: "$room", owner: "$wiz" });
+    const session = world.auth("guest:hidden-planner");
+    session.rosterVisible = false;
+    await world.directCall("hidden-enter-setup", session.actor, "the_chatroom", "leave", [], { sessionId: session.id });
+    const destination = "the_chatroom";
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const movementClassifier: ScopeClassifier = {
+      scopeOf: (object) => object === session.actor ? `cluster:${session.actor}` : SCOPE,
+      isShared: (scope) => scope === SCOPE
+    };
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "hidden-enter",
+        route: "sequenced",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: destination,
+        verb: "enter",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier: movementClassifier,
+      base: seq.head(),
+      idempotencyKey: "hidden-enter",
+      stamp: seq.stamp(),
+      slicePlanning: true,
+      planningRoomRoster: { room: destination, rows: [] }
+    });
+
+    expect(plan.transcript.sessionScopeTransition).toMatchObject({
+      session: session.id,
+      actor: session.actor,
+      rosterVisible: false,
+      to: destination
+    });
+    expect(plan.transcript.result).toMatchObject({ room: destination, roster: [] });
+    expect(plan.transcript.writes.find(
+      (write) => write.cell.kind === "session" && write.cell.object === session.id
+    )?.value).toMatchObject({ rosterVisible: false, activeScope: destination });
+  });
 });
 
 describe("slice-based planning (Phase 1 — the spine)", () => {

@@ -70,6 +70,9 @@ export type TranscriptSessionScopeTransition = {
    * lineage. Presence owners use it for roster projection without importing
    * the actor's authority cells into every room turn. */
   actorName?: string;
+  /** Immutable service-session presentation policy, copied from the
+   * authoritative session row. False suppresses social projections only. */
+  rosterVisible?: false;
   from: ObjRef | null;
   to: ObjRef | null;
 };
@@ -231,7 +234,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           session: event.session,
           actor: event.actor,
           from: sessionScopeTransition ? sessionScopeTransition.from : event.from,
-          to: event.to
+          to: event.to,
+          ...((sessionScopeTransition?.rosterVisible === false || event.rosterVisible === false)
+            ? { rosterVisible: false as const }
+            : {})
         };
         break;
       case "projection_write":
@@ -401,6 +407,9 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     if (transition.actor !== transcript.call.actor) {
       errors.push(`session scope transition actor mismatch: transition=${transition.actor} call=${transcript.call.actor}`);
     }
+    if (transition.rosterVisible !== undefined && transition.rosterVisible !== false) {
+      errors.push("session scope transition rosterVisible must be false when present");
+    }
     const priorScope = readerSessionActiveScope(reader, transition.session);
     if (priorScope !== undefined && (priorScope ?? null) !== (transition.from ?? null)) {
       errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
@@ -519,6 +528,11 @@ export function sessionScopePresenceDeltas(
 ): PresenceProjectionRowDelta[] {
   const transition = transcript.sessionScopeTransition;
   if (!transition || !transition.session || !transition.actor) return [];
+  // Hidden-roster is immutable for the session lifetime. Such a session never
+  // contributes to catalog social projections, so neither movement nor close
+  // may add OR remove a row (the latter could erase a visible sibling session's
+  // actor-keyed row).
+  if (transition.rosterVisible === false) return [];
   const { session, actor, from, to } = transition;
   if (from === to) return [];
   const deltas: PresenceProjectionRowDelta[] = [];

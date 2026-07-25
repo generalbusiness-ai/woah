@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -662,7 +662,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"], "persistence": "live" }
           },
-          "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } if (recipient != null && recipient != this && recipient != actor && !isa(recipient, $player)) { let matched = $match:match_verb(\"on_say_to\", recipient); if (typeof(matched) == \"map\") { return recipient:on_say_to(text); } } let audience = []; for row in this:room_roster() { let listener = row[\"id\"]; if (recipient == actor || listener != recipient) { audience = audience + [listener]; } } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now(), _audience_override: audience }); /* Non-player command recipients returned above through :on_say_to; only players get targeted [to you] text. */ if (recipient != null && recipient != actor && isa(recipient, $player)) { tell(recipient, actor.name + \" [to you] \" + text); } return true; }"
+          "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } if (recipient != null && recipient != this && recipient != actor && !isa(recipient, $player)) { let matched = $match:match_verb(\"on_say_to\", recipient); if (typeof(matched) == \"map\") { return recipient:on_say_to(text); } } let excluded = []; /* Delivery stays presence-based so hidden API-key services remain live recipients; the named player gets the private tell below instead of a duplicate public line. */ if (recipient != actor && recipient != null && isa(recipient, $player)) { excluded = [recipient]; } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now(), _audience_exclude: excluded }); /* Non-player command recipients returned above through :on_say_to; only players get targeted [to you] text. */ if (recipient != null && recipient != actor && isa(recipient, $player)) { tell(recipient, actor.name + \" [to you] \" + text); } return true; }"
         },
         {
           "name": "say_as",

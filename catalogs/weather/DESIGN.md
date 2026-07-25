@@ -231,8 +231,12 @@ authorization presence while a tick runs, but `roster_visible:false` keeps
 the appliance out of `who` and presence UI. `:look` does not infer health
 from that ephemeral session: it derives `healthy`, `stale`, `pending`,
 `error`, or `never` from `last_pushed_at`, `last_error`, and `config_state`.
-At the hourly cadence, a successful reading becomes `stale` after two hours:
-one missed run plus one run of grace.
+When an imported/seeded current reading predates `last_pushed_at`, its
+`observed_at` is fallback evidence of a successful update; a displayed reading
+without either timestamp does not also print the contradictory “no successful
+update yet” sentence. The manifest's 7,200,000 ms threshold is deliberately
+coupled to `plug/wrangler.toml`'s hourly cron: one missed run plus one run of
+grace. A cadence change MUST update both values and their tests.
 
 ### Free-tier budget
 

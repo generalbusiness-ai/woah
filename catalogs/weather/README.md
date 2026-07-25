@@ -75,11 +75,15 @@ at May 6, 2026, 9:01 AM PDT.` The plug formats this from the observation
 timestamp and the block's `timezone`; `:look_self()` does not show the raw
 `last_pushed_at` epoch. It includes a durable `plug_status` map derived from
 `last_pushed_at`, `last_error`, and `config_state`: `healthy`, `stale`
-(older than two hours), `pending`, `error`, or `never`. This status never
-depends on whether the plug happens to hold an ephemeral Net session. The
-look return also exposes `daily` for verbs that need a per-day summary;
-`timeseries` is intentionally projected separately and is not in the look
-return.
+(older than two hours), `pending`, `error`, or `never`; `current.observed_at`
+is the fallback success timestamp for imported/seeded readings that lack
+`last_pushed_at`. A reading with no timestamp remains `never` in the structured
+status but does not print “no successful update yet” beside the reading. The
+two-hour threshold is paired with the plug's hourly cron and must change with
+that schedule. This status never depends on whether the plug happens to hold an
+ephemeral Net session. The look return also exposes `daily` for verbs that need
+a per-day summary; `timeseries` is intentionally projected separately and is
+not in the look return.
 
 ## Chat: `ask weather <when>`
 

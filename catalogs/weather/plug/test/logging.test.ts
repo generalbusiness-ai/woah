@@ -89,6 +89,39 @@ describe("runLoggedWeatherTick", () => {
     expect(lines[1].duration_ms).toBeGreaterThan(0);
   });
 
+  it("names a failed session close before reporting the successful tick as failed", async () => {
+    const { fetchImpl } = makeFetch([
+      () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
+      () => propertyReply("Mountain View, CA"),
+      () => propertyReply("imperial"),
+      () => propertyReply("America/Los_Angeles"),
+      () => propertyReply({}),
+      () => propertyReply([]),
+      () => ({
+        status: 200,
+        body: { data: { time: "2026-05-05T18:00:00Z", values: { temperature: 70 } } }
+      }),
+      () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
+      () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
+      () => turnReply({ ok: true }),
+      () => ({ status: 503, body: { error: { code: "E_CLOSE", message: "close unavailable" } } })
+    ]);
+
+    await expect(runLoggedWeatherTick(env, "cron", { fetchImpl })).rejects.toMatchObject({ code: "E_CLOSE" });
+    expect(lines.find((line) => line.event === "session_close_error")).toMatchObject({
+      event: "session_close_error",
+      block: "the_weather_block",
+      code: "E_CLOSE",
+      category: "woo:E_CLOSE"
+    });
+    expect(lines.find((line) => line.event === "tick_error")).toMatchObject({
+      event: "tick_error",
+      trigger: "cron",
+      code: "E_CLOSE",
+      category: "woo:E_CLOSE"
+    });
+  });
+
   it("emits tick_error with category=woo:E_NOSESSION when woo auth fails", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 401, body: { error: { code: "E_NOSESSION", message: "apikey rejected" } } })

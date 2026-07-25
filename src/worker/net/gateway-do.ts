@@ -3731,13 +3731,18 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_PERM", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 403);
     }
-    const priorValue = cell?.value as { activeScope?: string | null; ephemeralActor?: boolean } | undefined;
+    const priorValue = cell?.value as {
+      activeScope?: string | null;
+      ephemeralActor?: boolean;
+      rosterVisible?: false;
+    } | undefined;
     const prior = priorValue?.activeScope ?? null;
     const opened = await this.sessionOpen({
       session,
       actor,
       ttl_ms: 0, // ignored in closing mode
       catalog_epoch: epoch,
+      ...(priorValue?.rosterVisible === false ? { roster_visible: false } : {}),
       closing: { priorActiveScope: prior, ...(priorValue?.ephemeralActor ? { ephemeralActor: true } : {}) }
     });
     if (opened.reply.status !== "accepted") {
@@ -5640,6 +5645,12 @@ export class NetGatewayDO {
       const parsed = row.body ? (JSON.parse(row.body) as { actor?: string }) : null;
       actorOf.set(row.member, typeof parsed?.actor === "string" ? parsed.actor : null);
     }
+    // Compile compact negative audiences once per fanout. Applying an array
+    // scan for every (carrier session × observation) would turn a catalog's
+    // exclusion list into an avoidable O(N*E) delivery cost.
+    const presenceExclusions = (liveBody?.observationAudienceExclusions ?? []).map(
+      (items) => new Set(Array.isArray(items) ? items.filter((item): item is string => typeof item === "string") : [])
+    );
     // NC8a fanout-cost evidence: audience size and frames actually sent —
     // the "fanout cost as audience grows" dashboard series.
     let deliveredMembers = 0;
@@ -5666,6 +5677,7 @@ export class NetGatewayDO {
             // The indexed query already selected sessions present in this
             // scope. Re-resolve the audience on every shard: the planning
             // gateway's enumerated room snapshot is not globally complete.
+            if (actor !== null && presenceExclusions[index]?.has(actor)) return false;
             return !(
               (obs.type === "entered" || obs.type === "left" || obs.type === "taken" || obs.type === "dropped")
               && typeof obs.actor === "string"

@@ -3,7 +3,13 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
 import { installCatalogManifest } from "../src/core/catalog-installer";
-import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld, type EffectTranscript } from "../src/core/effect-transcript";
+import {
+  effectTranscriptFromRecordedTurn,
+  sessionScopePresenceDeltas,
+  transcriptTouchedStateHash,
+  validateTranscriptAgainstSerializedWorld,
+  type EffectTranscript
+} from "../src/core/effect-transcript";
 import { remoteBridgeEffectName } from "../src/core/remote-bridge-transcript-policy";
 import { transcriptTouchedObjectIds } from "../src/core/shadow-commit-scope";
 import { shadowCommitReceipt } from "../src/core/turn-commit";
@@ -365,6 +371,74 @@ describe("turn recorder", () => {
         { kind: "prop", object: "custom_presence_room", name: "looks_like_presence_but_is_plain" }
       ]
     });
+  });
+
+  it("keeps hidden service sessions out of every catalog-declared social presence projection", () => {
+    const projections = () => [
+      { name: "actor_roster", def: { kind: "presence" as const, key: "actor" as const } },
+      {
+        name: "session_roster",
+        def: {
+          kind: "presence" as const,
+          key: "session" as const,
+          sessionField: "sid",
+          actorField: "who"
+        }
+      }
+    ];
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "cluster:service",
+      seq: 1,
+      session: "service-session",
+      call: { actor: "service", target: "service", verb: "session_mint", args: [] },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "hidden-social-projection",
+      sessionScopeTransition: {
+        session: "service-session",
+        actor: "service",
+        rosterVisible: false,
+        from: null,
+        to: "room"
+      }
+    } satisfies EffectTranscript;
+
+    expect(sessionScopePresenceDeltas(projections, transcript)).toEqual([]);
+    expect(sessionScopePresenceDeltas(projections, {
+      ...transcript,
+      sessionScopeTransition: {
+        session: "service-session",
+        actor: "service",
+        rosterVisible: false,
+        from: "room",
+        to: null
+      }
+    })).toEqual([]);
+
+    // Omission is the compact visible form and still derives both declared
+    // shapes, so this regression cannot "fix" privacy by disabling the
+    // facility globally.
+    expect(sessionScopePresenceDeltas(projections, {
+      ...transcript,
+      sessionScopeTransition: {
+        session: "human-session",
+        actor: "human",
+        from: null,
+        to: "room"
+      }
+    })).toEqual([
+      expect.objectContaining({ property: "actor_roster", op: "add", actor: "human" }),
+      expect.objectContaining({ property: "session_roster", op: "add", session: "human-session" })
+    ]);
   });
 
   it("keeps Tier 1 look and describe verbs in bytecode transcripts", async () => {

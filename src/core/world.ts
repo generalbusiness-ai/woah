@@ -741,30 +741,51 @@ export class WooWorld {
     // net planning always installs an explicit snapshot (including []).
     const now = this.logicalNow("room_roster.now");
     const roomName = this.objects.get(room)?.name ?? room;
-    return this.activeActorsIn(room).filter((actor) => this.objects.has(actor)).map((actor) => {
-      const stats = this.playerSessionStats(actor, now);
-      const presence = stats.connected
-        ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"
-        : "sleeping";
-      return {
-        player: actor,
-        name: this.objects.get(actor)?.name ?? actor,
-        connected: stats.connected,
-        connected_at: stats.connectedAt,
-        connected_seconds: stats.connectedSeconds,
-        idle_seconds: stats.idleSeconds,
-        last_login_at: stats.lastLoginAt,
-        location: room,
-        location_name: roomName,
-        presence
-      } as unknown as WooValue;
-    });
+    return this.activeActorsIn(room)
+      .filter((actor) => this.objects.has(actor) && this.actorIsRosterVisibleIn(actor, room))
+      .map((actor) => {
+        const stats = this.playerSessionStats(actor, now);
+        const presence = stats.connected
+          ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"
+          : "sleeping";
+        return {
+          player: actor,
+          name: this.objects.get(actor)?.name ?? actor,
+          connected: stats.connected,
+          connected_at: stats.connectedAt,
+          connected_seconds: stats.connectedSeconds,
+          idle_seconds: stats.idleSeconds,
+          last_login_at: stats.lastLoginAt,
+          location: room,
+          location_name: roomName,
+          presence
+        } as unknown as WooValue;
+      });
+  }
+
+  /** Local-runtime counterpart of Net's roomRosterRows filter. An actor is
+   * socially visible when any live session in the room is visible. Actors
+   * known only through a legacy projection remain visible for compatibility;
+   * complete local session state is authoritative whenever it exists. */
+  private actorIsRosterVisibleIn(actor: ObjRef, room: ObjRef): boolean {
+    const now = Date.now();
+    let hasLiveSession = false;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor || session.activeScope !== room || this.sessionExpired(session, now)) continue;
+      hasLiveSession = true;
+      if (session.rosterVisible !== false) return true;
+    }
+    return !hasLiveSession;
   }
 
   /** Apply a planned session transition to the transient owner snapshot so
    * move results describe post-turn presence. This mutates planning-only data;
    * the accepted relation remains the sole durable write path. */
   private applyTransientRoomRosterTransition(session: Session, from: ObjRef | null, to: ObjRef): void {
+    // Hidden service sessions never contribute to the social projection. Do
+    // not even remove the actor: a separate visible session may be the reason
+    // the deduplicated actor row exists.
+    if (session.rosterVisible === false) return;
     if (from) {
       const source = this.roomRosterProjections.get(from);
       if (source) {
@@ -4687,6 +4708,7 @@ export class WooWorld {
       observationAudiences: liveAudiences.observationAudiences,
       audienceSessions: liveAudiences.audienceSessions,
       observationSessionAudiences: liveAudiences.observationSessionAudiences,
+      observationAudienceExclusions: liveAudiences.observationAudienceExclusions,
       observationAudienceModes: liveAudiences.observationAudienceModes
     };
   }
@@ -6301,7 +6323,14 @@ export class WooWorld {
         // session-row materialization follow editor movement, not just physical
         // room movement (see movetoActorChecked).
         if (session.activeScope !== destination) {
-          this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: session.activeScope ?? null, to: destination });
+          this.recordTurnEvent({
+            kind: "session_scope",
+            session: session.id,
+            actor,
+            from: session.activeScope ?? null,
+            to: destination,
+            ...(session.rosterVisible === false ? { rosterVisible: false } : {})
+          });
         }
         this.setSessionActiveScope(session, destination);
         this.persistSession(session);
@@ -6726,7 +6755,14 @@ export class WooWorld {
       // physical containment. The accepted transcript carries this so every
       // materializer can repair the live presence projections + session row.
       if (oldLocation !== targetRef) {
-        this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: oldLocation ?? null, to: targetRef });
+        this.recordTurnEvent({
+          kind: "session_scope",
+          session: session.id,
+          actor,
+          from: oldLocation ?? null,
+          to: targetRef,
+          ...(session.rosterVisible === false ? { rosterVisible: false } : {})
+        });
       }
       this.setSessionActiveScope(session, targetRef);
       if (derivesPresenceFromTranscript) {
@@ -8845,7 +8881,8 @@ export class WooWorld {
         lastDetachAt: session.lastDetachAt,
         tokenClass: session.tokenClass,
         activeScope: session.activeScope,
-        ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
+        ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {}),
+        ...(session.rosterVisible === false ? { rosterVisible: false } : {})
       };
     }
 
@@ -9426,7 +9463,7 @@ export class WooWorld {
   }
 
   private hydrateSession(
-    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; activeScope?: ObjRef | null; active_scope?: ObjRef | null; currentLocation?: ObjRef | null; apikeyId?: string },
+    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; activeScope?: ObjRef | null; active_scope?: ObjRef | null; currentLocation?: ObjRef | null; apikeyId?: string; rosterVisible?: false },
     now: number
   ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
@@ -9453,7 +9490,8 @@ export class WooWorld {
       // rather than restoring some old timestamp from `started`. Otherwise
       // every freshly-rehydrated DO would show huge idle for everyone.
       lastInputAt: now,
-      ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
+      ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {}),
+      ...(session.rosterVisible === false ? { rosterVisible: false } : {})
     };
   }
 
@@ -9971,9 +10009,11 @@ export class WooWorld {
     const sessions = new Set<string>();
     const observationAudiences: ObjRef[][] = [];
     const observationSessionAudiences: string[][] = [];
+    const observationAudienceExclusions: ObjRef[][] = [];
     const observationAudienceModes: DirectLiveAudience["observationAudienceModes"] = [];
     for (const observation of observations) {
       observationAudienceModes.push(this.observationHasExplicitAudience(observation) ? "explicit" : "presence");
+      observationAudienceExclusions.push(this.observationAudienceExclusions(observation));
       const present = this.observationAudienceActors(audience, observation) ?? [];
       const presentSessions = await this.observationAudienceSessions(audience, observation) ?? [];
       observationAudiences.push(present);
@@ -9981,14 +10021,25 @@ export class WooWorld {
       for (const actor of present) actors.add(actor);
       for (const session of presentSessions) sessions.add(session);
       delete (observation as Record<string, unknown>)._audience_override;
+      delete (observation as Record<string, unknown>)._audience_exclude;
     }
     return {
       audienceActors: actors.size > 0 ? Array.from(actors) : undefined,
       observationAudiences: observations.length > 0 ? observationAudiences : undefined,
       audienceSessions: sessions.size > 0 ? Array.from(sessions) : undefined,
       observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined,
+      observationAudienceExclusions: observations.length > 0 ? observationAudienceExclusions : undefined,
       observationAudienceModes: observations.length > 0 ? observationAudienceModes : undefined
     };
+  }
+
+  /** Internal catalog routing hint: retain presence-mode delivery, but omit
+   * these actors. Positive presence membership is intentionally resolved at
+   * each gateway; a compact negative set remains valid across sparse shards. */
+  private observationAudienceExclusions(observation: Observation): ObjRef[] {
+    const raw = (observation as Record<string, unknown>)._audience_exclude;
+    if (!Array.isArray(raw)) return [];
+    return Array.from(new Set(raw.filter((item): item is ObjRef => typeof item === "string")));
   }
 
   /** Whether an observation names recipients independently of the audience
@@ -10017,26 +10068,29 @@ export class WooWorld {
   }
 
   private observationAudienceActors(fallbackAudience: ObjRef | null, observation: Observation): ObjRef[] | undefined {
+    const exclusions = new Set(this.observationAudienceExclusions(observation));
+    const withoutExclusions = (actors: ObjRef[] | undefined): ObjRef[] | undefined =>
+      actors?.filter((actor) => !exclusions.has(actor));
     // Per-observation audience override. Used when the source is a remote
     // $space whose subscriber list this host can't read locally — the caller
     // pre-fetches subscribers cross-host and stamps them here. The field is
     // stripped from the observation by directLiveAudiences before broadcast.
     const override = (observation as Record<string, unknown>)._audience_override;
     if (Array.isArray(override)) {
-      return override.filter((item): item is ObjRef => typeof item === "string");
+      return withoutExclusions(override.filter((item): item is ObjRef => typeof item === "string"));
     }
     if ((observation.type === "looked" || observation.type === "who") && typeof observation.to === "string") {
-      return [observation.to];
+      return withoutExclusions([observation.to]);
     }
     if (typeof observation.target === "string") {
-      if (this.objects.has(observation.target) && this.inheritsFrom(observation.target, "$actor")) return [observation.target];
-      if (!this.objects.has(observation.target)) return [observation.target];
+      if (this.objects.has(observation.target) && this.inheritsFrom(observation.target, "$actor")) return withoutExclusions([observation.target]);
+      if (!this.objects.has(observation.target)) return withoutExclusions([observation.target]);
     }
     const directed = directedRecipients(observation);
     if (directed.to) {
       const actors = [directed.to];
       if (directed.from) actors.push(directed.from);
-      return actors;
+      return withoutExclusions(actors);
     }
     const source = typeof observation.source === "string" && this.objects.has(observation.source) && this.inheritsFrom(observation.source, "$space")
       ? observation.source
@@ -10046,9 +10100,9 @@ export class WooWorld {
     const present = this.liveAudienceActors(audience);
     if (!present) return undefined;
     if ((observation.type === "entered" || observation.type === "left" || observation.type === "taken" || observation.type === "dropped") && typeof observation.actor === "string") {
-      return present.filter((actor) => actor !== observation.actor);
+      return withoutExclusions(present.filter((actor) => actor !== observation.actor));
     }
-    return present;
+    return withoutExclusions(present);
   }
 
   private async observationAudienceSessions(fallbackAudience: ObjRef | null, observation: Observation): Promise<string[] | undefined> {
