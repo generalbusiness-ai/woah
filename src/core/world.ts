@@ -3257,7 +3257,7 @@ export class WooWorld {
     const secret = payload.slice(colon + 1);
     if (!id || !secret) throw wooError("E_NOSESSION", "apikey token must be apikey:<id>:<secret>");
     const routed = parseRoutedApiKeyId(id);
-    if (routed && (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)) {
+    if (routed && (!this.objects.has(routed.actor) || this.authorityAnchorRoot(routed.actor) !== routed.authorityRoot)) {
       throw wooError("E_NOSESSION", "apikey not found or revoked");
     }
     const keys = routed
@@ -3385,7 +3385,7 @@ export class WooWorld {
   }
 
   private createApiKeyRecord(actor: ObjRef, target: ObjRef, label: string | null, auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
-    const authorityRoot = this.apiKeyAuthorityRoot(target);
+    const authorityRoot = this.authorityAnchorRoot(target);
     // n1 ids have one intentionally narrow routing grammar: catalog seed
     // roots route to `catalog`; concrete actor roots route to their cluster.
     // Refuse every other anchor shape instead of reproducing CO15's full
@@ -3439,7 +3439,7 @@ export class WooWorld {
 
   private revokeApiKeyWithClosedSessions(actor: ObjRef, id: string): { revoked: boolean; closedSessions: Session[] } {
     const routed = parseRoutedApiKeyId(id);
-    if (routed && (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)) {
+    if (routed && (!this.objects.has(routed.actor) || this.authorityAnchorRoot(routed.actor) !== routed.authorityRoot)) {
       return { revoked: false, closedSessions: [] };
     }
     const map = routed ? this.apiKeyMap(routed.actor) : this.legacyApiKeyMap();
@@ -3565,17 +3565,21 @@ export class WooWorld {
   /** Immutable anchor root encoded into new public key ids. The same walk
    * defines Net's actor cluster, so a gateway can route before it has any
    * actor cells. */
-  private apiKeyAuthorityRoot(actor: ObjRef): ObjRef {
+  /** The terminal of an object's immutable `anchor` chain, or the object
+   *  itself when unanchored. This is the object's authority root — the cluster
+   *  its cells belong to. Used both to route self-routing api-key ids and to
+   *  co-locate a runtime object with its author (createRuntimeObject). */
+  private authorityAnchorRoot(actor: ObjRef): ObjRef {
     let root = actor;
     const seen = new Set<ObjRef>();
     while (this.objects.has(root)) {
-      if (seen.has(root)) throw wooError("E_LINEAGE", "apikey authority anchor cycles", { actor, root });
+      if (seen.has(root)) throw wooError("E_LINEAGE", "authority anchor cycles", { actor, root });
       seen.add(root);
       const anchor = this.object(root).anchor;
       if (!anchor) return root;
       root = anchor;
     }
-    throw wooError("E_LINEAGE", "apikey authority anchor leaves the object graph", { actor, root });
+    throw wooError("E_LINEAGE", "authority anchor leaves the object graph", { actor, root });
   }
 
   async beginSignup(emailInput: string, password: string, options: { inviteCode?: string | null; signupMethod?: string } = {}): Promise<SignupStartResult> {
@@ -4133,7 +4137,7 @@ export class WooWorld {
       const routed = parseRoutedApiKeyId(id);
       if (
         routed &&
-        (!this.objects.has(routed.actor) || this.apiKeyAuthorityRoot(routed.actor) !== routed.authorityRoot)
+        (!this.objects.has(routed.actor) || this.authorityAnchorRoot(routed.actor) !== routed.authorityRoot)
       ) return false;
       const recordOwner = routed?.actor ?? null;
       const map = recordOwner ? this.apiKeyMap(recordOwner) : this.legacyApiKeyMap();
@@ -5672,6 +5676,10 @@ export class WooWorld {
     const displayName = optionMaybeString(options, "name") ?? null;
     const description = optionMaybeString(options, "description") ?? null;
     const aliases = optionStringList(options, "aliases", []);
+    // A builder object placed in a space anchors there; otherwise it co-locates
+    // in the AUTHOR's authority cluster (§7 authoring workspace) — see
+    // createBuilderObject, which applies the author fallback and reuses the
+    // self-host guard. `null` here means "no explicit space anchor".
     const anchor = location && this.isSpaceLike(location) ? location : null;
     const id = this.createBuilderObject(parentRef, actor, anchor, {
       location,
@@ -6854,18 +6862,31 @@ export class WooWorld {
       if (anchor) this.object(anchor);
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
+      // A runtime object created without an explicit space anchor co-locates in
+      // its AUTHOR's authority cluster (§7 authoring workspace), not the catalog
+      // scope: an anchorless plain-thing instance classifies catalog-adjacent
+      // (its parent chain hits no actor/space root), so a later source install
+      // on it would refuse E_CATALOG_MUTATION. Anchoring it to the author's
+      // authority root keeps that install a local cluster write. Only for a real
+      // actor author, and never for a self-hosted parent (which must stay
+      // anchorless — it roots its own DO; see the co-residency rule below).
+      const selfHosted = this.propOrNull(parent, "instances_self_host") === true;
+      const effectiveAnchor =
+        anchor === null && !selfHosted && this.isActorDescendant(progr)
+          ? this.authorityAnchorRoot(progr)
+          : anchor;
       // Self-hosted instances cannot be anchored. Per
       // spec/semantics/objects.md §4.1, combining the self-placement marker
       // with a non-null anchor would route the instance to its own DO (rule 1)
       // while declaring it a member of another cluster, breaking
       // co-residency. The recycle anchored-descendants check (recycle.md
       // §RC3 pre-flight A3) relies on this.
-      if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
-        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+      if (effectiveAnchor !== null && selfHosted) {
+        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor: effectiveAnchor });
       }
       const location = options.location ?? null;
       if (location) this.object(location);
-      const scope = runtimeObjectScope(anchor ?? parent);
+      const scope = runtimeObjectScope(effectiveAnchor ?? parent);
       let id: ObjRef;
       do {
         id = `obj_${scope}_${this.objectCounter++}`;
@@ -6876,7 +6897,7 @@ export class WooWorld {
         id,
         parent,
         owner,
-        anchor,
+        anchor: effectiveAnchor,
         location,
         name: options.name,
         flags
@@ -7567,13 +7588,23 @@ export class WooWorld {
   private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean }): ObjRef {
     this.object(parent);
     this.object(owner);
-    if (anchor) this.object(anchor);
+    const selfHosted = this.propOrNull(parent, "instances_self_host") === true;
+    // A builder object with no explicit space anchor co-locates in its AUTHOR's
+    // authority cluster (§7 authoring workspace), not the catalog scope — so a
+    // later source install on it is a local cluster write, not E_CATALOG_MUTATION
+    // (an anchorless instance classifies catalog-adjacent). A self-hosted parent
+    // stays anchorless (it roots its own DO; the rejection below relies on this).
+    const effectiveAnchor =
+      anchor === null && !selfHosted && this.isActorDescendant(owner)
+        ? this.authorityAnchorRoot(owner)
+        : anchor;
+    if (effectiveAnchor) this.object(effectiveAnchor);
     // Mirror the createRuntimeObject self-host/anchor rejection. See
     // spec/semantics/objects.md §4.1.
-    if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
-      throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+    if (effectiveAnchor !== null && selfHosted) {
+      throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor: effectiveAnchor });
     }
-    const scope = runtimeObjectScope(anchor ?? parent);
+    const scope = runtimeObjectScope(effectiveAnchor ?? parent);
     let id: ObjRef;
     do {
       id = `obj_${scope}_${this.objectCounter++}`;
@@ -7582,13 +7613,13 @@ export class WooWorld {
       id,
       parent,
       owner,
-      anchor,
+      anchor: effectiveAnchor,
       location: options.location,
       name: options.name,
       flags: { fertile: options.fertile }
     });
     // See createRuntimeObject for rationale.
-    if (this.propOrNull(parent, "instances_self_host") === true) {
+    if (selfHosted) {
       this.setProp(id, "host_placement", "self");
     }
     this.persistCounters();

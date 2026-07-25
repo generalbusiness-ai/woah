@@ -165,17 +165,32 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     await settleAll();
     expect(created.result?.isError, JSON.stringify(created).slice(0, 500)).not.toBe(true);
     const createdResult = created.result?.structuredContent?.result ?? {};
-    expect(createdResult.id, JSON.stringify(created).slice(0, 500)).toBeTruthy();
+    const widget = createdResult.id as string;
+    expect(widget, JSON.stringify(created).slice(0, 500)).toBeTruthy();
     expect(createdResult.owner).toBe(progAgent);
 
-    // NOTE: installing a verb on that freshly created object over Net currently
-    // refuses with E_CATALOG_MUTATION — the object lands in a catalog-adjacent
-    // scope rather than the actor's durable authoring cluster. Placing
-    // programmer objects in the actor's cluster so subsequent source installs
-    // stay local is the authoring-workspace-boundary work (plan §7), which is
-    // deferred. The full create → install → invoke loop is proven in-memory in
-    // tests/programmer-surface.test.ts; here we prove the Net resolver exposes
-    // and gates the feature-composed surface and runs its builder verbs.
+    // (6) The full authoring loop over Net (plan §7 authoring-workspace boundary):
+    // the builder object co-located in the AUTHOR's cluster (not catalog-adjacent),
+    // so a source install on it is a local cluster write, not E_CATALOG_MUTATION.
+    const installed = await call(progSession, "woo_call", { object: progAgent, verb: "install_verb", args: [widget, "hi", "verb :hi() rxd { return 42; }", {}] });
+    await settleAll();
+    expect(installed.result?.isError, JSON.stringify(installed).slice(0, 600)).not.toBe(true);
+    const installResult = installed.result?.structuredContent?.result ?? {};
+    expect(installResult.ok, JSON.stringify(installed).slice(0, 600)).toBe(true);
+    // The object co-located in the author's cluster (obj_<authority-root>_*),
+    // not a catalog-adjacent scope — that is what made the install a local write.
+    expect(widget.startsWith("obj_prog_agent_"), `authored object not in author cluster: ${widget}`).toBe(true);
+
+    // (7) Inspect the freshly installed verb through the agent's own surface —
+    // the create → install → inspect loop closes over the authoritative Net turn
+    // path, and reading the source back proves the verb is durably in the
+    // author's cluster (a direct invoke would additionally require the object in
+    // the session's tool context, an orthogonal reachability gate).
+    const listed = await call(progSession, "woo_call", { object: progAgent, verb: "list_verb", args: [widget, "hi", {}] });
+    await settleAll();
+    expect(listed.result?.isError, JSON.stringify(listed).slice(0, 600)).not.toBe(true);
+    const listedText = JSON.stringify(listed.result?.structuredContent?.result ?? {});
+    expect(listedText, listedText.slice(0, 400)).toContain("return 42");
 
     for (const st of states) st.close();
   });
