@@ -6912,31 +6912,23 @@ export class WooWorld {
       if (anchor) this.object(anchor);
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
-      // A runtime object created without an explicit space anchor co-locates in
-      // its AUTHOR's authority cluster (§7 authoring workspace), not the catalog
-      // scope: an anchorless plain-thing instance classifies catalog-adjacent
-      // (its parent chain hits no actor/space root), so a later source install
-      // on it would refuse E_CATALOG_MUTATION. Anchoring it to the author's
-      // authority root keeps that install a local cluster write. Only for a real
-      // actor author, and never for a self-hosted parent (which must stay
-      // anchorless — it roots its own DO; see the co-residency rule below).
-      const selfHosted = this.propOrNull(parent, "instances_self_host") === true;
-      const effectiveAnchor =
-        anchor === null && !selfHosted && this.isActorDescendant(progr)
-          ? this.authorityAnchorRoot(progr)
-          : anchor;
+      // Generic creation follows the executing-host contract (objects.md §4.1):
+      // `anchor` defaults to null and stays whatever the caller passed. It is
+      // NOT co-located to the author's cluster — that fallback is the builder
+      // surface's authoring-workspace behavior alone (createBuilderObject), so an
+      // ordinary or wizard-helper create keeps its parent-scoped placement.
       // Self-hosted instances cannot be anchored. Per
       // spec/semantics/objects.md §4.1, combining the self-placement marker
       // with a non-null anchor would route the instance to its own DO (rule 1)
       // while declaring it a member of another cluster, breaking
       // co-residency. The recycle anchored-descendants check (recycle.md
       // §RC3 pre-flight A3) relies on this.
-      if (effectiveAnchor !== null && selfHosted) {
-        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor: effectiveAnchor });
+      if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
       }
       const location = options.location ?? null;
       if (location) this.object(location);
-      const scope = runtimeObjectScope(effectiveAnchor ?? parent);
+      const scope = runtimeObjectScope(anchor ?? parent);
       let id: ObjRef;
       do {
         id = `obj_${scope}_${this.objectCounter++}`;
@@ -6947,7 +6939,7 @@ export class WooWorld {
         id,
         parent,
         owner,
-        anchor: effectiveAnchor,
+        anchor,
         location,
         name: options.name,
         flags

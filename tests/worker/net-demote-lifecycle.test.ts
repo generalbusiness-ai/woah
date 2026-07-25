@@ -30,6 +30,33 @@ function netState(name: string) {
   return { state, settle: async () => { while (deferred.length > 0) await deferred.shift(); }, close: () => fake.close() };
 }
 
+async function nextSseMessage(response: Response, timeoutMs = 1_000): Promise<Record<string, unknown> | null> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("SSE response has no body");
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const timeout = Symbol("timeout");
+  try {
+    for (;;) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), timeoutMs))
+      ]);
+      if (result === timeout) { await reader.cancel(); return null; }
+      if (result.done) return null;
+      buffered += decoder.decode(result.value, { stream: true });
+      const events = buffered.split(/\r?\n\r?\n/);
+      buffered = events.pop() ?? "";
+      for (const event of events) {
+        const data = event.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice("data:".length).trimStart()).join("\n");
+        if (data) return JSON.parse(data) as Record<string, unknown>;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function clientFetch(gateway: NetGatewayDO, path: string, token: string, body: unknown) {
   const resp = await gateway.fetch(new Request(`https://do${path}`, {
     method: "POST",
@@ -115,7 +142,11 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
       };
       const call = async (name: string, args: unknown) =>
         rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }, { "mcp-session-id": sid });
-      return { sid, list, call };
+      const listen = async () => gateway.fetch(new Request("https://do/net-api/mcp", {
+        method: "GET",
+        headers: { accept: "text/event-stream", "mcp-session-id": sid, origin: "https://do" }
+      }));
+      return { sid, list, call, listen };
     };
 
     const p = agent.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
@@ -134,12 +165,26 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
     const beforeDemote = await agentMcp.list();
     expect(beforeDemote, `${installTool} missing pre-demote`).toContain(installTool);
 
+    // The agent holds an open SSE stream (the baseline tools/list above pinned
+    // its digest). The demote fanout arrives from cluster:<human> — the agent's
+    // authority-root cluster, NOT cluster:<agent> — so the list_changed
+    // selection must be authority-root-aware to reach this session.
+    const agentEvents = await agentMcp.listen();
+
     // --- Demote over /net-api/turn ---
     const demoted = await clientFetch(warm, "/net-api/turn", humanToken, { target: human, verb: "demote_agent_from_programmer", args: [agent], session: sid });
     expect(demoted.status, JSON.stringify(demoted.body)).toBe(200);
     expect(demoted.body?.reply?.status, JSON.stringify(demoted.body).slice(0, 600)).toBe("accepted");
     expect(demoted.body?.error, `demote errored: ${JSON.stringify(demoted.body?.error)}`).toBeUndefined();
     await settleAll();
+
+    // (a0) The agent's live SSE stream received a real tools/list_changed
+    // notification (not just a next-poll re-list). Read it BEFORE re-listing,
+    // which would consume the pending hint.
+    expect(await nextSseMessage(agentEvents), "no tools/list_changed reached the anchored agent's SSE stream").toEqual({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed"
+    });
 
     // (a) Same-session re-list drops the programmer tools.
     const afterDemote = await agentMcp.list();

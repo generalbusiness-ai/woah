@@ -5026,7 +5026,14 @@ export class NetGatewayDO {
       );
       for (const row of present) if (this.mcpQueues.has(row.member)) candidates.add(row.member);
       for (const [session, state] of this.mcpQueues) {
-        if (body.scope === `cluster:${state.actor}`) candidates.add(session);
+        // An anchored agent's cells live in its AUTHORITY ROOT's cluster, so a
+        // fanout from that cluster (e.g. a demote committed in cluster:<human>)
+        // affects its session even though `body.scope !== cluster:<agent>`. Match
+        // the session actor's home cluster derived from view lineage (the anchor
+        // walk), which reduces to `cluster:<actor>` for an unanchored root. Falls
+        // back safely: an actor whose lineage this shard has not warmed classifies
+        // to a non-cluster scope and simply does not match.
+        if (body.scope === this.ownerScopeFor(state.actor)) candidates.add(session);
       }
     }
     for (const session of candidates) {
