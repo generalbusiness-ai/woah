@@ -144,11 +144,11 @@ The scheduled turn is an ordinary committed turn with:
 - `caller` = `$system` — it was woken, not called.
 - the actor recorded when it was armed, with permissions checked **now**,
   against live state, by the ordinary permission kernel: `x` / verb-owner
-  / wizard. `direct_callable` is not consulted — that flag gates what an
-  outside client may invoke while bypassing sequencing, and a scheduled
-  turn is neither outside nor unsequenced. **A scheduled turn is
-  authorized exactly as a sequenced call by that actor would be**, which
-  is the honest comparison for a turn that takes its own `seq`.
+  / wizard. `direct_callable` is **not** consulted: that flag gates what an
+  outside client may invoke, and a scheduled turn is not outside. So a
+  scheduled verb may reach targets an external direct call could not —
+  bounded by the recorded actor's ordinary permissions, but a real
+  difference worth knowing when you decide what to arm.
 - no presence check: there is no session and nothing to be present on.
 - programmer authority from the **fired verb's own owner**, exactly as on a
   live call. Arming a schedule stores no authority.

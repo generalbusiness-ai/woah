@@ -2266,12 +2266,37 @@ export class NetGatewayDO {
       call: {
         kind: "woo.turn_call.shadow.v1",
         id: key,
+        // CO16.4. The route stays `direct`, and that is a session posture
+        // here, not a log posture: the net pipeline's `sequenced` route
+        // requires a session (CO14), and a scheduled turn deliberately has
+        // none — the actor may not even be connected. Dispatching it as
+        // `sequenced` fails in planning with E_BUDGET, so "authorize it like
+        // a sequenced call" is not expressible as a route swap.
+        //
+        // What DOES hold, and is the substantive point: `direct_callable` is
+        // an INGRESS gate (gateway-do's client path checks it; this internal
+        // path does not), so a scheduled turn may reach a verb that external
+        // direct dispatch would refuse. That is bounded by the ordinary
+        // permission kernel running against the recorded actor at fire time,
+        // which is the same authority that actor already holds — but it is a
+        // real difference from the client surface and is documented as one.
         route: "direct",
         scope: body.scope,
         actor: turn.call.actor,
         target: turn.call.target,
         verb: turn.call.verb,
-        args: turn.call.args as PlanTurnInput["call"]["args"]
+        args: turn.call.args as PlanTurnInput["call"]["args"],
+        // CO16.8 fire-time context: the verb can tell it was woken rather than
+        // called, and how late. `at` and `fired_at` differ after eviction and
+        // after a busy scope defers a due batch — a month-old gap is exactly
+        // what a no-catch-up chain needs to be able to see.
+        body: {
+          scheduled: {
+            id: turn.id,
+            at: turn.at_logical_time,
+            fired_at: Date.now()
+          }
+        } as PlanTurnInput["call"]["body"]
       },
       ...(scheduledPrincipal ? { principal: scheduledPrincipal } : {}),
       ...(scheduledTrace ? { trace: scheduledTrace } : {}),

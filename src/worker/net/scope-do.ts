@@ -557,6 +557,11 @@ const LIVE_DELIVERY_BATCH = LIVE_FANOUT_BATCH_CAP;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */
+/** CO16.8 — bounded retention for the scheduled-failure record, and a cap on
+ * how much of a rejection detail is stored. Diagnostics, not a queue. */
+const SCHEDULED_FAILURE_KEEP = 64;
+const SCHEDULED_FAILURE_DETAIL_CHARS = 512;
+
 const OUTBOX_ABANDONED_KEEP = 256;
 
 /** Phase-3 scheduled-burst bound: one alarm firing moves at most this
@@ -776,6 +781,14 @@ export class NetScopeDO {
     // eviction could re-mint the id of a still-pending row, whose
     // ON CONFLICT DO NOTHING enqueue would silently swallow the new turn.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_sched_dispatch (id TEXT PRIMARY KEY, n INTEGER NOT NULL)");
+    // CO16.8: the durable record of scheduled turns that did not fire.
+    // Bounded (SCHEDULED_FAILURE_KEEP) — a diagnostic tail, not a queue.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_sched_failure ("
+        + "id TEXT PRIMARY KEY, at_logical_time INTEGER NOT NULL, fired_at INTEGER NOT NULL,"
+        + " target TEXT NOT NULL, verb TEXT NOT NULL, actor TEXT NOT NULL,"
+        + " outcome TEXT NOT NULL, detail TEXT NOT NULL)"
+    );
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -1653,7 +1666,21 @@ export class NetScopeDO {
     // Phase 3: one firing handles a BOUNDED batch of due turns; leftovers
     // re-arm immediately below (planner registered) or stay parked
     // (no-planner — future-only re-arm, so overdue rows cannot spin).
-    const due = seq.peekDue(now, SCHEDULED_BATCH_PER_ALARM);
+    // CO16.6: `while_active` entries do not fire into a scope with nobody
+    // attached. Parked entries stay queued — the next accepted turn in the
+    // scope re-arms them — so this defers work rather than dropping it.
+    const { deliverable: due, parked: idleParked } = seq.deliverableDue(now, SCHEDULED_BATCH_PER_ALARM);
+    for (const turn of idleParked) {
+      this.metric({
+        kind: "net_scope_scheduled_turn_fired",
+        scope: seq.scope,
+        id: turn.id,
+        at_logical_time: turn.at_logical_time,
+        fired_at: now,
+        reason: "idle_scope",
+        note: "parked: idle_policy while_active and the scope has no live session subscribers (CO16.6)"
+      });
+    }
     let planner: string | null = null;
     if (due.length > 0) {
       planner = this.plannerDestination();
@@ -1683,7 +1710,10 @@ export class NetScopeDO {
         // memory ahead of SQLite.
         this.discardSeqOnThrow(() =>
           this.store.transaction(() => {
-            for (const turn of seq.dueTurns(now, SCHEDULED_BATCH_PER_ALARM)) {
+            // Pop by id: an idle-parked entry is due but not deliverable,
+            // and popping it would drop it (CO16.6 defers, never discards).
+            const deliverableIds = new Set(due.map((entry) => entry.id));
+            for (const turn of seq.dueTurns(now, SCHEDULED_BATCH_PER_ALARM, deliverableIds)) {
               const dispatchBody: PlanScheduledOutboxBody = {
                 scope: seq.scope,
                 seq: this.nextScheduledDispatch(),
@@ -1862,6 +1892,86 @@ export class NetScopeDO {
       )
     );
     return rows.length > 0 ? rows[0].destination : null;
+  }
+
+  /**
+   * CO16.8/CO16.9 — write down a scheduled turn that did not do its job.
+   *
+   * Two distinct events land here and they are the same event from the
+   * world's point of view: the planner ran the turn and the scope terminally
+   * rejected it, or the planner could never be reached and the outbox lane
+   * abandoned the row. Either way the timer did not fire, and unless it is
+   * recorded nobody ever finds out — a scheduled turn has no session, no
+   * waiting caller, and often no live actor.
+   *
+   * The record is durable, bounded, and emitted as an observation so a live
+   * room sees it. Recording failures must not itself fail the drain, so
+   * every path here is best-effort.
+   */
+  private recordScheduledFailure(
+    turn: ScheduledTurn,
+    outcome: "rejected" | "abandoned",
+    detail: string
+  ): void {
+    const firedAt = this.host.now();
+    try {
+      this.state.storage.sql.exec(
+        "INSERT INTO net_scope_sched_failure (id, at_logical_time, fired_at, target, verb, actor, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          + " ON CONFLICT(id) DO UPDATE SET at_logical_time = excluded.at_logical_time, fired_at = excluded.fired_at, outcome = excluded.outcome, detail = excluded.detail",
+        turn.id,
+        turn.at_logical_time,
+        firedAt,
+        turn.call.target,
+        turn.call.verb,
+        turn.call.actor,
+        outcome,
+        detail.slice(0, SCHEDULED_FAILURE_DETAIL_CHARS)
+      );
+      // Bounded retention, like the abandoned-row tail: this is a diagnostic
+      // record, not a queue, and it must not grow with a broken chain's
+      // lifetime.
+      this.state.storage.sql.exec(
+        "DELETE FROM net_scope_sched_failure WHERE rowid NOT IN (SELECT rowid FROM net_scope_sched_failure ORDER BY fired_at DESC, rowid DESC LIMIT ?)",
+        SCHEDULED_FAILURE_KEEP
+      );
+    } catch (err) {
+      this.metric({ kind: "net_scope_sched_failure_write_failed", id: turn.id, status: "error", error: String(err) });
+    }
+    this.metric({
+      kind: "net_scope_scheduled_turn_failed",
+      scope: this.store.readMeta()?.scope ?? "",
+      id: turn.id,
+      at_logical_time: turn.at_logical_time,
+      fired_at: firedAt,
+      target: turn.call.target,
+      verb: turn.call.verb,
+      outcome,
+      status: "error",
+      error: detail.slice(0, SCHEDULED_FAILURE_DETAIL_CHARS)
+    });
+  }
+
+  /** Inspect a /plan-scheduled reply and record a terminal rejection. An
+   * accepted TurnResult, or any shape this does not recognize, records
+   * nothing: a false failure report is worse than none. */
+  private recordScheduledFailureIfRejected(turn: ScheduledTurn, reply: unknown, outcome: "rejected"): void {
+    if (!reply || typeof reply !== "object" || Array.isArray(reply)) return;
+    const status = (reply as { status?: unknown }).status;
+    if (status !== "rejected") return;
+    const reason = (reply as { reason?: unknown }).reason;
+    const error = (reply as { error?: unknown }).error;
+    this.recordScheduledFailure(turn, outcome, JSON.stringify({ reason: reason ?? null, error: error ?? null }));
+  }
+
+  /** Pending failure records, newest first. Read by the live introspection
+   * route (CO16.9) — deliberately NOT a committed read. */
+  private readScheduledFailures(limit: number): Array<Record<string, unknown>> {
+    return sqlRows<Record<string, unknown>>(
+      this.state.storage.sql.exec(
+        "SELECT id, at_logical_time, fired_at, target, verb, actor, outcome, detail FROM net_scope_sched_failure ORDER BY fired_at DESC, rowid DESC LIMIT ?",
+        limit
+      )
+    );
   }
 
   /** Next durable scheduled-dispatch sequence number (see the
@@ -2916,11 +3026,18 @@ export class NetScopeDO {
               // (planner down, E_BUDGET 400) retries on the lane's
               // backoff and abandons as the named divergence.
               const schedBody = row.body as PlanScheduledOutboxBody;
-              await this.host.rpc(row.destination, "/plan-scheduled", {
+              const dispatchReply = await this.host.rpc(row.destination, "/plan-scheduled", {
                 scheduled_turn: schedBody.scheduled_turn,
                 scope: schedBody.scope,
                 catalog_epoch: schedBody.catalog_epoch
               });
+              // CO16.8: a 200 carrying a TERMINAL REJECTION deletes this row
+              // (the verdict will not change on redelivery) — so unless the
+              // failure is written down here it vanishes entirely. Nobody is
+              // waiting on a scheduled turn: the actor has no session and may
+              // not exist any more. Silence is the one outcome a deadline
+              // must never have.
+              this.recordScheduledFailureIfRejected(schedBody.scheduled_turn, dispatchReply, "rejected");
             } else if (route === "/audit") {
               // AU6.2: at-least-once append; the shard no-ops on
               // (partition, idempotency), so redelivery is harmless.
@@ -3061,6 +3178,17 @@ export class NetScopeDO {
             );
             if (row.status === "abandoned") {
               abandonedCount += 1;
+              // CO16.8: an abandoned /plan-scheduled row means the timer
+              // never ran at all. From the world's point of view that is
+              // indistinguishable from running and failing, so it records
+              // identically — otherwise a persistently-unreachable planner
+              // would silently swallow every deadline in the scope.
+              if (route === "/plan-scheduled") {
+                const abandonedTurn = (row.body as PlanScheduledOutboxBody | undefined)?.scheduled_turn;
+                if (abandonedTurn) {
+                  this.recordScheduledFailure(abandonedTurn, "abandoned", deliveryErrors.get(row.id) ?? "E_OUTBOX_ABANDONED");
+                }
+              }
               this.metric({
                 kind: "net_scope_outbox_abandoned",
                 route,

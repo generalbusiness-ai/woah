@@ -94,6 +94,33 @@ function plannerStub(): { stub: NetStub; received: Array<{ path: string; body: u
   };
 }
 
+function failureRows(state: NetScopeDurableState): Array<{ id: string; outcome: string; detail: string; target: string; verb: string }> {
+  return (
+    state.storage.sql.exec("SELECT id, outcome, detail, target, verb FROM net_scope_sched_failure ORDER BY fired_at DESC") as {
+      toArray(): Array<{ id: string; outcome: string; detail: string; target: string; verb: string }>;
+    }
+  ).toArray();
+}
+
+/** A planner that answers 200 with a TERMINAL REJECTION — the shape that
+ * deletes the sender's outbox row and, before CO16.8, discarded the verdict. */
+function rejectingPlannerStub(): { stub: NetStub; received: Array<{ path: string; body: unknown }> } {
+  const received: Array<{ path: string; body: unknown }> = [];
+  return {
+    received,
+    stub: {
+      fetch: async (request: Request) => {
+        const url = new URL(request.url);
+        received.push({ path: url.pathname, body: request.method === "POST" ? await request.json() : undefined });
+        return new Response(
+          JSON.stringify({ status: "rejected", reason: "write_unauthorized", error: { code: "E_PERM", message: "verb owner lost authority" } }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+    }
+  };
+}
+
 function scheduledRows(state: NetScopeDurableState): Array<{ id: string }> {
   return (state.storage.sql.exec("SELECT id FROM net_scope_scheduled") as { toArray(): Array<{ id: string }> }).toArray();
 }
@@ -159,6 +186,89 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(body.scheduled_turn.id).toBe("sched-1");
     expect(body.scheduled_turn.call.verb).toBe("tick");
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_dispatched"))).toBe(true);
+  });
+
+  it("records a terminal failure durably instead of discarding it (CO16.8)", async () => {
+    // The regression this guards: a 200 carrying a terminal rejection deletes
+    // the outbox row, and NOBODY is waiting on a scheduled turn — no session,
+    // possibly no live actor. Without a written record a broken deadline fails
+    // in perfect silence, which is the one outcome a deadline must never have.
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const planner = rejectingPlannerStub();
+    const scope = netState(`scope-${SCOPE}-failrec`);
+    const env: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: () => planner.stub
+    };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:planner-a", role: "planner" });
+    await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-fail", Date.now() + 30) });
+
+    await sleep(60);
+    await scopeDO.alarm();
+    await scope.settle();
+
+    // Delivered and de-queued exactly as before — the verdict is terminal and
+    // will not change on redelivery, so the row is right to go.
+    expect(scheduledRows(scope.state)).toEqual([]);
+    expect(outboxRows(scope.state)).toEqual([]);
+
+    // ...but the failure is now written down, and named in the metric stream.
+    const failures = failureRows(scope.state);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ id: "sched-fail", outcome: "rejected", verb: "tick" });
+    expect(failures[0].detail).toMatch(/write_unauthorized/);
+    expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
+  });
+
+  it("records an abandoned dispatch the same way — never running is not different from failing", async () => {
+    // Abandonment takes the lane's full retry budget (8 attempts on an
+    // exponential backoff), which is ~30s of wall time — so seed a row that
+    // has already spent its budget and drive one failing pass. From the
+    // world's point of view "the planner never ran it" and "it ran and
+    // failed" are the same event: the timer did not do its job.
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const scope = netState(`scope-${SCOPE}-abandon`);
+    const env: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: () => ({ fetch: async () => { throw new Error("planner unreachable"); } }) as NetStub
+    };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:planner-a", role: "planner" });
+
+    const turn = tick("sched-gone", Date.now() + 30);
+    const body = JSON.stringify({
+      scope: SCOPE,
+      seq: 1,
+      cells: [],
+      observations: [],
+      scheduled_turn: turn,
+      catalog_epoch: EPOCH
+    });
+    scope.state.storage.sql.exec(
+      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms)"
+        + " VALUES ('/plan-scheduled', ?, 'gateway:planner-a', ?, 'pending', 7, NULL, ?, 1, 0)",
+      `gateway:planner-a/${SCOPE}/1`,
+      body,
+      SCOPE
+    );
+    scope.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES ('/plan-scheduled', 'gateway:planner-a')"
+    );
+
+    await scopeDO.alarm();
+    await scope.settle();
+
+    const failures = failureRows(scope.state);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ id: "sched-gone", outcome: "abandoned" });
+    expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
   });
 
   it("no planner registered → the due turn stays parked with the named metric (fanout role does not qualify)", async () => {

@@ -905,6 +905,70 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(store.readScheduled()).toEqual([]);
   });
 
+  it("defers while_active entries in an unattended scope, and never drops them (CO16.6)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    // An empty session_subscribers list is the scope saying "nobody is here".
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+
+    const idle = seq.deliverableDue(NOW + LEAD);
+    expect(idle.deliverable).toEqual([]);
+    expect(idle.parked.map((row) => row.id)).toEqual(["#thing:tick"]);
+    // Deferred, not discarded: the entry is still queued for when someone
+    // arrives. Dropping it would be the silent failure this design removes.
+    expect(seq.peekDue(NOW + LEAD)).toHaveLength(1);
+
+    // Someone attaches; the same entry becomes deliverable.
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [{ session: "s", actor: "#actor" }] as never, op: "set" as const, writer: WRITER }]
+    }), "someone-here"));
+    expect(seq.deliverableDue(NOW + LEAD).deliverable.map((row) => row.id)).toEqual(["#thing:tick"]);
+  });
+
+  it("fires always entries into an unattended scope — that is what they are for", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seedWizard(seq, "$scheduling");
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ idlePolicy: "always", armed_by: { ...WRITER, progr: "$scheduling" } })]
+    }, "s1"));
+    const due = seq.deliverableDue(NOW + LEAD);
+    expect(due.deliverable.map((row) => row.id)).toEqual(["#thing:tick"]);
+    expect(due.parked).toEqual([]);
+  });
+
+  it("fails OPEN when the scope publishes no audience", () => {
+    // An absent session_subscribers cell means "this scope does not publish an
+    // audience", not "nobody is present". Firing when nobody is watching costs
+    // one turn; never firing is the failure mode worth avoiding.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+    expect(seq.deliverableDue(NOW + LEAD).deliverable).toHaveLength(1);
+  });
+
+  it("pops only the deliverable set, leaving idle-parked entries queued", () => {
+    // dueTurns is destructive. Popping everything due and filtering afterwards
+    // would silently discard exactly the entries the idle policy defers.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seedWizard(seq, "$scheduling");
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, { schedules: [armed({ id: "#thing:idle" })] }, "s1"));
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ id: "#thing:always", idlePolicy: "always", armed_by: { ...WRITER, progr: "$scheduling" } })]
+    }, "s2"));
+
+    const { deliverable } = seq.deliverableDue(NOW + LEAD);
+    const popped = seq.dueTurns(NOW + LEAD, undefined, new Set(deliverable.map((row) => row.id)));
+    expect(popped.map((row) => row.id)).toEqual(["#thing:always"]);
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:idle"]);
+  });
+
   it("refuses more schedules in one turn than the per-turn cap", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));

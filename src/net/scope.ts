@@ -2170,6 +2170,57 @@ export class ScopeSequencer {
     return this.scheduled.delete(scheduleId);
   }
 
+
+  /**
+   * CO16.6 — does this scope have a live session subscriber?
+   *
+   * `while_active` entries do not fire while nobody is attached, which is what
+   * keeps an ambient chain from billing a world forever in a room no one will
+   * visit again. The test is a DELIVERY question, so it reads the space's
+   * `session_subscribers` — the live audience — and deliberately not the
+   * fanout/planner subscriber registry: a scope always has a planner
+   * registered when scheduling works at all, so counting one would make
+   * `while_active` a synonym for `always`.
+   *
+   * Hidden-roster service sessions count. They are absent from the social
+   * projection but present for delivery, and something attached that will
+   * receive the observation is exactly what this asks about.
+   *
+   * Unknown fails OPEN — an absent cell means "this scope does not publish an
+   * audience here", not "nobody is present". Firing when nobody is watching
+   * costs one turn; silently never firing is the failure mode this whole
+   * design exists to remove.
+   */
+  hasLiveSubscribers(): boolean {
+    const space = this.scope.startsWith("room:") ? this.scope.slice("room:".length) : this.scope;
+    const cell = this.store.get(cellKey("property_cell", space, "session_subscribers"));
+    if (!cell) return true;
+    const payload = cell.value;
+    const raw = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).value
+      : payload;
+    if (!Array.isArray(raw)) return true;
+    return raw.length > 0;
+  }
+
+  /** Due turns this scope may deliver right now: everything due, minus
+   * `while_active` entries in a scope with nobody attached. Parked entries
+   * stay in the queue and the next accepted turn re-arms the alarm. */
+  deliverableDue(nowLogical: number, limit?: number): { deliverable: ScheduledTurn[]; parked: ScheduledTurn[] } {
+    const due = this.peekDue(nowLogical, limit);
+    if (due.length === 0) return { deliverable: [], parked: [] };
+    if (this.hasLiveSubscribers()) return { deliverable: due, parked: [] };
+    const deliverable: ScheduledTurn[] = [];
+    const parked: ScheduledTurn[] = [];
+    for (const turn of due) {
+      // Rows written before idle_policy existed read as `always`, which is
+      // the behaviour they already had.
+      if ((turn.idle_policy ?? "always") === "always") deliverable.push(turn);
+      else parked.push(turn);
+    }
+    return { deliverable, parked };
+  }
+
   /** Earliest pending logical time, or null — the Host sets its alarm to
    * this (CO2.8: the scope wakes itself; a parked task survives eviction
    * because the queue is scope state). One indexed lookup on a durable
@@ -2207,8 +2258,12 @@ export class ScopeSequencer {
 
   /** Pop the turns due at or before `nowLogical`, in time order —
    * bounded to the first `limit` when given (see peekDue). */
-  dueTurns(nowLogical: number, limit?: number): ScheduledTurn[] {
-    const due = this.peekDue(nowLogical, limit);
+  dueTurns(nowLogical: number, limit?: number, onlyIds?: ReadonlySet<string>): ScheduledTurn[] {
+    // `onlyIds` exists for the CO16.6 idle filter: an entry that is DUE but
+    // not DELIVERABLE (a `while_active` chain in an unattended scope) must
+    // stay in the queue. Popping everything due and filtering afterwards
+    // would silently drop exactly the entries the policy means to defer.
+    const due = this.peekDue(nowLogical, limit).filter((turn) => onlyIds === undefined || onlyIds.has(turn.id));
     const durable = this.options.durable;
     const pop = () => {
       for (const turn of due) {

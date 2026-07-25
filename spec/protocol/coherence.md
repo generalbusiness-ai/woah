@@ -1199,14 +1199,11 @@ One write path per fact (CO9), concretized:
 
 ## CO16. Scheduled turns
 
-> Status: **delivery implemented** (CO16.5). **Transcript-carried queue
-> effects, provenance, namespacing, the `always` gate, the lead time, and
-> the quotas implemented** at the commit scope (CO16.2–CO16.4, CO16.7);
-> no producer arms them yet — the DSL builtins are the next step, so in a
-> running world the arrays are always absent. **Not yet implemented:** the
-> idle-policy delivery filter and no-catch-up (CO16.6), lifecycle
-> cancellation (CO16.8), and the failure record (CO16.8/CO16.9). Design
-> rationale in
+> Status: **implemented** — CO16.1–CO16.7 and the failure record of
+> CO16.8/CO16.9, end to end from the `schedule` builtins through the
+> transcript to delivery. **Not yet implemented:** the CO16.8 *lifecycle*
+> cancellations (recycle, scope retirement) and the CO16.9 live
+> introspection route. Design rationale in
 > `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
 > [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
 > where the two differ, this governs.
@@ -1360,25 +1357,34 @@ harmless.
 
 ### CO16.4 Authority
 
-- **Session-less, and on its own route.** `ScheduledTurn.call` carries
-  actor/target/verb/args and no session, so per CO14's sessions-absent
-  rule the fired turn runs on actor authority. It is **not** the external
-  `direct` route and MUST NOT be dispatched as one. `direct_callable` is
-  an *ingress* gate — it marks the verbs an outside client may invoke
-  while bypassing sequencing — and a scheduled turn is neither external
-  ingress nor unsequenced: it is a committed turn taking its own `seq`.
-  Applying the ingress gate would refuse ordinary verbs for no reason;
-  applying nothing at all, as the current implementation's `route:
-  "direct"` does, silently grants scheduled turns reach that external
-  direct dispatch refuses.
+- **Session-less.** `ScheduledTurn.call` carries actor/target/verb/args
+  and no session, so per CO14's sessions-absent rule the fired turn runs
+  on actor authority via the DIRECT route. Note that `direct` here is a
+  *session* posture, not a log posture: the `sequenced` route requires a
+  session, and a scheduled turn has none by construction — its actor may
+  not even be connected. An earlier draft of this section called for
+  dispatching scheduled turns as `sequenced`; that is not expressible,
+  and the implementation fails in planning if it is attempted.
 
-  The rule is therefore: **a scheduled turn is authorized exactly as a
-  sequenced call by the same actor would be.** Resolve the verb by normal
-  lookup; check `x` / verb-owner / wizard against the actor per
+  **Authorization is the ordinary permission kernel against the recorded
+  actor, at fire time.** Resolve the verb by normal lookup; check `x` /
+  verb-owner / wizard against the actor per
   [permissions.md §11.4](../semantics/permissions.md#114-effective-permission);
   run the frame with `progr` set to the resolved verb's owner. Presence
   checks do not apply — there is no session and no connection to be
-  present on — and `direct_callable` is not consulted in either direction.
+  present on.
+
+  **`direct_callable` is not consulted, and that is a real difference from
+  the client surface.** The flag is an *ingress* gate: the gateway's
+  client path refuses an externally-requested `direct` route to a verb
+  that does not declare it, and the internal planner path does not apply
+  that check. So a scheduled turn can invoke a verb an outside client
+  could not invoke directly. The bound is that it runs as the recorded
+  actor under the ordinary kernel, so it confers no authority that actor
+  lacks — but arming a schedule is a way to reach verbs the external
+  direct surface declines, and a catalog that relies on `direct_callable`
+  as a security boundary rather than an ingress convention would be
+  mistaken to do so.
   Arming a schedule therefore confers exactly the authority the actor
   already had to make the same call through the sequenced path, which is
   the only comparison that makes sense for a turn that *is* sequenced.
