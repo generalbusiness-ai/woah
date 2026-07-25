@@ -792,9 +792,19 @@ One write path per fact (CO9), concretized:
   - `POST /net-api/turn {target, verb, args?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the
-    AUTHENTICATED apikey actor — before planning; the turn then runs
-    route:`sequenced` so the committing scope's authorize revalidates
-    end-to-end (the gateway authenticates; scopes authorize). `target`
+    AUTHENTICATED apikey actor — before planning. **Route is derived from the
+    planning scope, not fixed:** a `room:*` (shared) scope runs the in-world
+    sequenced `$space:call`; a `cluster:*` (private authority) scope runs
+    `direct` — the committing Scope head sequences it, since a cluster root is
+    an actor, not a `$space` replay log with `next_seq`/subscribers/presence. A
+    scope that classifies to neither (e.g. `catalog`) is not client-plannable
+    and is refused. The direct route selects the invocation SHAPE only;
+    `world.directCall` still enforces `direct_callable`, so a non-direct-callable
+    verb in a cluster returns `E_DIRECT_DENIED` — a cluster is not a substitute
+    sequencing space. Session AUTHORIZATION does not depend on the route:
+    `foldSessionEffects` records the session read for either route, and the
+    committing Scope revalidates it end-to-end (the gateway authenticates;
+    scopes authorize). `target`
     is a concrete runtime object id, not a catalog-manifest reference:
     installed-alias forms such as `tasks:the_taskboard` have already
     resolved to their concrete seed id before runtime. A concrete object

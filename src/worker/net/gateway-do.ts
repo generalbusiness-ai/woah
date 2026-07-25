@@ -3371,9 +3371,11 @@ export class NetGatewayDO {
     audit?: { credential?: string; trace?: TraceContext }
   ): Promise<Response> {
     // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
-    // gateway refuses session-less turns up front (named), and the turn
-    // still runs route:"sequenced" so the committing scope's authorize
-    // revalidates the session end-to-end.
+    // gateway refuses session-less turns up front (named). Session
+    // AUTHORIZATION does not depend on the route (sequenced vs direct):
+    // foldSessionEffects records the session read for either, and the
+    // committing scope revalidates it end-to-end. Route is derived from the
+    // planning scope below (cluster -> direct, room -> sequenced).
     const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
     if (!session) {
       return json(
@@ -3446,6 +3448,24 @@ export class NetGatewayDO {
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
     const planningScope = await this.clientPlanningScope(anchorObject, actor);
+    // One route decision, derived from planningScope and used consistently for
+    // validation, authority prefetch, and the committed call. A private
+    // authority CLUSTER invokes DIRECT: the committing Scope head sequences it,
+    // not an in-world $space replay log (a cluster root is an actor, not a
+    // $space with next_seq/subscribers/presence). A shared ROOM invokes the
+    // in-world sequenced $space:call. This selects the invocation SHAPE only —
+    // world.directCall still enforces direct_callable, so a non-direct-callable
+    // verb in a cluster returns E_DIRECT_DENIED; a cluster is not a substitute
+    // sequencing space. Catalog (or any other classification) is not
+    // client-plannable and is refused, never silently coerced into either route.
+    let route: "direct" | "sequenced";
+    if (planningScope.startsWith("cluster:")) {
+      route = "direct";
+    } else if (planningScope.startsWith("room:")) {
+      route = "sequenced";
+    } else {
+      return json({ error: { code: "E_INVARG", message: "client turn cannot plan at this scope", detail: { field: "scope", reason: "unplannable_scope", scope: planningScope } } }, 400);
+    }
     // Phase 4: warm the TURN'S TARGET (and its anchor) at the planning
     // scope. Under targeted cold-open the room's cells no longer arrive
     // wholesale, and a client-turn target the view never materialized is
@@ -3465,7 +3485,7 @@ export class NetGatewayDO {
     const validationCall = {
       kind: "woo.turn_call.shadow.v1",
       id: "validate",
-      route: "sequenced",
+      route,
       scope: anchorObject,
       session,
       actor,
@@ -3518,7 +3538,7 @@ export class NetGatewayDO {
     await this.warmDeclaredAuthorityPrefetch({
       kind: "woo.turn_call.shadow.v1",
       id: "prefetch",
-      route: "sequenced",
+      route,
       scope: anchorObject,
       session,
       actor,
@@ -3576,7 +3596,7 @@ export class NetGatewayDO {
       call: {
         kind: "woo.turn_call.shadow.v1",
         id: key,
-        route: "sequenced",
+        route,
         scope: anchorObject,
         session,
         actor,
@@ -3656,7 +3676,14 @@ export class NetGatewayDO {
     const live = this.ensureView().get(cellKey("object_live", actor))?.value as
       | { location?: string | null }
       | undefined;
-    return typeof live?.location === "string" && live.location.length > 0 ? live.location : actor;
+    const location = typeof live?.location === "string" && live.location.length > 0 ? live.location : null;
+    // A located-nowhere actor plans at its OWN cluster (CO14). `$nowhere` is the
+    // catalog-scoped universal home, and any `$`-prefixed location is
+    // catalog-delivered seed substrate — neither is a plannable anchor, so fall
+    // back to the actor itself rather than routing the turn into the catalog
+    // scope (which is not client-plannable).
+    if (!location || location.startsWith("$")) return actor;
+    return location;
   }
 
   /**
