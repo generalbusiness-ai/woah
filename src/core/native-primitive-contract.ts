@@ -296,7 +296,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
         "account",
         "programmer_grant_quota",
         "programmer_agent_count",
-        "authority_root",
         "features",
         "features_version"
       ],
@@ -328,7 +327,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       object_property_names: [
         "account",
         "programmer_agent_count",
-        "authority_root",
         "features",
         "features_version"
       ],

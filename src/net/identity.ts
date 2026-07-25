@@ -95,7 +95,6 @@ const IDENTITY_PROPS = [
   "last_seen_at",
   "features",
   "features_version",
-  "authority_root",
   "api_keys"
 ] as const;
 

@@ -3820,15 +3820,15 @@ export class WooWorld {
       this.setProp(account, "primary_actor", actor);
       // Authority root (the single-human supported lifecycle case): the account,
       // its human, and the human's owned agents share ONE authority scope so a
-      // promote/demote turn commits atomically without a catalog write. Record
-      // the primary human as the stable root and anchor the account to it. This
-      // runs once (first binding wins) while the account is still in-memory and
-      // never yet carried/partitioned, so it is a provisioning-time placement,
-      // not a scope migration. A multi-human account keeps its original root —
-      // the explicit field stops later code from splitting agents by their
-      // immediate co-owner. Owned agents anchor to this root at provisioning.
-      if (this.propOrNull(account, "authority_root") == null) {
-        this.setProp(account, "authority_root", actor);
+      // promote/demote turn commits atomically without a catalog write. Anchor
+      // the account to the primary human; that anchor IS the family's authority
+      // root (authorityRootOf derives it — no duplicate authority_root prop).
+      // This runs once (first binding wins) while the account is still in-memory
+      // and never yet carried/partitioned, so it is a provisioning-time
+      // placement, not a scope migration. A multi-human account keeps its
+      // original root: the anchor pins it, so later agents of a co-owning human
+      // still land in the first human's cluster rather than splitting off.
+      if (this.object(account).anchor == null) {
         this.object(account).anchor = actor;
         this.markObjectDirty(account);
       }
@@ -3876,16 +3876,66 @@ export class WooWorld {
     }
 
     /**
-     * The authority root an owned actor anchors to: the primary human recorded
-     * on the owner's account (the single-human supported case), falling back to
-     * the owner itself when the account or root is unset. Keeps every agent of
-     * one human in that human's authority cluster.
+     * The authority root an owned actor anchors to: the family's shared root,
+     * derived from the account's own anchor (the primary human it was bound to).
+     * The anchor is the single source of truth — no duplicate authority_root
+     * prop. Falls back to the human when the account is unset or an unmigrated
+     * legacy account is still anchorless (so new agents anchor sanely even
+     * before the co-location repair migration runs). Keeps every agent of one
+     * human in that human's authority cluster.
      */
-    private authorityRootOf(human: ObjRef): ObjRef | null {
+    private authorityRootOf(human: ObjRef): ObjRef {
       const account = this.propOrNull(human, "account");
       if (typeof account !== "string" || !this.objects.has(account)) return human;
-      const root = this.propOrNull(account, "authority_root");
-      return typeof root === "string" && this.objects.has(root) ? root : human;
+      const root = this.authorityAnchorRoot(account);
+      // An anchorless legacy account is its own root; fall back to the human.
+      return root === account ? human : root;
+    }
+
+    /**
+     * Local-boot repair: co-locate legacy anchorless authority families into
+     * one cluster. A family provisioned before authority-root anchoring landed
+     * has an anchorless account (catalog-scoped) and possibly anchorless owned
+     * agents (own-cluster), so a promote/demote quota transition spans scopes.
+     * This anchors each account to its primary human, then each of that human's
+     * owned agents to the family root — the placement new provisioning already
+     * gives them.
+     *
+     * Support boundary: local-boot / single-host only, because it sets the
+     * anchor field in place. Net worlds receive correct placement from
+     * install/cutover (identity carries `anchor`); re-anchoring already-
+     * partitioned Net cells across Durable Objects is a spec-version scope
+     * migration (migrations.md M6), out of scope here. Idempotent: every step
+     * gates on a null anchor, so re-running repairs nothing. Returns the number
+     * of objects re-anchored.
+     */
+    repairAuthorityFamilyColocation(): number {
+      let repaired = 0;
+      // Pass 1: anchor each account to its primary human (the family root).
+      for (const obj of this.objects.values()) {
+        if (obj.anchor != null || !this.inheritsFrom(obj.id, "$account")) continue;
+        const primary = this.propOrNull(obj.id, "primary_actor");
+        if (typeof primary !== "string" || !this.objects.has(primary) || !this.inheritsFrom(primary, "$human")) continue;
+        obj.anchor = primary;
+        this.markObjectDirty(obj.id);
+        this.persistObject(obj.id);
+        repaired += 1;
+      }
+      // Pass 2: anchor each human-owned agent to the family root. Accounts are
+      // anchored now, so authorityRootOf resolves the shared root from them.
+      for (const obj of this.objects.values()) {
+        if (obj.anchor != null || !this.inheritsFrom(obj.id, "$agent")) continue;
+        const owner = obj.owner;
+        if (typeof owner !== "string" || !this.objects.has(owner) || !this.inheritsFrom(owner, "$human")) continue;
+        const root = this.authorityRootOf(owner);
+        if (root === obj.id) continue; // never self-anchor
+        obj.anchor = root;
+        this.markObjectDirty(obj.id);
+        this.persistObject(obj.id);
+        repaired += 1;
+      }
+      if (repaired > 0) this.persist();
+      return repaired;
     }
 
     private provisionActorInternal(classRef: ObjRef, owner: ObjRef, attrs: Record<string, WooValue>, caller: ObjRef): { actor: ObjRef } {
@@ -3901,7 +3951,7 @@ export class WooWorld {
       // real $human root: a $wiz-owned agent has no human authority family, and
       // anchoring to $wiz would classify it to the catalog scope.
       const anchor = classRef === "$agent" && this.inheritsFrom(owner, "$human")
-        ? (this.authorityRootOf(owner) ?? owner)
+        ? this.authorityRootOf(owner)
         : null;
       this.createObject({ id, name, parent: classRef, owner, location: "$nowhere", anchor });
       this.setProp(id, "name", name);

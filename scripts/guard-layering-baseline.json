@@ -50,7 +50,8 @@
     "$task": 28,
     "$task_registry": 16,
     "$taskspace": 9,
-    "$transparent": 11
+    "$transparent": 11,
+    "$account": 1
   },
   "src/core/repository.ts": {
     "$sequenced_log": 2,
@@ -65,9 +66,9 @@
     "$root": 1
   },
   "src/core/world.ts": {
-    "$account": 3,
+    "$account": 4,
     "$actor": 26,
-    "$agent": 15,
+    "$agent": 16,
     "$ambiguous_match": 2,
     "$block": 3,
     "$builder": 3,
@@ -77,7 +78,7 @@
     "$help": 1,
     "$help_db_main": 1,
     "$horoscope_note": 1,
-    "$human": 12,
+    "$human": 14,
     "$loop_class": 1,
     "$match": 1,
     "$note": 1,

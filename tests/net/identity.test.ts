@@ -149,8 +149,8 @@ describe("identity import into a fresh install (item A + B)", () => {
     const human = verify.actor as string;
     const account = world.propOrNull(human, "account") as string;
     world.setProp(account, "programmer_grant_quota", 10);
-    // Signup recorded the authority root and anchored the account to it.
-    expect(world.propOrNull(account, "authority_root")).toBe(human);
+    // Signup anchored the account to the human — that anchor IS the family's
+    // authority root (no duplicate authority_root prop).
     expect(world.object(account).anchor).toBe(human);
 
     // create_agent anchors the new agent to the same root.

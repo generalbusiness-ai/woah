@@ -74,6 +74,7 @@ const LOCAL_CATALOG_PINBOARD_FREE_COORDS_MIGRATION = "2026-05-01-pinboard-free-c
 const LOCAL_CATALOG_DUBSPACE_SOURCE_PRESENCE_MIGRATION = "2026-05-01-dubspace-source-presence";
 const LOCAL_CATALOG_PINBOARD_SOURCE_PRESENCE_MIGRATION = "2026-05-01-pinboard-source-presence";
 const LOCAL_CATALOG_PINBOARD_PINS_MODEL_MIGRATION = "2026-05-02-pinboard-pins-model";
+const LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION = "2026-07-25-authority-family-colocation";
 const LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION = "2026-05-02-pinboard-notes-to-pins";
 const LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION = "2026-05-02-pinboard-v02-repair";
 const LOCAL_CATALOG_PINBOARD_V02_DATA_REPAIR_MIGRATION = "2026-05-02-pinboard-v02-data-repair";
@@ -2025,6 +2026,15 @@ function markMigrationApplied(world: WooWorld, id: string): void {
 export function runHostScopedDataMigrations(world: WooWorld, host = "host"): void {
   if (world.objects.has("$pin") && world.objects.has("$pinboard")) {
     runPinboardNotesToPinsDataPlan(world, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION, "host", host);
+  }
+  // Co-locate legacy anchorless authority families (account + owned agents)
+  // into one cluster so a promote/demote quota transition stays single-scope.
+  // Local-boot / single-host only; Net placement comes from install/cutover.
+  // Idempotent (each object gates on a null anchor); the ledger skips the walk
+  // once applied. Gated on the account seed class so an empty world is a no-op.
+  if (world.objects.has("$account") && !migrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION)) {
+    world.repairAuthorityFamilyColocation();
+    markMigrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION);
   }
   // $note descendants (dispensed notes, pins, tasks) often live on
   // self-hosted slices. Walk text: list<str> → str here so the host's
