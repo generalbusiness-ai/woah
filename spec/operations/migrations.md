@@ -116,7 +116,7 @@ verb $migration:run() {
 }
 ```
 
-The migration is a recurring forked task that processes batches until done, with per-task tick budgets. Failure mid-batch leaves a partial migration; the next run resumes from the last-processed seq.
+The migration is a chain of scheduled turns that processes one batch each, with per-turn tick budgets. At the 60-second lead time ([scheduling.md §SC3](../semantics/scheduling.md#sc3-time)) a long migration is measured in batches-per-hour, so size the batch accordingly. Failure mid-batch leaves a partial migration; the next run resumes from the last-processed seq. Arm it as an `always` entry — a migration must not stall because nobody is watching the scope — which means the driver is wizard-owned.
 
 **Idempotency requirement.** Migrations must be idempotent. The transform verb checks whether each object has already been migrated (e.g., by reading a marker property or checking the value's shape) before transforming. This makes:
 - Crash recovery safe (resume from any point).

@@ -1,6 +1,6 @@
 ---
-date: 2026-04-30
-status: implemented
+date: 2026-07-25
+status: partial — implemented, except that step 7 of §S2 (deferred work via `schedule`) is specified and not yet built
 ---
 
 # Spaces

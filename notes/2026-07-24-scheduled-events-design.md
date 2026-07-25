@@ -114,7 +114,9 @@ producer, the safety envelope, and the catalog surface.
 `schedule()` and `cancel_schedule()` record entries in the turn's
 `EffectTranscript` — the `schedules` / `cancellations` arrays that CO3
 already declares as the target shape — and the commit scope applies them
-**atomically with the turn's writes**, inside `post_state_hash`.
+**atomically with the turn's writes**. (Superseded detail: an earlier
+version of this decision also put them inside `post_state_hash`. See §14
+item 2 — they are not, and should not be.)
 
 Rationale: CO9, one write path per fact. A timer set by a turn that was
 then rejected must not exist. A turn replayed must set the same timer.
@@ -558,7 +560,84 @@ The five open questions are closed:
 
 Nothing here blocks the spec edits in §11.
 
-## 14. Still unanswered (not blocking)
+## 14. Review round (2026-07-25) — six contract gaps closed
+
+An adversarial review of the committed spec found six P1 gaps plus stale
+status claims. All were real; two were worse than reported. Verified
+against the code before fixing, and the fixes are in the spec, not here —
+this section records what changed and why so the reasoning is not lost.
+
+1. **No arming-frame provenance.** `ScheduledTurnRequest` carried an id and
+   a call but nothing analogous to `TranscriptWrite.writer`, so the scope
+   could not itself prove which object's namespace an id belonged to, or
+   that the arming frame held wizard authority for `always` — it would
+   have had to trust the planner on both. Fixed: mandatory `armed_by:
+   RecordedWriteAuthority` on schedules *and* cancellations (which are
+   therefore no longer bare strings). `armed_by` is validated at commit and
+   **discarded** — D3's no-stored-authority rule is untouched, because
+   provenance answers "was this effect legitimate?", not "what may the
+   fired turn do?".
+
+2. **Queue reads across the plan/commit boundary.** `schedules()` returned
+   queue contents and `cancel_schedule` returned a bool, both computed at
+   plan time from state the planner does not hold, with no versioned read
+   to invalidate the turn if a concurrent fire or cancel falsified them.
+   And CO16.2 claimed the queue was in the `post_state_hash` preimage while
+   CO4 and the implementation derive that digest from touched cells only.
+   Fixed by weakening rather than by inventing a read proof: `schedules()`
+   is **removed** from the DSL (introspection is a live read, outside turn
+   semantics), `cancel_schedule` returns nothing, and the post-state claim
+   is dropped with an explanation of why the queue does not belong there —
+   it is an instruction the scope validates, not a prediction the planner
+   makes.
+
+3. **Delivery route.** The spec promised "any same-scope target with the
+   ordinary permission check"; the implementation dispatches `route:
+   "direct"` through the *internal* planner path. Worse than the review
+   stated: the `direct_callable` gate lives on the client ingress
+   (`gateway-do.ts:4124`), not on the internal path, so scheduled turns
+   today can reach verbs external direct dispatch refuses — a silent
+   privilege widening, not the blockage that was reported. Fixed by naming
+   the rule: a scheduled turn is authorized **exactly as a sequenced call
+   by the same actor**; `direct_callable` is an ingress gate and is not
+   consulted in either direction; no presence check. The implementation's
+   `route: "direct"` is now a known divergence for phase 4.
+
+4. **`idle_policy` unselectable.** Mandatory on the wire, absent from every
+   signature, and not inferable — a stable key means "cancellable", not
+   "repeating", so a deadline and a chain look identical. Fixed: explicit
+   `opts.idle_policy`, defaulting to `while_active`. Also defined "live
+   subscriber", which was undefined against a registry that always contains
+   a planner: it means a **session** subscriber, hidden-roster service
+   sessions included (they are real observers), fanout/planner
+   registrations excluded (counting one would make `while_active` a synonym
+   for `always`).
+
+5. **Contradictory floor.** SC3 defined a pairwise `(target, verb)` rate
+   limit; SC9 promised `fork(1, ...)` fires after a minute — only true
+   under a lead-time reading. The stored row has neither `armed_at` nor a
+   last-delivery index to implement the rate-limit reading. Resolved as a
+   **minimum lead time**, clamped not rejected: checkable from the turn
+   itself, no durable index, no cleanup question, and since a chain re-arms
+   only when it fires, a floor on each delay is also a ceiling of one turn
+   per minute on the chain — which was the cost argument all along.
+
+6. **Quotas bounded counts, not bytes.** 1000 entries per scope with
+   unbounded `id`/`verb`/`args` accumulates megabytes of durable scope
+   state that no cell accounting sees. Added per-entry (8 KiB) and
+   per-scope (2 MiB) serialized-byte caps, measured over the row as stored.
+
+Plus one gap the review did not name, found while fixing #3: **a terminal
+scheduled failure was discarded**. The planner returns a rejected
+`TurnResult`, the scope sees 200, deletes the outbox row, and drops the
+verdict — and nobody is waiting, since the actor has no session. Every
+"fails loudly" claim in the lifecycle rules was false. CO16.8 now requires
+a durable `scheduled_turn_failed` record plus an observation, written in
+the same transaction that deletes the row, with lane abandonment recorded
+identically: from the world's view, "never ran" and "ran and failed" are
+the same event.
+
+## 15. Still unanswered (not blocking)
 
 - **Multi-day alarm durability.** `tasks.md:50`'s open question — that
   alarms set across multi-day boundaries fire reliably and that hibernated

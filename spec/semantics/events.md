@@ -34,7 +34,7 @@ An object receives events via verbs whose names match `:on_<type>` or generic `:
 2. Else look up `:on_event`. Call with `(event)`.
 3. Else silently drop.
 
-Receiver verbs are dispatched as forked tasks (not joined to the emitter's task) so emit is asynchronous from the emitter's view.
+Receiver verbs are dispatched as separate tasks, not joined to the emitter's task, so emit is asynchronous from the emitter's view. This is delivery asynchrony within the turn pipeline, unrelated to `schedule` ([scheduling.md](scheduling.md)): the emitter does not wait, but nothing is deferred to a later turn.
 
 ### 12.3 Sticky vs transient targets
 

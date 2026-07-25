@@ -1,6 +1,6 @@
 ---
-date: 2026-04-30
-status: implemented
+date: 2026-07-25
+status: partial — implemented except the SCHEDULE / CANCEL_SCHEDULE opcodes (§8.3.8), which are specified and not yet built
 ---
 
 # Bytecode and VM
@@ -201,12 +201,14 @@ Cold-path operations (`length`, `slice`, `delete`, `has`, `keys`, type coercions
 
 | Op | Operands | Stack effect | Yield | Description |
 |---|---|---|---|---|
-| `SCHEDULE` | argc | target verb args at_ms [key] → schedule_id | N | Record a pending scheduled turn in the transcript. Does **not** yield: the current turn continues and the work happens in a later turn. |
-| `CANCEL_SCHEDULE` | — | schedule_id → removed | N | Record a cancellation in the transcript. |
+| `SCHEDULE`&nbsp;※ | argc | target verb args at_ms [opts] → schedule_id | N | Record a pending scheduled turn in the transcript. Does **not** yield: the current turn continues and the work happens in a later turn. |
+| `CANCEL_SCHEDULE`&nbsp;※ | — | schedule_id → null | N | Record a cancellation in the transcript. Returns nothing: see [scheduling.md §SC2](scheduling.md#sc2-signatures). |
 | `EMIT` | — | target event → | **Y** | Send event. Target may be obj, list of objs, or `$everyone_in(room)`. RPC to remote targets. |
 | `YIELD` | — | — | **Y** | Cooperative scheduler boundary. Inserted at backedges of long loops. |
 
-`SCHEDULE` and `CANCEL_SCHEDULE` are *recording* opcodes: they append to the turn's `schedules` / `cancellations` transcript arrays and nothing else. No task is created now, no authority is captured, and nothing has happened until the turn commits. The scheduled turn, when it fires, is a wholly separate task with a fresh budget, `caller = $system`, and programmer authority from the fired verb's own owner. Semantics: [scheduling.md](scheduling.md); mechanism: [coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
+※ **Not yet implemented.** Both are specified and neither is built; no world runs them today. They replace the `FORK` / `SUSPEND` / `READ` opcodes, which were implemented but did nothing at runtime — nothing resumed a parked task — and which this specification no longer defines. The runtime still carries them; phase 1 of the scheduling work deletes them.
+
+`SCHEDULE` and `CANCEL_SCHEDULE` are *recording* opcodes: they append to the turn's `schedules` / `cancellations` transcript arrays and nothing else. No task is created now and nothing has happened until the turn commits. The *arming frame's* authority IS recorded — `armed_by`, the same `RecordedWriteAuthority` a write carries — because the scope must prove the namespace and the wizard check itself rather than trusting the planner; it is validated at commit and discarded, and never rides into the fired turn. The scheduled turn, when it fires, is a wholly separate task with a fresh budget, `caller = $system`, and programmer authority from the fired verb's own owner. Semantics: [scheduling.md](scheduling.md); mechanism: [coherence.md §CO16](../protocol/coherence.md#co16-scheduled-turns).
 
 #### 8.3.9 Exceptions
 
