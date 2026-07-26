@@ -2804,7 +2804,12 @@ export class WooWorld {
       throw wooError("E_TYPE", "verb descriptor must be a name string or 1-based slot integer", descriptor);
     }
     const found = this.ownVerbExact(objRef, descriptor);
-    if (!found) throw wooError("E_VERBNF", `${objRef} has no verb named ${descriptor}`, { obj: objRef, descriptor });
+    // `{ obj, name }` is the engine's one E_VERBNF shape for a name-descriptor
+    // miss. It is not cosmetic: the Net sparse planner derives the exact
+    // `verb_bytecode:<obj>:<name>` cell to grow the turn's slice from this
+    // value (src/net/plan.ts sparseMissingKeys). A divergent key spelling made
+    // the miss unrepairable and terminal — see that function's comment.
+    if (!found) throw wooError("E_VERBNF", `${objRef} has no verb named ${descriptor}`, { obj: objRef, name: descriptor });
     return found;
   }
 
@@ -2917,7 +2922,9 @@ export class WooWorld {
     const verb = this.ownVerbResolve(objRef, descriptor);
     this.recordAuthoredVerbRead(objRef, verb);
     if (!this.removeVerb(objRef, verb.name)) {
-      throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, verb: verb.name });
+      // `{ obj, name }`: see ownVerbResolve — the Net planner derives the
+      // missing verb cell from this shape.
+      throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, name: verb.name });
     }
     this.recordAuthoredVerbWrite(objRef, null, verb.name);
   }

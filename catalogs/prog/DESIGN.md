@@ -55,6 +55,22 @@ Builder `create(parent, opts?)` creates objects owned by the invoking actor.
 There is no `owner` option in the builder surface. Creating on behalf of another
 actor is a wizard/admin operation, not ordinary delegated building.
 
+`opts.location` defaults to the invoking actor, matching LambdaCore's `@create`
+(`move(object, player)` at L42). Placement is not cosmetic: structural context —
+inventory, or the space you occupy and its contents — is what makes an object
+visible to `look`, to the client, and to an MCP session's tool resolver. An
+object created into no container exists only as a returned id, so a verb
+installed on it could never become a tool, and `create → install_verb → invoke`
+could not close. `location: null` remains the explicit way to ask for that.
+The default is applied here in woocode rather than inside
+`builder_create_object`: the native stays a generic placement primitive
+(carrying the presence and cross-host checks), while "a builder's output lands
+in the builder's hands" is surface policy, visible in the manifest where an
+agent reading the tool can see it. The `@create` command path keeps its
+post-create `moveto` — it is a faithful LambdaCore port and runs the receiver
+chain — so the two paths differ deliberately: `create` places atomically,
+`@create` places through `:acceptable`.
+
 Builder `chparent(id, parent, opts?)` follows LambdaCore's player-class safety:
 actor/player objects can only be reparented under actor-derived classes. Moving
 an actor out of the actor hierarchy is wizard/admin repair, not delegated

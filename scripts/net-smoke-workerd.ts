@@ -409,6 +409,63 @@ async function main(): Promise<number> {
     });
     step("the live agent session loses its authoring surface after Net demote", afterDemoteTools !== null);
 
+    // ---- Aged-world contents repair (CO13) on REAL workerd: real per-DO
+    // SQLite, a real cross-DO closure pull, and real JSON serialization of
+    // the relation family. A dedicated scope is seeded in the exact aged
+    // shape — correct object_live cells, explicitly empty relation family —
+    // so the assertion is about the repair alone and the lane's walkthrough
+    // world is untouched.
+    const AGED = "room:aged_hall";
+    await post(base, "scope", AGED, "seed", {
+      scope: AGED,
+      catalog_epoch: EPOCH,
+      cells: [
+        { kind: "object_lineage", object: "aged_hall", value: { parent: "$space", owner: "$wiz", name: "aged_hall", anchor: null, flags: {} } },
+        { kind: "object_lineage", object: "aged_item", value: { parent: "$thing", owner: "$wiz", name: "aged_item", anchor: "aged_hall", flags: {} } },
+        { kind: "object_live", object: "aged_item", value: { location: "aged_hall" } }
+      ],
+      relations: []
+    });
+    type RepairReply = { status: string; changed: string[]; unplaced: string[] };
+    type ClosureRelations = { relations?: Array<{ relation: string; owner: string; member: string }> };
+    const agedContents = async (): Promise<string[]> => {
+      const closure = await post<ClosureRelations>(base, "scope", AGED, "closure", { keys: [], relations: true });
+      return (closure.relations ?? [])
+        .filter((row) => row.relation === "contents" && row.owner === "aged_hall")
+        .map((row) => row.member);
+    };
+    step("aged scope starts with the membership missing (cells correct, no row)", (await agedContents()).length === 0);
+
+    const repair1 = await post<RepairReply>(base, "scope", AGED, "repair-contents", {});
+    const afterRepair = await agedContents();
+    step(
+      "repair-contents reconstructs the membership from the scope's own cells (real workerd)",
+      repair1.status === "applied" && repair1.unplaced.length === 0 && afterRepair.join(",") === "aged_item",
+      `changed=${repair1.changed.length} contents=[${afterRepair.join(",")}]`
+    );
+
+    const repair2 = await post<RepairReply>(base, "scope", AGED, "repair-contents", {});
+    step(
+      "a second repair-contents run is a no-op (add-only, idempotent)",
+      repair2.status === "empty" && repair2.changed.length === 0 && (await agedContents()).length === 1,
+      `status=${repair2.status} changed=${repair2.changed.length}`
+    );
+
+    // A gateway that has never seen this scope: only its own closure pull can
+    // carry the repaired family across the real DO boundary.
+    await post(base, "gateway", "aged-cold-gw", "pull", { scope: AGED, destination: `scope:${AGED}` });
+    const coldMembers = await get<{ members: Array<{ member: string }> }>(
+      base,
+      "gateway",
+      "aged-cold-gw",
+      "relation?relation=contents&owner=aged_hall"
+    );
+    step(
+      "a COLD gateway sees the repaired object after its own pull (real workerd)",
+      coldMembers.members.map((m) => m.member).join(",") === "aged_item",
+      `members=[${coldMembers.members.map((m) => m.member).join(",")}]`
+    );
+
     // ---- Phase-4 item 3: WS transport + observation push over REAL
     // workerd, driven with Node's NATIVE WebSocket client (the browser
     // API shape — it cannot set request headers, which is exactly why the

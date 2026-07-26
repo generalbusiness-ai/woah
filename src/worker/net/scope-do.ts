@@ -109,6 +109,7 @@ import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead }
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import {
   observationsForRelationOwners,
+  rebuildContentsRelation,
   relationKey,
   roomRosterRows,
   SESSION_PRESENCE_RELATION,
@@ -770,6 +771,14 @@ export class NetScopeDO {
     // would let whichever arrived first swallow the other.
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_related (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
+    );
+    // Send-side counter for operator repair deliveries. These ride /net/relate
+    // but must not share this scope's COMMIT seq stream: the receiver gates on
+    // `seq <= last`, so a repair borrowing a commit seq would either be
+    // suppressed at head 0 or, worse, consume a seq the commit stream has not
+    // reached and make the receiver drop the real delta that lands on it later.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_repair_delivery (lane TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     );
     // Rider residue ledger (rider-read integrity, fix 1): keys of cells
     // this scope committed via CA3 ride-along but does NOT anchor. After
@@ -1471,6 +1480,148 @@ export class NetScopeDO {
         }));
         this.armOutboxRetryAlarm();
         return json({ ok: true, scope: seq.scope, ...repaired });
+      }
+      if (request.method === "POST" && url.pathname === "/net/repair-contents") {
+        // Aged-world repair for contents rows that were never derived. Before
+        // the create-time derivation landed, an object minted directly INTO a
+        // container produced no `contents` delta at all (object_create records
+        // placement inline — no move, no projection write), so its membership
+        // row is missing while its object_live.location is correct. Creating
+        // straight into a container is an ordinary woocode idiom, so any world
+        // that ran before the fix carries the gap.
+        //
+        // BOUNDED, NOT GLOBAL: each scope derives candidates from its OWN
+        // object_live cells — the same O(scope size) walk CO13 already
+        // sanctions for rebuildContentsRelation and hydration. No scope ever
+        // enumerates another, and no caller enumerates objects.
+        //
+        // ADD-ONLY: unlike the full rebuild, this never deletes. A row this
+        // scope owns whose member lives elsewhere (delivered here by
+        // /net/relate) is invisible to a local cell scan, and a rebuild would
+        // drop it. Add-only also makes the operation idempotent for free:
+        // applyRelationDeltas reports no change for an identical row, so a
+        // second run advances no head and refans nothing.
+        const body = (await request.json()) as {
+          dry_run?: boolean;
+          /** Anchor topology is caller knowledge (the rider_destinations rule):
+           * owner object id -> owning scope name, for owners this scope does
+           * not sequence. Unmapped foreign owners are REPORTED, never guessed. */
+          owner_scopes?: Record<string, string>;
+        };
+        const dryRun = body.dry_run === true;
+        const ownerScopes = body.owner_scopes ?? {};
+        const seq = this.ensureSequencer();
+        const cells = [...seq.store.keys()]
+          .map((key) => seq.store.get(key))
+          .filter((cell): cell is Cell => Boolean(cell));
+        const candidates = [...rebuildContentsRelation(cells, seq.scope).values()];
+        const local: RelationRow[] = [];
+        const foreignByScope = new Map<string, RelationRow[]>();
+        const unplaced = new Set<string>();
+        for (const row of candidates) {
+          // Ownership uses the SAME predicate the sequencer validates reads
+          // with: holding a lineage copy is not owning it. Writing rows for an
+          // object this scope does not sequence would mint a second copy of
+          // another scope's row family (the CO9 dual write).
+          if (this.ownsCellLocally(seq, cellKey("object_lineage", row.owner))) {
+            local.push(row);
+            continue;
+          }
+          const target = ownerScopes[row.owner];
+          if (typeof target === "string" && target && target !== seq.scope) {
+            foreignByScope.set(target, [...(foreignByScope.get(target) ?? []), row]);
+          } else {
+            unplaced.add(row.owner);
+          }
+        }
+        if (dryRun) {
+          return json({
+            ok: true,
+            scope: seq.scope,
+            dry_run: true,
+            status: "empty",
+            head: seq.head(),
+            changed: [],
+            candidates: candidates.length,
+            local: local.length,
+            foreign: [...foreignByScope.values()].reduce((n, rows) => n + rows.length, 0),
+            unplaced: [...unplaced].sort()
+          });
+        }
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.applyForeignRelationDeltas(
+            local.map((row) => ({ op: "add" as const, row })),
+            { from_scope: "operator:repair-contents", seq: seq.head().seq + 1 }
+          );
+          if (result.status === "applied") {
+            const changed = new Set(result.changed);
+            const applied = local
+              .map((row) => ({ op: "add" as const, row }))
+              .filter((delta) => changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member)));
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            const repairBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
+              cells: [],
+              observations: [],
+              relations: applied
+            };
+            const repairText = JSON.stringify(repairBody);
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, repairBody, repairText);
+            }
+          }
+          // Cross-scope membership rides the ordinary /net/relate lane, exactly
+          // as a derivation-time foreign delta does: the owner applies, advances
+          // its own head, and refans to its own subscribers.
+          //
+          // The delivery is keyed in its OWN (from_scope, seq) namespace, not
+          // this scope's commit stream. The receiver's gate is `seq <= last`
+          // with `last` defaulting to 0, so a commit-stream seq would be
+          // suppressed at head 0 — and worse, borrowing a seq the commit stream
+          // has not reached yet would make the receiver later DROP the real
+          // delta that lands on it. A dedicated marker scope plus a private
+          // monotonic counter keeps repairs and commits from ever colliding,
+          // while still collapsing an identical re-run at the receiver.
+          if (foreignByScope.size > 0) {
+            const marker = `operator:repair-contents:${seq.scope}`;
+            const deliverySeq = this.nextRepairDeliverySeq();
+            for (const [target, rows] of foreignByScope) {
+              this.persistOutboxRow("/relate", `scope:${target}`, {
+                scope: marker,
+                seq: deliverySeq,
+                cells: [],
+                observations: [],
+                relations: rows.map((row) => ({ op: "add" as const, row }))
+              });
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        this.host.defer(() => this.drainOutbox());
+        this.metric({
+          kind: "net_scope_contents_repaired",
+          scope: seq.scope,
+          candidates: candidates.length,
+          added: repaired.changed.length,
+          foreign: [...foreignByScope.values()].reduce((n, rows) => n + rows.length, 0),
+          unplaced: unplaced.size
+        });
+        return json({
+          ok: true,
+          scope: seq.scope,
+          dry_run: false,
+          ...repaired,
+          candidates: candidates.length,
+          local: local.length,
+          foreign: [...foreignByScope.values()].reduce((n, rows) => n + rows.length, 0),
+          unplaced: [...unplaced].sort()
+        });
       }
       if (request.method === "POST" && url.pathname === "/net/repair-definitions") {
         const body = (await request.json()) as {
@@ -2214,9 +2365,21 @@ export class NetScopeDO {
       // in a CA3 commit is a cache of the owner's fact; claiming
       // ownership of it would let this scope validate reads against a
       // stale copy — the ownsSessionCell helper excludes the ledger).
+      //
+      // The residue exclusion applies to OBJECT lineage for the same reason.
+      // A create whose new object anchors to another scope commits HERE (the
+      // planning/shared scope serializes it) and rides the object's cells to
+      // its anchor, so this store keeps a lineage COPY. Reading that copy as
+      // ownership makes this scope claim an object it does not sequence: a
+      // later turn committing here that reads any cell of that object which
+      // lives only at the anchor takes the owned branch, finds "absent", and
+      // rejects read_version_mismatch forever — E_NONCONVERGENT_READ, because
+      // no refresh can put a foreign cell into this store. That is exactly the
+      // builder case (an authored object anchored to its author's cluster,
+      // created from a room turn, then invoked from another room turn).
       owns: (object) =>
-        seq.store.has(cellKey("object_lineage", object)) ||
-        seq.store.has(cellKey("object_tombstone", object)) ||
+        this.ownsCellLocally(seq, cellKey("object_lineage", object)) ||
+        this.ownsCellLocally(seq, cellKey("object_tombstone", object)) ||
         this.ownsSessionCell(seq, object),
       // CO13 relation-owner classification: the gateway's per-submit
       // relate_destinations hints (anchor topology is gateway knowledge —
@@ -2435,11 +2598,37 @@ export class NetScopeDO {
     return this.riderCacheMemo;
   }
 
-  /** CO14 session-ownership witness (see the `owns` wiring comment): the
-   * scope holds the session cell AND it is not rider residue. */
-  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
-    const key = cellKey("session", session);
+  /** Ownership witness for one cell (see the `owns` wiring comment): this
+   * scope holds it AND it is not rider residue — a cell that rode along in a
+   * CA3 commit here but is anchored elsewhere. Residue is a cache of the
+   * owner's fact; claiming it would let this scope validate reads against a
+   * copy it does not sequence. */
+  private ownsCellLocally(seq: ScopeSequencer, key: string): boolean {
     return seq.store.has(key) && !this.riderCacheKeys().has(key);
+  }
+
+  /** CO14 session-ownership witness. */
+  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
+    return this.ownsCellLocally(seq, cellKey("session", session));
+  }
+
+  /** Next seq on this scope's operator-repair delivery lane (see the table
+   * comment). Strictly increasing and durable, so a repair run that finds NEW
+   * cross-scope memberships is never mistaken for a redelivery of the last
+   * one — while an identical re-run still collapses at the receiver, whose
+   * applyRelationDeltas reports no change for a row it already holds. */
+  private nextRepairDeliverySeq(): number {
+    const lane = "relate";
+    const rows = sqlRows<{ seq: number }>(
+      this.state.storage.sql.exec("SELECT seq FROM net_scope_repair_delivery WHERE lane = ?", lane)
+    );
+    const next = (rows.length > 0 ? Number(rows[0].seq) : 0) + 1;
+    this.state.storage.sql.exec(
+      "INSERT INTO net_scope_repair_delivery (lane, seq) VALUES (?, ?) ON CONFLICT(lane) DO UPDATE SET seq = excluded.seq",
+      lane,
+      next
+    );
+    return next;
   }
 
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------

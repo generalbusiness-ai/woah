@@ -177,12 +177,22 @@ Activation requires ALL of, in order:
 `GET /net-install/probe`, `POST /net-install/scope/<name>/seed`,
 `GET /net-install/scope/<name>/head`,
 `POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
-`POST /net-install/scope/<name>/repair-relations`, and
+`POST /net-install/scope/<name>/repair-relations`,
+`POST /net-install/scope/<name>/repair-contents`, and
 `POST /net-install/scope/catalog/repair-definitions`, and
 `GET /net-install/identity-export` are the entire surface. The repair operation
 is an idempotent, add-only recovery for initial `contents` rows omitted by an
 older installer; it accepts only rows whose owner object is authoritative at
 the addressed scope and refans newly added rows at an advanced owner head.
+`repair-contents` is its RUNTIME twin, for memberships an aged world never
+derived at all because `object_create` recorded placement inline (see
+[coherence.md CO13](../protocol/coherence.md#co13-relations-and-the-projection-applier)).
+It needs no object allow-list because it infers nothing from a bundled image:
+the scope derives candidates from its own `object_live` cells, applies add-only,
+and hands memberships it does not own to the owning scope over `/net/relate` on
+a delivery lane separate from its commit seq stream. Owners the caller has not
+mapped are reported, never guessed. `--dry-run` sizes the repair without
+mutating; re-running is a no-op.
 The definition repair is the corresponding aged-world migration for bootstrap
 verb and property-definition pages. At the catalog scope it accepts replacement
 of existing `$`-object `verb_bytecode` cells and installation/replacement of

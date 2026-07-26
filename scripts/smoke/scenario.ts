@@ -308,7 +308,7 @@ export async function runSmokeWalkthrough(
         // distinguishable from an argument/auth error. The minimum acceptance bar
         // is that add_note appears in the reachable-tools list at all — the existing
         // pinboard:add_note step (always run, not gated) covers functional correctness.
-        const toolsResult = await alice.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 }, { signal: ctx.signal });
+        const toolsResult = await alice.callTool("woo_list_reachable_tools", { scope: "active", limit: 200 }, { signal: ctx.signal });
         const toolsList: unknown[] = (toolsResult as any)?.result?.structuredContent?.result?.tools ?? [];
         const addNoteTool = toolsList.find((t: any) => isRecord(t) && t.object === "the_pinboard" && t.verb === "add_note");
         if (!addNoteTool) {
@@ -584,9 +584,20 @@ export async function ensureInChatroom(
 ): Promise<void> {
   const listed = await session.callTool(
     "woo_list_reachable_tools",
-    { scope: "all", limit: 200 },
+    { scope: "active", limit: 200 },
     { signal }
   );
+  // A REFUSED tool call and an actor genuinely nowhere both leave `page` empty,
+  // and they need different fixes — report the refusal verbatim rather than
+  // letting it read as "no active scope". (A validator change that retired an
+  // argument this script still passed was diagnosed as a movement bug because
+  // this branch swallowed the error text.)
+  const failure = isRecord(listed) && isRecord(listed.result) && listed.result.isError === true
+    ? JSON.stringify(listed.result.content ?? listed.result).slice(0, 400)
+    : null;
+  if (failure) {
+    throw new Error(`woo_list_reachable_tools refused for ${session.label}: ${failure}`);
+  }
   const page = isRecord(listed) &&
     isRecord(listed.result) &&
     isRecord(listed.result.structuredContent) &&
