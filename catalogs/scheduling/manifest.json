@@ -1,0 +1,136 @@
+{
+  "name": "scheduling",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "The $scheduling feature: the author-facing surface over the schedule() primitive (spec/semantics/scheduling.md SC11). Mount it on a space or actor to gain one-shot reminders, cancellable deadlines, and a presence-gated tick chain. It exists because two rules in CO16 need a place to be discharged rather than merely stated: arming an unattended (`always`) timer requires wizard authority, so ordinary callers must reach it through catalog-owned verbs; and `tell` is live-only, so scheduled work whose output matters must land durably first. Chains keep no consumer-side state \u2014 the pending queue entry is the state, and stopping is cancelling it.",
+  "license": "MIT",
+  "depends": [
+    "@local:note"
+  ],
+  "classes": [],
+  "features": [
+    {
+      "local_name": "$scheduling",
+      "parent": "$thing",
+      "description": "Feature object carrying the scheduling surface. Verbs are catalog-owned ($wiz), which is what lets an ordinary actor arm an `always` reminder or deadline through them without holding wizard authority itself \u2014 the gate is on arming directly, not on the shapes built over it. Internal verbs (_deliver_reminder, _fire_deadline, _tick) refuse any caller but the scheduler.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "can_be_attached_by",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "who"
+            ]
+          },
+          "source": "verb :can_be_attached_by(who) rxd {\n  /* Freely attachable: mounting scheduling grants nothing by itself.\n     Every verb below re-checks its own authority at call time. */\n  return true;\n}",
+          "direct_callable": true
+        },
+        {
+          "name": "remind_in",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "delay_ms",
+              "text"
+            ]
+          },
+          "source": "verb :remind_in(delay_ms, text) rxd {\n  /* One-shot reminder for the CALLER. Armed `always`: a reminder whose\n     room happens to be empty must still fire, which is the whole point\n     of a reminder. Arming `always` needs wizard authority (CO16.6) and\n     this verb is catalog-owned ($wiz), so an ordinary actor reaches it\n     here and only here \u2014 that is what the gate is for. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"remind_in needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"remind_in needs a non-empty reminder\", value: text }; }\n  if (length(text) > 4096) { raise { code: \"E_QUOTA\", message: \"reminder text exceeds 4096 characters\", value: length(text) }; }\n  /* The scheduled turn runs as `actor`, so it can do no more than the\n     caller could. Passing the actor explicitly keeps the fired verb from\n     having to infer who asked. */\n  return schedule(this, \"_deliver_reminder\", [actor, text], delay_ms, { \"idle_policy\": \"always\" });\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "cancel_reminder",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "id"
+            ]
+          },
+          "source": "verb :cancel_reminder(id) rxd {\n  /* Takes the id `remind_in` returned. Cancelling something already\n     fired or never armed is a no-op, not an error (SC2). */\n  if (typeof(id) != \"string\" || !id) { raise { code: \"E_INVARG\", message: \"cancel_reminder needs a schedule id\", value: id }; }\n  cancel_schedule(id);\n  return null;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "_deliver_reminder",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "who",
+              "text"
+            ]
+          },
+          "source": "verb :_deliver_reminder(who, text) rxd {\n  /* Fired by the scheduler. DURABLE FIRST, then live.\n\n     `tell` is live-only, and a scheduled turn is exactly the case where\n     the actor is likely to be gone: no session, possibly not connected\n     at all (SC6). A reminder that only told would vanish precisely when\n     it mattered. So mint the note first \u2014 a real durable object the\n     actor finds later \u2014 and only then tell, for whoever is watching. */\n  if (caller != $system) { raise { code: \"E_PERM\", message: \"_deliver_reminder is fired by the scheduler, not called\", value: caller }; }\n  let note = create($note, { owner: who, name: \"reminder\", location: who });\n  note.text = text;\n  note.description = \"A reminder you asked for earlier.\";\n  tell(who, \"Reminder: \" + text);\n  return note;\n}"
+        },
+        {
+          "name": "deadline",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "delay_ms",
+              "verb_name",
+              "key"
+            ]
+          },
+          "source": "verb :deadline(delay_ms, verb_name, key) rxd {\n  /* \"If nothing happens by T, do X.\" Armed `always` because a deadline\n     with nobody watching is still a deadline \u2014 that is the shape the\n     escalation and auto-close patterns need.\n\n     `key` is caller-supplied and stable so the deadline can be CANCELLED\n     when the thing it was waiting for happens. Re-arming the same key\n     replaces rather than duplicates (CO16.2 upsert), so extending a\n     deadline is just calling this again. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"deadline needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(verb_name) != \"string\" || !verb_name) { raise { code: \"E_INVARG\", message: \"deadline needs a verb name\", value: verb_name }; }\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"deadline needs a stable key so it can be cancelled\", value: key }; }\n  /* Internal names are not reachable this way: a deadline that could\n     fire `_deliver_reminder` or `_tick` would let a caller forge the\n     scheduler's own internals. */\n  if (str_starts(verb_name, \"_\")) { raise { code: \"E_PERM\", message: \"deadline cannot target an internal verb\", value: verb_name }; }\n  return schedule(this, \"_fire_deadline\", [verb_name], delay_ms, { \"key\": \"deadline:\" + key, \"idle_policy\": \"always\" });\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "cancel_deadline",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "key"
+            ]
+          },
+          "source": "verb :cancel_deadline(key) rxd {\n  /* The ack path calls this. Idempotent: cancelling a deadline that\n     already fired, or was never armed, is a no-op. */\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"cancel_deadline needs the key the deadline was armed with\", value: key }; }\n  cancel_schedule(tostr(this) + \":deadline:\" + key);\n  return null;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "_fire_deadline",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "verb_name"
+            ]
+          },
+          "source": "verb :_fire_deadline(verb_name) rxd {\n  /* Fired by the scheduler; dispatches the caller-named verb on this\n     object. If that verb is gone (a catalog upgrade renamed it, say)\n     this raises and the failure is recorded \u2014 one visible failure per\n     broken timer, which is CO16.8 working rather than silence. */\n  if (caller != $system) { raise { code: \"E_PERM\", message: \"_fire_deadline is fired by the scheduler, not called\", value: caller }; }\n  return dispatch(this, verb_name, []);\n}"
+        },
+        {
+          "name": "start_ticking",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "rate_ms"
+            ]
+          },
+          "source": "verb :start_ticking(rate_ms) rxd {\n  /* Periodic `this:tick()`. `while_active` (the default) is deliberate:\n     ambient behaviour exists to be seen, so it should not bill a world\n     forever in a room nobody visits. The scope defers it while nobody is\n     attached and the next accepted turn wakes it (CO16.6).\n\n     Idempotent by construction: the stable key means calling this while\n     already ticking re-arms rather than starting a second chain. The\n     rate rides in the args, so the chain needs no stored state \u2014 the\n     pending entry IS the state, and stopping is cancelling it. */\n  if (typeof(rate_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"start_ticking needs a rate in milliseconds\", value: rate_ms }; }\n  return schedule(this, \"_tick\", [rate_ms], rate_ms, { \"key\": \"tick\" });\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "stop_ticking",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :stop_ticking() rxd {\n  /* Cancels the pending entry, which is the entire state of the chain.\n     A chain already stopped cancels to a no-op. */\n  cancel_schedule(tostr(this) + \":tick\");\n  return null;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "_tick",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "rate_ms"
+            ]
+          },
+          "source": "verb :_tick(rate_ms) rxd {\n  /* One beat. Calls the consumer's own :tick, then re-arms.\n\n     Both happen in ONE committed turn, so if :tick raises, the re-arm\n     rolls back with it and the chain stops. That is the intended failure\n     mode: a broken chain halts and leaves a recorded reason instead of\n     failing forever every minute. */\n  if (caller != $system) { raise { code: \"E_PERM\", message: \"_tick is fired by the scheduler, not called\", value: caller }; }\n  let result = dispatch(this, \"tick\", []);\n  schedule(this, \"_tick\", [rate_ms], rate_ms, { \"key\": \"tick\" });\n  return result;\n}"
+        }
+      ]
+    }
+  ]
+}

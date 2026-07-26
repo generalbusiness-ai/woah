@@ -18,8 +18,9 @@ import manifest16 from "../../catalogs/outliner/manifest.json";
 import manifest20 from "../../catalogs/perm/manifest.json";
 import manifest21 from "../../catalogs/pinboard/manifest.json";
 import manifest23 from "../../catalogs/prog/manifest.json";
-import manifest24 from "../../catalogs/tasks/manifest.json";
-import manifest26 from "../../catalogs/weather/manifest.json";
+import manifest24 from "../../catalogs/scheduling/manifest.json";
+import manifest25 from "../../catalogs/tasks/manifest.json";
+import manifest27 from "../../catalogs/weather/manifest.json";
 import * as uiModule0 from "../../catalogs/chat/ui/chat-space";
 import * as uiModule1 from "../../catalogs/demoworld/ui/demoworld-chat";
 import * as uiModule2 from "../../catalogs/dispenser/ui/dispenser-chat";
@@ -38,6 +39,6 @@ export const BUNDLED_CATALOG_UI = [
   { alias: "note", manifest: manifest13, modules: { "note-chat": uiModule4 } },
   { alias: "outliner", manifest: manifest16, modules: { "outliner-ui": uiModule5 } },
   { alias: "pinboard", manifest: manifest21, modules: { "pinboard-ui": uiModule6 } },
-  { alias: "tasks", manifest: manifest24, modules: { "tasks-ui": uiModule7 } },
-  { alias: "weather", manifest: manifest26, modules: { "weather-ui": uiModule8 } }
+  { alias: "tasks", manifest: manifest25, modules: { "tasks-ui": uiModule7 } },
+  { alias: "weather", manifest: manifest27, modules: { "weather-ui": uiModule8 } }
 ] as const;

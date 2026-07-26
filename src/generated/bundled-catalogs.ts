@@ -27,10 +27,11 @@ import manifest20 from "../../catalogs/perm/manifest.json";
 import manifest21 from "../../catalogs/pinboard/manifest.json";
 import migration22 from "../../catalogs/pinboard/migration-v0-to-v1.json";
 import manifest23 from "../../catalogs/prog/manifest.json";
-import manifest24 from "../../catalogs/tasks/manifest.json";
-import migration25 from "../../catalogs/tasks/migration-v0-to-v1.json";
-import manifest26 from "../../catalogs/weather/manifest.json";
-import migration27 from "../../catalogs/weather/migration-v0-to-v1.json";
+import manifest24 from "../../catalogs/scheduling/manifest.json";
+import manifest25 from "../../catalogs/tasks/manifest.json";
+import migration26 from "../../catalogs/tasks/migration-v0-to-v1.json";
+import manifest27 from "../../catalogs/weather/manifest.json";
+import migration28 from "../../catalogs/weather/migration-v0-to-v1.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -58,6 +59,7 @@ export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/perm/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
   { path: "catalogs/pinboard/manifest.json", manifest: manifest21 as unknown as CatalogManifest, migrations: [migration22 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/pinboard/migration-v0-to-v1.json"] },
   { path: "catalogs/prog/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/tasks/manifest.json", manifest: manifest24 as unknown as CatalogManifest, migrations: [migration25 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/tasks/migration-v0-to-v1.json"] },
-  { path: "catalogs/weather/manifest.json", manifest: manifest26 as unknown as CatalogManifest, migrations: [migration27 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/weather/migration-v0-to-v1.json"] }
+  { path: "catalogs/scheduling/manifest.json", manifest: manifest24 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/tasks/manifest.json", manifest: manifest25 as unknown as CatalogManifest, migrations: [migration26 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/tasks/migration-v0-to-v1.json"] },
+  { path: "catalogs/weather/manifest.json", manifest: manifest27 as unknown as CatalogManifest, migrations: [migration28 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/weather/migration-v0-to-v1.json"] }
 ];
