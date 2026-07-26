@@ -1,13 +1,14 @@
 {
   "name": "casework",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "Proof-of-kernel catalog for acts (kernel note S3/S5): $case rooms whose task lifecycle is recorded as tasks.* acts and projected by $task_board (per-task rows, view-time joins) and $kind_lanes (per-kind counts with bounded auxiliary state). Temporary by design: the real tasks-catalog migration supersedes it, and these classes then retire.",
   "license": "MIT",
   "depends": [
     "@local:acts",
     "@local:chat",
-    "@local:note"
+    "@local:note",
+    "@local:scheduling"
   ],
   "classes": [
     {
@@ -121,7 +122,7 @@
               "row_cap"
             ]
           },
-          "source": "verb :initialize(row_cap) rxd {\n  /* Seed-time setup: create the board projection co-anchored with the\n     case (same anchor cluster, so SL2 atomicity covers fold writes).\n     A case is both composer and log authority, so both bindings name it. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"case initialize is owner-only\" }; }\n  this:add_feature($acts);\n  let board = create($task_board, { owner: this.owner, name: \"board\", location: this });\n  board.source_space = this;\n  board.log_space = this;\n  if (typeof(row_cap) == \"number\" && row_cap > 0) { board.row_cap = toint(row_cap); }\n  this.projections = [board];\n  return board;\n}",
+          "source": "verb :initialize(row_cap) rxd {\n  /* Seed-time setup: create the board projection co-anchored with the\n     case (same anchor cluster, so SL2 atomicity covers fold writes).\n     A case is both composer and log authority, so both bindings name it. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"case initialize is owner-only\" }; }\n  this:add_feature($acts);\n  /* Escalation timers (catalogs/scheduling). A case is a $room, so the\n     feature attaches; the deadline verbs are $wiz-owned, which is what\n     lets an ordinary caseworker arm an unattended timer through them. */\n  this:add_feature($scheduling);\n  let board = create($task_board, { owner: this.owner, name: \"board\", location: this });\n  board.source_space = this;\n  board.log_space = this;\n  if (typeof(row_cap) == \"number\" && row_cap > 0) { board.row_cap = toint(row_cap); }\n  this.projections = [board];\n  return board;\n}",
           "direct_callable": true,
           "skip_presence_check": true
         },
@@ -145,10 +146,11 @@
               "text",
               "kind",
               "labels",
-              "obligations"
+              "obligations",
+              "escalate_after_ms"
             ]
           },
-          "source": "verb :open_task(name, text, kind, labels, obligations) rxd {\n  /* Domain verb: mints the task artifact (object-authoritative content),\n     then records the coordination fact as an act in the same turn. */\n  if (typeof(name) != \"string\" || name == \"\") { raise { code: \"E_INVARG\", message: \"task name required\" }; }\n  if (typeof(labels) != \"list\") { labels = []; }\n  if (typeof(obligations) != \"list\") { obligations = []; }\n  let obs = [];\n  for k in obligations { obs = obs + [{ \"key\": to_string(k), \"met\": false }]; }\n  let t = create($note, { owner: actor, name: name, location: this });\n  if (typeof(text) == \"string\" && text != \"\") { t:set_text(text); }\n  this:act(\"tasks.opened\", { \"task\": t, \"kind\": to_string(kind), \"labels\": labels, \"obligations\": obs });\n  return t;\n}",
+          "source": "verb :open_task(name, text, kind, labels, obligations, escalate_after_ms) rxd {\n  /* Domain verb: mints the task artifact (object-authoritative content),\n     then records the coordination fact as an act in the same turn. */\n  if (typeof(name) != \"string\" || name == \"\") { raise { code: \"E_INVARG\", message: \"task name required\" }; }\n  if (typeof(labels) != \"list\") { labels = []; }\n  if (typeof(obligations) != \"list\") { obligations = []; }\n  let obs = [];\n  for k in obligations { obs = obs + [{ \"key\": to_string(k), \"met\": false }]; }\n  let t = create($note, { owner: actor, name: name, location: this });\n  if (typeof(text) == \"string\" && text != \"\") { t:set_text(text); }\n  this:act(\"tasks.opened\", { \"task\": t, \"kind\": to_string(kind), \"labels\": labels, \"obligations\": obs });\n  /* An unclaimed task is the case that needs a timer: nobody is waiting on\n     it, so nobody notices it going stale. Armed only when the caller asks,\n     keyed by the task so claiming can cancel it. */\n  if (typeof(escalate_after_ms) == \"number\" && escalate_after_ms > 0) {\n    this:deadline(escalate_after_ms, \"escalate_task\", [t, escalate_after_ms], \"task:\" + to_string(t));\n  }\n  return t;\n}",
           "direct_callable": true,
           "tool_exposed": true
         },
@@ -160,7 +162,7 @@
               "task"
             ]
           },
-          "source": "verb :claim(task) rxd {\n  /* The move IS the lease; the act records the coordination fact in the\n     same sequenced turn. The log envelope already identifies the actor,\n     so the payload carries only the task whose lease changed. Validated\n     against the board row: a closed or dropped task cannot be re-claimed\n     even though close_task returned it to the case physically (review\n     finding 1, 2026-07-21). Fail-closed: if the fold refuses, the move\n     rolls back with it. */\n  let row = this:_board_row(task);\n  if (row == null || row[\"phase\"] != \"active\") { raise { code: \"E_TRANSITION\", message: \"task is not claimable\", value: task }; }\n  if (!valid(task) || location(task) != this) { raise { code: \"E_INVARG\", message: \"task not open here\", value: task }; }\n  moveto(task, actor);\n  this:act(\"tasks.claimed\", { \"task\": task });\n  return task;\n}",
+          "source": "verb :claim(task) rxd {\n  /* The move IS the lease; the act records the coordination fact in the\n     same sequenced turn. The log envelope already identifies the actor,\n     so the payload carries only the task whose lease changed. Validated\n     against the board row: a closed or dropped task cannot be re-claimed\n     even though close_task returned it to the case physically (review\n     finding 1, 2026-07-21). Fail-closed: if the fold refuses, the move\n     rolls back with it. */\n  let row = this:_board_row(task);\n  if (row == null || row[\"phase\"] != \"active\") { raise { code: \"E_TRANSITION\", message: \"task is not claimable\", value: task }; }\n  if (!valid(task) || location(task) != this) { raise { code: \"E_INVARG\", message: \"task not open here\", value: task }; }\n  moveto(task, actor);\n  /* Claiming is the thing the escalation was waiting for. Cancelling is\n     idempotent, so a task that had no timer, or whose timer already\n     fired, costs nothing here. Guarded because a case initialized before\n     this catalog version carries no $scheduling feature and therefore has\n     no deadlines to cancel \u2014 that is absence, not failure. */\n  try { this:cancel_deadline(\"task:\" + to_string(task)); } except err { }\n  this:act(\"tasks.claimed\", { \"task\": task });\n  return task;\n}",
           "direct_callable": true,
           "tool_exposed": true
         },
@@ -228,6 +230,18 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true
+        },
+        {
+          "name": "escalate_task",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "task",
+              "waited_ms"
+            ]
+          },
+          "source": "verb :escalate_task(task, waited_ms) rxd {\n  /* Fired by the scheduler when nobody claimed in time (and callable\n     directly to escalate by hand). Records the fact on the log rather\n     than only telling someone: the scheduled turn has no session, its\n     actor may be gone, and an escalation nobody durably recorded is the\n     silent-deadline failure CO16.8 exists to prevent.\n\n     Still-unclaimed is re-checked here, not assumed. Cancellation on\n     claim is best-effort by design, so a race can still deliver this\n     after the task was taken; escalating an already-claimed task would\n     be a false alarm. */\n  let row = this:_board_row(task);\n  if (row == null || row[\"phase\"] != \"active\") { return null; }\n  if (!valid(task) || location(task) != this) { return null; }\n  let waited = waited_ms;\n  if (typeof(waited) != \"number\") { waited = 0; }\n  this:act(\"tasks.escalated\", { \"task\": task, \"waited_ms\": floor(waited) });\n  return task;\n}"
         }
       ]
     }
@@ -272,6 +286,14 @@
         "task": "obj",
         "outcome_code": "str"
       }
+    },
+    {
+      "on": "$case",
+      "type": "tasks.escalated",
+      "shape": {
+        "task": "obj",
+        "waited_ms": "int"
+      }
     }
   ],
   "seed_hooks": [
@@ -279,6 +301,11 @@
       "kind": "attach_feature",
       "consumer": "$case",
       "feature": "$acts"
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "$case",
+      "feature": "$scheduling"
     }
   ]
 }

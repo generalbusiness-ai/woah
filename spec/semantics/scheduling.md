@@ -1,6 +1,6 @@
 ---
 date: 2026-07-25
-status: partial — SC1–SC10 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records); SC11's `$scheduling` catalog surface and SC2's live introspection read are specified and not yet built
+status: partial — SC1–SC11 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records, and the `$scheduling` catalog feature); the live introspection read (`:pending`, CO16.9) is specified and not yet built
 ---
 
 # Scheduling
@@ -286,13 +286,37 @@ author passing a large `args` payload should pass a reference instead.
 ## SC11. Catalog surface
 
 The builtins are the substrate. What authors and users should normally
-touch is the `$scheduling` feature: `:remind_in`, `:deadline`,
-`:start_ticking`, `:stop_ticking`, `:pending`. It is where the wizard gate
-of SC7 is discharged and where the durable-landing discipline of SC6 is
-already applied.
+touch is the `$scheduling` feature (`catalogs/scheduling`), mounted on a
+space or actor:
 
-`:pending` is the introspection surface, and it is a **live** read, not a
-committed one: it asks the scope what is queued and reports the answer.
-That answer may be stale the moment it arrives — an entry may fire while
-the reply is in flight — which is fine for "what does this room have
-armed?" and is why no committed builtin offers the same thing (SC2).
+```
+:remind_in(delay_ms, text)                    -> schedule_id
+:cancel_reminder(schedule_id)
+:deadline(delay_ms, verb_name, verb_args, key) -> schedule_id
+:cancel_deadline(key)
+:start_ticking(rate_ms)                       -> schedule_id
+:stop_ticking()
+```
+
+It is where the wizard gate of SC7 is discharged — these verbs are
+catalog-owned (`$wiz`), so an ordinary actor arms an `always` reminder or
+deadline through them without holding wizard authority — and where the
+durable-landing discipline of SC6 is applied: `:remind_in` mints a note
+before it tells.
+
+`verb_args` on `:deadline` carries the SUBJECT. A deadline that cannot say
+what it is about can only fire object-wide verbs, which is useless for the
+case it exists to serve; the first real consumer found that out
+immediately. (The parameter is `verb_args` rather than `args` because
+`args` is a verb-body global.)
+
+Tick chains hold **no consumer-side state**. The rate rides in the
+schedule's own arguments and the stable key IS the chain, so starting
+twice re-arms one entry rather than racing two, and stopping is
+cancelling. Nothing needs a `ticking` property.
+
+**`:pending` does not exist yet.** Introspection has to be a *live* read —
+a committed queue read would need a versioned read proof the queue cannot
+give (SC2) — and the CO16.9 live route is unbuilt. Until it lands there is
+no supported way to ask a room what it has armed, which is a real gap for
+authors and operators.

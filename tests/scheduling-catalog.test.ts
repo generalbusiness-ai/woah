@@ -149,12 +149,13 @@ describe("$scheduling — deadlines", () => {
   it("arms a cancellable always deadline under a stable key", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { transcript } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", "case-42"], session.id);
+    const { transcript } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], session.id);
     const armed = transcript.schedules![0];
     expect(armed.id).toBe("the_widget:deadline:case-42");
     expect(armed.idlePolicy).toBe("always");
     expect(armed.call.verb).toBe("_fire_deadline");
-    expect(armed.call.args).toEqual(["escalate"]);
+    // The subject rides with it: a deadline must be able to say what it is about.
+    expect(armed.call.args).toEqual(["escalate", ["t1"]]);
   });
 
   it("cancels by the same key the caller armed it with", async () => {
@@ -162,7 +163,7 @@ describe("$scheduling — deadlines", () => {
     // trip through both verbs or the ack silently fails to stop the timer.
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const armedTurn = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", "case-42"], "arm", session.id);
+    const armedTurn = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], "arm", session.id);
     const { seq } = commit(world, armedTurn.transcript, "arm");
     expect(seq.peekDue(Date.now() + 2 * 86_400_000)).toHaveLength(1);
 
@@ -188,9 +189,9 @@ describe("$scheduling — deadlines", () => {
   it("re-arming the same key extends rather than duplicates", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const first = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", "case-42"], "arm-1", session.id);
+    const first = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], "arm-1", session.id);
     const { seq } = commit(world, first.transcript, "arm-1");
-    const second = await callAndRecord(world, actor, "the_widget", "deadline", [172_800_000, "escalate", "case-42"], "arm-2", session.id);
+    const second = await callAndRecord(world, actor, "the_widget", "deadline", [172_800_000, "escalate", ["t1"], "case-42"], "arm-2", session.id);
     const submitted = { ...second.transcript, reads: [] } as EffectTranscript;
     const derived = applyTranscript(seq.store as CellStore, submitted, { scope_head: "x", catalog_epoch: EPOCH });
     seq.submit({
@@ -211,14 +212,14 @@ describe("$scheduling — deadlines", () => {
     // _tick with forged arguments, wearing the scheduler's own identity.
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "_tick", "sneaky"], session.id);
+    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "_tick", [], "sneaky"], session.id);
     expect(JSON.stringify(outcome)).toMatch(/E_PERM/);
   });
 
   it("requires a stable key, because a deadline you cannot cancel is a bug", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ""], session.id);
+    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", [], ""], session.id);
     expect(JSON.stringify(outcome)).toMatch(/E_INVARG/);
   });
 });
@@ -337,7 +338,7 @@ describe("$scheduling — internals are not a public surface", () => {
     await enter(world, session);
     for (const [name, body] of [
       ["forge_tick", 'verb :forge_tick() rxd { return dispatch(this, "_tick", [300000]); }'],
-      ["forge_deadline", 'verb :forge_deadline() rxd { return dispatch(this, "_fire_deadline", ["escalate"]); }']
+      ["forge_deadline", 'verb :forge_deadline() rxd { return dispatch(this, "_fire_deadline", ["escalate", []]); }']
     ] as const) {
       expect(installVerb(world, "the_widget", name, body, null).ok).toBe(true);
       const outcome = await world.directCall(
@@ -356,7 +357,7 @@ describe("$scheduling — internals are not a public surface", () => {
     await enter(world, session);
     for (const [verb, args] of [
       ["_deliver_reminder", [actor, "forged"]],
-      ["_fire_deadline", ["escalate"]],
+      ["_fire_deadline", ["escalate", []]],
       ["_tick", [300_000]]
     ] as const) {
       // Not direct_callable, so the refusal lands at ingress and no turn is
@@ -367,5 +368,121 @@ describe("$scheduling — internals are not a public surface", () => {
       expect(outcome.op).toBe("error");
       expect(JSON.stringify(outcome)).toMatch(/E_PERM|E_VERBNF|E_DIRECT_DENIED/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The first real user. A feature with no consumer proves nothing about whether
+// the surface is usable — and this one immediately found a hole in it: the
+// original `deadline` dispatched with no arguments, so a fired escalation
+// could not say WHICH task it was about.
+// ---------------------------------------------------------------------------
+describe("casework escalation — arm on open, cancel on claim", () => {
+  async function caseWorld() {
+    const world = createWorld();
+    const session = world.auth("guest:casework-escalation");
+    const actor = session.actor;
+    world.createObject({ id: "proof_case", name: "Proof Case", parent: "$case", owner: actor });
+    const init = await world.directCall("case-init", actor, "proof_case", "initialize", [null] as never, {
+      sessionId: session.id
+    } as never);
+    expect(init.op).toBe("result");
+    const moved = await world.directCall("enter-case", actor, actor, "moveto", ["proof_case"] as never, {
+      sessionId: session.id
+    } as never);
+    expect(moved.op).toBe("result");
+    return { world, session, actor };
+  }
+
+  function seqCall(w: Awaited<ReturnType<typeof caseWorld>>, verb: string, args: unknown[], id: string) {
+    return w.world.call(id, w.session.id, "proof_case", {
+      actor: w.actor,
+      target: "proof_case",
+      verb,
+      args: args as never[]
+    });
+  }
+
+  it("arms an escalation deadline keyed to the task it opened", async () => {
+    const w = await caseWorld();
+    const recorder = new InMemoryTurnRecorder();
+    w.world.setTurnRecorder(recorder);
+    const opened = await seqCall(w, "open_task", ["triage", "", "do:it", [], [], 900_000], "open-1");
+    expect(opened.op).toBe("applied");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+    w.world.setTurnRecorder(null as never);
+
+    expect(transcript.schedules).toHaveLength(1);
+    const armed = transcript.schedules![0];
+    expect(armed.idlePolicy).toBe("always");
+    expect(armed.call.verb).toBe("_fire_deadline");
+    // The subject rides with it. Without this the escalation could only fire
+    // a case-wide verb and would not know which task went stale.
+    expect(armed.call.args[0]).toBe("escalate_task");
+    expect((armed.call.args[1] as unknown[])[1]).toBe(900_000);
+    // Keyed by the task, so claiming that task can cancel exactly this timer.
+    expect(armed.id).toMatch(/^proof_case:deadline:task:/);
+  });
+
+  it("opens without a timer when no escalation window is given", async () => {
+    const w = await caseWorld();
+    const recorder = new InMemoryTurnRecorder();
+    w.world.setTurnRecorder(recorder);
+    expect((await seqCall(w, "open_task", ["quiet", "", "do:it", [], []], "open-2")).op).toBe("applied");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+    w.world.setTurnRecorder(null as never);
+    expect(transcript.schedules ?? []).toHaveLength(0);
+  });
+
+  it("cancels the escalation when the task is claimed", async () => {
+    // The whole point of the pattern: the ack path stops the timer. If the key
+    // did not round-trip between open_task and claim, this silently escalates
+    // a task somebody already took.
+    const w = await caseWorld();
+    const opened = await seqCall(w, "open_task", ["triage", "", "do:it", [], [], 900_000], "open-3");
+    expect(opened.op).toBe("applied");
+    const task = (opened as { op: "applied"; result?: unknown }).result as string;
+
+    const recorder = new InMemoryTurnRecorder();
+    w.world.setTurnRecorder(recorder);
+    expect((await seqCall(w, "claim", [task], "claim-1")).op).toBe("applied");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+    w.world.setTurnRecorder(null as never);
+
+    expect(transcript.cancellations).toHaveLength(1);
+    expect(transcript.cancellations![0].id).toBe(`proof_case:deadline:task:${task}`);
+  });
+
+  it("records an escalation act when the deadline fires on a still-unclaimed task", async () => {
+    const w = await caseWorld();
+    const opened = await seqCall(w, "open_task", ["triage", "", "do:it", [], [], 900_000], "open-4");
+    const task = (opened as { op: "applied"; result?: unknown }).result as string;
+
+    const fired = await seqCall(w, "escalate_task", [task, 900_000], "escalate-1");
+    expect(fired.op).toBe("applied");
+
+    // Durable: the act rides the APPLIED FRAME, which is the sequenced log
+    // entry — not a live tell to whoever happened to be watching. A scheduled
+    // turn has no session and its actor may be gone, so anything that only
+    // told would be lost exactly when the escalation mattered.
+    const observations = (fired as { observations?: Array<{ type: string; payload?: Record<string, unknown> }> }).observations ?? [];
+    const act = observations.find((o) => o.type === "tasks.escalated");
+    expect(act).toBeTruthy();
+    expect(act!.payload).toMatchObject({ task, waited_ms: 900_000 });
+  });
+
+  it("does not escalate a task that was already claimed", async () => {
+    // Cancellation on claim is best-effort, so a race can still deliver the
+    // escalation afterwards. Re-checking here is what keeps that from
+    // becoming a false alarm.
+    const w = await caseWorld();
+    const opened = await seqCall(w, "open_task", ["triage", "", "do:it", [], [], 900_000], "open-5");
+    const task = (opened as { op: "applied"; result?: unknown }).result as string;
+    expect((await seqCall(w, "claim", [task], "claim-2")).op).toBe("applied");
+
+    const fired = await seqCall(w, "escalate_task", [task, 900_000], "escalate-2");
+    expect(fired.op).toBe("applied");
+    const observations = (fired as { observations?: Array<{ type: string }> }).observations ?? [];
+    expect(observations.find((o) => o.type === "tasks.escalated")).toBeUndefined();
   });
 });
