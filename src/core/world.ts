@@ -6178,6 +6178,12 @@ export class WooWorld {
     const expectedVersion = optionNullableInt(options, "expected_version");
     const compiled = compileVerb(source);
     const selected = this.selectOwnVerbForInstall(objRef, descriptor, { mode, append });
+    // Net planning: pin the page this install is predicated on (the same
+    // optimistic-conflict read addVerbForActor/setVerbCode record). Without
+    // it the editor-save path produced a transcript with no verb read OR
+    // write, so the install silently never left the committing room's turn.
+    if (selected.current) this.recordAuthoredVerbRead(objRef, selected.current);
+    else this.recordAuthoredVerbAbsence(objRef, selected.name);
     if ((selected.current?.version ?? null) !== expectedVersion && expectedVersion !== null) {
       throw wooError("E_VERSION", "verb version conflict", { expected: expectedVersion, actual: selected.current?.version ?? null });
     }
@@ -6229,6 +6235,11 @@ export class WooWorld {
       version,
       line_map: compiled.line_map ?? {}
     }, { append: selected.append, slot: selected.current ? selected.slot : undefined });
+    // Make the install durable over Net: record the written page so the
+    // transcript carries a verb cell write that rides to the object's
+    // anchor scope (mirrors addVerbForActor / setVerbCode).
+    const installed = this.ownVerbExact(objRef, selected.name);
+    if (installed) this.recordAuthoredVerbWrite(objRef, installed, selected.name);
     propagateVerbPurity(this);
     return summary;
   }
@@ -6745,8 +6756,15 @@ export class WooWorld {
     const editorSession = sessionRow && sessionRow.actor === actor ? sessionRow : null;
     const priorScope = editorSession?.activeScope ?? null;
     const current = await this.objectLocationChecked(actor, ctx.hostMemo);
-    if (current && current !== destination && this.objects.has(current) && this.isSpaceLike(current)) {
-      await this.updatePresenceChecked(actor, current, false, ctx);
+    // Exit presence is keyed by the moving SESSION's active scope when one
+    // exists (moveto.md M2.1 step 4: an actor may hold several sessions, and
+    // only presence-at-scope is meaningful for exit routing). The physical
+    // location is the fallback for the sessionless object-graph path only —
+    // using it for a secondary session would strip the actor's presence from
+    // the primary session's room.
+    const exitScope = editorSession ? priorScope : current;
+    if (exitScope && exitScope !== destination && this.objects.has(exitScope) && this.isSpaceLike(exitScope)) {
+      await this.updatePresenceChecked(actor, exitScope, false, ctx);
     }
     if (this.isSpaceLike(destination)) {
       await this.updatePresenceChecked(actor, destination, true, ctx);
@@ -6777,7 +6795,15 @@ export class WooWorld {
       this.setSessionActiveScope(editorSession, destination);
       this.persistSession(editorSession);
     }
-    await this.moveObjectChecked(actor, destination);
+    // Primary-session gate (moveto.md M2.1 step 7, same rule as
+    // movetoActorChecked): only the actor's primary session performs the
+    // physical relocate — a secondary session moves its own scope and
+    // presence but must not drag the shared body along. The sessionless
+    // object-graph fallback (seed/install movement) still relocates.
+    const primary = editorSession ? this.primarySessionForActor(actor) : null;
+    if (!editorSession || primary?.id === editorSession.id) {
+      await this.moveObjectChecked(actor, destination);
+    }
     if (previousLocation && previousLocation !== destination && this.objects.has(actor) && this.objects.has(previousLocation) && this.isSpaceLike(previousLocation)) {
       await this.updatePresenceChecked(actor, previousLocation, false, ctx);
     }

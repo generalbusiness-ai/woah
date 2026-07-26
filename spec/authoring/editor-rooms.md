@@ -12,17 +12,24 @@ editor is a room-like object: an actor enters it, runs ordinary verbs there, and
 leaves or resumes later. There is no separate workshop abstraction and no
 special coordination layer for agent teams.
 
-**Implementation status (2026-07-26).** In-memory this works as described. Over
-Net, entering and editing work; **leaving does not**. `pause`/`save`/`abort`
-move the actor out of the editor, so the turn commits in the editor's room scope
-while writing the actor-cluster-owned session cell, and the commit is refused
-`rider_unattested` — a room can prove a foreign session *read* from its
-`session_presence` checkpoint, but not for a turn that both reads and writes the
-cell. The choice this forces — where a room verb that moves the actor out should
-commit, or how that proof composes with the write — is unresolved, and the rest
-of this document describes the intended model rather than current Net behavior.
-Covered by `tests/worker/net-verb-editor.test.ts`; rationale in
-`catalogs/prog/DESIGN.md`.
+**Implementation status (2026-07-26).** Implemented in-memory and over Net.
+The full loop — enter, edit, pause, resume, save-through, and the edited verb
+running with its new behavior — is exercised on the authoritative Net turn path
+by `tests/worker/net-verb-editor.test.ts`. Two protocol notes that fell out of
+proving it:
+
+- A room verb that moves the actor OUT of the room it commits in (pause/save/
+  abort) makes the turn both read and write the actor-cluster-owned session
+  cell. CO14's local-proof rule (spec/protocol/coherence.md §CO14) covers this:
+  the committing room's exact `session_presence` checkpoint proves the folded
+  session read, while the written replacement validates under the mint rule.
+- Editor movement follows ordinary actor-movement semantics
+  (spec/semantics/moveto.md M2.1): exit presence keys off the moving session's
+  active scope, and only the actor's primary session physically relocates the
+  body — a secondary session entering the editor moves its own scope and
+  presence only.
+
+Defect history and rationale live in `catalogs/prog/DESIGN.md`.
 
 ## E1. Principle
 

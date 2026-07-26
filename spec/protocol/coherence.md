@@ -1011,6 +1011,15 @@ One write path per fact (CO9), concretized:
   that active room uses the ordinary CO2.3 owner attestation. Thus close
   completion removes the proof before returning, and an overdue relation
   cannot extend a session because expiry is checked from its value.
+  The proof applies equally when the same turn also WRITES the session
+  cell — the plan-time transition fold of a room verb that moves the
+  actor out of the committing room (an editor's pause/save/abort). The
+  written replacement validates under the mint/refresh rule as usual;
+  the checkpoint proves only the folded read of the prior row, whose
+  liveness and actor binding are still validated before the proof is
+  recorded. Without this composition such a turn would terminally reject
+  `rider_unattested`, making any room that moves its occupants out on
+  its own verbs (editor rooms) unable to release them.
 
   Ownership witness: the scope holds the cell AND it is not CA3 rider
   residue. Sessions absent entirely → allowed only for

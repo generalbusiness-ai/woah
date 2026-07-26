@@ -130,20 +130,38 @@ three places. Entering and editing now work; **leaving does not**.
    from. Every editor verb answered "tool is not available in this session
    context". `moveEditorActor` now captures the prior scope before the presence
    update.
-3. **Open.** `pause`, `save`, and `abort` all move the actor OUT of the editor.
+3. *Fixed.* `pause`, `save`, and `abort` all move the actor OUT of the editor.
    The turn commits in `room:the_verb_editor` (the call target's scope) and the
-   move writes the session cell, which is owned by the actor's cluster. A room
-   can normally prove a foreign session *read* from its `session_presence`
-   checkpoint, but `authorizeSessionSubmit` takes the mint-write branch first
-   and never records that proof for a turn that both reads and writes the cell —
-   so the commit is refused `rider_unattested`. Ordinary room movement never
-   hits this, so it is specific to a room verb that moves the actor out of the
-   scope it commits in. Resolving it is a design call about where such turns
-   commit, or about composing the proof with the write; the test pins the
-   current rejection and says what to restore when it lands.
+   move writes the session cell, which is owned by the actor's cluster — so the
+   plan-time fold makes the turn both read AND write a foreign session cell.
+   `authorizeSessionSubmit` took the mint-write branch first and never recorded
+   the committing room's `session_presence` checkpoint as proof of the folded
+   read, so CO4 step 7 refused the commit `rider_unattested`. This was never a
+   design gap: CO14's local-proof rule (spec/protocol/coherence.md, "A room
+   authority has one equivalent local proof") already sanctions exactly this
+   proof, and applies whether or not the same turn writes the replacement row —
+   the written value is validated separately by the mint rule. The fix records
+   that proof in the write branch (`src/net/sessions.ts`); a commit anywhere
+   other than the active room still requires the ordinary CO2.3 owner
+   attestation.
+4. *Fixed.* Once (3) let a save commit at all, the commit was silently
+   non-durable: `programmerInstallVerb` — reachable only through the editor
+   machinery since the catalog verbs inlined the pipeline — mutated the
+   planning world via `addVerb` without recording the authored verb read/write
+   the way the `*ForActor` builtins do. The accepted transcript carried no verb
+   cell, nothing rode to the target's anchor scope, and `save` reported ok
+   while the live verb kept its old body. The fix records the page read
+   (optimistic conflict pin) and the written page there.
+5. *Fixed.* `moveEditorActor` relocated the body unconditionally, so a
+   SECONDARY session entering or leaving the editor dragged the shared body
+   with it, bypassing ordinary movement's primary-session gate
+   (spec/semantics/moveto.md M2.1 step 7). Editor movement now keys exit
+   presence by the moving session's active scope and physically relocates only
+   from the actor's primary session (or the sessionless object-graph fallback).
 
-Until (3) is resolved an actor that enters the editor over Net cannot leave it,
-so the surface is not usable end-to-end on the Net path.
+The full loop — enter, edit, pause, resume, save, and the edited verb running
+with its new behavior — is exercised over the authoritative Net turn path by
+`tests/worker/net-verb-editor.test.ts`, including the secondary-session gate.
 
 ## Eval
 
