@@ -203,6 +203,20 @@ patching activity.
 
 **Test selection discipline**
 
+**Test isolation.** The suite runs two Vitest projects that differ only in
+isolation. `shared` keeps `isolate: false` — one module registry per worker,
+which is what makes the sweep fast. `isolated` runs the files listed in
+`vite.config.ts` `MODULE_MOCKING_TESTS` with `isolate: true`, because
+`vi.mock`/`vi.doMock`/`vi.resetModules` do not stay inside the file that calls
+them under a shared registry: they reach whichever files that worker happens to
+run, and thread scheduling picks different neighbours each run. The resulting
+breakage is intermittent and lands in an innocent file, so **a one-off failure
+in a file you did not touch is worth re-running and baselining against `main`
+before you attribute it to your change**. `npm run guard:module-mocking-tests`
+keeps the list honest in both directions. Never put `include`/`exclude` on the
+root `test` config — `extends: true` concatenates arrays, so a root `include`
+makes the isolated project run the entire suite a second time.
+
 Use targeted Vitest files for the code just changed (`npm run test:files --
 tests/path.test.ts`), then run `npm test` as the fast guarded local gate. `npm
 test` is intentionally not the entire Vitest corpus; it keeps the default
@@ -231,6 +245,7 @@ must include a vitest case before it lands.
 
 - `npm run guard:object-names` enforces a subset of the naming rule.
 - `npm run guard:catalog-migrations` requires a `migration-v(N-1)-to-vN.json` for every bundled catalog at major version N.
+- `npm run guard:module-mocking-tests` keeps `vite.config.ts` `MODULE_MOCKING_TESTS` in sync with the test files that actually call `vi.mock`/`vi.doMock`/`vi.resetModules`.
 - `npm test` — fast guarded Vitest gate (runs `catalog:index` and all guards first).
 - `npm run test:acts` — guarded Acts release gate: kernel, Outliner behavior and migrations, movement, Net convergence, relation replacement, and gateway cache migration.
 - `npm run test:guards` — catalog index/check plus all local guard scripts.
