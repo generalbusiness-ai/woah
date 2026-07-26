@@ -120,6 +120,20 @@ that seam:
    rider reads against the attestation; a rider read with no attestation
    rejects `rider_unattested` (terminal, named). The committing scope's
    `owns` predicate scopes what it validates against its own store.
+   **`owns` MUST exclude rider residue.** A ride-along leaves the committing
+   scope holding a COPY of cells anchored elsewhere — including the lifecycle
+   and lineage cells of an object CREATED here but anchored to another scope
+   (the shared/planning scope serializes the mint; the object's own cells ride
+   to its anchor). Reading such a copy as ownership makes the scope claim an
+   object it does not sequence: a later turn committing here that reads any
+   cell of that object which lives only at the anchor takes the local branch,
+   finds it absent, and rejects `read_version_mismatch` with no possible
+   repair — no refresh can move a foreign cell into this store — so the
+   gateway's loop escalates to terminal `E_NONCONVERGENT_READ`. The residue
+   ledger recorded at ride-along time is therefore authoritative for the
+   ownership question as well as for transfer provenance: a cell this scope
+   holds AND has shipped as a rider is foreign, and its reads take the
+   attestation path above.
    The catalog scope has one explicit epoch-validation policy: because CO15
    permits **class-definition cells** to change only with a `catalog_epoch`
    bump, the active epoch itself certifies lineage, property-definition/default,
@@ -222,6 +236,22 @@ no delivery-gap evidence.
 Under sparse execution, a lookup miss for an unmaterialized id MUST surface
 as `E_MISSING_STATE` (acquire closure, retry — CO6), never as `E_OBJNF`.
 Only a full-closure executor may report semantic absence directly.
+
+The translation is derived from the engine error's VALUE, so that value is a
+protocol contract, not a diagnostic convenience. An `E_VERBNF` for a
+name-descriptor miss MUST carry `{ obj, name }`: the planner names
+`verb_bytecode:<obj>:<name>` as the missing key and grows the turn's slice (or
+pulls from the authority) from exactly that. A raiser that spells the verb name
+under some other key makes the miss underivable, and it degrades to semantic
+absence — a verb read on an object the turn did not target then fails
+terminally with the page sitting resident in the gateway view. The affected
+reads are the ones a slice never covers by construction: the seed holds the
+actor's and target's class chains, so any verb-metadata read on an ARGUMENT
+object (`verb_info`, `set_verb_info`, `list_verb` against a passed id) depends
+on this repair. An implementation SHOULD additionally accept the historical
+`descriptor`/`verb` spellings so a future divergence degrades to a repairable
+miss rather than a terminal error. A numeric slot descriptor names no page and
+is deliberately not resolvable this way.
 
 ### CO2.7 Fanout guarantee
 
@@ -724,8 +754,17 @@ One write path per fact (CO9), concretized:
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
-  parents), ordered-edge writes/moves (`ordered_edge` rows at the current
-  container), and session-scope transitions (presence). The ordered-edge row
+  parents), **creates carrying a location** (a contents add at that
+  container), ordered-edge writes/moves (`ordered_edge` rows at the current
+  container), and session-scope transitions (presence). The create source is
+  not redundant with the other two: `object_create` records placement inline,
+  so an object minted directly INTO a container produces neither a move nor a
+  contents projection write, and without this rule its membership row would
+  never exist — leaving the object absent from every contents-derived surface
+  (structural tool context, room presentation, roster hydration) while its
+  `object_live.location` is perfectly correct. Deltas carry set semantics per
+  `(op, row)`, so a create-then-move within one turn collapses to a single
+  destination row rather than a contradictory pair. The ordered-edge row
   is required when an item's immutable anchor differs from its current
   container: the authored edge cell remains truth at the anchor, while the
   container owner gets a complete bounded ordering without global enumeration.

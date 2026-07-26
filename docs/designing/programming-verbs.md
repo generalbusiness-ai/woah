@@ -268,6 +268,40 @@ Don't set it by default — only on verbs that make sense as agent
 affordances. Implementation-detail verbs and inherited
 self-control verbs should stay `tool_exposed: false`.
 
+### Making your own verb callable as a tool
+
+Installing a verb makes it real and callable in-world. It does **not**
+make it an MCP tool. Two things must both be true, and they are
+independent:
+
+1. **Placement.** The object has to be in your structural context —
+   your inventory, or the space you're in and its contents. `create`
+   defaults its `location` to you, so an object you just made is
+   already there. An object created into no container is reachable
+   only through its returned id, and no verb on it can ever surface.
+2. **Exposure.** Your own object surface and your inventory advertise
+   only verbs explicitly marked `tool_exposed`. (The space you're in
+   and the things in it also offer command-shaped verbs — that's the
+   "obvious affordances" rule for the room around you, and it
+   deliberately doesn't extend to what you're carrying.) So you opt
+   in, with `set_verb_info`.
+
+The whole loop:
+
+```
+woo_call("$me", "create",       ["$thing", {name: "probe"}])   → <obj>
+woo_call("$me", "install_verb", [<obj>, "ping", "verb :ping() rxd { return \"pong\"; }", {}])
+woo_call("$me", "set_verb_info",[<obj>, "ping", {tool_exposed: true}])
+```
+
+`install_verb` deliberately refuses metadata options — the source
+header is canonical for perms — so exposure is always a separate,
+visible act.
+
+After the third call your session receives
+`notifications/tools/list_changed`; re-list and `<obj>__ping` is
+there, callable like any other tool.
+
 `direct_callable` is the routing decision. If your verb mutates state
 that should be replayable (a task transition, a pin placement),
 leave it sequenced. If it's chat-shaped or read-shaped, mark it

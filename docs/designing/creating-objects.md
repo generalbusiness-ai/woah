@@ -139,8 +139,12 @@ The complete value contract is in
 
 ## Moving the new object
 
-`create` can take a `location` argument and place the object there.
-If you didn't, place it after the fact.
+`create` takes a `location` argument and places the object there;
+with no `location` it places the object in your inventory. Either way
+that placement is an authoring write — it sets the container directly
+and does **not** run the receiver-driven move chain, so a destination's
+`:acceptable` cannot refuse it. Pass `location: null` if you want the
+object in no container at all, and move it yourself afterwards.
 
 For a normal in-world move (the receiver-driven move chain that lets
 the destination accept/refuse and run hooks):
