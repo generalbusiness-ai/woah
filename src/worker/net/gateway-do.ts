@@ -1551,6 +1551,13 @@ export class NetGatewayDO {
     // dependency. A concurrent actor/session move can change the resolved room
     // after repair, in which case the next attempt must fetch the new room.
     let planningRoomRosterRoom: string | null | undefined;
+    // Only a gateway-local preflight mismatch (no submit issued) may carry the
+    // owner attestations it just fetched into the immediate re-plan. The
+    // attestation builder reuses an owner only when every new transcript
+    // version it must prove is exactly covered; any changed/new read goes live.
+    // Scope-returned conflicts never populate this cache and therefore retain
+    // the ordinary fresh-attestation retry.
+    let preflightRetryAttestations: CommitSubmit["attestations"];
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1811,12 +1818,21 @@ export class NetGatewayDO {
       }
       // CO2.3 rider integrity (rule 1): attest every FOREIGN read — a
       // read whose object anchors to a scope other than the committing
-      // one — from its owner before submitting. Fetched fresh on EVERY
-      // round (including stale_head resubmits), so a read_version_
-      // mismatch repair — which refreshes the mismatched cells from
-      // their owners (refreshCells routes by the classifier) and
-      // re-plans — automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, classifier, planned, view, targetScope, structure);
+      // one — from its owner before submitting. Ordinary retries fetch
+      // fresh. A gateway-local preflight mismatch issued no submit, so its
+      // immediate re-plan may reuse an owner proof only when it exactly
+      // covers every version the new transcript records.
+      const priorPreflightAttestations = preflightRetryAttestations;
+      preflightRetryAttestations = undefined;
+      const attestations = await this.attestForeignReads(
+        request,
+        classifier,
+        planned,
+        view,
+        targetScope,
+        structure,
+        priorPreflightAttestations
+      );
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
@@ -1900,6 +1916,7 @@ export class NetGatewayDO {
         // exact repair input locally and preserve the submit RPC for the
         // re-planned round. Acceptance still happens only at the scope; this
         // optimization can skip a provably doomed write attempt, never accept.
+        preflightRetryAttestations = submit.attestations;
         reply = {
           kind: "woo.net.commit_reply.v1",
           status: "rejected",
@@ -7176,9 +7193,11 @@ export class NetGatewayDO {
     planned: PlanTurnResult,
     view: CellStore,
     targetScope: string,
-    structure?: TurnStructure
+    structure?: TurnStructure,
+    reusable?: CommitSubmit["attestations"]
   ): Promise<CommitSubmit["attestations"]> {
     const byOwner = new Map<string, Set<string>>();
+    const cellVersionsByOwner = new Map<string, Map<string, string>>();
     for (const read of planned.transcript.reads) {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
@@ -7213,6 +7232,11 @@ export class NetGatewayDO {
       const keys = byOwner.get(owner) ?? new Set<string>();
       keys.add(key);
       byOwner.set(owner, keys);
+      if (read.version !== undefined) {
+        const versions = cellVersionsByOwner.get(owner) ?? new Map<string, string>();
+        versions.set(key, String(read.version));
+        cellVersionsByOwner.set(owner, versions);
+      }
     }
     // R3: foreign ORDERING reads owner-attest exactly like foreign cell
     // reads — the same /net/attest reply reports the owner's CURRENT
@@ -7325,12 +7349,72 @@ export class NetGatewayDO {
       }
       return reply;
     };
-    const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
+    const canReuse = (
+      owner: string,
+      keys: Set<string>,
+      entry: NonNullable<CommitSubmit["attestations"]>[string] | undefined
+    ): entry is NonNullable<CommitSubmit["attestations"]>[string] => {
+      if (!entry) return false;
+      const expectedCells = cellVersionsByOwner.get(owner);
+      const cells = new Map(entry.cells.map((cell) => [cell.key, cell.version]));
+      for (const key of keys) {
+        const expected = expectedCells?.get(key);
+        if (expected === undefined || cells.get(key) !== expected) return false;
+      }
+
+      const orderings = new Map(
+        (entry.orderings ?? []).map((ordering) => [
+          orderedProjectionKey(ordering.container, ordering.parent),
+          ordering.version
+        ])
+      );
+      for (const read of planned.transcript.orderingReads ?? []) {
+        if (read.scope !== owner || read.scope === targetScope) continue;
+        if (orderings.get(orderedProjectionKey(read.container, read.parent)) !== read.version) return false;
+      }
+
+      const replays = new Map(
+        (entry.replays ?? []).map((page) => [replayPageQueryKey(page), page.version])
+      );
+      for (const read of planned.transcript.replayReads ?? []) {
+        if (read.scope !== owner || read.scope === targetScope) continue;
+        if (replays.get(replayPageQueryKey(read)) !== read.version) return false;
+      }
+      return true;
+    };
+
+    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
+    const liveOwners: Array<[string, Set<string>]> = [];
+    for (const [owner, keys] of owners) {
+      const prior = reusable?.[owner];
+      if (canReuse(owner, keys, prior)) {
+        // Carry only what the new transcript still requires. Besides keeping
+        // the wire envelope bounded, pruning prevents a stale extra cell from
+        // a prior owner entry competing with the same globally unique key if
+        // refreshed topology reclassifies another read during the re-plan.
+        const requiredOrderings = orderingsByOwner.get(owner);
+        const requiredReplays = replaysByOwner.get(owner);
+        const orderings = (prior.orderings ?? []).filter((ordering) =>
+          requiredOrderings?.has(orderedProjectionKey(ordering.container, ordering.parent))
+        );
+        const replays = (prior.replays ?? []).filter((page) =>
+          requiredReplays?.has(replayPageQueryKey(page))
+        );
+        attestations[owner] = {
+          owner_head: prior.owner_head,
+          cells: prior.cells.filter((cell) => keys.has(cell.key)),
+          ...(orderings.length > 0 ? { orderings } : {}),
+          ...(replays.length > 0 ? { replays } : {})
+        };
+      } else {
+        liveOwners.push([owner, keys]);
+      }
+    }
+    const actions: Array<() => Promise<unknown>> = liveOwners.map(([owner, keys]) => () => attest(owner, keys));
     const replies = structure
       ? await structure.rpcGroup(actions, { phase: "attest" })
       : await Promise.all(actions.map((action) => action()));
-    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
-    owners.forEach(([owner], index) => {
+    liveOwners.forEach(([owner], index) => {
       const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }>; replays?: Array<{ space: string; from: number; limit: number; version: string }> };
       attestations[owner] = {
         owner_head: reply.owner_head,

@@ -1065,7 +1065,11 @@ upper bound.
 
 The room-roster response is held as the presentation snapshot for one logical
 turn across read-version repair rounds. It is fetched again only if refreshed
-actor/session topology resolves the call to a different room. Separately, an
+actor/session topology resolves the call to a different room. A gateway-local
+attestation preflight that skips a doomed submit may carry an owner proof into
+the immediate re-plan only while that proof exactly covers every required
+version; a changed/new read and every scope-returned conflict attest live.
+Separately, an
 idempotent `/net/subscribe` response carries `resume_delivery_seq`: the
 acknowledged subscriber-lane prefix (current counter, or one before the oldest
 pending stamped row). A gateway persists that delivery watermark before its

@@ -25,7 +25,8 @@ import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
 import { CATALOG_SCOPE, isEpochImmutableDefinition, partitionCells } from "../../src/net/topology";
 import type { AttemptTraceEntry } from "../../src/net/errors";
 import { SESSION_PRESENCE_RELATION } from "../../src/net/relations";
-import type { CommitReply, ScopeHead } from "../../src/net/scope";
+import { ScopeSequencer, type CommitReply, type CommitSubmit, type ScopeHead } from "../../src/net/scope";
+import { applyTranscript } from "../../src/net/transcript";
 
 const SECRET = "net-topology-test-secret";
 const EPOCH = "cat-net-topo-1";
@@ -352,7 +353,67 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // the test can assert WHERE attestations went.
     const rpcLog: string[] = [];
     const catalogAttestKeys: string[][] = [];
-    let forceOneCatalogAttestationMismatch = false;
+    let advanceClusterBeforeOneAttestation: number | null = null;
+    let advanceClusterBeforeOneRefresh: number | null = null;
+    const advanceActorGreeted = async (instance: NetScopeDO, value: number): Promise<void> => {
+      const base = (await call<{ head: ScopeHead }>(instance, scopeEnv, "/head")).head;
+      const closure = await call<{ cells: Array<{
+        kind: string;
+        object: string;
+        name?: string;
+        value: unknown;
+      }> }>(instance, scopeEnv, "/closure", { keys: ["*"], known: [] });
+      const transcript = {
+        kind: "woo.effect_transcript.shadow.v1",
+        route: "direct",
+        scope: clusterScope,
+        seq: base.seq + 1,
+        call: { actor, target: actor, verb: "set_greeted", args: [value], body: undefined },
+        reads: [],
+        writes: [{
+          cell: { kind: "prop", object: actor, name: "greeted" },
+          value,
+          op: "set",
+          writer: {
+            progr: actor,
+            thisObj: actor,
+            verb: "set_greeted",
+            definer: actorClass,
+            caller: actor,
+            callerPerms: actor
+          }
+        }],
+        creates: [],
+        moves: [],
+        observations: [],
+        logicalInputs: [],
+        untrackedEffects: [],
+        complete: true,
+        incompleteReasons: [],
+        hash: `topology-cluster-greeted-advance-${value}`
+      };
+      // Compute the scope digest from the authority's actual current closure.
+      // This is a real owner commit, unlike the old fixture's forged reply
+      // version that no authority held and refresh could never reproduce.
+      const twin = new ScopeSequencer(clusterScope, EPOCH);
+      twin.seed(closure.cells as never);
+      const applied = applyTranscript(
+        twin.store,
+        transcript as never,
+        { scope_head: "test", catalog_epoch: EPOCH }
+      );
+      const submit: CommitSubmit = {
+        kind: "woo.net.commit_submit.v1",
+        scope: clusterScope,
+        base,
+        idempotency_key: `topology-cluster-greeted-advance-${value}`,
+        transcript: transcript as never,
+        post_state_version: applied.postStateVersion,
+        stamp: { scope_head: "test", catalog_epoch: EPOCH }
+      };
+      const reply = await call<CommitReply>(instance, scopeEnv, "/submit", submit);
+      expect(reply.status, JSON.stringify(reply)).toBe("accepted");
+    };
     const gatewayState = netState("gateway-topology");
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
@@ -368,27 +429,25 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
               const body = await request.clone().json() as { keys?: string[] };
               catalogAttestKeys.push([...(body.keys ?? [])]);
             }
-            const response = await instance.fetch(request);
             if (
-              forceOneCatalogAttestationMismatch &&
-              destination === `scope:${CATALOG_SCOPE}` &&
+              destination === `scope:${clusterScope}` &&
               path === "/net/attest" &&
-              response.ok
+              advanceClusterBeforeOneAttestation !== null
             ) {
-              forceOneCatalogAttestationMismatch = false;
-              const decoded = await response.json() as {
-                cells?: Array<{ key: string; version: string }>;
-              };
-              return new Response(JSON.stringify({
-                ...decoded,
-                cells: (decoded.cells ?? []).map((cell) =>
-                  cell.key === "property_cell:topo_config:bonus"
-                    ? { ...cell, version: `mismatch:${cell.version}` }
-                    : cell
-                )
-              }), { headers: { "content-type": "application/json" } });
+              const value = advanceClusterBeforeOneAttestation;
+              advanceClusterBeforeOneAttestation = null;
+              await advanceActorGreeted(instance, value);
             }
-            return response;
+            if (
+              destination === `scope:${clusterScope}` &&
+              path === "/net/closure" &&
+              advanceClusterBeforeOneRefresh !== null
+            ) {
+              const value = advanceClusterBeforeOneRefresh;
+              advanceClusterBeforeOneRefresh = null;
+              await advanceActorGreeted(instance, value);
+            }
+            return instance.fetch(request);
           }
         };
       }
@@ -630,19 +689,47 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // look shape that extra RPC exhausted the exact 32-RPC ceiling.
     rpcLog.length = 0;
     catalogAttestKeys.length = 0;
-    forceOneCatalogAttestationMismatch = true;
+    await (doStates.get(roomScope) as ReturnType<typeof netState>).settle();
+    advanceClusterBeforeOneAttestation = 10;
     const repaired = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-attestation-repair"));
     expect(repaired.reply.status, JSON.stringify(repaired.reply)).toBe("accepted");
     expect(repaired.attempt).toBe(2);
     expect(repaired.trace.map((entry) => entry.code)).toContain("E_READ_VERSION");
     expect(repaired.result).toBe(3);
-    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(2);
+    // No submit occurred on the mismatching round, so the exact owner proof
+    // just fetched still covers the re-planned reads and is reused.
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/room-roster`)).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/submit`)).toHaveLength(1);
+
+    // If the owner moves again between the preflight proof and its repair
+    // closure, that proof no longer covers the re-plan. The next round must
+    // attest that owner live while still reusing exact proofs from the other
+    // owners and issuing only the accepting submit.
+    await (doStates.get(roomScope) as ReturnType<typeof netState>).settle();
+    rpcLog.length = 0;
+    catalogAttestKeys.length = 0;
+    advanceClusterBeforeOneAttestation = 20;
+    advanceClusterBeforeOneRefresh = 30;
+    const movedAgain = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      turnRequest("topo-attestation-repair-moved-again")
+    );
+    expect(movedAgain.reply.status, JSON.stringify(movedAgain.reply)).toBe("accepted");
+    expect(movedAgain.attempt).toBe(2);
+    expect(movedAgain.trace.map((entry) => entry.code)).toContain("E_READ_VERSION");
+    expect(movedAgain.result).toBe(4);
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(2);
     expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/room-roster`)).toHaveLength(1);
     expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/submit`)).toHaveLength(1);
 
     // Phase-4 item 1, idempotent replay: resubmitting turn 1's key returns
     // the scope's RECORDED reply (CO2.5). The world moved on (counter is
-    // now 3), so this round's re-plan predicts a different post-state than
+    // now 4), so this round's re-plan predicts a different post-state than
     // the recorded accept — the gateway detects that digest mismatch,
     // marks the reply replayed, and omits result/observations rather than
     // presenting the re-planned execution as the committed one.
@@ -663,12 +750,12 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       keys: ["property_cell:topo_box:counter"],
       known: ["object_lineage:topo_box"]
     });
-    expect(counter.cells[0]?.value).toMatchObject({ value: 3 });
+    expect(counter.cells[0]?.value).toMatchObject({ value: 4 });
     const greeted = await call<{ cells: Array<{ value: unknown }> }>(clusterDO, scopeEnv, "/closure", {
       keys: [`property_cell:${actor}:greeted`],
       known: [`object_lineage:${actor}`]
     });
-    expect(greeted.cells[0]?.value).toMatchObject({ value: 3 });
+    expect(greeted.cells[0]?.value).toMatchObject({ value: 31 });
 
     // A truncated live authority response fails before submit. The next
     // attempt requests the same mutable catalog key and succeeds from the

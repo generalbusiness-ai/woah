@@ -298,10 +298,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   state remain live per-turn attestations.
   A freshly fetched foreign attestation that already disagrees with the plan
   triggers the same targeted `E_READ_VERSION` repair locally before a doomed
-  submit is issued; every repaired round still re-attests all foreign owners
-  before the scope can accept. The compact room-roster value is one
-  owner-produced snapshot per logical turn and is reused across cell-repair
-  rounds only while the actor/session still resolves to the same room.
+  submit is issued. Its immediate re-plan may reuse an owner entry only when
+  that proof exactly covers every version the new transcript requires; changed
+  or new reads re-attest live, and scope-returned conflicts remain fully fresh.
+  The compact room-roster value is one owner-produced snapshot per logical turn
+  and is reused across cell-repair rounds only while the actor/session still
+  resolves to the same room.
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
   retry with named verdicts and exact serialization at the authority —

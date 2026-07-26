@@ -158,10 +158,14 @@ that seam:
    attestations, the gateway MAY compare their cell versions with the
    transcript before submit. A disagreement is already the exact
    `read_version_mismatch` the scope would return, so the gateway may skip that
-   provably doomed submit, refresh the named cells, and re-plan. It MUST fetch
-   fresh owner attestations for the repaired round, and only the scope may
-   accept; this optimization removes one rejected RPC but creates no acceptance
-   path. Cross-invocation promises MUST NOT
+   provably doomed submit, refresh the named cells, and re-plan. Because no
+   submit occurred, that immediate re-plan MAY reuse an owner attestation from
+   the preflight round only when the entry exactly covers every cell, ordering,
+   and replay version the new transcript requires from that owner. A changed or
+   newly required version MUST fetch a live owner attestation. Scope-returned
+   conflicts do not use this reuse path, and only the scope may accept; this
+   optimization removes rejected/redundant RPCs but creates no acceptance path.
+   Cross-invocation promises MUST NOT
    coalesce authority I/O: they join otherwise-independent platform request
    lineages and can violate the CO2.7 subrequest-depth bound.
    **Ordering reads follow the same rule.** An owner-computed ordering read
