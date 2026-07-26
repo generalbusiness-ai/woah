@@ -36,9 +36,8 @@ behavior, not VM concepts.
 - No user-authored source language.
 - No full DSL parser.
 - No cross-host RPC.
-- No `suspend`, `fork`, or `read`.
+- No deferred execution (`schedule` / `fork`).
 - No browser-hosted transient VM.
-- No long-lived task serialization.
 - No exception handlers.
 - No general-purpose standard library.
 
@@ -200,8 +199,8 @@ T0 should be a subset of the full VM in [vm.md](vm.md):
 - T0 `TinyFrame` fields map onto full `Frame` fields.
 - T0 opcodes keep names compatible with full opcodes where possible.
 - T0 bytecode versions are explicit so seeded behavior can migrate.
-- Full `CALL_VERB`, `SUSPEND`, `FORK`, `READ`, exceptions, and cross-host yield
-  can be added without changing T0 object data.
+- Full `CALL_VERB`, `SCHEDULE`, exceptions, and cross-host yield can be added
+  without changing T0 object data.
 
 ## Concrete Fixtures
 

@@ -1,11 +1,11 @@
 import type { EffectTranscript } from "./effect-transcript";
-import type { ParkedTaskRecord, SerializedObject, SerializedSession, SerializedWorld, SpaceSnapshotRecord } from "./repository";
+import type { SerializedObject, SerializedSession, SerializedWorld, SpaceSnapshotRecord } from "./repository";
 import { stableShadowJson } from "./shadow-cell-version";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "./shadow-commit-scope";
 import { hashSource } from "./source-hash";
 import { cloneValue, type ObjRef, type Observation, type PropertyDef, type RemoteToolDescriptor, type SpaceLogEntry, type WooValue } from "./types";
 
-export type CounterKey = "objectCounter" | "sessionCounter" | "parkedTaskCounter";
+export type CounterKey = "objectCounter" | "sessionCounter";
 
 export type RowOp<Key> = {
   key: Key;
@@ -67,7 +67,6 @@ export type ProjectionDeltaSummary = {
   logs?: RowOp<{ space: ObjRef; seq: number }>[];
   counters?: RowOp<CounterKey>[];
   snapshots?: RowOp<{ space: ObjRef; seq: number }>[];
-  parked_tasks?: RowOp<string>[];
   tombstones?: RowOp<ObjRef>[];
   tool_surfaces?: RowOp<{ scope: ObjRef; object: ObjRef }>[];
   tool_surface_sources?: RowOp<{ table: "objects"; authority_scope: ObjRef; key: ObjRef }>[];
@@ -79,7 +78,6 @@ export type ProjectionProfile = {
   sessions: unknown;
   logs: unknown;
   snapshots: unknown;
-  parked_tasks: unknown;
   counters: unknown;
   tombstones: unknown;
   tool_surfaces: unknown;
@@ -90,7 +88,6 @@ export type AuthorityProfile = {
   sessions: SerializedSession;
   logs: SpaceLogEntry;
   snapshots: SpaceSnapshotRecord;
-  parked_tasks: ParkedTaskRecord;
   counters: { value: number };
   tombstones: { id: ObjRef };
   tool_surfaces: ToolSurfaceProjectionRow;
@@ -148,7 +145,6 @@ export type BrowserProfile = {
   sessions: BrowserSessionRow;
   logs: BrowserLogRow;
   snapshots: never;
-  parked_tasks: never;
   counters: never;
   tombstones: { id: ObjRef };
   tool_surfaces: BrowserToolRow;
@@ -159,7 +155,6 @@ export type ProjectionKey<T extends keyof ProjectionProfile> =
   T extends "sessions" ? string :
   T extends "logs" ? { space: ObjRef; seq: number } :
   T extends "snapshots" ? { space: ObjRef; seq: number } :
-  T extends "parked_tasks" ? string :
   T extends "counters" ? CounterKey :
   T extends "tombstones" ? ObjRef :
   T extends "tool_surfaces" ? { scope: ObjRef; object: ObjRef } :
@@ -293,7 +288,6 @@ export function projectionDeltaMissingWrites(delta: ProjectionDeltaSummary, writ
   requireRows("logs", delta.logs);
   requireRows("counters", delta.counters);
   requireRows("snapshots", delta.snapshots);
-  requireRows("parked_tasks", delta.parked_tasks);
   requireRows("tombstones", delta.tombstones);
   requireRows("tool_surfaces", delta.tool_surfaces);
   // tool_surface_sources are cache-invalidation markers for rows that may have
@@ -328,9 +322,6 @@ export function summarizeProjectionWrites(writes: readonly ProjectionWrite[]): P
         break;
       case "snapshots":
         add("snapshots", { key: write.key, op: write.op, bytes: write.bytes });
-        break;
-      case "parked_tasks":
-        add("parked_tasks", { key: write.key, op: write.op, bytes: write.bytes });
         break;
       case "counters":
         add("counters", { key: write.key, op: write.op, bytes: write.bytes });
@@ -508,7 +499,6 @@ export function browserProfileProjectionWriteFromAuthority(input: {
         ? { table: "tool_surfaces", key: write.key, op: "delete", bytes: 0 }
         : browserProjectionWrite("tool_surfaces", write.key, browserToolRow(write.row, head));
     case "snapshots":
-    case "parked_tasks":
     case "counters":
       return null;
   }
@@ -534,7 +524,6 @@ function browserProfileProjectionPageFromAuthority(input: {
     case "tool_surfaces":
       return browserProjectionPage("tool_surfaces", page.page, page.rows.map((row) => browserToolRow(row, head)));
     case "snapshots":
-    case "parked_tasks":
       return null;
   }
 }

@@ -36,7 +36,7 @@ A **seed** is a `SerializedWorld` slice plus:
   every satellite receiver. The receiver does not require per-id host
   metadata to act on these.
 
-The seed MUST NOT carry sessions, logs, snapshots, parked tasks, or
+The seed MUST NOT carry sessions, logs, snapshots, scheduled turns, or
 gateway-global allocation counters. Each is per-host or per-host-spaces
 state for which the gateway is not authoritative on the receiver, so
 they have no place in the merge channel. Counters in the seed must be

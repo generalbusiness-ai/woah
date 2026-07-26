@@ -141,6 +141,7 @@ const BUILTINS = new Set([
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
+  "schedule", "schedule_at", "cancel_schedule",
   "describe_object", "present_actors", "active_actors", "session_metadata", "room_roster", "ordered_children", "ordered_neighbors",
   "visible_contents", "obvious_verbs", "remote_describe",
   // builder_create_object and builder_chparent stay native. The other
@@ -1139,25 +1140,33 @@ class Codegen {
       this.emit("PUSH_LIT", this.literal(null));
       return;
     }
-    if (name === "suspend") {
-      if (expr.args.length !== 1) throw new CompileError("E_COMPILE", "suspend expects seconds", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.emit("SUSPEND");
-      return;
+    // Phase 1 (scheduled events): the parked-task model these compiled to is
+    // deleted. `fork` returns in phase 3 as sugar over `schedule`; `suspend`
+    // and `read` have no replacement. Reserved here so an author who reaches
+    // for them gets told what happened instead of "unknown builtin".
+    if (name === "suspend" || name === "read") {
+      throw new CompileError(
+        "E_COMPILE",
+        `${name}() no longer exists: a verb runs to completion within its turn. To do work later, use schedule() (spec/semantics/scheduling.md)`,
+        expr.span
+      );
     }
-    if (name === "read") {
-      if (expr.args.length !== 1) throw new CompileError("E_COMPILE", "read expects player", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.emit("READ");
-      return;
-    }
+    // `fork` is the LambdaMOO spelling, kept as sugar over schedule()
+    // (scheduling.md SC9). Three things are load-bearing and deliberate:
+    // it takes SECONDS where schedule takes milliseconds; the 60s lead time
+    // still clamps, so a v1 author's `fork(1, ...)` fires a minute later; and
+    // there is no block form, because a scheduled entry carries values in a
+    // durable row and cannot capture the forking frame's locals.
     if (name === "fork") {
-      if (expr.args.length < 3) throw new CompileError("E_COMPILE", "fork expects delay, target, verb, and optional args", expr.span);
-      this.compileExpr(expr.args[0]);
-      this.compileExpr(expr.args[1]);
-      this.compileExpr(expr.args[2]);
+      if (expr.args.length < 3) throw new CompileError("E_COMPILE", "fork expects delay_seconds, target, verb, and optional args", expr.span);
+      this.compileExpr(expr.args[1]);                       // target
+      this.compileExpr(expr.args[2]);                       // verb
       for (const arg of expr.args.slice(3)) this.compileExpr(arg);
-      this.emit("FORK", expr.args.length - 3);
+      this.emit("MAKE_LIST", expr.args.length - 3);         // args list
+      this.compileExpr(expr.args[0]);                       // delay (seconds)
+      this.emit("PUSH_INT", 1000);
+      this.emit("MUL");                                     // → milliseconds
+      this.emit("BUILTIN", "schedule", 4);
       return;
     }
     if (!BUILTINS.has(name)) throw new CompileError("E_COMPILE", `unknown builtin: ${name}`, expr.span);

@@ -429,33 +429,6 @@ describe("recycle", () => {
     if (viewed.op === "error") expect(viewed.error.code).toBe("E_INVARG");
   });
 
-  it("kills parked tasks anchored to the recycled object", async () => {
-    const world = createWorld();
-    const { actor: wiz } = wizActor(world);
-
-    const target = world.createAuthoredObject(wiz, { parent: "$thing", name: "Target Space" });
-
-    // Inject a parked task referencing the target. The internal parked-task
-    // counter is private but `world.parkedTasks` is the source of truth.
-    const taskId = "ptask_test_kill";
-    world.parkedTasks.set(taskId, {
-      id: taskId,
-      parked_on: target,
-      state: "suspended",
-      resume_at: Date.now() + 60_000,
-      awaiting_player: null,
-      correlation_id: null,
-      serialized: { kind: "test" } as never,
-      created: Date.now(),
-      origin: target
-    });
-    expect(world.parkedTasks.has(taskId)).toBe(true);
-
-    await recycleVia(world, wiz, target, { force: true });
-    expect(world.parkedTasks.has(taskId)).toBe(false);
-    expect(world.objects.has(target)).toBe(false);
-  });
-
   it("wiz:force_recycle accepts a universal class that ordinary recycle refuses", async () => {
     const world = createWorld();
     const { actor: wiz } = wizActor(world);

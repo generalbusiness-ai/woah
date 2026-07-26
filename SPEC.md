@@ -80,7 +80,8 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 - [tiny-vm.md](spec/semantics/tiny-vm.md) — T0 VM subset for early fixtures
 - [permissions.md](spec/semantics/permissions.md) — perms, wizard, trust, quotas (§11)
 - [events.md](spec/semantics/events.md) — emit, schemas (§12, §13)
-- [tasks.md](spec/semantics/tasks.md) — lifecycle, suspend, fork, read (§16)
+- [tasks.md](spec/semantics/tasks.md) — task lifecycle and cross-host RPC (§16)
+- [scheduling.md](spec/semantics/scheduling.md) — `schedule` / `cancel_schedule` / `fork`: deferred execution as authors write it (SC1–SC11, **draft**)
 - [builtins.md](spec/semantics/builtins.md) — builtins, errors (§19, §20)
 - [recycle.md](spec/semantics/recycle.md) — `recycle()` semantics: cleanup, handlers, dangling refs (RC1–RC9)
 - [moveto.md](spec/semantics/moveto.md) — receiver-driven container moves with acceptable/enter/exit hooks (M1–M10, **implemented core**)

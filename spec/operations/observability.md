@@ -80,7 +80,7 @@ Each persistent host emits standard metrics:
   execution-cache composition and accepted write-cell promotion. These
   client-side probes were removed with the v2 browser client in the net-only
   cutover.
-- `parked_tasks` (gauge)
+- `pending_scheduled_turns` (gauge, per scope)
 - `inbound_rate_drops` (counter)
 - `outbound_overflow_drops` (counter)
 
@@ -105,7 +105,7 @@ For multi-developer, multi-team operations:
 
 - `calls_by_actor` (counter, per actor)
 - `errors_by_actor` (counter, per actor)
-- `quota_consumed_by_owner` (gauge: storage, object count, parked tasks)
+- `quota_consumed_by_owner` (gauge: storage, object count)
 - `space_active_subscribers` (gauge, per space)
 - `replay_request_rate` (rate, per space — useful for catching gap-recovery storms)
 

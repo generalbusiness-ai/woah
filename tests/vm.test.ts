@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
-import { createSerializedTinyVmTask, runSerializedTinyVmTask, type SerializedVmTask } from "../src/core/tiny-vm";
+import { BUILTIN_NAMES, runTinyVm } from "../src/core/tiny-vm";
 import { freezeTinyBytecode, type Message, type TinyBytecode, type VerbDef } from "../src/core/types";
 
 function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
@@ -334,34 +334,6 @@ describe("v0.5 in-memory VM", () => {
       )
     ).toBe("E_BOOM");
   });
-
-  it("hydrates a serialized VM call stack and resumes execution", async () => {
-    const { world, actor } = authedWorld();
-    const callerBytecode: TinyBytecode = {
-      literals: [],
-      num_locals: 0,
-      max_stack: 2,
-      version: 1,
-      ops: [["PUSH_INT", 5], ["ADD"], ["RETURN"]]
-    };
-    const calleeBytecode: TinyBytecode = {
-      literals: [],
-      num_locals: 0,
-      max_stack: 1,
-      version: 1,
-      ops: [["PUSH_INT", 7], ["RETURN"]]
-    };
-    const task: SerializedVmTask = {
-      version: 1,
-      frames: [
-        createSerializedTinyVmTask(vmCtx(world, actor, "delay_1", "caller"), callerBytecode, []).frames[0],
-        createSerializedTinyVmTask(vmCtx(world, actor, "delay_1", "callee"), calleeBytecode, []).frames[0]
-      ]
-    };
-
-    expect((await runSerializedTinyVmTask(world, task)).result).toBe(12);
-  });
-
   it("turns tick exhaustion into a sequenced behavior failure", async () => {
     const { world, session, actor } = authedWorld();
     world.addVerb(
@@ -479,202 +451,166 @@ describe("v0.5 in-memory VM", () => {
       )
     ).toBe(14);
   });
+});
 
-  it("schedules delayed FORK tasks through the durable task queue", async () => {
-    const { world, session, actor } = authedWorld();
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("mark", {
-        literals: ["forked", "type", "fork_ran", "value", null],
-        num_locals: 0,
-        max_stack: 6,
-        version: 1,
-        ops: [
-          ["PUSH_THIS"],
-          ["PUSH_LIT", 0],
-          ["PUSH_ARG", 0],
-          ["SET_PROP"],
-          ["PUSH_LIT", 1],
-          ["PUSH_LIT", 2],
-          ["PUSH_LIT", 3],
-          ["PUSH_ARG", 0],
-          ["MAKE_MAP", 2],
-          ["OBSERVE"],
-          ["PUSH_LIT", 4],
-          ["RETURN"]
-        ]
-      })
-    );
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("schedule_mark", {
-        literals: ["mark"],
-        num_locals: 0,
-        max_stack: 5,
-        version: 1,
-        ops: [["PUSH_INT", 0], ["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_ARG", 0], ["FORK", 1], ["RETURN"]]
-      })
-    );
-
-    const scheduled = await callInDubspace(world, session.id, "fork", message(actor, "delay_1", "schedule_mark", ["later"]));
-    expect(scheduled.op).toBe("applied");
-    expect(world.parkedTasks.size).toBe(1);
-    expect(world.propOrNull("delay_1", "forked")).toBeNull();
-    const ran = await world.runDueTasks(Date.now() + 1);
-    expect(ran).toHaveLength(1);
-    expect(ran[0].frame?.op).toBe("applied");
-    if (ran[0].frame?.op === "applied") {
-      expect(ran[0].frame.seq).toBe(2);
-      expect(ran[0].frame.observations[0].type).toBe("fork_ran");
-      expect(ran[0].frame.message.verb).toBe("mark");
-    }
-    expect(world.replay("the_dubspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["schedule_mark", "mark"]);
-    expect(world.getProp("delay_1", "forked")).toBe("later");
-    expect(world.parkedTasks.size).toBe(0);
+describe("builtin index stability", () => {
+  it("keeps every previously-published builtin at its original index", () => {
+    // Persisted bytecode encodes builtins by INDEX. Inserting a name anywhere
+    // but the end silently re-points every later builtin in an aged world's
+    // stored verbs — which is exactly what the scheduling work did once, and
+    // a green test suite said nothing. This freezes a prefix so the next
+    // insert fails here instead of in someone's world.
+    const frozen = [
+      "length",
+      "keys",
+      "values",
+      "has",
+      "typeof",
+      "to_string",
+      "min",
+      "max",
+      "floor",
+      "ceil",
+      "round",
+      "abs",
+      "now",
+      "create",
+      "recycle",
+      "move",
+      "moveto",
+      "chparent",
+      "has_flag",
+      "isa",
+      "is_recycled",
+      "directory_reconcile_corenames",
+      "random",
+      "contents",
+      "location",
+      "task_perms",
+      "caller_perms",
+      "set_task_perms",
+      "set_presence",
+      "observe_to_space",
+      "tell",
+      "current_location",
+      "current_session",
+      "session_location",
+      "all_locations",
+      "primary_session",
+      "is_connected",
+      "idle_seconds",
+      "builder_create_object",
+      "builder_chparent",
+      "_dead_builder_set_property",
+      "_dead_builder_inspect",
+      "_dead_builder_search",
+      "_dead_programmer_inspect",
+      "_dead_programmer_resolve_verb",
+      "_dead_programmer_list_verb",
+      "_dead_programmer_search",
+      "_dead_programmer_install_verb",
+      "_dead_programmer_set_verb_info",
+      "_dead_programmer_set_property_info",
+      "_dead_programmer_trace",
+      "editor_invoke",
+      "editor_what",
+      "editor_view",
+      "editor_replace",
+      "editor_insert",
+      "editor_delete",
+      "editor_dry_run",
+      "editor_save",
+      "editor_pause",
+      "editor_abort",
+      "str_trim",
+      "str_lower",
+      "str_starts",
+      "str_index",
+      "str_slice",
+      "str_char",
+      "dispatch",
+      "execute_command_plan",
+      "str_join",
+      "collect_prop",
+      "to_int",
+      "to_float",
+      "str_split",
+      "programmer_eval",
+      "parents",
+      "children",
+      "valid",
+      "verbs",
+      "verb_info",
+      "verb_code",
+      "add_verb",
+      "delete_verb",
+      "set_verb_info",
+      "set_verb_code",
+      "compile_verb",
+      "properties",
+      "property_info",
+      "add_property",
+      "delete_property",
+      "set_property_info",
+      "clear_property",
+      "is_clear_property",
+      "authoring_inspect",
+      "authoring_search",
+      "set_object_name",
+      "is_remote_object",
+      "presence_status",
+      "_dead_room_look_projection",
+      "_dead_room_who_projection",
+      "_dead_player_listing_projection",
+      "_dead_object_examine_projection",
+      "_dead_help_topic_projection",
+      "present_actors",
+      "_dead_connected_players",
+      "session_metadata",
+      "visible_contents",
+      "obvious_verbs",
+      "remote_describe",
+      "active_actors",
+      "listinsert",
+      "object_tree_rows",
+      "_dead_object_siblings_ordered",
+      "room_roster",
+      "ordered_children",
+      "rank_between",
+      "ordered_neighbors",
+      "event_schema",
+      "has_surface",
+      "schedule",
+      "schedule_at",
+      "cancel_schedule"
+    ];
+    // The ENTIRE published list, not a prefix: freezing only the first N
+    // still lets an insert after position N renumber everything later.
+    // Appending is fine — the assertion below pins the new tail explicitly,
+    // so adding a builtin means consciously extending this list.
+    expect(BUILTIN_NAMES).toEqual(frozen);
+    // The scheduling builtins must be at the END, after everything else.
+    expect(BUILTIN_NAMES.slice(-3)).toEqual(["schedule", "schedule_at", "cancel_schedule"]);
+    // No duplicates: a duplicate would make one index unreachable.
+    expect(new Set(BUILTIN_NAMES).size).toBe(BUILTIN_NAMES.length);
   });
 
-  it("parks SUSPEND continuations and resumes them through a sequenced frame", async () => {
-    const { world, session, actor } = authedWorld();
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("suspend_then_mark", {
-        literals: ["after_suspend", "type", "resumed_after_suspend", null],
-        num_locals: 0,
-        max_stack: 6,
-        version: 1,
-        ops: [
-          ["PUSH_INT", 0],
-          ["SUSPEND"],
-          ["POP"],
-          ["PUSH_THIS"],
-          ["PUSH_LIT", 0],
-          ["PUSH_ARG", 0],
-          ["SET_PROP"],
-          ["PUSH_LIT", 1],
-          ["PUSH_LIT", 2],
-          ["MAKE_MAP", 1],
-          ["OBSERVE"],
-          ["PUSH_LIT", 3],
-          ["RETURN"]
-        ]
-      })
-    );
-
-    const applied = await callInDubspace(world, session.id, "suspend", message(actor, "delay_1", "suspend_then_mark", ["ok"]));
-    expect(applied.op).toBe("applied");
-    if (applied.op === "applied") {
-      expect(applied.observations[0].type).toBe("task_suspended");
-    }
-    expect(world.parkedTasks.size).toBe(1);
-    expect(world.propOrNull("delay_1", "after_suspend")).toBeNull();
-    const ran = await world.runDueTasks(Date.now() + 1);
-    expect(ran).toHaveLength(1);
-    expect(ran[0].frame?.op).toBe("applied");
-    if (ran[0].frame?.op === "applied") {
-      expect(ran[0].frame.seq).toBe(2);
-      expect(ran[0].frame.message.verb).toBe("$resume");
-      expect(ran[0].frame.observations.map((obs) => obs.type)).toContain("resumed_after_suspend");
-    }
-    expect(world.getProp("delay_1", "after_suspend")).toBe("ok");
-    expect(world.replay("the_dubspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["suspend_then_mark", "$resume"]);
-    expect(world.parkedTasks.size).toBe(0);
-  });
-
-  it("serializes observations that exist when a VM continuation parks", async () => {
-    const { world, session, actor } = authedWorld();
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("observe_then_suspend", {
-        literals: ["type", "before_suspend", null],
+  it("names the removal when aged bytecode still carries FORK/SUSPEND/READ", async () => {
+    // Verbs persisted before the parked-task deletion still contain these
+    // opcodes. A bare "unknown VM opcode" is a worse diagnosis than saying
+    // what happened and where to go.
+    const { world, actor } = authedWorld();
+    for (const op of ["FORK", "SUSPEND", "READ"]) {
+      const bytecode: TinyBytecode = {
+        literals: [],
         num_locals: 0,
         max_stack: 4,
         version: 1,
-        ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["MAKE_MAP", 1], ["OBSERVE"], ["PUSH_INT", 0], ["SUSPEND"], ["PUSH_LIT", 2], ["RETURN"]]
-      })
-    );
-
-    const applied = await callInDubspace(world, session.id, "observe-suspend", message(actor, "delay_1", "observe_then_suspend", []));
-    expect(applied.op).toBe("applied");
-    if (applied.op === "applied") expect(applied.observations.map((obs) => obs.type)).toEqual(["before_suspend", "task_suspended"]);
-    const parked = Array.from(world.parkedTasks.values())[0]?.serialized as any;
-    expect(parked?.task?.frames?.[0]?.ctx?.observations?.map((obs: any) => obs.type)).toEqual(["before_suspend"]);
-  });
-
-  it("does not count suspended wall time against resumed VM continuations", async () => {
-    const { world, session, actor } = authedWorld();
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("short_wall_suspend", {
-        literals: ["after_wall_suspend", null],
-        num_locals: 0,
-        max_stack: 4,
-        max_wall_ms: 5,
-        version: 1,
-        ops: [["PUSH_INT", 0], ["SUSPEND"], ["POP"], ["PUSH_THIS"], ["PUSH_LIT", 0], ["PUSH_ARG", 0], ["SET_PROP"], ["PUSH_LIT", 1], ["RETURN"]]
-      })
-    );
-
-    const applied = await callInDubspace(world, session.id, "wall-suspend", message(actor, "delay_1", "short_wall_suspend", ["ok"]));
-    expect(applied.op).toBe("applied");
-    const parked = Array.from(world.parkedTasks.values())[0]?.serialized as any;
-    parked.task.frames[0].startedAt = Date.now() - 60_000;
-    parked.task.frames[0].activeWallMs = 0;
-
-    const ran = await world.runDueTasks(Date.now() + 1);
-    expect(ran).toHaveLength(1);
-    expect(ran[0].frame?.op).toBe("applied");
-    expect(world.getProp("delay_1", "after_wall_suspend")).toBe("ok");
-  });
-
-  it("parks READ continuations and resumes them through a sequenced input frame", async () => {
-    const { world, session, actor } = authedWorld();
-    world.addVerb(
-      "delay_1",
-      addBytecodeVerb("read_then_mark", {
-        literals: ["read_value", "type", "read_resumed", "value", null],
-        num_locals: 1,
-        max_stack: 6,
-        version: 1,
-        ops: [
-          ["PUSH_ACTOR"],
-          ["READ"],
-          ["POP_LOCAL", 0],
-          ["PUSH_THIS"],
-          ["PUSH_LIT", 0],
-          ["PUSH_LOCAL", 0],
-          ["SET_PROP"],
-          ["PUSH_LIT", 1],
-          ["PUSH_LIT", 2],
-          ["PUSH_LIT", 3],
-          ["PUSH_LOCAL", 0],
-          ["MAKE_MAP", 2],
-          ["OBSERVE"],
-          ["PUSH_LIT", 4],
-          ["RETURN"]
-        ]
-      })
-    );
-
-    const applied = await callInDubspace(world, session.id, "read", message(actor, "delay_1", "read_then_mark", []));
-    expect(applied.op).toBe("applied");
-    if (applied.op === "applied") expect(applied.observations[0].type).toBe("task_awaiting_read");
-    expect(world.parkedTasks.size).toBe(1);
-    expect(world.propOrNull("delay_1", "read_value")).toBeNull();
-
-    const noTask = await world.deliverInput("guest_999", "ignored");
-    expect(noTask).toBeNull();
-
-    const ran = await world.deliverInput(actor, "typed text");
-    expect(ran?.frame?.op).toBe("applied");
-    if (ran?.frame?.op === "applied") {
-      expect(ran.frame.seq).toBe(2);
-      expect(ran.frame.message.verb).toBe("$resume");
-      expect(ran.frame.message.body?.kind).toBe("vm_read");
-      expect(ran.frame.message.body?.input).toBe("typed text");
-      expect(ran.frame.observations.map((obs) => obs.type)).toContain("read_resumed");
+        ops: [["PUSH_INT", 1], [op, 0], ["RETURN"]] as never
+      };
+      await expect(
+        runTinyVm(vmCtx(world, actor, "delay_1", `aged_${op.toLowerCase()}`), freezeTinyBytecode(bytecode), [])
+      ).rejects.toMatchObject({ code: "E_VERSION" });
     }
-    expect(world.getProp("delay_1", "read_value")).toBe("typed text");
-    expect(world.replay("the_dubspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["read_then_mark", "$resume"]);
-    expect(world.parkedTasks.size).toBe(0);
   });
 });

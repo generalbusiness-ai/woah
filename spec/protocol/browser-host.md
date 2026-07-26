@@ -65,5 +65,4 @@ The abstract host trust rules in [hosts.md §3.3](hosts.md#33-trust-model-across
 On websocket close:
 1. Player host marks all `~`-children dead in its session table.
 2. Any in-flight RPCs targeting those refs reply with `E_GONE`.
-3. Tasks that were `awaiting_read` on the player remain (player may reconnect within a grace period and resume).
-4. After grace period (default 5 minutes), `awaiting_read` tasks are killed.
+3. No task state outlives the connection: a browser-hosted turn runs to completion or fails with the connection. There is no input-awaiting parked task to preserve or reap.

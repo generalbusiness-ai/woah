@@ -96,48 +96,78 @@ describe("turn recorder", () => {
     expect(rankCapabilityAdsForTurn([ad, cheaper], turnKey).map((item) => item.node)).toEqual(["node-b", "node-a"]);
   });
 
-  it("records parked-task projection writes at the mutation site", async () => {
+  // The parked-task model this test used to exercise is deleted
+  // (spec/semantics/tasks.md); scheduled turns replace it. Two things matter
+  // here: that arming records a transcript effect with the ARMING FRAME's
+  // provenance (CO16.2 — the scope must be able to prove the namespace and
+  // the authority itself), and that the replaced spellings still fail loudly
+  // rather than returning to the silent no-op that motivated the deletion.
+  it("records schedule effects with arming-frame provenance", async () => {
     const world = createWorld();
-    const session = world.auth("guest:turn-recorder-projection");
+    const session = world.auth("guest:turn-recorder-schedule");
     const actor = session.actor;
     world.createObject({ id: "scheduler", name: "Scheduler", parent: "$thing", owner: actor });
-    expect(installVerb(
-      world,
-      "scheduler",
-      "noop",
-      "verb :noop() rxd { return 0; }",
-      null
-    ).ok).toBe(true);
+    expect(installVerb(world, "scheduler", "noop", "verb :noop() rxd { return 0; }", null).ok).toBe(true);
     expect(installVerb(
       world,
       "scheduler",
       "queue",
-      "verb :queue() rxd { return fork(60, this, \"noop\", []); }",
+      "verb :queue() rxd { return schedule(this, \"noop\", [], 600000, {\"key\": \"tick\"}); }",
       null
     ).ok).toBe(true);
+
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
-
     const result = await world.directCall("queue-task", actor, "scheduler", "queue", []);
-
     expect(result.op).toBe("result");
+
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
-    expect(transcript.projectionWrites).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        table: "counters",
-        key: "parkedTaskCounter",
-        op: "upsert"
-      }),
-      expect.objectContaining({
-        table: "parked_tasks",
-        op: "upsert",
-        row: expect.objectContaining({
-          parked_on: "scheduler",
-          state: "suspended",
-          origin: "scheduler"
-        })
-      })
-    ]));
+    expect(transcript.schedules).toHaveLength(1);
+    const armed = transcript.schedules![0];
+    // The namespace half is built by the engine from the arming object, never
+    // supplied by the author — that is the whole CO16.3 defence.
+    expect(armed.id).toBe("scheduler:tick");
+    expect(armed.idlePolicy).toBe("while_active");
+    expect(armed.call).toMatchObject({ target: "scheduler", verb: "noop", actor });
+    expect(armed.armed_by).toMatchObject({ thisObj: "scheduler", verb: "queue" });
+    // Nothing is written now: arming is one transcript entry and no more.
+    expect(transcript.writes).toEqual([]);
+  });
+
+  it("clamps a sub-minute delay to the lead time rather than failing", async () => {
+    // SC3: `fork(1, ...)` is a v1 reflex. It fires a minute later, silently —
+    // clamping is the specified behaviour, so the author gets a working timer
+    // at the rate the committed plane actually offers.
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-clamp");
+    const actor = session.actor;
+    world.createObject({ id: "clamper", name: "Clamper", parent: "$thing", owner: actor });
+    expect(installVerb(world, "clamper", "noop", "verb :noop() rxd { return 0; }", null).ok).toBe(true);
+    expect(installVerb(world, "clamper", "soon", "verb :soon() rxd { return fork(1, this, \"noop\"); }", null).ok).toBe(true);
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+    const before = Date.now();
+    expect((await world.directCall("clamp", actor, "clamper", "soon", [])).op).toBe("result");
+
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.schedules).toHaveLength(1);
+    expect(transcript.schedules![0].at).toBeGreaterThanOrEqual(before + 60_000);
+  });
+
+  it("still refuses suspend and read, which have no replacement", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-refuse");
+    const actor = session.actor;
+    world.createObject({ id: "waiter", name: "Waiter", parent: "$thing", owner: actor });
+
+    const suspended = installVerb(world, "waiter", "wait", "verb :wait() rxd { suspend(60); return 0; }", null);
+    expect(suspended.ok).toBe(false);
+    expect(JSON.stringify(suspended)).toMatch(/schedule/);
+
+    const reader = installVerb(world, "waiter", "ask", "verb :ask() rxd { return read(player); }", null);
+    expect(reader.ok).toBe(false);
+    expect(JSON.stringify(reader)).toMatch(/schedule/);
   });
 
   it("promotes a successful tombstone write to a typed recycle effect", async () => {

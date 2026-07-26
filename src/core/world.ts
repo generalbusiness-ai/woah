@@ -28,8 +28,8 @@ import {
   type WooValue,
   wooError
 } from "./types";
-import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
-import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
+import type { ObjectRepository, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
+import { runTinyVm } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import {
   deriveCustomerAttribution,
@@ -41,6 +41,7 @@ import {
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
+import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
 import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
   createV2TurnEffects,
@@ -92,7 +93,6 @@ export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | P
  * ordered-children miss = missing owner projection (P1.2).
  */
 function isUncatchableControlSignal(err: unknown): boolean {
-  if (isVmSuspendSignal(err) || isVmReadSignal(err)) return true;
   const code = isErrorValue(err) ? err.code : undefined;
   // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the
   // ordered-children miss (P2.4) — same repair path, same swallowing hazard.
@@ -445,13 +445,6 @@ export type MeSnapshot = {
 
 const DEFAULT_OBJECT_HOST = "world";
 
-export type ParkedTaskRun = {
-  task: ParkedTaskRecord;
-  frame?: AppliedFrame | ErrorFrame;
-  observations: Observation[];
-  error?: ErrorValue;
-};
-
 export type DirectCallOptions = {
   forceDirect?: boolean;
   forceReason?: string;
@@ -476,10 +469,8 @@ type BehaviorSavepoint = {
   objects: Map<ObjRef, WooObject>;
   sessions: Map<string, Session>;
   snapshots: SpaceSnapshotRecord[];
-  parkedTasks: Map<string, ParkedTaskRecord>;
   tombstones: Set<ObjRef>;
   objectCounter: number;
-  parkedTaskCounter: number;
   sessionCounter: number;
   guestFreePool: Set<ObjRef>;
   persistence: PersistenceDirtyState;
@@ -507,8 +498,6 @@ type PersistenceDirtyState = {
   dirtyProperties: Map<ObjRef, Set<string>>;
   dirtySessions: Set<string>;
   deletedSessions: Set<string>;
-  dirtyTasks: Set<string>;
-  deletedTasks: Set<string>;
   dirtyTombstones: Set<ObjRef>;
   dirtyCounters: boolean;
   dirty: boolean;
@@ -543,11 +532,9 @@ export class WooWorld {
   sessions = new Map<string, Session>();
   logs = new Map<ObjRef, SpaceLogEntry[]>();
   snapshots: SpaceSnapshotRecord[] = [];
-  parkedTasks = new Map<string, ParkedTaskRecord>();
   private nativeHandlers = new Map<string, NativeHandler>();
   private idempotency = new Map<string, { at: number; frame: AppliedFrame | ErrorFrame }>();
   private objectCounter = 1;
-  private parkedTaskCounter = 1;
   private sessionCounter = 1;
   private persistencePaused = 0;
   // Defers whole-world fallback saves while grouped in-memory mutations settle.
@@ -559,8 +546,6 @@ export class WooWorld {
   private dirtyProperties = new Map<ObjRef, Set<string>>();
   private dirtySessions = new Set<string>();
   private deletedSessions = new Set<string>();
-  private dirtyTasks = new Set<string>();
-  private deletedTasks = new Set<string>();
   private dirtyTombstones = new Set<ObjRef>();
   private dirtyCounters = false;
   // Tombstoned ULIDs from `recycle()`. Distinct from `objects` having no row,
@@ -628,6 +613,20 @@ export class WooWorld {
   // See spec/protocol/v2-turn-network.md §VTN10.1.
   private shadowExecutionGuardActive = false;
   private currentTurnWriter: RecordedWriteAuthority | null = null;
+  /** Schedules armed by the turn in progress: the CO16.7 per-turn budget and
+   * the derivation of turn-unique schedule ids. */
+  private turnScheduleCount = 0;
+  /** The turn's ONE scheduling clock reading, recorded under
+   * SCHEDULE_CLOCK_INPUT. Every schedule armed by a turn is measured against
+   * the same instant, so the committing scope has a single unambiguous value
+   * to validate all of them against — with one reading per call the validator
+   * could not tell which entry belonged to which reading, and any choice
+   * (first/last/max) would misjudge some entry in a multi-schedule turn. */
+  private turnScheduleClock: number | null = null;
+  /** Unique-per-turn token for implicit schedule keys. Derived from the
+   * recorded turn's id, which is unique per call — `seq` is NOT, because a
+   * direct route always carries seq -1 and would collide across calls. */
+  private turnScheduleToken = "";
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
   // CA11.2 occupancy-transition: per-cell provenance for the ephemeral planning
   // world this WooWorld was built from. Only the sparse gateway planning path
@@ -1159,8 +1158,21 @@ export class WooWorld {
     const previous = this.activeTurnRecorder;
     const previousWriter = this.currentTurnWriter;
     const active = recorder.startTurn(turn);
+    const previousScheduleCount = this.turnScheduleCount;
+    const previousScheduleClock = this.turnScheduleClock;
+    const previousScheduleToken = this.turnScheduleToken;
     this.activeTurnRecorder = active;
     this.currentTurnWriter = null;
+    // Per-turn schedule budget, clock, and id token all reset here, so a
+    // nested recorded turn cannot inherit any of them (CO16.7).
+    this.turnScheduleCount = 0;
+    this.turnScheduleClock = null;
+    // Turn identity, deterministic across re-plans of the SAME turn (so a
+    // retried turn upserts its own entry rather than arming a second one) and
+    // distinct between different turns. `seq` alone is not enough: the direct
+    // route always carries -1.
+    this.turnScheduleToken = turn.id
+      ?? hashSource(`${turn.scope}:${turn.seq}:${turn.actor}:${turn.target}:${turn.verb}:${JSON.stringify(turn.args ?? [])}`);
     try {
       const result = await fn(active);
       active.event({ kind: "turn_finish", ok: true, result: result as WooValue });
@@ -1171,6 +1183,9 @@ export class WooWorld {
     } finally {
       this.activeTurnRecorder = previous;
       this.currentTurnWriter = previousWriter;
+      this.turnScheduleCount = previousScheduleCount;
+      this.turnScheduleClock = previousScheduleClock;
+      this.turnScheduleToken = previousScheduleToken;
     }
   }
 
@@ -1208,6 +1223,107 @@ export class WooWorld {
       // sessionWriter precedent for engine-folded writes).
       writer: { progr: actor, thisObj: spaceRef, verb: "call", definer: spaceRef, caller: "#-1", callerPerms: actor }
     });
+  }
+
+  /**
+   * CO16 / scheduling.md — arm a scheduled turn. The whole effect is one
+   * recorded transcript entry: nothing is written now, no task is created,
+   * and nothing has happened at all until the turn commits.
+   *
+   * The delivery time is derived from `logicalNow()`, the same recorded and
+   * replayed logical input `now()` returns, so the planner and the committing
+   * scope compute the same instant and a replay reproduces it.
+   */
+  recordScheduleRequest(
+    ctx: CallContext,
+    target: ObjRef,
+    verbName: string,
+    args: WooValue[],
+    when: { delayMs?: number; atMs?: number },
+    opts: { key?: string; idlePolicy?: "while_active" | "always" } = {}
+  ): string {
+    assertObj(target);
+    const relative = when.delayMs;
+    const absolute = when.atMs;
+    if (relative === undefined && absolute === undefined) throw wooError("E_INVARG", "schedule needs a delay or a time");
+    if (relative !== undefined && !Number.isFinite(relative)) throw wooError("E_TYPE", "schedule delay must be numeric", relative);
+    if (absolute !== undefined && !Number.isFinite(absolute)) throw wooError("E_TYPE", "schedule time must be numeric", absolute);
+    const idlePolicy = opts.idlePolicy ?? "while_active";
+    if (idlePolicy !== "while_active" && idlePolicy !== "always") {
+      throw wooError("E_INVARG", `unknown idle_policy ${String(idlePolicy)}`, idlePolicy);
+    }
+    // CO16.6: `always` is the shape that runs unattended and bills a world
+    // forever. Refused here for a useful author-facing error; the scope
+    // re-checks against provenance because it does not trust the planner.
+    if (idlePolicy === "always" && !this.isWizard(ctx.progr)) {
+      throw wooError("E_PERM", "arming an idle_policy \"always\" schedule requires wizard authority", { progr: ctx.progr });
+    }
+    if (this.turnScheduleCount >= SCHEDULE_MAX_PER_TURN) {
+      throw wooError("E_QUOTA", `a turn may arm at most ${SCHEDULE_MAX_PER_TURN} schedules`, {
+        quota: "schedules_per_turn",
+        current: this.turnScheduleCount,
+        limit: SCHEDULE_MAX_PER_TURN
+      });
+    }
+
+    // One reading per turn, recorded under the name the scope validates
+    // against. Reading per call would put several clock inputs in the
+    // transcript with no way to say which schedule each belonged to.
+    if (this.turnScheduleClock === null) this.turnScheduleClock = this.logicalNow(SCHEDULE_CLOCK_INPUT);
+    const now = this.turnScheduleClock;
+    // The floor CLAMPS rather than failing (SC3): a v1 author's `fork(1, ...)`
+    // reflex becomes a minute, not an error. The horizon does fail — a time a
+    // year out is a mistake, not a rounding.
+    const requested = relative !== undefined ? now + relative : (absolute as number);
+    const at = Math.max(requested, now + SCHEDULE_MIN_LEAD_MS);
+    if (at > now + SCHEDULE_MAX_HORIZON_MS) {
+      throw wooError("E_QUOTA", `schedule is beyond the ${SCHEDULE_MAX_HORIZON_MS}ms horizon`, {
+        quota: "schedule_horizon",
+        current: at - now,
+        limit: SCHEDULE_MAX_HORIZON_MS
+      });
+    }
+
+    // CO16.3: the namespace half is the arming object and is built HERE, never
+    // supplied by the author — that is the entire defence against one verb
+    // upserting over or cancelling another object's timer.
+    // Turn-unique, not seq-unique: a direct route always carries seq -1, so
+    // `space:seq:counter` collided across every direct call on a scope.
+    const key = opts.key ?? `t${hashSource(`${this.turnScheduleToken}:${this.turnScheduleCount}`).slice(0, 12)}`;
+    const id = `${ctx.thisObj}:${key}`;
+    this.turnScheduleCount += 1;
+
+    this.recordTurnEvent({
+      kind: "schedule",
+      request: {
+        id,
+        at,
+        idlePolicy,
+        call: {
+          actor: ctx.actor,
+          target,
+          verb: verbName,
+          args: cloneValue(args as WooValue) as WooValue[]
+        }
+      }
+    });
+    return id;
+  }
+
+  /** CO16.3 — record a cancellation. Returns nothing: the pending queue is
+   * scope state the planner does not hold, so any "did it exist" answer
+   * computed here could be falsified before the turn commits. */
+  recordScheduleCancellation(ctx: CallContext, scheduleId: string): null {
+    assertString(scheduleId);
+    // First colon, matching the authority's split: the namespace is the
+    // arming object, and a stable key may itself contain colons.
+    const separator = scheduleId.indexOf(":");
+    const namespace = separator < 0 ? "" : scheduleId.slice(0, separator);
+    if (namespace !== ctx.thisObj && !this.isWizard(ctx.progr)) {
+      throw wooError("E_PERM", `cannot cancel schedule ${scheduleId} outside ${ctx.thisObj}`, { id: scheduleId, this: ctx.thisObj });
+    }
+    this.recordTurnEvent({ kind: "cancel_schedule", id: scheduleId });
+    return null;
   }
 
   // Called by the VM whenever execution changes frames. The recorder annotates
@@ -1348,6 +1464,10 @@ export class WooWorld {
       case "prop_write":
       case "object_create":
       case "object_move":
+      // Schedule effects are stamped exactly like writes (CO16.2): the frame
+      // that armed or cancelled is what the scope validates against.
+      case "schedule":
+      case "cancel_schedule":
         return event.writer ? event : { ...event, writer: this.currentTurnWriter };
       default:
         return event;
@@ -1431,7 +1551,7 @@ export class WooWorld {
     });
   }
 
-  private recordProjectionWrite(write: Extract<ProjectionWrite, { table: "snapshots" | "parked_tasks" | "tombstones" | "counters" }>): void {
+  private recordProjectionWrite(write: Extract<ProjectionWrite, { table: "snapshots" | "tombstones" | "counters" }>): void {
     this.recordTurnEvent({ kind: "projection_write", write });
   }
 
@@ -1443,30 +1563,6 @@ export class WooWorld {
       row: snapshot,
       bytes: this.effects.projectionRowBytes(snapshot)
     });
-  }
-
-  private recordParkedTaskProjectionUpsert(task: ParkedTaskRecord): void {
-    this.recordProjectionWrite({
-      table: "parked_tasks",
-      key: task.id,
-      op: "upsert",
-      row: task,
-      bytes: this.effects.projectionRowBytes(task)
-    });
-  }
-
-  private recordParkedTaskCounterProjectionUpsert(): void {
-    this.recordProjectionWrite({
-      table: "counters",
-      key: "parkedTaskCounter",
-      op: "upsert",
-      value: this.parkedTaskCounter,
-      bytes: this.effects.projectionRowBytes({ key: "parkedTaskCounter", value: this.parkedTaskCounter })
-    });
-  }
-
-  private recordParkedTaskProjectionDelete(id: string): void {
-    this.recordProjectionWrite({ table: "parked_tasks", key: id, op: "delete", bytes: 0 });
   }
 
   private recordTombstoneProjectionUpsert(id: ObjRef): void {
@@ -1524,8 +1620,6 @@ export class WooWorld {
     this.dirtyProperties.clear();
     this.dirtySessions.clear();
     this.deletedSessions.clear();
-    this.dirtyTasks.clear();
-    this.deletedTasks.clear();
     this.dirtyTombstones.clear();
     this.dirtyCounters = false;
     this.persistenceDirty = false;
@@ -4986,22 +5080,16 @@ export class WooWorld {
         await this.withPersistencePaused(async () => {
           const before = this.snapshotProps();
           const beforePlacement = this.snapshotPlacement();
-          const beforeParkedTasks = new Map(this.parkedTasks);
-          const beforeParkedTaskCounter = this.parkedTaskCounter;
           const beforeObjectCount = this.objects.size;
           try {
             result = await this.dispatch(dispatchCtx, target, verbName, args);
             mutated =
               beforeObjectCount !== this.objects.size ||
               this.propsChanged(before) ||
-              this.placementChanged(beforePlacement) ||
-              beforeParkedTasks.size !== this.parkedTasks.size ||
-              beforeParkedTaskCounter !== this.parkedTaskCounter;
+              this.placementChanged(beforePlacement);
           } catch (err) {
             this.restoreProps(before);
             this.restorePlacement(beforePlacement);
-            this.parkedTasks = new Map(beforeParkedTasks);
-            this.parkedTaskCounter = beforeParkedTaskCounter;
             throw err;
           }
         });
@@ -5162,21 +5250,11 @@ export class WooWorld {
         );
         logEntry.applied_ok = true;
       } catch (err) {
-        if (isVmSuspendSignal(err)) {
-          const task = this.parkVmContinuation(ctx, err.seconds, err.task);
-          logEntry.applied_ok = true;
-          observations.push({ type: "task_suspended", source: spaceRef, task, resume_at: this.parkedTasks.get(task)?.resume_at ?? null });
-        } else if (isVmReadSignal(err)) {
-          const task = this.parkReadContinuation(ctx, err.player, err.task);
-          logEntry.applied_ok = true;
-          observations.push({ type: "task_awaiting_read", source: spaceRef, task, player: err.player });
-        } else {
-          const error = normalizeError(err);
-          logEntry.applied_ok = false;
-          logEntry.error = error;
-          observations.length = 0;
-          observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-        }
+        const error = normalizeError(err);
+        logEntry.applied_ok = false;
+        logEntry.error = error;
+        observations.length = 0;
+        observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
       }
 
       logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
@@ -5278,21 +5356,11 @@ export class WooWorld {
           );
           logEntry.applied_ok = true;
         } catch (err) {
-          if (isVmSuspendSignal(err)) {
-            const task = this.parkVmContinuation(ctx, err.seconds, err.task);
-            logEntry.applied_ok = true;
-            observations.push({ type: "task_suspended", source: spaceRef, task, resume_at: this.parkedTasks.get(task)?.resume_at ?? null });
-          } else if (isVmReadSignal(err)) {
-            const task = this.parkReadContinuation(ctx, err.player, err.task);
-            logEntry.applied_ok = true;
-            observations.push({ type: "task_awaiting_read", source: spaceRef, task, player: err.player });
-          } else {
-            const error = normalizeError(err);
-            logEntry.applied_ok = false;
-            logEntry.error = error;
-            observations.length = 0;
-            observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-          }
+          const error = normalizeError(err);
+          logEntry.applied_ok = false;
+          logEntry.error = error;
+          observations.length = 0;
+          observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
         }
 
         logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
@@ -7697,22 +7765,6 @@ export class WooWorld {
     // moved to a §RC5-style lazy check.
 
     // Step 2: kill parked tasks anchored to obj. Any task whose parked_on,
-    // awaiting_player, or origin is obj is removed. Per
-    // spec/semantics/recycle.md §RC3 step 2 and failures.md §F7. Awaiting
-    // consumers see E_INTRPT when they next look up the task; the parked-task
-    // table is the single source of truth, so deleting the row is enough.
-    const killedTasks: string[] = [];
-    for (const [id, task] of this.parkedTasks) {
-      if (task.parked_on === objRef || task.awaiting_player === objRef || task.origin === objRef) {
-        killedTasks.push(id);
-      }
-    }
-    for (const id of killedTasks) {
-      this.parkedTasks.delete(id);
-      this.recordParkedTaskProjectionDelete(id);
-      this.deletePersistedTask(id);
-    }
-
     const parent = obj.parent;
     const location = obj.location;
 
@@ -7791,158 +7843,10 @@ export class WooWorld {
     }
   }
 
-  scheduleFork(ctx: CallContext, seconds: number, target: ObjRef, verbName: string, args: WooValue[]): string {
-    if (!Number.isFinite(seconds)) throw wooError("E_TYPE", "fork delay must be numeric", seconds);
-    const id = `ptask_${this.parkedTaskCounter++}`;
-    this.persistCounters();
-    this.recordParkedTaskCounterProjectionUpsert();
-    const now = Date.now();
-    const task: ParkedTaskRecord = {
-      id,
-      parked_on: target,
-      state: "suspended",
-      resume_at: now + Math.max(0, seconds) * 1000,
-      awaiting_player: null,
-      correlation_id: null,
-      created: now,
-      origin: ctx.thisObj,
-      serialized: {
-        kind: "fork",
-        space: ctx.space,
-        actor: ctx.actor,
-        player: ctx.player,
-        progr: ctx.progr,
-        target,
-        verb: verbName,
-        args: cloneValue(args as WooValue) as WooValue,
-        message: cloneValue(ctx.message as unknown as WooValue)
-      }
-    };
-    this.parkedTasks.set(id, task);
-    this.recordParkedTaskProjectionUpsert(task);
-    this.persistTask(task);
-    this.persist();
-    return id;
-  }
-
-  parkVmContinuation(ctx: CallContext, seconds: number, task: SerializedVmTask): string {
-    if (!Number.isFinite(seconds)) throw wooError("E_TYPE", "suspend delay must be numeric", seconds);
-    const id = `ptask_${this.parkedTaskCounter++}`;
-    this.persistCounters();
-    this.recordParkedTaskCounterProjectionUpsert();
-    const now = Date.now();
-    const parked: ParkedTaskRecord = {
-      id,
-      parked_on: ctx.thisObj,
-      state: "suspended",
-      resume_at: now + Math.max(0, seconds) * 1000,
-      awaiting_player: null,
-      correlation_id: null,
-      created: now,
-      origin: ctx.thisObj,
-      serialized: {
-        kind: "vm_continuation",
-        space: ctx.space,
-        actor: ctx.actor,
-        player: ctx.player,
-        progr: ctx.progr,
-        target: ctx.thisObj,
-        verb: ctx.verbName,
-        task: cloneValue(task as unknown as WooValue)
-      }
-    };
-    this.parkedTasks.set(id, parked);
-    this.recordParkedTaskProjectionUpsert(parked);
-    this.persistTask(parked);
-    this.persist();
-    return id;
-  }
-
-  parkReadContinuation(ctx: CallContext, player: ObjRef, task: SerializedVmTask): string {
-    const id = `ptask_${this.parkedTaskCounter++}`;
-    this.persistCounters();
-    this.recordParkedTaskCounterProjectionUpsert();
-    const now = Date.now();
-    const parked: ParkedTaskRecord = {
-      id,
-      parked_on: ctx.thisObj,
-      state: "awaiting_read",
-      resume_at: null,
-      awaiting_player: player,
-      correlation_id: null,
-      created: now,
-      origin: ctx.thisObj,
-      serialized: {
-        kind: "vm_continuation",
-        space: ctx.space,
-        actor: ctx.actor,
-        player: ctx.player,
-        progr: ctx.progr,
-        target: ctx.thisObj,
-        verb: ctx.verbName,
-        task: cloneValue(task as unknown as WooValue)
-      }
-    };
-    this.parkedTasks.set(id, parked);
-    this.recordParkedTaskProjectionUpsert(parked);
-    this.persistTask(parked);
-    this.persist();
-    return id;
-  }
-
-  async deliverInput(player: ObjRef, input: WooValue): Promise<ParkedTaskRun | null> {
-    return await this.enqueueHostTask(() => this.deliverInputNow(player, input), `deliverInput:${player}`);
-  }
-
-  private async deliverInputNow(player: ObjRef, input: WooValue): Promise<ParkedTaskRun | null> {
-    const task = Array.from(this.parkedTasks.values())
-      .filter((item) => item.state === "awaiting_read" && item.awaiting_player === player)
-      .sort((left, right) => left.created - right.created || left.id.localeCompare(right.id))[0];
-    if (!task) return null;
-    this.parkedTasks.delete(task.id);
-    this.recordParkedTaskProjectionDelete(task.id);
-    this.deletePersistedTask(task.id);
-    const result = await this.runParkedTask(task, input);
-    this.persist(true);
-    return result;
-  }
-
-  async runDueTasks(now = Date.now()): Promise<ParkedTaskRun[]> {
-    // Pre-check before enqueueing so an idle dev poll (every 250ms) doesn't
-    // flood structured-log tails with no-op host_task_* metrics. A concurrent
-    // task insert between this check and the next tick is fine: the next
-    // poll re-checks.
-    if (!this.hasDueParkedTask(now)) return [];
-    return await this.enqueueHostTask(() => this.runDueTasksNow(now), "runDueTasks");
-  }
-
-  private hasDueParkedTask(now: number): boolean {
-    for (const task of this.parkedTasks.values()) {
-      if (task.state === "suspended" && task.resume_at !== null && task.resume_at <= now) return true;
-    }
-    return false;
-  }
-
-  private async runDueTasksNow(now = Date.now()): Promise<ParkedTaskRun[]> {
-    const due = Array.from(this.parkedTasks.values())
-      .filter((task) => task.state === "suspended" && task.resume_at !== null && task.resume_at <= now)
-      .sort((left, right) => (left.resume_at ?? 0) - (right.resume_at ?? 0) || left.created - right.created || left.id.localeCompare(right.id));
-    const results: ParkedTaskRun[] = [];
-    for (const task of due) {
-      this.parkedTasks.delete(task.id);
-      this.recordParkedTaskProjectionDelete(task.id);
-      this.deletePersistedTask(task.id);
-      results.push(await this.runParkedTask(task));
-    }
-    if (due.length > 0) this.persist(true);
-    return results;
-  }
-
   exportWorld(): SerializedWorld {
     return {
       version: 1,
       objectCounter: this.objectCounter,
-      parkedTaskCounter: this.parkedTaskCounter,
       sessionCounter: this.sessionCounter,
       objects: Array.from(this.objects.values())
         .sort((a, b) => a.id.localeCompare(b.id))
@@ -7952,7 +7856,6 @@ export class WooWorld {
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
-      parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
       tombstones: Array.from(this.tombstones).sort()
     };
   }
@@ -8130,7 +8033,6 @@ export class WooWorld {
       objects: this.exportObjects(ids),
       counters: {
         objectCounter: this.objectCounter,
-        parkedTaskCounter: this.parkedTaskCounter,
         sessionCounter: this.sessionCounter
       },
       tombstones: Array.from(this.tombstones),
@@ -8146,12 +8048,12 @@ export class WooWorld {
    * SerializedWorld slice plus the `objectHosts` routing map required
    * by spec/protocol/host-seeds.md §HS1).
    *
-   * This export preserves logs, snapshots, parked tasks, and counters
-   * relevant to the slice — it doubles as a satellite's self-slicing
-   * primitive, which must round-trip losslessly. To produce a seed for
-   * delivery to a foreign host (the HS1 contract: no logs/snapshots/
-   * parkedTasks/sessions; tombstones scoped to foreign-hosted ids;
-   * counters neutralized), call `buildHostSeedForDelivery` instead.
+   * This export preserves logs, snapshots, and counters relevant to the
+   * slice — it doubles as a satellite's self-slicing primitive, which must
+   * round-trip losslessly. To produce a seed for delivery to a foreign host
+   * (the HS1 contract: no logs/snapshots/sessions; tombstones scoped to
+   * foreign-hosted ids; counters neutralized), call
+   * `buildHostSeedForDelivery` instead.
    */
   exportHostScopedWorld(host: ObjRef): SeedWorld {
     const scope = this.hostScope(host);
@@ -8161,13 +8063,9 @@ export class WooWorld {
     for (const id of scope.objects) {
       objectHosts[id] = scope.hostByObject.get(id) ?? DEFAULT_OBJECT_HOST;
     }
-    const parkedTasks = Array.from(this.parkedTasks.values())
-      .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
-      .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
     return {
       version: 1,
       objectCounter: nextScopedObjectCounter(scope.objects),
-      parkedTaskCounter: nextScopedParkedTaskCounter(parkedTasks),
       sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
@@ -8179,7 +8077,6 @@ export class WooWorld {
       snapshots: (this.snapshots ?? [])
         .filter((snapshot) => scope.hostedSpaces.has(snapshot.space_id))
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
-      parkedTasks,
       tombstones: Array.from(this.tombstones).sort(),
       objectHosts
     };
@@ -8187,7 +8084,7 @@ export class WooWorld {
 
   /**
    * Per spec/protocol/host-seeds.md §HS1: build the seed delivered to
-   * a satellite. Strips logs/snapshots/parkedTasks (gateway is not
+   * a satellite. Strips logs/snapshots (gateway is not
    * authoritative for them on the receiver), neutralizes
    * gateway-global counters.
    *
@@ -8253,11 +8150,9 @@ export class WooWorld {
     const seed: SeedWorld = {
       ...slice,
       objectCounter: nextScopedObjectCounter(slice.objects.map((obj) => obj.id)),
-      parkedTaskCounter: 1,
       sessionCounter: 1,
       logs: [],
       snapshots: [],
-      parkedTasks: [],
       tombstones: slice.tombstones ?? [],
       objects: slice.objects.map(stripAuthoringMetadataFromObject)
     };
@@ -8291,7 +8186,6 @@ export class WooWorld {
       this.sessions.clear();
       this.logs.clear();
       this.snapshots = [];
-      this.parkedTasks.clear();
       this.tombstones = new Set(serialized.tombstones ?? []);
       this.presenceIndexBuilt = false;
       this.subscribersIndex.clear();
@@ -8325,11 +8219,7 @@ export class WooWorld {
         this.logs.set(space, hydrated.map((entry) => ({ ...entry, observations: entry.observations ?? [] })));
       }
       this.snapshots = cloneImportedPlainData(serialized.snapshots ?? []);
-      for (const task of serialized.parkedTasks ?? []) {
-        this.parkedTasks.set(task.id, cloneImportedPlainData(task));
-      }
       this.objectCounter = serialized.objectCounter ?? serialized.taskCounter ?? 1;
-      this.parkedTaskCounter = serialized.parkedTaskCounter ?? 1;
       this.sessionCounter = serialized.sessionCounter;
       this.rebuildGuestPool();
     });
@@ -8454,20 +8344,9 @@ export class WooWorld {
             : upsertProjectionRow(this.snapshots, (row) => row.space_id === write.key.space && row.seq === write.key.seq, cloneValue(write.row as unknown as WooValue) as unknown as SpaceSnapshotRecord);
           if (persist && write.op === "upsert") this.activeObjectRepository()?.saveSpaceSnapshot(write.row);
           break;
-        case "parked_tasks":
-          if (write.op === "delete") {
-            this.parkedTasks.delete(write.key);
-            if (persist) this.deletePersistedTask(write.key);
-          } else {
-            const task = cloneValue(write.row as unknown as WooValue) as unknown as ParkedTaskRecord;
-            this.parkedTasks.set(write.key, task);
-            if (persist) this.persistTask(task);
-          }
-          break;
         case "counters":
           if (write.key === "objectCounter") this.objectCounter = write.value;
           if (write.key === "sessionCounter") this.sessionCounter = write.value;
-          if (write.key === "parkedTaskCounter") this.parkedTaskCounter = write.value;
           if (persist) this.persistCounters();
           break;
         case "tombstones":
@@ -9235,18 +9114,6 @@ export class WooWorld {
     return raw.filter(isPlainValueMap);
   }
 
-  private taskBelongsToHostScope(task: ParkedTaskRecord, hostedSpaces: Set<ObjRef>, objects: Set<ObjRef>): boolean {
-    if (objects.has(task.parked_on)) return true;
-    const serialized = task.serialized;
-    if (serialized && typeof serialized === "object" && !Array.isArray(serialized)) {
-      const raw = serialized as Record<string, WooValue>;
-      if (typeof raw.space === "string" && hostedSpaces.has(raw.space)) return true;
-      if (typeof raw.target === "string" && objects.has(raw.target)) return true;
-      if (typeof raw.origin === "string" && objects.has(raw.origin)) return true;
-    }
-    return false;
-  }
-
   private serializeSession(session: Session): SerializedSession {
     return {
       id: session.id,
@@ -9375,7 +9242,6 @@ export class WooWorld {
       logs: stats.logs,
       snapshots: stats.snapshots,
       sessions: stats.sessions,
-      tasks: stats.tasks,
       tombstones: stats.tombstones,
       ms: Date.now() - startedAt
     });
@@ -9426,18 +9292,6 @@ export class WooWorld {
     this.persistenceDirty = true;
   }
 
-  private markTaskDirty(taskId: string): void {
-    this.deletedTasks.delete(taskId);
-    this.dirtyTasks.add(taskId);
-    this.persistenceDirty = true;
-  }
-
-  private markTaskDeleted(taskId: string): void {
-    this.dirtyTasks.delete(taskId);
-    this.deletedTasks.add(taskId);
-    this.persistenceDirty = true;
-  }
-
   private markCountersDirty(): void {
     this.dirtyCounters = true;
     this.persistenceDirty = true;
@@ -9450,8 +9304,6 @@ export class WooWorld {
       dirtyProperties: new Map(Array.from(this.dirtyProperties.entries()).map(([objRef, properties]) => [objRef, new Set(properties)])),
       dirtySessions: new Set(this.dirtySessions),
       deletedSessions: new Set(this.deletedSessions),
-      dirtyTasks: new Set(this.dirtyTasks),
-      deletedTasks: new Set(this.deletedTasks),
       dirtyTombstones: new Set(this.dirtyTombstones),
       dirtyCounters: this.dirtyCounters,
       dirty: this.persistenceDirty
@@ -9464,8 +9316,6 @@ export class WooWorld {
     this.dirtyProperties = new Map(Array.from(state.dirtyProperties.entries()).map(([objRef, properties]) => [objRef, new Set(properties)]));
     this.dirtySessions = new Set(state.dirtySessions);
     this.deletedSessions = new Set(state.deletedSessions);
-    this.dirtyTasks = new Set(state.dirtyTasks);
-    this.deletedTasks = new Set(state.deletedTasks);
     this.dirtyTombstones = new Set(state.dirtyTombstones);
     this.dirtyCounters = state.dirtyCounters;
     this.persistenceDirty = state.dirty;
@@ -9478,8 +9328,6 @@ export class WooWorld {
       this.dirtyProperties.size > 0 ||
       this.dirtySessions.size > 0 ||
       this.deletedSessions.size > 0 ||
-      this.dirtyTasks.size > 0 ||
-      this.deletedTasks.size > 0 ||
       this.dirtyTombstones.size > 0 ||
       this.dirtyCounters
     );
@@ -9621,19 +9469,6 @@ export class WooWorld {
     this.recordMetric({ kind: "storage_direct_write", what: "session_delete", ms: Date.now() - startedAt, rows: 1 });
   }
 
-  private persistTask(task: ParkedTaskRecord): void {
-    this.bumpMutationVersion();
-    const repo = this.activeObjectRepository();
-    if (!repo) return;
-    if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
-      this.markTaskDirty(task.id);
-      return;
-    }
-    const startedAt = Date.now();
-    repo.saveTask(task);
-    this.recordMetric({ kind: "storage_direct_write", what: "task", ms: Date.now() - startedAt, rows: 1 });
-  }
-
   private persistCounters(): void {
     this.bumpMutationVersion();
     const repo = this.activeObjectRepository();
@@ -9644,22 +9479,8 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.saveMeta("objectCounter", String(this.objectCounter));
-    repo.saveMeta("parkedTaskCounter", String(this.parkedTaskCounter));
     repo.saveMeta("sessionCounter", String(this.sessionCounter));
-    this.recordMetric({ kind: "storage_direct_write", what: "counters", ms: Date.now() - startedAt, rows: 3 });
-  }
-
-  private deletePersistedTask(taskId: string): void {
-    this.bumpMutationVersion();
-    const repo = this.activeObjectRepository();
-    if (!repo) return;
-    if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
-      this.markTaskDeleted(taskId);
-      return;
-    }
-    const startedAt = Date.now();
-    repo.deleteTask(taskId);
-    this.recordMetric({ kind: "storage_direct_write", what: "task_delete", ms: Date.now() - startedAt, rows: 1 });
+    this.recordMetric({ kind: "storage_direct_write", what: "counters", ms: Date.now() - startedAt, rows: 2 });
   }
 
   private flushIncrementalState(): void {
@@ -9679,8 +9500,6 @@ export class WooWorld {
     );
     const dirtySessions = Array.from(this.dirtySessions);
     const deletedSessions = Array.from(this.deletedSessions);
-    const dirtyTasks = Array.from(this.dirtyTasks);
-    const deletedTasks = Array.from(this.deletedTasks);
     const dirtyTombstones = Array.from(this.dirtyTombstones);
     const dirtyCounters = this.dirtyCounters;
     const startedAt = Date.now();
@@ -9702,18 +9521,6 @@ export class WooWorld {
           rows += 1;
         }
       }
-      for (const taskId of deletedTasks) {
-        repo.deleteTask(taskId);
-        rows += 1;
-      }
-      for (const taskId of dirtyTasks) {
-        if (this.deletedTasks.has(taskId)) continue;
-        const task = this.parkedTasks.get(taskId);
-        if (task) {
-          repo.saveTask(task);
-          rows += 1;
-        }
-      }
       for (const objRef of dirtyObjects) {
         if (deletedObjectSet.has(objRef)) continue;
         const obj = this.objects.get(objRef);
@@ -9731,9 +9538,8 @@ export class WooWorld {
       if (dirtyCounters) {
         repo.saveMeta("version", "1");
         repo.saveMeta("objectCounter", String(this.objectCounter));
-        repo.saveMeta("parkedTaskCounter", String(this.parkedTaskCounter));
         repo.saveMeta("sessionCounter", String(this.sessionCounter));
-        rows += 4;
+        rows += 3;
       }
       const now = Date.now();
       for (const id of dirtyTombstones) {
@@ -9750,8 +9556,6 @@ export class WooWorld {
     }
     for (const sessionId of dirtySessions) this.dirtySessions.delete(sessionId);
     for (const sessionId of deletedSessions) this.deletedSessions.delete(sessionId);
-    for (const taskId of dirtyTasks) this.dirtyTasks.delete(taskId);
-    for (const taskId of deletedTasks) this.deletedTasks.delete(taskId);
     for (const id of dirtyTombstones) this.dirtyTombstones.delete(id);
     if (dirtyCounters) this.dirtyCounters = false;
     this.persistenceDirty = this.hasDirtyPersistence();
@@ -9768,8 +9572,6 @@ export class WooWorld {
       properties: persistedProps.length,
       sessions: dirtySessions.length,
       deleted_sessions: deletedSessions.length,
-      tasks: dirtyTasks.length,
-      deleted_tasks: deletedTasks.length,
       counters: dirtyCounters,
       ms: Date.now() - startedAt,
       rows,
@@ -9916,7 +9718,6 @@ export class WooWorld {
     // non-live even before the map deletion and persistence work complete.
     session.closedAt = Date.now();
     session.attachedSockets.clear();
-    this.killReadTasksFor(session.actor);
     this.removeSessionPresence(sessionId, session.actor);
     // session_id mirror is no longer written (see createSessionForActor /
     // ensureSessionForActor); the matching reset on reap would just rewrite
@@ -9984,16 +9785,6 @@ export class WooWorld {
   private inventoryEjectTarget(item: ObjRef, fallback: ObjRef): ObjRef {
     const homeValue = this.propOrNull(item, "home");
     return typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : fallback;
-  }
-
-  private killReadTasksFor(actor: ObjRef): void {
-    for (const [id, task] of Array.from(this.parkedTasks.entries())) {
-      if (task.state === "awaiting_read" && task.awaiting_player === actor) {
-        this.parkedTasks.delete(id);
-        this.recordParkedTaskProjectionDelete(id);
-        this.deletePersistedTask(id);
-      }
-    }
   }
 
     // Session-close cleanup may only durably mutate objects whose durable
@@ -10790,305 +10581,6 @@ export class WooWorld {
     return true;
   }
 
-  private async runParkedTask(task: ParkedTaskRecord, input?: WooValue): Promise<ParkedTaskRun> {
-    try {
-      const serialized = assertMap(task.serialized);
-      if (serialized.kind === "vm_continuation") return await this.runParkedVmContinuation(task, serialized, input);
-      if (serialized.kind !== "fork") throw wooError("E_INVARG", "unsupported parked task kind", serialized.kind);
-      const actor = assertObj(serialized.actor);
-      const player = assertObj(serialized.player);
-      const progr = assertObj(serialized.progr);
-      const target = assertObj(serialized.target);
-      const verbName = assertString(serialized.verb);
-      const args = Array.isArray(serialized.args) ? (cloneValue(serialized.args) as WooValue[]) : [];
-      const rawSpace = serialized.space;
-      if (typeof rawSpace === "string" && rawSpace !== "#-1") {
-        const message: Message = { actor, target, verb: verbName, args };
-        const frame = await this.applyCall(undefined, rawSpace, message);
-        return { task, frame, observations: frame.observations };
-      }
-      const message =
-        serialized.message && typeof serialized.message === "object" && !Array.isArray(serialized.message)
-          ? (cloneValue(serialized.message as WooValue) as unknown as Message)
-          : { actor, target, verb: verbName, args };
-      const observations: Observation[] = [];
-      const hostSpace = "#-1";
-      const ctx: CallContext = {
-          world: this,
-          space: hostSpace,
-          seq: -1,
-          session: null,
-        actor,
-        player,
-        caller: "#-1",
-        callerPerms: progr,
-        progr,
-        thisObj: target,
-        verbName,
-        definer: target,
-        message,
-        observations,
-        hostMemo: createHostOperationMemo(),
-        observe: (event) => {
-          const observation = { ...event, source: event.source ?? hostSpace };
-          this.recordTurnEvent({ kind: "observe", observation });
-          observations.push(observation);
-        }
-      };
-
-      let error: ErrorValue | undefined;
-      await this.withPersistencePaused(async () => {
-        const before = this.snapshotProps();
-        const beforeParkedTasks = new Map(this.parkedTasks);
-        const beforeParkedTaskCounter = this.parkedTaskCounter;
-        try {
-          await this.dispatch(ctx, target, verbName, args);
-        } catch (err) {
-          if (isVmSuspendSignal(err)) {
-            const resumedTask = this.parkVmContinuation(ctx, err.seconds, err.task);
-            observations.push({ type: "task_suspended", source: hostSpace, task: resumedTask, resume_at: this.parkedTasks.get(resumedTask)?.resume_at ?? null });
-            return;
-          }
-          if (isVmReadSignal(err)) {
-            const resumedTask = this.parkReadContinuation(ctx, err.player, err.task);
-            observations.push({ type: "task_awaiting_read", source: hostSpace, task: resumedTask, player: err.player });
-            return;
-          }
-          this.restoreProps(before);
-          this.parkedTasks = new Map(beforeParkedTasks);
-          this.parkedTaskCounter = beforeParkedTaskCounter;
-          error = normalizeError(err);
-          observations.length = 0;
-          observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-        }
-      });
-      return { task, observations, error };
-    } catch (err) {
-      const error = normalizeError(err);
-      return { task, observations: [{ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] }], error };
-    }
-  }
-
-  private async runParkedVmContinuation(task: ParkedTaskRecord, serialized: Record<string, WooValue>, input?: WooValue): Promise<ParkedTaskRun> {
-    const rawSpace = serialized.space;
-    if (typeof rawSpace === "string" && rawSpace !== "#-1") {
-      const frame = await this.applyResumeFrame(task, serialized, rawSpace, input);
-      return { task, frame, observations: frame.observations };
-    }
-
-    const observations: Observation[] = [];
-    let error: ErrorValue | undefined;
-    await this.withPersistencePaused(async () => {
-      const before = this.snapshotProps();
-      const beforeParkedTasks = new Map(this.parkedTasks);
-      const beforeParkedTaskCounter = this.parkedTaskCounter;
-      try {
-        if (input === undefined) await runSerializedTinyVmTask(this, serialized.task as unknown as SerializedVmTask, observations);
-        else await runSerializedTinyVmTaskWithInput(this, serialized.task as unknown as SerializedVmTask, input, observations);
-      } catch (err) {
-        if (isVmSuspendSignal(err)) {
-          const resumedTask = this.parkVmContinuation(this.hostContinuationContext(serialized, observations), err.seconds, err.task);
-          observations.push({ type: "task_suspended", source: "#-1", task: resumedTask, resume_at: this.parkedTasks.get(resumedTask)?.resume_at ?? null });
-          return;
-        }
-        if (isVmReadSignal(err)) {
-          const resumedTask = this.parkReadContinuation(this.hostContinuationContext(serialized, observations), err.player, err.task);
-          observations.push({ type: "task_awaiting_read", source: "#-1", task: resumedTask, player: err.player });
-          return;
-        }
-        this.restoreProps(before);
-        this.parkedTasks = new Map(beforeParkedTasks);
-        this.parkedTaskCounter = beforeParkedTaskCounter;
-        error = normalizeError(err);
-        observations.length = 0;
-        observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-      }
-    });
-    return { task, observations, error };
-  }
-
-  private async applyResumeFrame(task: ParkedTaskRecord, serialized: Record<string, WooValue>, spaceRef: ObjRef, input?: WooValue): Promise<AppliedFrame> {
-    const repo = this.activeObjectRepository();
-    if (repo) return await this.applyResumeFrameRepository(repo, task, serialized, spaceRef, input);
-    return await this.withPersistencePaused(async () => {
-      const actor = assertObj(serialized.actor);
-      this.authorizePresence(actor, spaceRef);
-      const space = this.object(spaceRef);
-      const nextSeq = Number(this.getProp(spaceRef, "next_seq"));
-      const seq = nextSeq;
-      this.setProp(spaceRef, "next_seq", nextSeq + 1);
-
-      const body: Record<string, WooValue> = {
-        kind: input === undefined ? "vm_resume" : "vm_read",
-        task: task.id,
-        continuation: cloneValue(serialized.task as WooValue)
-      };
-      if (input !== undefined) body.input = cloneValue(input);
-      const message: Message = {
-        actor,
-        target: spaceRef,
-        verb: "$resume",
-        args: [task.id],
-        body
-      };
-      const logEntry: SpaceLogEntry = {
-        space: spaceRef,
-        seq,
-        ts: Date.now(),
-        actor,
-        message: cloneValue(message) as Message,
-        observations: [],
-        applied_ok: true
-      };
-      const log = this.logs.get(spaceRef) ?? [];
-      log.push(logEntry);
-      this.logs.set(spaceRef, log);
-
-      const observations: Observation[] = [{ type: "task_resumed", source: spaceRef, task: task.id }];
-      try {
-        await this.withBehaviorSavepoint(async () => {
-          if (input === undefined) await runSerializedTinyVmTask(this, serialized.task as unknown as SerializedVmTask, observations);
-          else await runSerializedTinyVmTaskWithInput(this, serialized.task as unknown as SerializedVmTask, input, observations);
-        });
-      } catch (err) {
-        if (isVmSuspendSignal(err)) {
-          const resumedTask = this.parkVmContinuation(this.resumeContext(serialized, message, observations, spaceRef, seq), err.seconds, err.task);
-          observations.push({ type: "task_suspended", source: spaceRef, task: resumedTask, resume_at: this.parkedTasks.get(resumedTask)?.resume_at ?? null });
-        } else if (isVmReadSignal(err)) {
-          const resumedTask = this.parkReadContinuation(this.resumeContext(serialized, message, observations, spaceRef, seq), err.player, err.task);
-          observations.push({ type: "task_awaiting_read", source: spaceRef, task: resumedTask, player: err.player });
-        } else {
-          const error = normalizeError(err);
-          logEntry.applied_ok = false;
-          logEntry.error = error;
-          observations.length = 0;
-          observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-        }
-      }
-
-      logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
-      const frame = { op: "applied" as const, space: space.id, seq, ts: logEntry.ts, message, observations };
-      this.persist(true);
-      return frame;
-    });
-  }
-
-  private async applyResumeFrameRepository(repo: ObjectRepository, task: ParkedTaskRecord, serialized: Record<string, WooValue>, spaceRef: ObjRef, input?: WooValue): Promise<AppliedFrame> {
-    // Same two-boundary rollback contract as applyCallRepository: fatal
-    // storage errors restore the whole pre-turn state, while VM errors inside
-    // the resumed continuation preserve an applied error/suspend/read frame.
-    const before = this.snapshotBehaviorState();
-    const beforeLogs = this.snapshotLogs();
-    try {
-      const frame = await this.withPersistencePaused(async () => {
-        const actor = assertObj(serialized.actor);
-        this.authorizePresence(actor, spaceRef);
-        const space = this.object(spaceRef);
-        const body: Record<string, WooValue> = {
-          kind: input === undefined ? "vm_resume" : "vm_read",
-          task: task.id,
-          continuation: cloneValue(serialized.task as WooValue)
-        };
-        if (input !== undefined) body.input = cloneValue(input);
-        const message: Message = {
-          actor,
-          target: spaceRef,
-          verb: "$resume",
-          args: [task.id],
-          body
-        };
-        const seq = Number(this.getProp(spaceRef, "next_seq"));
-        const ts = Date.now();
-        this.setPropLocal(spaceRef, "next_seq", seq + 1);
-        const logEntry: SpaceLogEntry = {
-          space: spaceRef,
-          seq,
-          ts,
-          actor,
-          message: cloneValue(message) as Message,
-          observations: [],
-          applied_ok: true
-        };
-        const log = this.logs.get(spaceRef) ?? [];
-        log.push(logEntry);
-        this.logs.set(spaceRef, log);
-        // `state(actor).spaces` exposes next_seq/log_count. In repository
-        // mode, appendLog persists next_seq directly, bypassing persistProperty.
-        this.bumpMutationVersion();
-
-        const observations: Observation[] = [{ type: "task_resumed", source: spaceRef, task: task.id }];
-        try {
-          await this.withBehaviorSavepoint(async () => {
-            if (input === undefined) await runSerializedTinyVmTask(this, serialized.task as unknown as SerializedVmTask, observations);
-            else await runSerializedTinyVmTaskWithInput(this, serialized.task as unknown as SerializedVmTask, input, observations);
-          });
-          logEntry.applied_ok = true;
-        } catch (err) {
-          if (isVmSuspendSignal(err)) {
-            const resumedTask = this.parkVmContinuation(this.resumeContext(serialized, message, observations, spaceRef, seq), err.seconds, err.task);
-            logEntry.applied_ok = true;
-            observations.push({ type: "task_suspended", source: spaceRef, task: resumedTask, resume_at: this.parkedTasks.get(resumedTask)?.resume_at ?? null });
-          } else if (isVmReadSignal(err)) {
-            const resumedTask = this.parkReadContinuation(this.resumeContext(serialized, message, observations, spaceRef, seq), err.player, err.task);
-            logEntry.applied_ok = true;
-            observations.push({ type: "task_awaiting_read", source: spaceRef, task: resumedTask, player: err.player });
-          } else {
-            const error = normalizeError(err);
-            logEntry.applied_ok = false;
-            logEntry.error = error;
-            observations.length = 0;
-            observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
-          }
-        }
-
-        logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
-        repo.transaction(() => {
-          const appended = repo.appendLog(spaceRef, actor, message);
-          if (appended.seq !== seq) throw wooError("E_STORAGE", `sequenced log drift for ${spaceRef}: expected ${seq}, got ${appended.seq}`);
-          logEntry.ts = appended.ts;
-          repo.recordLogOutcome(spaceRef, seq, logEntry.applied_ok === true, observations, logEntry.error);
-          this.flushIncrementalState();
-        });
-        return { op: "applied" as const, space: space.id, seq, ts: logEntry.ts, message, observations };
-      });
-      return frame;
-    } catch (err) {
-      this.restoreBehaviorState(before);
-      this.logs = beforeLogs;
-      throw err;
-    }
-  }
-
-  private resumeContext(serialized: Record<string, WooValue>, message: Message, observations: Observation[], space: ObjRef, seq: number): CallContext {
-    return {
-        world: this,
-        space,
-        seq,
-        session: typeof serialized.session === "string" ? serialized.session : null,
-      actor: assertObj(serialized.actor),
-      player: assertObj(serialized.player),
-      caller: "#-1",
-      callerPerms: typeof serialized.callerPerms === "string" ? serialized.callerPerms : assertObj(serialized.progr),
-      progr: assertObj(serialized.progr),
-      thisObj: typeof serialized.target === "string" ? serialized.target : space,
-      verbName: typeof serialized.verb === "string" ? serialized.verb : "$resume",
-      definer: typeof serialized.target === "string" ? serialized.target : space,
-      message,
-      observations,
-      observe: (event) => {
-        const observation = { ...event, source: event.source ?? space };
-        this.recordTurnEvent({ kind: "observe", observation });
-        observations.push(observation);
-      }
-    };
-  }
-
-  private hostContinuationContext(serialized: Record<string, WooValue>, observations: Observation[]): CallContext {
-    const target = typeof serialized.target === "string" ? serialized.target : "#-1";
-    const message: Message = { actor: assertObj(serialized.actor), target, verb: typeof serialized.verb === "string" ? serialized.verb : "$resume", args: [] };
-    return this.resumeContext(serialized, message, observations, "#-1", -1);
-  }
-
   private allocateGuest(): ObjRef {
     if (this.guestFreePool.size === 0) this.rebuildGuestPool();
     const pooled = Array.from(this.guestFreePool).sort()[0];
@@ -11173,13 +10665,13 @@ export class WooWorld {
       const result = fn();
       if (isPromiseLike(result)) {
         return result.catch((err) => {
-          if (!isVmSuspendSignal(err) && !isVmReadSignal(err)) this.restoreBehaviorState(savepoint);
+          this.restoreBehaviorState(savepoint);
           throw err;
         });
       }
       return result;
     } catch (err) {
-      if (!isVmSuspendSignal(err) && !isVmReadSignal(err)) this.restoreBehaviorState(savepoint);
+      this.restoreBehaviorState(savepoint);
       throw err;
     }
   }
@@ -11189,10 +10681,8 @@ export class WooWorld {
       objects: new Map(Array.from(this.objects.entries()).map(([id, obj]) => [id, this.cloneObject(obj)])),
       sessions: new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)])),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
-      parkedTasks: new Map(Array.from(this.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord])),
       tombstones: new Set(this.tombstones),
       objectCounter: this.objectCounter,
-      parkedTaskCounter: this.parkedTaskCounter,
       sessionCounter: this.sessionCounter,
       guestFreePool: new Set(this.guestFreePool),
       persistence: this.snapshotPersistenceDirtyState()
@@ -11203,10 +10693,8 @@ export class WooWorld {
     this.objects = new Map(Array.from(savepoint.objects.entries()).map(([id, obj]) => [id, this.cloneObject(obj)]));
     this.sessions = new Map(Array.from(savepoint.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)]));
     this.snapshots = cloneValue(savepoint.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[];
-    this.parkedTasks = new Map(Array.from(savepoint.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord]));
     this.tombstones = new Set(savepoint.tombstones);
     this.objectCounter = savepoint.objectCounter;
-    this.parkedTaskCounter = savepoint.parkedTaskCounter;
     this.sessionCounter = savepoint.sessionCounter;
     this.guestFreePool = new Set(savepoint.guestFreePool);
     this.restorePersistenceDirtyState(savepoint.persistence);
@@ -13526,7 +13014,6 @@ type SerializedWorldRowStats = {
   logs: number;
   snapshots: number;
   sessions: number;
-  tasks: number;
   tombstones: number;
 };
 
@@ -13565,32 +13052,18 @@ function serializedWorldRowStats(world: SerializedWorld): SerializedWorldRowStat
   const logs = world.logs.reduce((sum, [, entries]) => sum + entries.length, 0);
   const snapshots = world.snapshots.length;
   const sessions = world.sessions.length;
-  const tasks = world.parkedTasks.length;
   const tombstones = (world.tombstones ?? []).length;
-  const META_ROWS = 4; // version + objectCounter + parkedTaskCounter + sessionCounter
+  const META_ROWS = 3; // version + objectCounter + sessionCounter
   return {
-    rows: perObjectRows + logs + snapshots + sessions + tasks + tombstones + META_ROWS,
+    rows: perObjectRows + logs + snapshots + sessions + tombstones + META_ROWS,
     objects: world.objects.length,
     properties,
     verbs,
     logs,
     snapshots,
     sessions,
-    tasks,
     tombstones
   };
-}
-
-function nextScopedParkedTaskCounter(tasks: readonly ParkedTaskRecord[]): number {
-  // Mirrors the scheduleFork/park*Continuation allocator format: ptask_<counter>.
-  let next = 1;
-  for (const task of tasks) {
-    const match = /^ptask_(\d+)$/.exec(task.id);
-    if (!match) continue;
-    const value = Number(match[1]);
-    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
-  }
-  return next;
 }
 
 function isPlainValueMap(value: WooValue | undefined): value is Record<string, WooValue> {

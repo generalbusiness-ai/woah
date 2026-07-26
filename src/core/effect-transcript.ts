@@ -77,6 +77,27 @@ export type TranscriptSessionScopeTransition = {
   to: ObjRef | null;
 };
 
+/** CO16.2: a scheduled turn armed by this turn. `armed_by` is the frame that
+ * armed it — validated at commit and then DISCARDED. It never enters the
+ * pending row and never rides into the fired turn, so CO16.4's "no stored
+ * programmer authority" rule is untouched: provenance answers "was this
+ * effect legitimate when recorded", not "what may the fired turn do". */
+export type TranscriptSchedule = {
+  id: string;
+  at: number;
+  idlePolicy: "while_active" | "always";
+  call: { actor: ObjRef; target: ObjRef; verb: string; args: WooValue[] };
+  armed_by?: RecordedWriteAuthority;
+};
+
+/** CO16.2: a cancellation. Typed rather than a bare id string precisely
+ * because it must carry provenance — without it any verb in a scope could
+ * cancel any other object's timer. */
+export type TranscriptScheduleCancel = {
+  id: string;
+  armed_by?: RecordedWriteAuthority;
+};
+
 export type TranscriptUntrackedEffect = {
   name: string;
   detail: WooValue | null;
@@ -109,6 +130,13 @@ export type EffectTranscript = {
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
   recycles?: TranscriptRecycle[];
+  // CO16.2. Named typed arrays with their own validation path, parallel to
+  // creates/recycles — never TranscriptWrite entries under a fabricated op.
+  // They are part of the transcript hash (they are effects of this turn) but
+  // NOT of post_state_hash: that digest covers touched authority cells, and
+  // the pending queue is a separate row family the planner does not hold.
+  schedules?: TranscriptSchedule[];
+  cancellations?: TranscriptScheduleCancel[];
   // Net session active-scope transition for this turn (coalesced first.from →
   // last.to). Drives presence projections + session-row materialization. CA8.
   sessionScopeTransition?: TranscriptSessionScopeTransition;
@@ -154,6 +182,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
   const recycles: TranscriptRecycle[] = [];
+  // Last-write-wins per id within a turn: arming the same stable key twice in
+  // one turn is one entry, matching the scope's upsert semantics (CO16.2).
+  const schedules = new Map<string, TranscriptSchedule>();
+  const cancellations = new Map<string, TranscriptScheduleCancel>();
   let sessionScopeTransition: TranscriptSessionScopeTransition | undefined;
   const projectionWrites: RecordedProjectionWrite[] = [];
   const observations: Observation[] = [];
@@ -280,6 +312,21 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         });
         incompleteReasons.add(event.name);
         break;
+      case "schedule":
+        schedules.set(event.request.id, {
+          id: event.request.id,
+          at: event.request.at,
+          idlePolicy: event.request.idlePolicy,
+          call: event.request.call,
+          ...(event.writer ? { armed_by: event.writer } : {})
+        });
+        break;
+      case "cancel_schedule":
+        cancellations.set(event.id, {
+          id: event.id,
+          ...(event.writer ? { armed_by: event.writer } : {})
+        });
+        break;
       case "turn_finish":
         turnFinishedOk = event.ok;
         if (event.ok) result = event.result;
@@ -310,6 +357,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     creates,
     moves,
     ...(turnFinishedOk && recycles.length > 0 ? { recycles } : {}),
+    // Only a turn that finished OK arms or cancels anything: a failed turn
+    // must not leave a timer behind (CO16.2 — a rejected turn arms nothing).
+    ...(turnFinishedOk && schedules.size > 0 ? { schedules: [...schedules.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+    ...(turnFinishedOk && cancellations.size > 0 ? { cancellations: [...cancellations.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
     ...(sessionScopeTransition ? { sessionScopeTransition } : {}),
     ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
@@ -437,11 +488,6 @@ function projectionWriteShapeError(write: RecordedProjectionWrite): string | nul
       return write.row.space_id === write.key.space && write.row.seq === write.key.seq
         ? null
         : `projection_write snapshots key mismatch ${write.key.space}@${write.key.seq}`;
-    case "parked_tasks":
-      if (write.op === "delete") return write.bytes === 0 ? null : "projection_write parked_tasks delete must have zero bytes";
-      return write.row.id === write.key
-        ? null
-        : `projection_write parked_tasks key mismatch ${write.key}`;
     case "tombstones":
       if (write.op === "delete") return write.bytes === 0 ? null : "projection_write tombstones delete must have zero bytes";
       return write.row.id === write.key

@@ -34,7 +34,7 @@ An object receives events via verbs whose names match `:on_<type>` or generic `:
 2. Else look up `:on_event`. Call with `(event)`.
 3. Else silently drop.
 
-Receiver verbs are dispatched as forked tasks (not joined to the emitter's task) so emit is asynchronous from the emitter's view.
+Receiver verbs are dispatched as separate tasks, not joined to the emitter's task, so emit is asynchronous from the emitter's view. This is delivery asynchrony within the turn pipeline, unrelated to `schedule` ([scheduling.md](scheduling.md)): the emitter does not wait, but nothing is deferred to a later turn.
 
 ### 12.3 Sticky vs transient targets
 
@@ -80,7 +80,7 @@ Same opcode, same emit shape, two delivery contracts — but the contract is an 
 
 **Receiver discipline.**
 
-- Handlers for live observations should be side-effect-free: no `SET_PROP` on persistent state, no `emit` of would-be-sequenced observations, no `FORK`/`SUSPEND`. Violating this leaks non-replayable mutations into persistent state — the same anti-pattern as a log-handler that mutates behind the log's back.
+- Handlers for live observations should be side-effect-free: no `SET_PROP` on persistent state, no `emit` of would-be-sequenced observations, no `schedule`. Violating this leaks non-replayable mutations into persistent state — the same anti-pattern as a log-handler that mutates behind the log's back.
 - Receivers should not persist live observations. Doing so makes a non-replayable observation durable; reload won't reproduce it.
 
 ### 12.7 Observation audience and direct-message routing

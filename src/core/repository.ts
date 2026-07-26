@@ -58,7 +58,7 @@ export type SerializedAuthorityCellSlice = {
   // cache/projection/fallback/gossip derivation.
   page_refs: AuthorityPageRef[];
   inline_pages: ShadowStatePage[];
-  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  counters: Pick<SerializedWorld, "objectCounter" | "sessionCounter">;
   tombstones: ObjRef[];
   source_object_count: number;
 };
@@ -73,30 +73,23 @@ export type SpaceSnapshotRecord = {
   hash: string;
 };
 
-export type ParkedTaskRecord = {
-  id: string;
-  parked_on: ObjRef;
-  state: "suspended" | "awaiting_read";
-  resume_at: number | null;
-  awaiting_player: ObjRef | null;
-  correlation_id: string | null;
-  serialized: WooValue;
-  created: number;
-  origin: ObjRef;
-};
-
 export type SerializedWorld = {
   version: 1;
   objectCounter: number;
   /** Legacy v0.5 field; load paths accept it while older JSON/SQLite dumps exist. */
   taskCounter?: number;
-  parkedTaskCounter: number;
+  /**
+   * Legacy fields. Parked tasks were deleted with the pre-Net execution model
+   * (spec/semantics/tasks.md): nothing ever resumed one, so no live world has
+   * rows here. Accepted on load and ignored so older dumps still import.
+   */
+  parkedTaskCounter?: number;
+  parkedTasks?: unknown[];
   sessionCounter: number;
   objects: SerializedObject[];
   sessions: SerializedSession[];
   logs: [ObjRef, SpaceLogEntry[]][];
   snapshots: SpaceSnapshotRecord[];
-  parkedTasks: ParkedTaskRecord[];
   /** Tombstoned ULIDs (recycled). Per spec/semantics/recycle.md §RC3.9 and
    * spec/reference/persistence.md §14.2.1. Optional in legacy dumps; absent
    * means "no recycles recorded yet for this world". */
@@ -160,9 +153,6 @@ export type LogReadResult = {
   next_seq: number;
   has_more: boolean;
 };
-
-/** A read of one parked task record (alias retained for clarity at call sites). */
-export type SerializedTask = ParkedTaskRecord;
 
 export interface ObjectRepository {
   // ----- Transactions / unit of work -----
@@ -338,32 +328,6 @@ export interface ObjectRepository {
    * at the storage layer for efficiency.
    */
   loadExpiredSessions(now: number): SerializedSession[];
-
-  // ----- Parked tasks (per spec/semantics/tasks.md §16) -----
-
-  saveTask(task: ParkedTaskRecord): void;
-
-  deleteTask(id: string): void;
-
-  loadTask(id: string): ParkedTaskRecord | null;
-
-  /**
-   * Tasks with `state == 'suspended' AND resume_at <= now`, ordered by `resume_at`.
-   * The runtime's alarm handler (cloudflare.md §R7) loads these on alarm fire.
-   */
-  loadDueTasks(now: number): ParkedTaskRecord[];
-
-  /**
-   * Tasks with `state == 'awaiting_read' AND awaiting_player == player`, in FIFO
-   * order. The runtime's input-delivery path loads these on inbound input.
-   */
-  loadAwaitingReadTasks(player: ObjRef): ParkedTaskRecord[];
-
-  /**
-   * Earliest `resume_at` over all suspended tasks on this host, or null if none.
-   * Drives `state.storage.setAlarm()` on CF; ignored by the local poller backend.
-   */
-  earliestResumeAt(): number | null;
 
   // ----- Tombstones (per spec/reference/persistence.md §14.2.1) -----
 

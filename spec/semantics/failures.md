@@ -46,7 +46,7 @@ Each row cites its primary doc. This document only adds context not already cove
 | Bytecode version skew | task resumes against incompatible bytecode | `E_VERSION` in applied | task aborts cleanly; never silently runs old code | applied with error | re-issue against current code | [hosts.md §3.4 (4)](../protocol/hosts.md#34-host-rpc-invariants) |
 | Storage write failure (call commit) | persistent storage rejects before the final call commit completes | `op:"error"` w/ `E_STORAGE` | call rejected; **no durable seq advance**; nothing committed to log | nothing | client retry; investigate operator-side | (this doc, §F6) |
 | Storage write failure (during behavior) | storage fails during verb body | `op:"applied"` w/ `$error E_STORAGE` | mutations rolled back; seq stays in log | applied with error | behavior-failure semantics; investigate operator-side | (this doc, §F6) |
-| Quota exceeded | per-task / per-owner / per-space cap hit | `E_QUOTA` in applied | call rejected before behavior runs | nothing | wait, request more quota | [permissions.md §11.7](permissions.md#117-storage-quotas-and-accounting), [tasks.md §16.7](tasks.md#167-fork-and-suspend-caps) |
+| Quota exceeded | per-task / per-owner / per-space / per-scope cap hit | `E_QUOTA` in applied | call rejected before behavior runs | nothing | wait, request more quota | [permissions.md §11.7](permissions.md#117-storage-quotas-and-accounting), [coherence.md §CO16.7](../protocol/coherence.md#co167-quotas) |
 | Inbound rate limit | client over `connection_*` budget | `op:"error"` w/ `E_RATE` | excess frames dropped at the transport | nothing | client backoff | [v2-turn-network.md §VTN19.3](../protocol/v2-turn-network.md#vtn193-ping-idle-and-backpressure) |
 | Outbound overflow | client can't keep up with applied stream | transport gap/error | accepted-frame queue overflow | nothing | client reconnects and uses `space:replay` / VTN9 catch-up | [v2-turn-network.md §VTN19.3](../protocol/v2-turn-network.md#vtn193-ping-idle-and-backpressure) |
 | Recycled object reference | call to a now-recycled object | `E_OBJNF` | rejected at routing | nothing | use a different ref; remove stale ref from caller | (this doc, §F7) |
@@ -93,7 +93,7 @@ The failure-mode table above maps these to concrete observables. Two follow-up n
 
 Tick, memory, and wall-time exhaustion ([vm.md §8.4–§8.7](vm.md#8-bytecode-and-vm)) are post-sequence behavior failures: the message is in the log, mutations roll back, an `$error` observation surfaces. Because the budgets are monotone within a task, catching one and continuing doesn't get a fresh budget.
 
-Quota failures (per-owner storage, per-task creation, per-object/per-owner parked tasks, per-task fork count) are *pre-action* rejections: the budget check fires before the would-be-allocation, so no partial state results. `E_QUOTA` carries enough context (which quota, current vs limit) for the caller to surface a useful message.
+Quota failures (per-owner storage, per-task creation, per-scope/per-object pending scheduled turns, per-turn schedule count) are *pre-action* rejections: the budget check fires before the would-be-allocation, so no partial state results. `E_QUOTA` carries enough context (which quota, current vs limit) for the caller to surface a useful message.
 
 Tick weights for cross-host operations (`GET_PROP` remote 100, `CALL_VERB` remote 500) are how the tick budget catches RPC-amplification — a verb that fans 1000 prop reads across remote objects spends 100k ticks before the bodies even run, and tip-stops itself.
 
@@ -124,7 +124,7 @@ Other storage incidents:
 
 **Recycle of an object with anchored descendants.** Disallowed at runtime. `recycle(obj)` raises `E_NACC` if any object's `anchor` is `obj` (transitively). The wizard recycles bottom-up.
 
-**Recycle of an object holding parked tasks.** The parked tasks are killed (E_INTRPT delivered to handlers if any). Recycle proceeds.
+**Recycle of an object with pending scheduled turns.** The pending entries are cancelled silently — nothing is in progress to interrupt. Recycle proceeds.
 
 **Host teardown after recycle.** When a recycle drains a DO's hosted-payload count to zero ([recycle.md §RC11](recycle.md#rc11-host-teardown-after-recycle)), the DO enters a `tearing_down` state and then calls `state.storage.deleteAll()`. Requests that race the teardown raise `E_HOST_RECYCLED`. Cold-loaded DOs whose id appears in Directory's `inherited_tombstone` table also raise `E_HOST_RECYCLED`. Callers that do not distinguish between "gone-just-now" and "long-since-recycled" treat `E_HOST_RECYCLED` as equivalent to `E_OBJNF`. `is_recycled(<id>)` returns true for any ULID covered by an inherited tombstone.
 

@@ -17,7 +17,7 @@ These are the natural sequel to [worktrees.md](worktrees.md): a developer in a w
 
 Three flavors of "the world has changed":
 
-1. **Bytecode upgrades.** A verb's source and bytecode are replaced. New calls run new bytecode. In-flight calls and parked tasks may carry old bytecode versions.
+1. **Bytecode upgrades.** A verb's source and bytecode are replaced. New calls run new bytecode. In-flight cross-host calls may carry old bytecode versions.
 2. **Schema changes.** A property definition's type, default, perms, or shape changed. Existing values may not fit the new contract.
 3. **Data migrations.** Existing values are still valid under the schema but represent old conventions that need rewriting (e.g., a string field becomes a structured map, capitalization rules change, an enum's values are renamed).
 
@@ -33,9 +33,7 @@ Policy: **a task always runs the version it started under**. New calls into the 
 
 For a task suspended for hours with old bytecode: it resumes against old bytecode, completes, and *new* calls into the same verb use new bytecode. This is correct semantics — a task is a deterministic execution of a specific bytecode version, not a forward-only concept.
 
-**Cleanup.** Very-old bytecode versions accumulate in the verb-cache and ancestor-cache stores. The platform may purge versions older than N months (operator policy; default 12 months). Tasks parked against purged versions raise `E_VERSION` on resume; the task aborts cleanly. Authors of long-suspending verbs should anticipate that migrations may aggressively purge old bytecode if a known-incompatible change has been deployed.
-
-**No silent rewrites.** The runtime never silently rewrites a parked task's bytecode reference. A migration that *intends* to rewrite parked tasks (rare, advanced) is a `rewrite_parked_tasks(filter, transform)` operation; it inspects each task's bytecode, calls a transform verb, and re-serializes. Out of v1 scope; documented here so the option exists.
+**Cleanup.** Very-old bytecode versions accumulate in the verb-cache and ancestor-cache stores. The platform may purge versions older than N months (operator policy; default 12 months). Nothing holds a durable reference to a bytecode version across time: a pending scheduled turn names a verb and arguments, and resolves them against current code when it fires ([coherence.md §CO16.8](../protocol/coherence.md#co168-lifecycle)). A migration that renames or removes a verb some chain re-arms therefore breaks that chain loudly at its next fire, and must re-arm it — the same obligation any migration carries for the state it rewrites.
 
 ---
 
@@ -111,14 +109,14 @@ verb $migration:run() {
     }
   }
   if (this:has_more()) {
-    fork(0, this, "run");
+    schedule(this, "run", [], 60_000);
   } else {
     emit(this, { type: "migration_complete", source: this });
   }
 }
 ```
 
-The migration is a recurring forked task that processes batches until done, with per-task tick budgets. Failure mid-batch leaves a partial migration; the next run resumes from the last-processed seq.
+The migration is a chain of scheduled turns that processes one batch each, with per-turn tick budgets. At the 60-second lead time ([scheduling.md §SC3](../semantics/scheduling.md#sc3-time)) a long migration is measured in batches-per-hour, so size the batch accordingly. Failure mid-batch leaves a partial migration; the next run resumes from the last-processed seq. Arm it as an `always` entry — a migration must not stall because nobody is watching the scope — which means the driver is wizard-owned.
 
 **Idempotency requirement.** Migrations must be idempotent. The transform verb checks whether each object has already been migrated (e.g., by reading a marker property or checking the value's shape) before transforming. This makes:
 - Crash recovery safe (resume from any point).

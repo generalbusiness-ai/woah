@@ -1,5 +1,4 @@
 import type {
-  ParkedTaskRecord,
   SerializedObject,
   SerializedSession,
   SerializedWorld,
@@ -73,9 +72,8 @@ export type ShadowObjectRecordTransfer = {
   sessions: SerializedSession[];
   logs: SerializedWorld["logs"];
   snapshots: SpaceSnapshotRecord[];
-  parkedTasks: ParkedTaskRecord[];
   tombstones: ObjRef[];
-  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  counters: Pick<SerializedWorld, "objectCounter" | "sessionCounter">;
   source_object_count: number;
   proof: ShadowStateProof;
 };
@@ -102,9 +100,8 @@ export type ShadowCellPageTransfer = {
   sessions: SerializedSession[];
   logs: SerializedWorld["logs"];
   snapshots: SpaceSnapshotRecord[];
-  parkedTasks: ParkedTaskRecord[];
   tombstones: ObjRef[];
-  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  counters: Pick<SerializedWorld, "objectCounter" | "sessionCounter">;
   source_object_count: number;
   source_page_count: number;
   capsule?: ShadowExecutionCapsuleMetadata;
@@ -421,11 +418,9 @@ export function buildShadowObjectRecordTransfer(input: {
     sessions,
     logs,
     snapshots,
-    parkedTasks: [],
     tombstones: [...(input.serialized.tombstones ?? [])].sort(),
     counters: {
       objectCounter: input.serialized.objectCounter,
-      parkedTaskCounter: input.serialized.parkedTaskCounter,
       sessionCounter: input.serialized.sessionCounter
     },
     source_object_count: input.serialized.objects.length
@@ -1371,7 +1366,6 @@ function shadowStateTransferRoot(
         sessions: transfer.sessions,
         logs: transfer.logs,
         snapshots: transfer.snapshots,
-        parkedTasks: transfer.parkedTasks,
         tombstones: transfer.tombstones,
         counters: transfer.counters,
         source_object_count: transfer.source_object_count,
@@ -1383,7 +1377,6 @@ function shadowStateTransferRoot(
         sessions: transfer.sessions,
         logs: transfer.logs,
         snapshots: transfer.snapshots,
-        parkedTasks: transfer.parkedTasks,
         tombstones: transfer.tombstones,
         counters: transfer.counters,
         source_object_count: transfer.source_object_count
@@ -2028,7 +2021,7 @@ function shadowTransferWorldTail(
   serialized: SerializedWorld,
   key: ShadowTurnKey,
   session: string | null | undefined
-): Pick<ShadowObjectRecordTransfer, "sessions" | "logs" | "snapshots" | "parkedTasks" | "tombstones" | "counters" | "source_object_count"> {
+): Pick<ShadowObjectRecordTransfer, "sessions" | "logs" | "snapshots" | "tombstones" | "counters" | "source_object_count"> {
   return {
     sessions: serialized.sessions
       .filter((item) => item.id === session || item.actor === key.actor)
@@ -2040,11 +2033,9 @@ function shadowTransferWorldTail(
     snapshots: serialized.snapshots
       .filter((snapshot) => snapshot.space_id === key.scope)
       .map((snapshot) => structuredClone(snapshot) as SpaceSnapshotRecord),
-    parkedTasks: [],
     tombstones: [...(serialized.tombstones ?? [])].sort(),
     counters: {
       objectCounter: serialized.objectCounter,
-      parkedTaskCounter: serialized.parkedTaskCounter,
       sessionCounter: serialized.sessionCounter
     },
     source_object_count: serialized.objects.length
@@ -2099,21 +2090,17 @@ function mergeObjectRecordTransfer(
   const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(base.logs.map(([space, entries]) => [space, entries]));
   for (const [space, entries] of transfer.logs) logs.set(space, structuredClone(entries) as SerializedWorld["logs"][number][1]);
 
-  const parkedTasks = new Map<string, ParkedTaskRecord>(base.parkedTasks.map((task) => [task.id, task]));
-  for (const task of transfer.parkedTasks) parkedTasks.set(task.id, structuredClone(task) as ParkedTaskRecord);
 
   const tombstones = new Set<ObjRef>([...(base.tombstones ?? []), ...transfer.tombstones]);
 
   return {
     version: 1,
     objectCounter: Math.max(base.objectCounter ?? 1, transfer.counters.objectCounter ?? 1),
-    parkedTaskCounter: Math.max(base.parkedTaskCounter ?? 1, transfer.counters.parkedTaskCounter ?? 1),
     sessionCounter: Math.max(base.sessionCounter ?? 1, transfer.counters.sessionCounter ?? 1),
     objects: Array.from(objects.values()).sort((a, b) => a.id.localeCompare(b.id)),
     sessions: Array.from(sessions.values()).sort((a, b) => a.id.localeCompare(b.id)),
     logs: Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b)),
     snapshots: mergeSnapshots(base.snapshots, transfer.snapshots),
-    parkedTasks: Array.from(parkedTasks.values()).sort((a, b) => a.id.localeCompare(b.id)),
     tombstones: Array.from(tombstones).sort()
   };
 }
@@ -2171,13 +2158,11 @@ function emptySerializedWorldForCache(): SerializedWorld {
   return {
     version: 1,
     objectCounter: 1,
-    parkedTaskCounter: 1,
     sessionCounter: 1,
     objects: [],
     sessions: [],
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: []
   };
 }
@@ -2186,13 +2171,11 @@ function emptySerializedWorld(transfer: ShadowObjectRecordTransfer | ShadowCellP
   return {
     version: 1,
     objectCounter: transfer.counters.objectCounter,
-    parkedTaskCounter: transfer.counters.parkedTaskCounter,
     sessionCounter: transfer.counters.sessionCounter,
     objects: [],
     sessions: [],
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: []
   };
 }
@@ -2207,20 +2190,16 @@ function mergeTransferTail(
   const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(base.logs.map(([space, entries]) => [space, entries]));
   for (const [space, entries] of transfer.logs) logs.set(space, structuredClone(entries) as SerializedWorld["logs"][number][1]);
 
-  const parkedTasks = new Map<string, ParkedTaskRecord>(base.parkedTasks.map((task) => [task.id, task]));
-  for (const task of transfer.parkedTasks) parkedTasks.set(task.id, structuredClone(task) as ParkedTaskRecord);
 
   const tombstones = new Set<ObjRef>([...(base.tombstones ?? []), ...transfer.tombstones]);
 
   return {
     ...base,
     objectCounter: Math.max(base.objectCounter ?? 1, transfer.counters.objectCounter ?? 1),
-    parkedTaskCounter: Math.max(base.parkedTaskCounter ?? 1, transfer.counters.parkedTaskCounter ?? 1),
     sessionCounter: Math.max(base.sessionCounter ?? 1, transfer.counters.sessionCounter ?? 1),
     sessions: Array.from(sessions.values()).sort((a, b) => a.id.localeCompare(b.id)),
     logs: Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b)),
     snapshots: mergeSnapshots(base.snapshots, transfer.snapshots),
-    parkedTasks: Array.from(parkedTasks.values()).sort((a, b) => a.id.localeCompare(b.id)),
     tombstones: Array.from(tombstones).sort()
   };
 }

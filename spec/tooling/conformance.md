@@ -102,7 +102,7 @@ The conformance runner distinguishes **live storage backends** from
 **archive/import-export targets**.
 
 Live storage backends must satisfy the full runtime contract: sequenced calls,
-rollback, replay, restart reconstruction, scheduler wakeups, parked tasks,
+rollback, replay, restart reconstruction, scheduled-turn wakeups,
 storage-failure behavior, and concurrent-write semantics. The reference live
 targets are in-memory, SQLite, and future host storage adapters.
 
@@ -111,7 +111,7 @@ world dump/import format. The suite covers it as an archive target:
 
 - Full world dump/load round trip.
 - Manifest and per-object file shape.
-- Inclusion of logs, snapshots, sessions, and parked tasks in complete dumps.
+- Inclusion of logs, snapshots, sessions, and pending scheduled turns in complete dumps.
 - Partial object dumps are inspectable but not loadable as complete worlds.
 - Deterministic ordering for files and manifest entries where specified.
 
