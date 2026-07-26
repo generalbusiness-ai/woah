@@ -2222,6 +2222,13 @@ export class ScopeSequencer {
     };
   }
 
+  /** Every pending row, in id order. The CO16.9 live introspection read
+   * (`GET /net/schedules`) surfaces this; it is a live answer and may be
+   * stale the instant it is returned. */
+  pendingRows(): ScheduledTurn[] {
+    return this.pendingScheduleRows().slice().sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));
+  }
+
   /** Every pending row. Bounded by the per-scope cap (CO16.7), so this is a
    * bounded read rather than an unbounded scan — which is what lets recycle
    * cancellation be a scan and need no secondary index. */

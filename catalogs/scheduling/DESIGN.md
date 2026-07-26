@@ -72,10 +72,16 @@ task" and could not express it, so the subject is now carried. The
 parameter is `verb_args`, not `args`, because `args` is a verb-body global
 and a parameter of that name does not compile.
 
-## What is missing
+## Why there is no `:pending` verb
 
-`:pending` — "what does this room have armed?" — is not here. Introspection
-must be a live read, since a committed queue read would need a versioned
-read proof the queue cannot give (SC2), and the CO16.9 live route is
-unbuilt. Authors and operators currently have no supported way to see
-pending entries. That is the largest known gap in this surface.
+"What does this room have armed?" is a real question and this catalog does
+not answer it — on purpose. A verb runs inside a turn, and a committed read
+of the pending queue would need a versioned read proof the queue cannot
+give (SC2): any answer computed while planning could be falsified before
+the turn committed, with nothing to catch it.
+
+The question is answered instead by `GET /net-api/schedules?scope=`
+(CO16.9), a live read outside turn semantics, authorized by co-presence and
+returning recent failures alongside pending entries. Woocode cannot ask it,
+and giving woocode a verb that appeared to answer it would be worse than
+the gap.

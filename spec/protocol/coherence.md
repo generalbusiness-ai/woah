@@ -1230,9 +1230,9 @@ One write path per fact (CO9), concretized:
 
 > Status: **implemented** — CO16.1–CO16.7 and the failure record of
 > CO16.8/CO16.9, end to end from the `schedule` builtins through the
-> transcript to delivery, plus recycle cancellation. **Not yet
-> implemented:** cancellation on scope retirement (CO17 is itself draft)
-> and the CO16.9 live introspection route. Design rationale in
+> transcript to delivery, plus recycle cancellation and the CO16.9 live
+> introspection read. **Not yet implemented:** cancellation on scope
+> retirement (CO17 is itself draft). Design rationale in
 > `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
 > [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
 > where the two differ, this governs.
@@ -1694,8 +1694,17 @@ making the durable path the default one.
 - `net_scope_scheduled_turn_failed` — a recorded terminal failure or
   abandonment, per CO16.8. A world with a rising count here has timers
   that are not doing their job, and it is the alert that matters most.
-- Pending entries are introspectable through a **live** read — a
-  non-committed query answered by the scope, outside turn semantics.
+- Pending entries are introspectable through a **live** read: the scope
+  answers `GET /net/schedules` with its pending rows *and its recent
+  failure records*, and the gateway exposes it as
+  `GET /net-api/schedules?scope=` under the same co-presence rule the
+  other client reads use — you can see what a room has armed if you are in
+  it. Failures ride along because "what is armed" and "what did not fire"
+  are one operational question, and a failed timer is absent from the
+  pending list precisely because it is gone.
+
+  It is a **live** read — a non-committed query answered by the scope,
+  outside turn semantics.
   Invisible timers are unmaintainable for authors and worse for operators,
   but introspection deliberately does not enter the commit path: a queue
   read inside a turn would need a versioned read proof to be honest, and

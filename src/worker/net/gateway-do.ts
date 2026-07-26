@@ -2860,6 +2860,24 @@ export class NetGatewayDO {
         // a co-present peer's session id IS their credential.
         return json({ relation, owner, members: this.clientRelationMembers(relation, owner) });
       }
+      if (request.method === "GET" && url.pathname === "/net-api/schedules") {
+        /* CO16.9. "What has this room got armed, and what failed?" — the
+           question authors and operators had no way to ask, which is why
+           invisible timers were the largest gap in the scheduling surface.
+           A LIVE read: the queue is not a cell and cannot be read inside a
+           turn honestly (SC2), so this deliberately sits outside turn
+           semantics and may be stale the moment it returns. */
+        const scope = url.searchParams.get("scope") ?? "";
+        if (!scope) return json({ error: { code: "E_INVARG", message: "scope query param is required" } }, 400);
+        const session = this.readSession(url, actor, bearerSession);
+        // Same co-presence rule the other reads use: you can see what a room
+        // has armed if you are in it. No global reads.
+        if (!this.callerPresenceScopes(session, actor).has(scope)) {
+          throw new ClientAuthError("schedules not readable outside the caller's presence", { scope }, "E_PERM", 403);
+        }
+        const reply = await this.host.rpc(`scope:${scope}`, "/schedules");
+        return json(reply as Record<string, unknown>);
+      }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";
         if (!key) return json({ error: { code: "E_INVARG", message: "key query param is required" } }, 400);

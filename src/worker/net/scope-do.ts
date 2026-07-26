@@ -1601,6 +1601,34 @@ export class NetScopeDO {
         this.discardSeqOnThrow(() => seq.operatorActivationWrite(body.active_epoch));
         return json({ ok: true, scope: seq.scope, active_epoch: body.active_epoch });
       }
+      if (request.method === "GET" && url.pathname === "/net/schedules") {
+        /* CO16.9 live introspection. Deliberately NOT a committed read: the
+           queue is not a cell, so a turn that read it could not carry a
+           versioned read proof and any answer it computed could be falsified
+           before commit (SC2). A live answer may be stale the instant it is
+           returned, which for "what does this room have armed?" is fine.
+           Bounded by the per-scope cap, so no pagination is needed. */
+        const meta = this.store.readMeta();
+        if (meta === null) return json({ scope: null, pending: [], failures: [] });
+        const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
+        return json({
+          scope: seq.scope,
+          now: this.host.now(),
+          pending: seq.pendingRows().map((row) => ({
+            id: row.id,
+            at: row.at_logical_time,
+            idle_policy: row.idle_policy ?? "always",
+            target: row.call.target,
+            verb: row.call.verb,
+            actor: row.call.actor
+          })),
+          // The recent failures alongside them: "what is armed" and "what
+          // did not fire" are the same operational question, and a timer
+          // that failed is invisible in the pending list precisely because
+          // it is gone (CO16.8).
+          failures: this.readScheduledFailures(SCHEDULED_FAILURE_KEEP)
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/schedule") {
         const body = (await request.json()) as { scope: string; catalog_epoch: string; turn: ScheduledTurn };
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);

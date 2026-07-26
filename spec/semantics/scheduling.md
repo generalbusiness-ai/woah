@@ -1,6 +1,6 @@
 ---
 date: 2026-07-25
-status: partial — SC1–SC11 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records, and the `$scheduling` catalog feature); the live introspection read (`:pending`, CO16.9) is specified and not yet built
+status: partial — SC1–SC11 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records, and the `$scheduling` catalog feature); introspection is the live `GET /net-api/schedules` read (CO16.9), not a verb
 ---
 
 # Scheduling
@@ -315,8 +315,16 @@ schedule's own arguments and the stable key IS the chain, so starting
 twice re-arms one entry rather than racing two, and stopping is
 cancelling. Nothing needs a `ticking` property.
 
-**`:pending` does not exist yet.** Introspection has to be a *live* read —
-a committed queue read would need a versioned read proof the queue cannot
-give (SC2) — and the CO16.9 live route is unbuilt. Until it lands there is
-no supported way to ask a room what it has armed, which is a real gap for
-authors and operators.
+**Introspection is a read, not a verb.** "What has this room got armed?"
+is answered by `GET /net-api/schedules?scope=` (CO16.9), authorized by the
+same co-presence rule as the other client reads, and it returns recent
+*failures* alongside pending entries — a timer that failed is missing from
+the pending list precisely because it is gone.
+
+There is deliberately no `:pending` verb. A verb runs inside a turn, and a
+committed read of the queue would need a versioned read proof the queue
+cannot give (SC2); any answer it computed could be falsified before the
+turn committed, with nothing to catch it. So the introspection surface is
+live and sits outside turn semantics, where a possibly-stale answer is
+honest. Woocode cannot ask this question, and should not be given a way
+that lies.
