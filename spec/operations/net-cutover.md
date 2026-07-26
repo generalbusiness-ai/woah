@@ -296,6 +296,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   copy stamped at any other epoch falls back to live owner attestation.
   Arbitrary catalog objects, identities, sessions, room state, and cluster
   state remain live per-turn attestations.
+  A freshly fetched foreign attestation that already disagrees with the plan
+  triggers the same targeted `E_READ_VERSION` repair locally before a doomed
+  submit is issued; every repaired round still re-attests all foreign owners
+  before the scope can accept. The compact room-roster value is one
+  owner-produced snapshot per logical turn and is reused across cell-repair
+  rounds only while the actor/session still resolves to the same room.
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
   retry with named verdicts and exact serialization at the authority —
@@ -367,6 +373,13 @@ item; what remains is exactly what the workerd lanes cannot prove
   the VM's dispatch order: receiver parent chain first, then each declared
   feature chain. Feature-composed room verbs therefore cannot silently bypass
   their `reads_room_presence` declaration.
+
+  A repair attempt reuses that owner-produced roster snapshot within the same
+  logical turn while its topology-derived room is unchanged. If refreshed
+  actor/session state resolves the call to another room, the gateway fetches a
+  new snapshot. This keeps one stable presentation input through ordinary
+  read-version repair without turning the 32-RPC ceiling into a repeated
+  roster-read failure.
 
   The declaration covers the complete bounded room-presentation dependency, not
   only live players. Before planning, the net gateway also materializes any

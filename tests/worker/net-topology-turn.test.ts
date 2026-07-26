@@ -129,6 +129,16 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       null
     );
     expect(installed.ok).toBe(true);
+    const bumpDef = world.ownVerbExact("topo_box", "bump");
+    expect(bumpDef).toBeTruthy();
+    world.addVerb("topo_box", {
+      ...bumpDef!,
+      // Production `look` uses the same compact owner-produced room roster.
+      // Mark this test verb so the mismatch round also proves one logical turn
+      // does not pay the roster RPC twice.
+      reads_room_presence: true,
+      version: bumpDef!.version + 1
+    }, { slot: bumpDef!.slot });
     // Install on the class, not the instance: invoking this through topo_box
     // records genuine class-chain reads at the catalog owner. The cache may
     // amortize these cells; it must not amortize topo_config below merely
@@ -342,6 +352,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // the test can assert WHERE attestations went.
     const rpcLog: string[] = [];
     const catalogAttestKeys: string[][] = [];
+    let forceOneCatalogAttestationMismatch = false;
     const gatewayState = netState("gateway-topology");
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
@@ -357,7 +368,27 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
               const body = await request.clone().json() as { keys?: string[] };
               catalogAttestKeys.push([...(body.keys ?? [])]);
             }
-            return await instance.fetch(request);
+            const response = await instance.fetch(request);
+            if (
+              forceOneCatalogAttestationMismatch &&
+              destination === `scope:${CATALOG_SCOPE}` &&
+              path === "/net/attest" &&
+              response.ok
+            ) {
+              forceOneCatalogAttestationMismatch = false;
+              const decoded = await response.json() as {
+                cells?: Array<{ key: string; version: string }>;
+              };
+              return new Response(JSON.stringify({
+                ...decoded,
+                cells: (decoded.cells ?? []).map((cell) =>
+                  cell.key === "property_cell:topo_config:bonus"
+                    ? { ...cell, version: `mismatch:${cell.version}` }
+                    : cell
+                )
+              }), { headers: { "content-type": "application/json" } });
+            }
+            return response;
           }
         };
       }
@@ -592,9 +623,26 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
     expect(catalogAttestKeys[0]).toContain("property_cell:topo_config:bonus");
 
+    // A just-fetched foreign attestation that already disagrees with the
+    // planned read makes a submit provably doomed. Repair locally from that
+    // exact mismatch, re-plan, and issue only the accepting submit. The old
+    // path spent one rejected /submit here; at production's fourteen-owner
+    // look shape that extra RPC exhausted the exact 32-RPC ceiling.
+    rpcLog.length = 0;
+    catalogAttestKeys.length = 0;
+    forceOneCatalogAttestationMismatch = true;
+    const repaired = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-attestation-repair"));
+    expect(repaired.reply.status, JSON.stringify(repaired.reply)).toBe("accepted");
+    expect(repaired.attempt).toBe(2);
+    expect(repaired.trace.map((entry) => entry.code)).toContain("E_READ_VERSION");
+    expect(repaired.result).toBe(3);
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(2);
+    expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/room-roster`)).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/submit`)).toHaveLength(1);
+
     // Phase-4 item 1, idempotent replay: resubmitting turn 1's key returns
     // the scope's RECORDED reply (CO2.5). The world moved on (counter is
-    // now 2), so this round's re-plan predicts a different post-state than
+    // now 3), so this round's re-plan predicts a different post-state than
     // the recorded accept — the gateway detects that digest mismatch,
     // marks the reply replayed, and omits result/observations rather than
     // presenting the re-planned execution as the committed one.
@@ -608,19 +656,19 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(replay.observations).toBeUndefined();
 
     // Authority landed where the topology says it lives: counter at the
-    // room, greeted at the cluster (after the second adoption settles).
+    // room, greeted at the cluster (after the repaired turn's adoption settles).
     await (doStates.get(roomScope) as ReturnType<typeof netState>).settle();
     const roomDO = scopeDOs.get(roomScope) as NetScopeDO;
     const counter = await call<{ cells: Array<{ value: unknown }> }>(roomDO, scopeEnv, "/closure", {
       keys: ["property_cell:topo_box:counter"],
       known: ["object_lineage:topo_box"]
     });
-    expect(counter.cells[0]?.value).toMatchObject({ value: 2 });
+    expect(counter.cells[0]?.value).toMatchObject({ value: 3 });
     const greeted = await call<{ cells: Array<{ value: unknown }> }>(clusterDO, scopeEnv, "/closure", {
       keys: [`property_cell:${actor}:greeted`],
       known: [`object_lineage:${actor}`]
     });
-    expect(greeted.cells[0]?.value).toMatchObject({ value: 2 });
+    expect(greeted.cells[0]?.value).toMatchObject({ value: 3 });
 
     // A truncated live authority response fails before submit. The next
     // attempt requests the same mutable catalog key and succeeds from the
