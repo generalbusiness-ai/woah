@@ -723,6 +723,28 @@ One write path per fact (CO9), concretized:
   For namespaces created before this rule, the signed add-only
   `repair-relations` operator operation advances the owner head only when a row
   is missing and refans that delta; replay is an idempotent no-op.
+- **Aged runtime memberships repair per scope, from that scope's own cells.**
+  A namespace that ran before the create-derived rule (above) holds objects
+  whose `object_live.location` is correct while their membership row was never
+  derived at all; replaying the rule cannot reach them, and the fixture-scoped
+  `repair-relations` operation deliberately refuses ids it cannot find in a
+  bundled image. The signed `repair-contents` operator operation closes this:
+  each scope derives candidate rows from its OWN `object_live` cells — the same
+  O(scope size) walk this section already sanctions for the bounded rebuild and
+  for hydration, so no scope enumerates another and no operator enumerates
+  objects. It MUST be **add-only**: a row the scope owns whose member is
+  anchored elsewhere arrived by `/net/relate` and is invisible to a local cell
+  scan, so a full rebuild would delete it. Add-only also makes the operation
+  idempotent — an identical row reports no change, so a second run advances no
+  head and refans nothing. Rows whose owner this scope does not sequence (the
+  same ownership predicate read validation uses, which excludes rider residue)
+  ride the ordinary `/net/relate` lane to the owning scope; because anchor
+  topology is caller knowledge, an owner the caller has not mapped MUST be
+  reported rather than guessed. Repair deliveries MUST carry their own
+  `(from_scope, seq)` lane, never the scope's commit seq stream: the receiver
+  gate is `seq <= last`, so borrowing a commit seq is either suppressed at head
+  0 or consumes a seq the commit stream has not reached, which would make the
+  receiver drop the real delta that later lands on it.
 - **Persisted bootstrap definitions upgrade as ordered catalog events.** A
   runtime deployment does not rewrite definition pages already installed in an
   active world. The signed `repair-definitions` operator operation therefore

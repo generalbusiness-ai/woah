@@ -28,6 +28,7 @@
     "cf:migrations:check": "node scripts/sync-wrangler-do-migrations.mjs --check",
     "plugs:bootstrap:v2": "node scripts/bootstrap-demo-plugs.mjs",
     "repair:net-relations": "tsx scripts/net-repair-relations.ts",
+    "repair:net-contents": "tsx scripts/net-repair-contents.ts",
     "repair:net-definitions": "tsx scripts/net-repair-definitions.ts",
     "credential:net-ensure": "tsx scripts/net-ensure-credential.ts",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
