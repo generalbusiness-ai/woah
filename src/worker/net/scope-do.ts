@@ -1972,9 +1972,21 @@ export class NetScopeDO {
       // in a CA3 commit is a cache of the owner's fact; claiming
       // ownership of it would let this scope validate reads against a
       // stale copy — the ownsSessionCell helper excludes the ledger).
+      //
+      // The residue exclusion applies to OBJECT lineage for the same reason.
+      // A create whose new object anchors to another scope commits HERE (the
+      // planning/shared scope serializes it) and rides the object's cells to
+      // its anchor, so this store keeps a lineage COPY. Reading that copy as
+      // ownership makes this scope claim an object it does not sequence: a
+      // later turn committing here that reads any cell of that object which
+      // lives only at the anchor takes the owned branch, finds "absent", and
+      // rejects read_version_mismatch forever — E_NONCONVERGENT_READ, because
+      // no refresh can put a foreign cell into this store. That is exactly the
+      // builder case (an authored object anchored to its author's cluster,
+      // created from a room turn, then invoked from another room turn).
       owns: (object) =>
-        seq.store.has(cellKey("object_lineage", object)) ||
-        seq.store.has(cellKey("object_tombstone", object)) ||
+        this.ownsCellLocally(seq, cellKey("object_lineage", object)) ||
+        this.ownsCellLocally(seq, cellKey("object_tombstone", object)) ||
         this.ownsSessionCell(seq, object),
       // CO13 relation-owner classification: the gateway's per-submit
       // relate_destinations hints (anchor topology is gateway knowledge —
@@ -2193,11 +2205,18 @@ export class NetScopeDO {
     return this.riderCacheMemo;
   }
 
-  /** CO14 session-ownership witness (see the `owns` wiring comment): the
-   * scope holds the session cell AND it is not rider residue. */
-  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
-    const key = cellKey("session", session);
+  /** Ownership witness for one cell (see the `owns` wiring comment): this
+   * scope holds it AND it is not rider residue — a cell that rode along in a
+   * CA3 commit here but is anchored elsewhere. Residue is a cache of the
+   * owner's fact; claiming it would let this scope validate reads against a
+   * copy it does not sequence. */
+  private ownsCellLocally(seq: ScopeSequencer, key: string): boolean {
     return seq.store.has(key) && !this.riderCacheKeys().has(key);
+  }
+
+  /** CO14 session-ownership witness. */
+  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
+    return this.ownsCellLocally(seq, cellKey("session", session));
   }
 
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------

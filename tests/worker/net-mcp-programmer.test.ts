@@ -7,6 +7,17 @@
 // the surface, not the flag, gates the tool set. The resolver walks the
 // object's feature chain (gateway-do.ts mcpObjectToolDrafts), so this exercises
 // the same reachability decision production uses.
+//
+// Steps (5)-(11) close create -> install -> INVOKE: the agent writes a verb on
+// an object it just made and then calls it as an ordinary MCP tool. Two
+// independent gates stand between "the verb is in the database" and "an agent
+// can call it", and the test asserts both:
+//   PLACEMENT  — the object must be in structural context. `create` defaults
+//                its location to the author's inventory (§6.4).
+//   EXPOSURE   — self and inventory advertise only tool_exposed verbs, so the
+//                author must opt in through `set_verb_info`.
+// Between them the session receives a real tools/list_changed on its SSE
+// stream, so the agent learns about its own new tool without polling.
 import { describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
@@ -43,6 +54,37 @@ function netState(name: string) {
 }
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
+
+/** Read one JSON-RPC message off an open MCP SSE stream, or null on timeout.
+ * Mirrors tests/worker/net-demote-lifecycle.test.ts — the only way to prove a
+ * real `notifications/tools/list_changed` was pushed rather than inferred from
+ * a later poll. */
+async function nextSseMessage(response: Response, timeoutMs = 1_000): Promise<Record<string, unknown> | null> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("SSE response has no body");
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const timeout = Symbol("timeout");
+  try {
+    for (;;) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), timeoutMs))
+      ]);
+      if (result === timeout) { await reader.cancel(); return null; }
+      if (result.done) return null;
+      buffered += decoder.decode(result.value, { stream: true });
+      const events = buffered.split(/\r?\n\r?\n/);
+      buffered = events.pop() ?? "";
+      for (const event of events) {
+        const data = event.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice("data:".length).trimStart()).join("\n");
+        if (data) return JSON.parse(data) as Record<string, unknown>;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 describe("Net MCP programmer surface (fake-DO lane)", () => {
   it("exposes a feature-composed agent's authoring tools over Net MCP and authors through the turn path", async () => {
@@ -132,6 +174,10 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
       const listed = await mcp({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} }, { "mcp-session-id": session });
       return (listed.body?.result?.tools ?? []).map((t: any) => t.name);
     };
+    const listen = async (session: string) => gateway.fetch(new Request("https://do/net-api/mcp", {
+      method: "GET",
+      headers: { accept: "text/event-stream", "mcp-session-id": session, origin: "https://do" }
+    }));
 
     const progSession = await open(progToken);
     const sanitize = (id: string) => id.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
@@ -168,6 +214,11 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const widget = createdResult.id as string;
     expect(widget, JSON.stringify(created).slice(0, 500)).toBeTruthy();
     expect(createdResult.owner).toBe(progAgent);
+    // Placement default (§6.4, LambdaMOO @create): with no explicit location the
+    // new object lands in the AUTHOR'S INVENTORY. Placement is the first of the
+    // two gates on reachability — an object in no container never enters MCP
+    // structural context, so no verb installed on it can ever become a tool.
+    expect(createdResult.location, `created object was not placed in the author's inventory: ${JSON.stringify(createdResult)}`).toBe(progAgent);
 
     // (6) The full authoring loop over Net (plan §7 authoring-workspace boundary):
     // the builder object co-located in the AUTHOR's cluster (not catalog-adjacent),
@@ -182,15 +233,62 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     expect(widget.startsWith("obj_prog_agent_"), `authored object not in author cluster: ${widget}`).toBe(true);
 
     // (7) Inspect the freshly installed verb through the agent's own surface —
-    // the create → install → inspect loop closes over the authoritative Net turn
-    // path, and reading the source back proves the verb is durably in the
-    // author's cluster (a direct invoke would additionally require the object in
-    // the session's tool context, an orthogonal reachability gate).
+    // reading the source back proves the verb is durably in the author's cluster.
     const listed = await call(progSession, "woo_call", { object: progAgent, verb: "list_verb", args: [widget, "hi", {}] });
     await settleAll();
     expect(listed.result?.isError, JSON.stringify(listed).slice(0, 600)).not.toBe(true);
     const listedText = JSON.stringify(listed.result?.structuredContent?.result ?? {});
     expect(listedText, listedText.slice(0, 400)).toContain("return 42");
+
+    // (8) The second reachability gate. The widget is now in structural context
+    // (inventory), but inventory objects expose only EXPLICITLY tool_exposed
+    // verbs — mcpActiveCommandContext grants command-shaped affordances to the
+    // room and its contents, never to self or inventory. So a freshly installed
+    // verb is durable and callable in-world but is deliberately not yet a tool.
+    const w = sanitize(widget);
+    const beforeExposure = await listNames(progSession);
+    expect(beforeExposure, "an unexposed authored verb must not be advertised").not.toContain(`${w}__hi`);
+    // woo_call agrees with the advertised set: same resolver, same answer.
+    const unexposedCall = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
+    expect(unexposedCall.result?.isError, JSON.stringify(unexposedCall).slice(0, 400)).toBe(true);
+
+    // The last tools/list pinned this session's digest; open the live stream so
+    // the exposure change has somewhere to push its notification.
+    const progEvents = await listen(progSession);
+
+    // (9) Expose it. `install_verb` deliberately refuses metadata options (the
+    // source header is canonical for perms); exposure flags are the
+    // `set_verb_info` seat.
+    const exposed = await call(progSession, "woo_call", {
+      object: progAgent,
+      verb: "set_verb_info",
+      args: [widget, "hi", { tool_exposed: true }]
+    });
+    await settleAll();
+    expect(exposed.result?.isError, JSON.stringify(exposed).slice(0, 600)).not.toBe(true);
+    expect((exposed.result?.structuredContent?.result ?? {}).ok, JSON.stringify(exposed).slice(0, 600)).toBe(true);
+
+    // (10) The session was told, not left to poll: a real tools/list_changed
+    // reached the open SSE stream. Read it BEFORE re-listing, which would
+    // consume the pending hint.
+    expect(await nextSseMessage(progEvents), "no tools/list_changed followed the exposure change").toEqual({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed"
+    });
+
+    // (11) create -> install -> INVOKE closes. The verb the agent wrote minutes
+    // ago is now an ordinary MCP tool in its own tools/list, and calling it
+    // through the authoritative turn path returns the authored value.
+    const afterExposure = await listNames(progSession);
+    expect(afterExposure, `authored verb missing from tools/list: ${JSON.stringify(afterExposure.filter((n) => n.startsWith(w)))}`).toContain(`${w}__hi`);
+    const invoked = await call(progSession, `${w}__hi`, {});
+    await settleAll();
+    expect(invoked.result?.isError, JSON.stringify(invoked).slice(0, 600)).not.toBe(true);
+    expect(invoked.result?.structuredContent?.result, JSON.stringify(invoked).slice(0, 600)).toBe(42);
+    // The generic woo_call route reaches the same verb.
+    const invokedGeneric = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
+    await settleAll();
+    expect(invokedGeneric.result?.structuredContent?.result, JSON.stringify(invokedGeneric).slice(0, 600)).toBe(42);
 
     for (const st of states) st.close();
   });

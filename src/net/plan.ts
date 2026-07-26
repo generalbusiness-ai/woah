@@ -900,6 +900,22 @@ function sparseMissFromRecordedError(transcript: EffectTranscript, view: CellSto
   });
 }
 
+/** The verb NAME an E_VERBNF value identifies, whatever key the raiser spelled
+ * it under. The engine's canonical shape is `{ obj, name }` (world.ts
+ * ownVerbResolve), but woocode `raise` sites and older natives have also used
+ * `descriptor` and `verb`. Accepting all three keeps a spelling divergence a
+ * repairable miss instead of a terminal E_VERBNF: naming no cell here makes the
+ * planner treat a slice-absent verb page as semantic absence, which is how a
+ * verb read on a NON-TARGET object (`set_verb_info(other, "hi", …)`) used to die
+ * over Net even though the page was resident in the gateway view. A numeric slot
+ * descriptor names no page and is deliberately not resolvable here. */
+function verbMissName(value: { name?: unknown; descriptor?: unknown; verb?: unknown } | null): string | null {
+  for (const candidate of [value?.name, value?.descriptor, value?.verb]) {
+    if (typeof candidate === "string" && candidate.length > 0) return candidate;
+  }
+  return null;
+}
+
 /** Missing-cell derivation shared by the thrown and recorded paths:
  * lineage+live for unmaterialized subjects; the specific verb page for a
  * verb miss whose object IS materialized (dispatch found the object but
@@ -912,10 +928,11 @@ function sparseMissingKeys(
   call: { target?: string; actor?: string }
 ): string[] {
   const missing = new Set<string>();
-  const verbMiss = value as { obj?: unknown; name?: unknown } | null;
-  if (code === "E_VERBNF" && typeof verbMiss?.obj === "string" && typeof verbMiss?.name === "string") {
-    if (!view.has(cellKey("verb_bytecode", verbMiss.obj, verbMiss.name))) {
-      missing.add(cellKey("verb_bytecode", verbMiss.obj, verbMiss.name));
+  const verbMiss = value as { obj?: unknown; name?: unknown; descriptor?: unknown; verb?: unknown } | null;
+  const verbName = code === "E_VERBNF" ? verbMissName(verbMiss) : null;
+  if (verbName !== null && typeof verbMiss?.obj === "string") {
+    if (!view.has(cellKey("verb_bytecode", verbMiss.obj, verbName))) {
+      missing.add(cellKey("verb_bytecode", verbMiss.obj, verbName));
     }
   }
   if (code === "E_PROPNF" && typeof verbMiss?.obj === "string" && typeof verbMiss?.name === "string") {

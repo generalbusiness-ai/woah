@@ -93,6 +93,36 @@ describe("programmer surface (feature-composed)", () => {
     expect((pong as any).result).toBe("pong");
   });
 
+  it("places a new object in the author's inventory by default, and honours an explicit location (§6.4)", async () => {
+    // LambdaMOO's @create puts the object in your inventory, and that placement
+    // is what makes it REACHABLE: structural context (inventory / the room's
+    // contents) is how a fresh object becomes visible to `look`, to the client,
+    // and to an MCP session. An object created into no container exists only as
+    // a returned id, so a verb installed on it can never become a tool.
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "place@example.com");
+    const agent = await createAgent(world, human, "placebot", true);
+
+    const created = (await world.directCall("mk", agent, agent, "create", ["$thing", { name: "Carried" }])) as CallResult;
+    expect(created.op, JSON.stringify(created)).toBe("result");
+    const carried = (created as any).result.id as string;
+    expect(world.object(carried).location).toBe(agent);
+    expect((created as any).result.location).toBe(agent);
+    expect(world.contentsOf(agent)).toContain(carried);
+
+    // An explicit `location: null` is the escape hatch — deliberate nowhere.
+    const loose = (await world.directCall("mk2", agent, agent, "create", ["$thing", { name: "Loose", location: null }])) as CallResult;
+    expect(loose.op, JSON.stringify(loose)).toBe("result");
+    expect(world.object((loose as any).result.id).location).toBeNull();
+
+    // An explicit location still wins over the default.
+    const room = world.object(agent).location as string;
+    expect(room, "the agent must be somewhere for the explicit-location leg").toBeTruthy();
+    const placed = (await world.directCall("mk3", agent, agent, "create", ["$thing", { name: "Placed", location: room }])) as CallResult;
+    expect(placed.op, JSON.stringify(placed)).toBe("result");
+    expect(world.object((placed as any).result.id).location).toBe(room);
+  });
+
   it("refuses source mutation when the surface is attached but the programmer flag is absent (§8.3)", async () => {
     const world = createWorld();
     const { human } = await provisionHuman(world, "noflag@example.com");

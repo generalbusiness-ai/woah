@@ -468,6 +468,128 @@ describe("NetScopeDO over fake-DO storage", () => {
     scope.close();
   });
 
+  it("a create that rides to another anchor leaves residue, not ownership (owns excludes the rider ledger)", async () => {
+    // A create whose new object anchors ELSEWHERE still commits here — the
+    // shared/planning scope serializes it — and rides the object's cells to
+    // that anchor. This store keeps a lineage COPY. If `owns` read that copy
+    // as ownership, every later turn committing here that reads a cell of the
+    // object which lives only at the anchor would take the LOCAL branch, find
+    // "absent", and reject read_version_mismatch forever: no refresh can put a
+    // foreign cell into this store, so the gateway's repair loop escalates to
+    // E_NONCONVERGENT_READ. (That is the builder case: an object anchored to
+    // its author's cluster, created from a room turn, invoked from a later
+    // room turn.) The correct verdict is "foreign" — attest or refuse.
+    const scope = makeScope("room-a", env);
+    await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const postStateFor = (transcript: unknown, priorSubmits: unknown[] = []) => {
+      const twin = new ScopeSequencer("room-a", EPOCH);
+      twin.seed(seedCells());
+      for (const prior of priorSubmits) {
+        applyTranscript(twin.store, prior as never, { scope_head: "x", catalog_epoch: EPOCH });
+      }
+      return applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH }).postStateVersion;
+    };
+
+    // Turn 1: mint #ridden here, anchored to cluster-elsewhere.
+    const createTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "room-a",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "make", args: [], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [{
+        object: "#ridden",
+        name: "Ridden",
+        parent: "#thing",
+        owner: "#actor",
+        anchor: "#elsewhere",
+        location: null,
+        flags: {},
+        writer: WRITER
+      }],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-residue-create"
+    };
+    const created = await call<CommitReply>(scope.instance, env, "/submit", {
+      submit: {
+        kind: "woo.net.commit_submit.v1",
+        scope: "room-a",
+        base: head0,
+        idempotency_key: "residue-create",
+        transcript: createTranscript,
+        post_state_version: postStateFor(createTranscript),
+        stamp: { scope_head: "x", catalog_epoch: EPOCH }
+      },
+      // The gateway names the created object as cluster-elsewhere's rider.
+      rider_destinations: {
+        "cluster-elsewhere": { destination: "scope:cluster-elsewhere", objects: ["#ridden"] }
+      }
+    });
+    expect(created.status, JSON.stringify(created)).toBe("accepted");
+    // The lineage copy IS here — the ownership question is what that means.
+    const residue = await call<{ cells: Array<{ key: string }> }>(scope.instance, env, "/closure", {
+      keys: ["object_lineage:#ridden"],
+      known: []
+    });
+    expect(residue.cells.map((c) => c.key)).toContain("object_lineage:#ridden");
+
+    // Turn 2: read a cell of #ridden this scope does NOT hold. Foreign
+    // classification means "attest it"; ownership would mean "absent, mismatch".
+    const head1 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    const readRidden = {
+      ...createTranscript,
+      creates: [],
+      seq: 2,
+      hash: "net-do-residue-read",
+      reads: [{ cell: { kind: "verb", object: "#ridden", name: "hi" }, version: "owner-verb-version", value: null }],
+      writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "residue-check", op: "set", writer: WRITER }]
+    };
+    const unattested = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head1,
+      idempotency_key: "residue-read-0",
+      transcript: readRidden,
+      post_state_version: postStateFor(readRidden, [createTranscript]),
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(unattested.status).toBe("rejected");
+    // rider_unattested, NOT read_version_mismatch: the scope knows the cell is
+    // someone else's and asks for the owner's word instead of consulting a
+    // copy it does not sequence.
+    expect(unattested.status === "rejected" && unattested.reason).toBe("rider_unattested");
+
+    // With the owner's attestation the same turn commits.
+    const accepted = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head1,
+      idempotency_key: "residue-read-1",
+      transcript: readRidden,
+      post_state_version: postStateFor(readRidden, [createTranscript]),
+      stamp: { scope_head: "x", catalog_epoch: EPOCH },
+      attestations: {
+        "cluster-elsewhere": {
+          owner_head: { seq: 7, hash: "owner-h7" },
+          cells: [{ key: "verb_bytecode:#ridden:hi", version: "owner-verb-version" }]
+        }
+      }
+    });
+    expect(accepted.status, JSON.stringify(accepted)).toBe("accepted");
+    scope.close();
+  });
+
   it("catalog authority rejects a same-epoch definition write even when the gateway guard is bypassed", async () => {
     // The most important authority check runs at the COMMITTING room, before a
     // catalog-bound rider can become room residue or fan out a poisoned class
