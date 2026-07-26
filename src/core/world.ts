@@ -6739,7 +6739,16 @@ export class WooWorld {
     }
     if (this.isSpaceLike(destination)) {
       await this.updatePresenceChecked(actor, destination, true, ctx);
-    } else if (ctx.session) {
+    }
+    // Independent of space-likeness. This used to be the `else` of the branch
+    // above, which left the space-like case recording no scope transition at
+    // all: the plain object move below is not the actor-move path that normally
+    // records one (see movetoActorChecked). A space-like editor therefore took
+    // the actor in physically while its session still pointed at the old room,
+    // so the editor's own verbs never entered the session's context. Presence
+    // and active scope now move together, as they do for ordinary room
+    // movement.
+    if (ctx.session) {
       const session = this.sessions.get(ctx.session);
       if (session && session.actor === actor) {
         // CA8: record the active-scope transition so presence projections +
