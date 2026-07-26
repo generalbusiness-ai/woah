@@ -6,7 +6,12 @@ import {
   SmokeCascadeHalt,
   raceWithAbort
 } from "../scripts/smoke-walkthrough";
-import { ensureInChatroom, normalizeOutlinerObservation } from "../scripts/smoke/scenario";
+import {
+  ensureInChatroom,
+  normalizeDispenserObservation,
+  normalizeOutlinerObservation,
+  rateLimitRetrySeconds
+} from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
@@ -148,6 +153,73 @@ describe("smoke walkthrough harness", () => {
       item: "item_1"
     })).toBeNull();
     expect(normalizeOutlinerObservation({ type: "said", item: "item_1" })).toBeNull();
+  });
+
+  it("normalizes both allowed dispenser rolling-upgrade observation shapes", () => {
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      payload: { order_id: "ord_9", request: "walkthrough", artifact: "o_note" },
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9" });
+    expect(normalizeDispenserObservation({
+      type: "dispenser.canceled",
+      version: 1,
+      payload: { order_id: "ord_9" },
+      source: "the_horoscope"
+    }, "canceled", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9" });
+    // Pre-Acts flat shapes from an aged installed catalog page.
+    expect(normalizeDispenserObservation({
+      type: "order_placed",
+      block: "the_horoscope",
+      order_id: "ord_9",
+      requester: "guest_a"
+    }, "ordered", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9" });
+    expect(normalizeDispenserObservation({
+      type: "canceled",
+      block: "the_horoscope",
+      order_id: "ord_9"
+    }, "canceled", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9" });
+  });
+
+  it("does not match malformed dispenser Acts or another block's observations", () => {
+    // A partial Act envelope never falls back to legacy.
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 2,
+      payload: { order_id: "ord_9" },
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toBeNull();
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      order_id: "ord_9",
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toBeNull();
+    // Both shapes must name the emitting block: the legacy `canceled` type is a
+    // generic word and must not match another catalog's observation.
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      payload: { order_id: "ord_9" },
+      source: "other_block"
+    }, "ordered", "the_horoscope")).toBeNull();
+    expect(normalizeDispenserObservation({
+      type: "canceled",
+      order_id: "ord_9"
+    }, "canceled", "the_horoscope")).toBeNull();
+  });
+
+  it("parses the admission-window wait only out of E_RATE_LIMIT refusals", () => {
+    expect(rateLimitRetrySeconds(
+      'MCP tool error: {"code":"E_RATE_LIMIT","message":"too many orders from this requester; try again later",' +
+      '"value":{"retry_in_seconds":12.3,"scope":"requester","rate_limit_seconds":60}}'
+    )).toBe(13);
+    // A rate refusal with an unparseable detail still gets the demo default.
+    expect(rateLimitRetrySeconds('MCP tool error: {"code":"E_RATE_LIMIT","message":"cooldown"}')).toBe(60);
+    // Non-rate errors are not retried.
+    expect(rateLimitRetrySeconds('MCP tool error: {"code":"E_QUEUE_FULL","message":"too many pending orders"}')).toBeNull();
+    expect(rateLimitRetrySeconds("I don't see \"mug\" here.")).toBeNull();
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {

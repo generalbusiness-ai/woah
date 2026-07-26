@@ -3,7 +3,8 @@
 // emitted by one actor lands in the other's MCP wait queue (or that a verb
 // reply carries the expected shape). This is the cross-actor coverage the
 // narrow single-call smoke does not provide: cross-scope moves, take/drop
-// fanout, pinboard/outliner/tasks tool-space collaboration.
+// fanout, pinboard/outliner/tasks tool-space collaboration, and the dispenser
+// order/cancel round on the_horoscope.
 //
 // The scenario is driver-agnostic: it operates on a mutable `SmokeSessionPair`
 // and an injected `step` runner. The runner owns lane-specific policy — the
@@ -355,6 +356,80 @@ export async function runSmokeWalkthrough(
       typeof obs.note.text === "string" &&
       obs.note.text.includes(text),
     waitMs, ctx.signal, cfg);
+  });
+
+  // Dispenser: the Acts-kernel anchored-actor adopter (the_horoscope, standing
+  // on the_deck). One order/cancel round proves the typed surface end-to-end in
+  // every lane: sequenced admission (`order`), the recorded fact fanning out to
+  // a co-present peer, the requester-facing `status` read, the plug-only
+  // authority boundary refusing an ordinary actor, and `cancel` retiring the
+  // order with its own peer-visible fact. The deliver half is deliberately
+  // absent: `next_pending`/`prepare_artifact`/`deliver` accept only the block
+  // actor (the apikey plug) or a wizard (catalogs/dispenser/DESIGN.md), so the
+  // right walkthrough assertion for an ordinary credential is that they REFUSE;
+  // delivery mechanics are covered by tests/dispenser-acts.test.ts and the
+  // plug's own suite.
+  //
+  // Rolling v0→v1 contract: a runtime deploy does not rewrite an installed
+  // world's catalog pages, so an aged world may still run the pre-Acts
+  // dispenser page, which emits flat `order_placed`/`canceled` observations
+  // instead of the `dispenser.ordered`/`dispenser.canceled` Act envelopes.
+  // Accept both, exactly like the Outliner steps below.
+  await step("dispenser: order and cancel facts reach peer; plug surface refuses", async (ctx) => {
+    const { alice, bob } = pair;
+    // Both actors to the_deck. The pinboard step normally leaves them inside
+    // the_pinboard; the chatroom guard covers a recorded earlier failure.
+    await alice.leaveIfIn("the_pinboard", ctx.signal);
+    await bob.leaveIfIn("the_pinboard", ctx.signal);
+    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
+    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", [], ctx.signal);
+    if (alice.currentRoom !== "the_deck" || bob.currentRoom !== "the_deck") {
+      throw new Error(`dispenser: both actors expected on the_deck; alice=${alice.currentRoom} bob=${bob.currentRoom}`);
+    }
+    await drain(alice, cfg, ctx.signal);
+    await drain(bob, cfg, ctx.signal);
+
+    const request = `walkthrough-order-${runId}`;
+    const reply = await orderWithAdmissionRetry(alice, request, ctx.signal, cfg);
+    if (!isRecord(reply) || reply.queued !== true || typeof reply.order_id !== "string" || !reply.order_id) {
+      throw new Error(`dispenser order should return {order_id, queued:true}; got ${JSON.stringify(reply).slice(0, 300)}`);
+    }
+    const orderId = reply.order_id;
+
+    // The recorded ordered fact reaches the co-present peer through the room's
+    // ordinary observation fanout.
+    await waitFor(bob, (obs) => matchesDispenserFact(obs, "ordered", "the_horoscope", orderId), waitMs, ctx.signal, cfg);
+
+    // Requester-facing status: a live (direct-route) read of the queue
+    // projection — or the legacy pending list — sees the queued order.
+    const status = await alice.call("the_horoscope", "status", [orderId], ctx.signal);
+    if (!isRecord(status) || status.state !== "queued") {
+      throw new Error(`dispenser status for ${orderId} should be queued; got ${JSON.stringify(status).slice(0, 300)}`);
+    }
+
+    // Authority boundary: the pending queue is plug-only. `next_pending` is
+    // command-shaped and therefore reachable in the room's tool context, so a
+    // refusal here is the verb's own E_PERM guard, not tool enumeration.
+    let refusal: string | null = null;
+    try {
+      await bob.call("the_horoscope", "next_pending", [], ctx.signal);
+    } catch (err) {
+      refusal = err instanceof Error ? err.message : String(err);
+    }
+    if (!refusal || !refusal.includes("E_PERM")) {
+      throw new Error(`the_horoscope:next_pending must refuse an ordinary actor with E_PERM; got ${refusal ?? "success"}`);
+    }
+
+    // The requester cancels her own order: the queue retires it (recycling the
+    // preallocated artifact) and the peer sees the terminal fact. This also
+    // keeps the step state-neutral — no pending order survives the run.
+    const canceled = await alice.call("the_horoscope", "cancel", [orderId], ctx.signal);
+    if (!isRecord(canceled) || canceled.canceled !== true) {
+      throw new Error(`dispenser cancel for ${orderId} should return canceled:true; got ${JSON.stringify(canceled).slice(0, 300)}`);
+    }
+    await waitFor(bob, (obs) => matchesDispenserFact(obs, "canceled", "the_horoscope", orderId), waitMs, ctx.signal, cfg);
+    await drain(alice, cfg, ctx.signal);
+    await drain(bob, cfg, ctx.signal);
   });
 
   // Outliner is mounted in the_chatroom, so both actors come back west. Movement
@@ -728,6 +803,99 @@ function matchesOutlinerFact(
   if (observation.type !== type) return false;
   const normalized = normalizeOutlinerObservation(observation);
   return normalized !== null && matches(normalized.fact);
+}
+
+export type DispenserFactKind = "ordered" | "canceled";
+
+/** Normalize the two shapes allowed by the dispenser v0→v1 rolling contract:
+ * the v1 Act envelope (`dispenser.ordered`/`dispenser.canceled`, `version: 1`,
+ * `payload.order_id`, composer in `source`) and the pre-Acts flat observation
+ * (`order_placed`/`canceled` with a top-level `order_id` and `block`). Both
+ * shapes must name the emitting block: legacy `canceled` is a generic word and
+ * must not match another catalog's observation. A partial/malformed Act never
+ * falls back to legacy — once the `dispenser.` type is present, the exact
+ * envelope is required, mirroring the Outliner normalizer above. */
+export function normalizeDispenserObservation(
+  observation: unknown,
+  kind: DispenserFactKind,
+  block: string
+): { mode: "act" | "legacy"; orderId: string } | null {
+  if (!isRecord(observation) || typeof observation.type !== "string") return null;
+  if (observation.type === `dispenser.${kind}`) {
+    if (observation.version !== 1 || observation.source !== block) return null;
+    if (!isRecord(observation.payload) || typeof observation.payload.order_id !== "string") return null;
+    return { mode: "act", orderId: observation.payload.order_id };
+  }
+  const legacyType = kind === "ordered" ? "order_placed" : "canceled";
+  if (observation.type !== legacyType) return null;
+  if (observation.block !== block || typeof observation.order_id !== "string") return null;
+  return { mode: "legacy", orderId: observation.order_id };
+}
+
+function matchesDispenserFact(
+  observation: Record<string, any>,
+  kind: DispenserFactKind,
+  block: string,
+  orderId: string
+): boolean {
+  const normalized = normalizeDispenserObservation(observation, kind, block);
+  return normalized !== null && normalized.orderId === orderId;
+}
+
+/** Extract the admission-window wait from a thrown E_RATE_LIMIT refusal. The
+ * dispenser's refusal detail carries `retry_in_seconds`; a rate refusal whose
+ * detail cannot be parsed still gets the demo block's 60s default window.
+ * Returns null when the message is not a rate refusal at all. */
+export function rateLimitRetrySeconds(message: string): number | null {
+  if (!message.includes("E_RATE_LIMIT")) return null;
+  const match = message.match(/"retry_in_seconds"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
+  const parsed = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return 60;
+  return Math.ceil(parsed);
+}
+
+// Persistent deployed actors keep dispenser admission state between runs, so a
+// rerun inside the requester rate window is refused E_RATE_LIMIT with a stated
+// retry_in_seconds. Honor that one bounded wait rather than failing — the retry
+// proves the admission contract's own recovery path. The 66s ceiling covers the
+// demo block's 60s window with slack while staying far inside the deployed
+// lane's 120s step watchdog; a larger stated window means an operator changed
+// the block's config, and the walkthrough should say so rather than stall.
+async function orderWithAdmissionRetry(
+  session: SmokeSession,
+  request: string,
+  signal: AbortSignal | undefined,
+  cfg: DrainConfig
+): Promise<unknown> {
+  try {
+    return await session.call("the_horoscope", "order", [request], signal);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const retrySeconds = rateLimitRetrySeconds(message);
+    if (retrySeconds === null) throw err;
+    if (retrySeconds > 66) {
+      throw new Error(`dispenser admission window too large to wait out (${retrySeconds}s): ${message.slice(0, 200)}`);
+    }
+    cfg.log?.(`    [${session.label}] dispenser admission window active; waiting ${retrySeconds + 1}s for the one retry`);
+    await sleepUnlessAborted((retrySeconds + 1) * 1000, signal);
+    return await session.call("the_horoscope", "order", [request], signal);
+  }
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    throwIfAborted(signal);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      const reason = signal?.reason;
+      reject(reason instanceof Error ? reason : new Error("operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 // Drain pending observations from a session's wait queue so the next assertion

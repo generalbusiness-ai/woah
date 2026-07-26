@@ -148,6 +148,22 @@ Rebuild starts from declared empty state and reproduces rows, counters,
 indexes, receipts, genesis status, and `at_seq` from recorded observations.
 Composer source filters Acts for another Dispenser on the same room log.
 
+## Coverage
+
+`tests/dispenser-acts.test.ts` proves the queue contract (emission authority,
+fail-closed folds, dropped-reply idempotency, legacy genesis, rebuild,
+eviction, caps). The shared walkthrough (`scripts/smoke/scenario.ts`, run by
+the workerd and deployed lanes) drives the cross-actor half on
+`the_horoscope`: a sequenced `order` whose recorded fact reaches a co-present
+peer, the requester `status` read, an ordinary actor's `next_pending` refused
+`E_PERM`, and a requester `cancel` whose terminal fact reaches the peer. The
+walkthrough accepts both rolling-contract observation shapes (v1 Act envelope
+and the pre-Acts flat `order_placed`/`canceled`) because a runtime deploy does
+not rewrite an installed world's catalog pages. The plug's deliver half is
+deliberately absent from the walkthrough — those verbs accept only the block
+actor or a wizard, and the walkthrough's job is to prove they refuse ordinary
+credentials.
+
 ## Deliberate exclusions
 
 - Note content and physical location retain artifact authority; the queue
