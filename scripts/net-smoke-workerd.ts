@@ -349,6 +349,66 @@ async function main(): Promise<number> {
     });
     step("authenticated roster read over /net-api shows the room contents", clientRoster !== null);
 
+    // ---- Programmer lifecycle over REAL workerd (P1/P2): a fully anchored
+    // programmer family promotes over /net-api/turn, authors + invokes through
+    // the real MCP surface, and demotes — the same shape as the fake-DO
+    // net-programmer-lifecycle test, now on real per-DO SQLite + cross-DO RPC.
+    const progTools = async (sid: string): Promise<string[]> => {
+      const r = await fetch(`${base}/net-api/mcp`, {
+        method: "POST", headers: { "content-type": "application/json", "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
+      });
+      const b = (await r.json()) as { result?: { tools?: Array<{ name: string }> } };
+      return (b.result?.tools ?? []).map((t) => t.name);
+    };
+    const progCall = async (sid: string, name: string, args: unknown): Promise<any> => {
+      const r = await fetch(`${base}/net-api/mcp`, {
+        method: "POST", headers: { "content-type": "application/json", "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } })
+      });
+      return (await r.json());
+    };
+    const progResult = (r: any) => r?.result?.structuredContent?.result ?? {};
+    const progErrored = (r: any) => r?.result?.isError === true || r?.error != null;
+    // The agent opens its MCP session (self-routing n1_ key → its home cluster).
+    const agentInit = await fetch(`${base}/net-api/mcp`, {
+      method: "POST", headers: { "content-type": "application/json", "mcp-token": fixture.progAgentToken },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
+    });
+    const agentSid = agentInit.headers.get("mcp-session-id") ?? "";
+    await fetch(`${base}/net-api/mcp`, { method: "POST", headers: { "content-type": "application/json", "mcp-session-id": agentSid }, body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
+    const pp = fixture.progAgent.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
+    step("anchored programmer agent MCP session opened over real workerd (routed n1_ key)", Boolean(agentSid), `sid=${agentSid ? "yes" : "no"}`);
+    step("agent has NO authoring surface before promote", !(await progTools(agentSid)).includes(`${pp}__install_verb`));
+    // The human mints a session and promotes the agent over /net-api/turn.
+    const hMint = await fetch(`${base}/net-api/session`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer apikey:prog-human-key:prog-human-secret" }, body: JSON.stringify({ ttl_ms: 600_000 }) });
+    const hSession = ((await hMint.json()) as { session?: string }).session ?? "";
+    const promoteRes = await fetch(`${base}/net-api/turn`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer apikey:prog-human-key:prog-human-secret" }, body: JSON.stringify({ target: fixture.progHuman, verb: "promote_agent_to_programmer", args: [fixture.progAgent], session: hSession }) });
+    const promoteBody = (await promoteRes.json()) as { reply?: { status?: string }; error?: unknown };
+    step("promote over /net-api/turn accepted with no error (real workerd)", promoteRes.status === 200 && promoteBody.reply?.status === "accepted" && promoteBody.error == null, `status=${promoteRes.status} reply=${promoteBody.reply?.status}`);
+    const afterPromoteTools = await poll(async () => {
+      const t = await progTools(agentSid);
+      return t.includes(`${pp}__install_verb`) ? t : null;
+    });
+    step("the live agent session gains its authoring surface after Net promote", afterPromoteTools !== null);
+    // Author: create an object into the agent's inventory, install a verb, invoke it.
+    const created = await progCall(agentSid, `${pp}__create`, { parent: "$thing", opts: { name: "LaneWidget", location: fixture.progAgent } });
+    const widget = progResult(created).id as string;
+    step("agent created a co-located object over real workerd", !progErrored(created) && typeof widget === "string" && widget.startsWith("obj_"), `id=${widget}`);
+    const installRes = await progCall(agentSid, `${pp}__install_verb`, { id: widget, descriptor: "ping", source: "verb :ping() rxd { return 7; }", opts: {} });
+    step("agent installed a verb on the authored object (local cluster write, no E_CATALOG_MUTATION)", !progErrored(installRes) && progResult(installRes).ok === true && progResult(installRes).version === 1, JSON.stringify(progResult(installRes)).slice(0, 200));
+    const invokeRes = await progCall(agentSid, `${pp}__eval`, { source: "let o = contents(actor)[1]; return o:ping();", opts: { mode: "stmts" } });
+    step("agent invoked the authored verb via eval → 7 (real workerd)", !progErrored(invokeRes) && progResult(invokeRes).value === 7, JSON.stringify(progResult(invokeRes)).slice(0, 200));
+    // Demote over /net-api/turn; the live session loses the surface.
+    const demoteRes = await fetch(`${base}/net-api/turn`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer apikey:prog-human-key:prog-human-secret" }, body: JSON.stringify({ target: fixture.progHuman, verb: "demote_agent_from_programmer", args: [fixture.progAgent], session: hSession }) });
+    const demoteBody = (await demoteRes.json()) as { reply?: { status?: string }; error?: unknown };
+    step("demote over /net-api/turn accepted with no error (real workerd)", demoteRes.status === 200 && demoteBody.reply?.status === "accepted" && demoteBody.error == null, `status=${demoteRes.status} reply=${demoteBody.reply?.status}`);
+    const afterDemoteTools = await poll(async () => {
+      const t = await progTools(agentSid);
+      return !t.includes(`${pp}__install_verb`) ? t : null;
+    });
+    step("the live agent session loses its authoring surface after Net demote", afterDemoteTools !== null);
+
     // ---- Phase-4 item 3: WS transport + observation push over REAL
     // workerd, driven with Node's NATIVE WebSocket client (the browser
     // API shape — it cannot set request headers, which is exactly why the
