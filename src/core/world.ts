@@ -6733,6 +6733,17 @@ export class WooWorld {
   private async moveEditorActor(ctx: CallContext, destination: ObjRef, previousLocation: ObjRef | null): Promise<void> {
     this.object(destination);
     const actor = ctx.actor;
+    // Capture the session's scope BEFORE any presence update. For a space-like
+    // destination `updatePresence` sets `activeScope` as a side effect of
+    // joining presence, so reading it afterwards reports the destination and
+    // the transition below looks like a no-op. That silent mutation is enough
+    // locally, but over Net only a recorded `session_scope` event becomes the
+    // committed session-cell write (foldSessionEffects), and the MCP session
+    // scope is read from that cell — so without this the actor entered the
+    // editor while its session still pointed at the old room.
+    const sessionRow = ctx.session ? this.sessions.get(ctx.session) : undefined;
+    const editorSession = sessionRow && sessionRow.actor === actor ? sessionRow : null;
+    const priorScope = editorSession?.activeScope ?? null;
     const current = await this.objectLocationChecked(actor, ctx.hostMemo);
     if (current && current !== destination && this.objects.has(current) && this.isSpaceLike(current)) {
       await this.updatePresenceChecked(actor, current, false, ctx);
@@ -6748,25 +6759,23 @@ export class WooWorld {
     // so the editor's own verbs never entered the session's context. Presence
     // and active scope now move together, as they do for ordinary room
     // movement.
-    if (ctx.session) {
-      const session = this.sessions.get(ctx.session);
-      if (session && session.actor === actor) {
-        // CA8: record the active-scope transition so presence projections +
-        // session-row materialization follow editor movement, not just physical
-        // room movement (see movetoActorChecked).
-        if (session.activeScope !== destination) {
-          this.recordTurnEvent({
-            kind: "session_scope",
-            session: session.id,
-            actor,
-            from: session.activeScope ?? null,
-            to: destination,
-            ...(session.rosterVisible === false ? { rosterVisible: false } : {})
-          });
-        }
-        this.setSessionActiveScope(session, destination);
-        this.persistSession(session);
+    if (editorSession) {
+      // CA8: record the active-scope transition so presence projections +
+      // session-row materialization follow editor movement, not just physical
+      // room movement (see movetoActorChecked). Compared against the scope
+      // captured above, not the live row, for the reason given there.
+      if (priorScope !== destination) {
+        this.recordTurnEvent({
+          kind: "session_scope",
+          session: editorSession.id,
+          actor,
+          from: priorScope,
+          to: destination,
+          ...(editorSession.rosterVisible === false ? { rosterVisible: false } : {})
+        });
       }
+      this.setSessionActiveScope(editorSession, destination);
+      this.persistSession(editorSession);
     }
     await this.moveObjectChecked(actor, destination);
     if (previousLocation && previousLocation !== destination && this.objects.has(actor) && this.objects.has(previousLocation) && this.isSpaceLike(previousLocation)) {

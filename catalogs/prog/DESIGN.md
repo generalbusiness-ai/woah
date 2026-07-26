@@ -111,6 +111,40 @@ editor.
 
 See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md).
 
+### Status over Net (2026-07-26)
+
+The editor had no Net or worker coverage until
+`tests/worker/net-verb-editor.test.ts`, and the distributed path broke it in
+three places. Entering and editing now work; **leaving does not**.
+
+1. *Fixed.* The seeded instance lives in its own scope, which an ordinary turn
+   never warms, so it was absent from the turn's world and `isa(editor, $space)`
+   answered false — `edit_verb` raised `E_TYPE`. `edit_verb` now declares
+   `authority.prefetch: [{ ref: "the_verb_editor" }, { arg: 0 }]`. Because the
+   editor is named in the verb body rather than passed in, no derived prefetch
+   root could reach it; the literal form was added for exactly this shape.
+2. *Fixed.* Entering moved the actor's body but not its session: for a
+   space-like destination `updatePresence` sets `activeScope` as a side effect,
+   so the CA8 `session_scope` event was recorded as a no-op, and over Net only
+   that event becomes the committed session cell the MCP active scope is read
+   from. Every editor verb answered "tool is not available in this session
+   context". `moveEditorActor` now captures the prior scope before the presence
+   update.
+3. **Open.** `pause`, `save`, and `abort` all move the actor OUT of the editor.
+   The turn commits in `room:the_verb_editor` (the call target's scope) and the
+   move writes the session cell, which is owned by the actor's cluster. A room
+   can normally prove a foreign session *read* from its `session_presence`
+   checkpoint, but `authorizeSessionSubmit` takes the mint-write branch first
+   and never records that proof for a turn that both reads and writes the cell —
+   so the commit is refused `rider_unattested`. Ordinary room movement never
+   hits this, so it is specific to a room verb that moves the actor out of the
+   scope it commits in. Resolving it is a design call about where such turns
+   commit, or about composing the proof with the write; the test pins the
+   current rejection and says what to restore when it lands.
+
+Until (3) is resolved an actor that enters the editor over Net cannot leave it,
+so the surface is not usable end-to-end on the Net path.
+
 ## Eval
 
 `$programmer:eval(source, opts?)` is the LambdaCore `eval` analogue. It compiles

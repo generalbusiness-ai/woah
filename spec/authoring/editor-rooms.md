@@ -12,6 +12,18 @@ editor is a room-like object: an actor enters it, runs ordinary verbs there, and
 leaves or resumes later. There is no separate workshop abstraction and no
 special coordination layer for agent teams.
 
+**Implementation status (2026-07-26).** In-memory this works as described. Over
+Net, entering and editing work; **leaving does not**. `pause`/`save`/`abort`
+move the actor out of the editor, so the turn commits in the editor's room scope
+while writing the actor-cluster-owned session cell, and the commit is refused
+`rider_unattested` — a room can prove a foreign session *read* from its
+`session_presence` checkpoint, but not for a turn that both reads and writes the
+cell. The choice this forces — where a room verb that moves the actor out should
+commit, or how that proof composes with the write — is unresolved, and the rest
+of this document describes the intended model rather than current Net behavior.
+Covered by `tests/worker/net-verb-editor.test.ts`; rationale in
+`catalogs/prog/DESIGN.md`.
+
 ## E1. Principle
 
 An editor room adds only editor-specific state and verbs:

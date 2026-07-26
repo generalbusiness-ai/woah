@@ -735,8 +735,17 @@ read against the owner.
    metadata, not by transport-layer knowledge of command words or catalog
    property conventions: the runtime may interpret generic `authority.prefetch`
    references such as the current scope, target, actor, property paths,
-   argument-derived path segments such as `{ "arg": 0 }`, and fallback lists,
+   argument-derived path segments such as `{ "arg": 0 }`, a literal object named
+   by the declaration (`{ "ref": "<object>" }`), and fallback lists,
    but the property names and destination rules come from the verb declaration.
+   The literal form exists because a verb may reach a fixed object its catalog
+   owns — an editor room, a registry — that appears in neither the call nor the
+   actor's context, and so cannot be named by any of the derived roots. Warming
+   it is not an optimization there but a correctness requirement: an object
+   absent from the turn's world answers `isa()` false rather than raising, so
+   the verb sees a well-formed wrong answer and no repair is triggered. The
+   literal stays in the catalog manifest that owns the object; the runtime only
+   learns "warm the object this verb names".
    The optimization is for cold topology reads; the moment of occupancy
    correctly pays one owner fetch.
 
