@@ -150,7 +150,7 @@ export function cellProvenanceFromAuthoritySlice(authority: MergeSerializedAutho
 export function buildSerializedAuthorityCellSlice(input: {
   sessions: readonly SerializedSession[];
   objects: readonly SerializedObject[];
-  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  counters: Pick<SerializedWorld, "objectCounter" | "sessionCounter">;
   tombstones?: readonly ObjRef[];
   pageProvenance: (page: ShadowStatePage) => AuthorityPageProvenance;
 }): SerializedAuthorityCellSlice {
@@ -214,13 +214,11 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
   const serialized: SerializedWorld = {
     version: 1,
     objectCounter: inferObjectCounter(authority.objects),
-    parkedTaskCounter: 1,
     sessionCounter: inferSessionCounter(authority.sessions),
     objects: authority.objects.map((obj) => structuredClone(obj) as SerializedObject).sort((a, b) => a.id.localeCompare(b.id)),
     sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession).sort((a, b) => a.id.localeCompare(b.id)),
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: []
   };
   repairDerivedContentsProjection(serialized);
@@ -256,7 +254,7 @@ function referencedInlinePagesWithLineage(
 }
 
 export function mergeSerializedAuthoritySlice(
-  serialized: { sessions: SerializedSession[]; objects: SerializedObject[] } & Partial<Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter" | "tombstones">>,
+  serialized: { sessions: SerializedSession[]; objects: SerializedObject[] } & Partial<Pick<SerializedWorld, "objectCounter" | "sessionCounter" | "tombstones">>,
   authority: MergeSerializedAuthorityInput,
   options: MergeSerializedAuthorityOptions = {}
 ): boolean {
@@ -291,9 +289,8 @@ export function combineSerializedAuthoritySlices(
   const lastPageByKey = new Map<string, AuthorityPageRef>();
   const inlineByHash = new Map<string, ShadowStatePage>();
   const legacyObjects = new Map<ObjRef, SerializedObject>();
-  let counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter"> = {
+  let counters: Pick<SerializedWorld, "objectCounter" | "sessionCounter"> = {
     objectCounter: 1,
-    parkedTaskCounter: 1,
     sessionCounter: inferSessionCounter(sessions)
   };
   const tombstones = new Set<ObjRef>();
@@ -319,7 +316,6 @@ export function combineSerializedAuthoritySlices(
     if (isAuthorityCellSlice(slice)) {
       counters = {
         objectCounter: Math.max(counters.objectCounter, slice.counters.objectCounter),
-        parkedTaskCounter: Math.max(counters.parkedTaskCounter, slice.counters.parkedTaskCounter),
         sessionCounter: Math.max(counters.sessionCounter, slice.counters.sessionCounter)
       };
       for (const id of slice.tombstones) tombstones.add(id);
@@ -639,13 +635,12 @@ function mergeAuthoritySessions(
 }
 
 function authorityMergeFingerprint(
-  serialized: { sessions: SerializedSession[]; objects: SerializedObject[] } & Partial<Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter" | "tombstones">>
+  serialized: { sessions: SerializedSession[]; objects: SerializedObject[] } & Partial<Pick<SerializedWorld, "objectCounter" | "sessionCounter" | "tombstones">>
 ): string {
   return stableShadowJson({
     sessions: serialized.sessions,
     objects: serialized.objects,
     objectCounter: serialized.objectCounter ?? null,
-    parkedTaskCounter: serialized.parkedTaskCounter ?? null,
     sessionCounter: serialized.sessionCounter ?? null,
     tombstones: serialized.tombstones ?? null
   } as unknown as WooValue);
@@ -805,13 +800,11 @@ function mergeAuthorityCellPages(
   const base: SerializedWorld = {
     version: 1,
     objectCounter: 1,
-    parkedTaskCounter: 1,
     sessionCounter: 1,
     objects: serialized.objects,
     sessions: [],
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: []
   };
   const merged = mergeShadowStatePagesIntoSerialized(base, changedPages, () => base);
@@ -820,19 +813,14 @@ function mergeAuthorityCellPages(
 }
 
 function mergeAuthorityMetadata(
-  serialized: Partial<Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter" | "tombstones">>,
+  serialized: Partial<Pick<SerializedWorld, "objectCounter" | "sessionCounter" | "tombstones">>,
   authority: SerializedAuthorityCellSlice
 ): boolean {
   let changed = false;
   const objectCounter = Math.max(serialized.objectCounter ?? 1, authority.counters.objectCounter);
-  const parkedTaskCounter = Math.max(serialized.parkedTaskCounter ?? 1, authority.counters.parkedTaskCounter);
   const sessionCounter = Math.max(serialized.sessionCounter ?? 1, authority.counters.sessionCounter);
   if (serialized.objectCounter !== undefined && serialized.objectCounter !== objectCounter) {
     serialized.objectCounter = objectCounter;
-    changed = true;
-  }
-  if (serialized.parkedTaskCounter !== undefined && serialized.parkedTaskCounter !== parkedTaskCounter) {
-    serialized.parkedTaskCounter = parkedTaskCounter;
     changed = true;
   }
   if (serialized.sessionCounter !== undefined && serialized.sessionCounter !== sessionCounter) {
@@ -890,13 +878,11 @@ function emptySerializedWorldFromAuthority(authority: SerializedAuthorityCellSli
   return {
     version: 1,
     objectCounter: authority.counters.objectCounter,
-    parkedTaskCounter: authority.counters.parkedTaskCounter,
     sessionCounter: authority.counters.sessionCounter,
     objects: [],
     sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession).sort((a, b) => a.id.localeCompare(b.id)),
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: [...authority.tombstones].sort()
   };
 }

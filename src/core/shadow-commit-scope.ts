@@ -123,13 +123,11 @@ export type ShadowCommitScopeState = {
   kind: "woo.commit_scope_state.shadow.v1";
   version: 1;
   objectCounter: number;
-  parkedTaskCounter: number;
   sessionCounter: number;
   objectsById: Map<ObjRef, SerializedObject>;
   sessionsById: Map<string, SerializedWorld["sessions"][number]>;
   logsByScope: Map<ObjRef, SerializedWorld["logs"][number][1]>;
   snapshots: SerializedWorld["snapshots"];
-  parkedTasks: SerializedWorld["parkedTasks"];
   tombstones?: ObjRef[];
   serializedRefs: ShadowCommitScopeSerializedRefs;
 };
@@ -140,7 +138,6 @@ type ShadowCommitScopeSerializedRefs = {
   sessions: SerializedWorld["sessions"];
   logs: SerializedWorld["logs"];
   snapshots: SerializedWorld["snapshots"];
-  parkedTasks: SerializedWorld["parkedTasks"];
   tombstones?: ObjRef[];
 };
 
@@ -149,7 +146,6 @@ type ShadowSerializedSync = {
   sessions?: Iterable<string>;
   logs?: Iterable<ObjRef>;
   snapshots?: Iterable<string>;
-  parkedTasks?: Iterable<string>;
   counters?: boolean;
   tombstones?: boolean;
 };
@@ -479,7 +475,6 @@ export function applyAuthorityMergeToCommitScopeState(
   // Update the counter fields in case mergeAuthorityMetadata bumped them.
   // These are cheap scalar assignments — always safe to sync.
   state.objectCounter = serialized.objectCounter;
-  state.parkedTaskCounter = serialized.parkedTaskCounter;
   state.sessionCounter = serialized.sessionCounter;
 
   // Patch the objectsById map: update/add changed objects, remove tombstoned ones.
@@ -520,7 +515,7 @@ export function applyAuthorityMergeToCommitScopeState(
 
   // Update the serializedRefs so stateMatchesSerializedRefs returns true for
   // the new arrays. The objects/sessions arrays were replaced by the merge; all
-  // other arrays (logs, snapshots, parkedTasks, tombstones) are NOT mutated by
+  // other arrays (logs, snapshots, tombstones) are NOT mutated by
   // an authority merge, so their refs remain valid.
   state.serializedRefs = serializedRefs(serialized);
   scope.serializedDirty = false;
@@ -822,13 +817,11 @@ function createShadowCommitScopeState(serialized: SerializedWorld): ShadowCommit
     kind: "woo.commit_scope_state.shadow.v1",
     version: serialized.version,
     objectCounter: serialized.objectCounter,
-    parkedTaskCounter: serialized.parkedTaskCounter,
     sessionCounter: serialized.sessionCounter,
     objectsById: new Map(serialized.objects.map((obj) => [obj.id, obj])),
     sessionsById: new Map(serialized.sessions.map((session) => [session.id, session])),
     logsByScope: new Map(serialized.logs.map(([space, entries]) => [space, entries] as const)),
     snapshots: serialized.snapshots,
-    parkedTasks: serialized.parkedTasks,
     tombstones: serialized.tombstones,
     serializedRefs: serializedRefs(serialized)
   };
@@ -851,7 +844,6 @@ function stateMatchesSerializedRefs(state: ShadowCommitScopeState, serialized: S
     state.serializedRefs.sessions === serialized.sessions &&
     state.serializedRefs.logs === serialized.logs &&
     state.serializedRefs.snapshots === serialized.snapshots &&
-    state.serializedRefs.parkedTasks === serialized.parkedTasks &&
     state.serializedRefs.tombstones === serialized.tombstones;
 }
 
@@ -862,7 +854,6 @@ function serializedRefs(serialized: SerializedWorld): ShadowCommitScopeSerialize
     sessions: serialized.sessions,
     logs: serialized.logs,
     snapshots: serialized.snapshots,
-    parkedTasks: serialized.parkedTasks,
     tombstones: serialized.tombstones
   };
 }
@@ -874,7 +865,6 @@ function cloneShadowCommitScopeState(current: ShadowCommitScopeState): ShadowCom
     sessionsById: new Map(current.sessionsById),
     logsByScope: new Map(current.logsByScope),
     snapshots: current.snapshots.slice(),
-    parkedTasks: current.parkedTasks.slice(),
     tombstones: current.tombstones?.slice()
   };
 }
@@ -1106,9 +1096,6 @@ function projectionWritesForIndexedApply(
   if (next.sessionCounter !== current.sessionCounter) {
     writes.push({ table: "counters", key: "sessionCounter", op: "upsert", value: next.sessionCounter, bytes: projectionRowBytes({ key: "sessionCounter", value: next.sessionCounter }) });
   }
-  if (next.parkedTaskCounter !== current.parkedTaskCounter) {
-    writes.push({ table: "counters", key: "parkedTaskCounter", op: "upsert", value: next.parkedTaskCounter, bytes: projectionRowBytes({ key: "parkedTaskCounter", value: next.parkedTaskCounter }) });
-  }
 
   // Side-channel tables are intentionally not diffed here. Snapshot, parked
   // task, and tombstone mutations, plus their required counter updates, enter
@@ -1139,9 +1126,6 @@ function projectionWritesAreAuthorityRows(writes: readonly ProjectionWrite[]): b
         break;
       case "snapshots":
         if (!isSerializedSnapshotRow(write.row)) return false;
-        break;
-      case "parked_tasks":
-        if (!isSerializedParkedTaskRow(write.row)) return false;
         break;
       case "tombstones":
         if (!isSerializedTombstoneRow(write.row)) return false;
@@ -1200,15 +1184,6 @@ function isSerializedSnapshotRow(value: unknown): value is SerializedWorld["snap
     typeof value.seq === "number" &&
     typeof value.ts === "number" &&
     typeof value.hash === "string";
-}
-
-function isSerializedParkedTaskRow(value: unknown): value is SerializedWorld["parkedTasks"][number] {
-  if (!isRecord(value)) return false;
-  return typeof value.id === "string" &&
-    typeof value.parked_on === "string" &&
-    typeof value.state === "string" &&
-    typeof value.created === "number" &&
-    typeof value.origin === "string";
 }
 
 function isSerializedTombstoneRow(value: unknown): value is { id: ObjRef } {
@@ -1346,15 +1321,9 @@ function applyProjectionWritesToCommitScopeState(next: ShadowCommitScopeState, w
           ? next.snapshots.filter((row) => row.space_id !== write.key.space || row.seq !== write.key.seq)
           : upsertBy(next.snapshots, (row) => row.space_id === write.key.space && row.seq === write.key.seq, structuredClone(write.row) as SerializedWorld["snapshots"][number]);
         break;
-      case "parked_tasks":
-        next.parkedTasks = write.op === "delete"
-          ? next.parkedTasks.filter((row) => row.id !== write.key)
-          : upsertBy(next.parkedTasks, (row) => row.id === write.key, structuredClone(write.row) as SerializedWorld["parkedTasks"][number]);
-        break;
       case "counters":
         if (write.key === "objectCounter") next.objectCounter = write.value;
         if (write.key === "sessionCounter") next.sessionCounter = write.value;
-        if (write.key === "parkedTaskCounter") next.parkedTaskCounter = write.value;
         break;
       case "tombstones": {
         const tombstones = new Set(next.tombstones ?? []);
@@ -1447,7 +1416,6 @@ function projectionWriteSerializedSync(writes: readonly ProjectionWrite[]): Shad
     sessions: Set<string>;
     logs: Set<ObjRef>;
     snapshots: Set<string>;
-    parkedTasks: Set<string>;
     counters: boolean;
     tombstones: boolean;
   } = {
@@ -1455,7 +1423,6 @@ function projectionWriteSerializedSync(writes: readonly ProjectionWrite[]): Shad
     sessions: new Set(),
     logs: new Set(),
     snapshots: new Set(),
-    parkedTasks: new Set(),
     counters: false,
     tombstones: false
   };
@@ -1472,9 +1439,6 @@ function projectionWriteSerializedSync(writes: readonly ProjectionWrite[]): Shad
         break;
       case "snapshots":
         sync.snapshots.add(snapshotSyncKey(write.key.space, write.key.seq));
-        break;
-      case "parked_tasks":
-        sync.parkedTasks.add(write.key);
         break;
       case "counters":
         sync.counters = true;
@@ -1517,23 +1481,14 @@ function syncSerializedFromState(
     (row) => snapshotSyncKey(row.space_id, row.seq),
     (a, b) => a.space_id.localeCompare(b.space_id) || a.seq - b.seq
   );
-  const parkedTasks = syncArrayRows(
-    previous.parkedTasks,
-    sync.parkedTasks,
-    state.parkedTasks,
-    (row) => row.id,
-    (a, b) => a.id.localeCompare(b.id)
-  );
   scope.serialized = {
     ...previous,
     objectCounter: state.objectCounter,
-    parkedTaskCounter: state.parkedTaskCounter,
     sessionCounter: state.sessionCounter,
     objects,
     sessions,
     logs,
     snapshots,
-    parkedTasks,
     tombstones: sync.tombstones ? state.tombstones : previous.tombstones
   };
 }
@@ -1594,13 +1549,11 @@ function serializedWorldFromCommitScopeState(state: ShadowCommitScopeState): Ser
   return {
     version: state.version,
     objectCounter: state.objectCounter,
-    parkedTaskCounter: state.parkedTaskCounter,
     sessionCounter: state.sessionCounter,
     objects: Array.from(state.objectsById.values()).sort((a, b) => a.id.localeCompare(b.id)),
     sessions: Array.from(state.sessionsById.values()).sort((a, b) => a.id.localeCompare(b.id)),
     logs: Array.from(state.logsByScope.entries()).sort(([a], [b]) => a.localeCompare(b)),
     snapshots: state.snapshots,
-    parkedTasks: state.parkedTasks,
     tombstones: state.tombstones
   };
 }
@@ -1609,13 +1562,11 @@ function serializedShellFromCommitScopeState(state: ShadowCommitScopeState): Ser
   return {
     version: state.version,
     objectCounter: state.objectCounter,
-    parkedTaskCounter: state.parkedTaskCounter,
     sessionCounter: state.sessionCounter,
     objects: [],
     sessions: [],
     logs: [],
     snapshots: state.snapshots,
-    parkedTasks: state.parkedTasks,
     tombstones: state.tombstones
   };
 }

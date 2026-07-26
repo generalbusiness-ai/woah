@@ -9,7 +9,6 @@ type JsonFolderManifest = {
   partial: boolean;
   objectCounter: number;
   taskCounter?: number;
-  parkedTaskCounter?: number;
   sessionCounter: number;
   objects: Array<{ id: ObjRef; file: string }>;
   logs: Array<{ space: ObjRef; file: string }>;
@@ -42,13 +41,11 @@ export class JsonFolderWorldRepository implements WorldRepository {
     return {
       version: 1,
       objectCounter: manifest.objectCounter ?? manifest.taskCounter ?? 1,
-      parkedTaskCounter: manifest.parkedTaskCounter ?? 1,
       sessionCounter: manifest.sessionCounter,
       objects: manifest.objects.map((item) => readJson<SerializedObject>(join(this.folder, item.file))),
       sessions: manifest.sessions_file ? readJson(join(this.folder, manifest.sessions_file)) : [],
       logs: manifest.logs.map((item) => [item.space, readJson(join(this.folder, item.file))]),
       snapshots: manifest.snapshots.flatMap((item) => readJson<SpaceSnapshotRecord[]>(join(this.folder, item.file))),
-      parkedTasks: manifest.tasks_file ? readJson(join(this.folder, manifest.tasks_file)) : [],
       tombstones: manifest.tombstones ?? []
     };
   }
@@ -93,7 +90,6 @@ export function dumpSerializedWorldToJsonFolder(world: SerializedWorld, folder: 
     version: 1,
     partial: Boolean(objectIds),
     objectCounter: world.objectCounter,
-    parkedTaskCounter: world.parkedTaskCounter,
     sessionCounter: world.sessionCounter,
     objects: [],
     logs: [],
@@ -110,7 +106,6 @@ export function dumpSerializedWorldToJsonFolder(world: SerializedWorld, folder: 
   }
 
   if (includeSessions) writeJson(join(folder, "sessions.json"), world.sessions);
-  if (includeTasks) writeJson(join(folder, "tasks.json"), world.parkedTasks);
 
   if (includeLogs) {
     for (const [space, entries] of world.logs.sort(([left], [right]) => left.localeCompare(right))) {

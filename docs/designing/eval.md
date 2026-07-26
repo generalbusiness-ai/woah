@@ -75,7 +75,7 @@ runs; nothing changes.
 
 **Runtime errors** thrown by the body propagate up to the outer
 direct-call transaction. The transaction **rolls back property
-writes, placement changes, and parked tasks**. The chat layer then
+writes and placement changes**. The chat layer then
 renders the error frame.
 
 This rollback is deliberate. Without it, a chat-fired

@@ -185,7 +185,7 @@ Each is a `$workflow_space` subclass with a domain-specific workflow value. The 
 ## WF9. What's not in workflow primitives
 
 - **Computed branches.** Workflows are state-name based; "if X then go to Y else Z" requires a custom verb that computes the target state and calls `:transition`. Pattern works; not a built-in.
-- **Time-based transitions.** "After 24h, auto-cancel" is achievable via forked tasks that call `:transition` after `suspend`. Not built-in.
+- **Time-based transitions.** "After 24h, auto-cancel" is a scheduled turn that calls `:transition` ([semantics/scheduling.md](../semantics/scheduling.md)), armed on entry to the state and cancelled by any transition out of it — use a stable key per item so re-entering the state re-arms rather than accumulating. The deadline is an `always` entry, so it goes through the wizard-owned `$scheduling:deadline` verb. The mechanism is built in; a workflow-level declarative `timeout` on a state is not, and remains a refinement.
 - **Sub-workflows / nested state machines.** One workflow per item; composition via separate items linked by reference.
 - **Workflow versioning.** A workflow value lives on a class; changing the workflow affects future transitions. Existing in-flight items may have their `status` not match a state in the new workflow; `:transition` rejects until repair. Migration is a deliberate operator action — typically a worktree that updates the workflow value paired with a `migrate_property` to map old states to new.
 

@@ -106,17 +106,6 @@ describe("shadow commit scope", () => {
       snapshots: [
         { space_id: "room", seq: 1, ts: 1, state: { before: true }, hash: "snapshot-before" }
       ],
-      parkedTasks: [{
-        id: "ptask_existing",
-        parked_on: "room",
-        state: "suspended" as const,
-        resume_at: null,
-        awaiting_player: null,
-        correlation_id: null,
-        serialized: {},
-        created: 1,
-        origin: "room"
-      }],
       tombstones: ["recycled_existing"]
     };
     const transcript: EffectTranscript = {
@@ -146,17 +135,6 @@ describe("shadow commit scope", () => {
 
   it("folds explicit side-channel projection writes without scanning side-channel tables", () => {
     const snapshot = { space_id: "room", seq: 2, ts: 2, state: { after: true }, hash: "snapshot-after" };
-    const parkedTask = {
-      id: "ptask_new",
-      parked_on: "room",
-      state: "suspended" as const,
-      resume_at: 10,
-      awaiting_player: null,
-      correlation_id: null,
-      serialized: {},
-      created: 2,
-      origin: "room"
-    };
     const transcript: EffectTranscript = {
       ...addChildTranscript(),
       id: "side-channel-explicit",
@@ -165,7 +143,6 @@ describe("shadow commit scope", () => {
       writes: [],
       projectionWrites: [
         { table: "snapshots", key: { space: "room", seq: 2 }, op: "upsert", row: snapshot, bytes: 10 },
-        { table: "parked_tasks", key: "ptask_new", op: "upsert", row: parkedTask, bytes: 11 },
         { table: "tombstones", key: "recycled_new", op: "upsert", row: { id: "recycled_new" }, bytes: 12 }
       ]
     };
@@ -174,10 +151,8 @@ describe("shadow commit scope", () => {
     const applied = applyShadowTranscriptToIndexedState(scope.state, transcript);
 
     expect(applied.projection_delta.snapshots).toEqual([{ key: { space: "room", seq: 2 }, op: "upsert", bytes: 10 }]);
-    expect(applied.projection_delta.parked_tasks).toEqual([{ key: "ptask_new", op: "upsert", bytes: 11 }]);
     expect(applied.projection_delta.tombstones).toEqual([{ key: "recycled_new", op: "upsert", bytes: 12 }]);
     expect(applied.state.snapshots).toContainEqual(snapshot);
-    expect(applied.state.parkedTasks).toContainEqual(parkedTask);
     expect(applied.state.tombstones).toContain("recycled_new");
   });
 
@@ -191,7 +166,6 @@ describe("shadow commit scope", () => {
     const before: SerializedWorld = {
       version: 1,
       objectCounter: 1,
-      parkedTaskCounter: 1,
       sessionCounter: 1,
       objects: [
         objectRecord("mover", "Mover", "room", []),
@@ -201,7 +175,6 @@ describe("shadow commit scope", () => {
       sessions: [],
       logs: [],
       snapshots: [],
-      parkedTasks: [],
       tombstones: []
     };
     const transcript: EffectTranscript = {
@@ -334,7 +307,6 @@ describe("shadow commit scope", () => {
     const before: SerializedWorld = {
       version: 1,
       objectCounter: 1,
-      parkedTaskCounter: 1,
       sessionCounter: 2,
       objects: [
         objectRecord("alice", "Alice", "dest", []),
@@ -348,7 +320,6 @@ describe("shadow commit scope", () => {
       ],
       logs: [],
       snapshots: [],
-      parkedTasks: [],
       tombstones: []
     };
     // Bob moves from "origin" to "dest", and his session transitions to "dest".
@@ -446,7 +417,6 @@ function serializedWorld(): SerializedWorld {
   return {
     version: 1,
     objectCounter: 1,
-    parkedTaskCounter: 1,
     sessionCounter: 1,
     objects: [
       objectRecord("$thing", "$thing", null, []),
@@ -458,7 +428,6 @@ function serializedWorld(): SerializedWorld {
     sessions: [{ id: "session-1", actor: "actor", started: 1, activeScope: "room" }],
     logs: [],
     snapshots: [],
-    parkedTasks: [],
     tombstones: []
   };
 }

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorld } from "../src/core/bootstrap";
-import type { SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, ParkedTaskRecord } from "../src/core/repository";
+import type { SerializedObject, SerializedProperty, SerializedSession, SerializedWorld } from "../src/core/repository";
 import type { Message, MetricEvent, ObjRef } from "../src/core/types";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
@@ -15,8 +15,6 @@ class ProfilingSQLiteRepository extends LocalSQLiteRepository {
   propertyWrites: PropertyWrite[] = [];
   sessionWrites = 0;
   sessionDeletes = 0;
-  taskWrites = 0;
-  taskDeletes = 0;
   metaWrites = 0;
   appendLogs = 0;
   recordLogOutcomes = 0;
@@ -27,8 +25,6 @@ class ProfilingSQLiteRepository extends LocalSQLiteRepository {
     this.propertyWrites = [];
     this.sessionWrites = 0;
     this.sessionDeletes = 0;
-    this.taskWrites = 0;
-    this.taskDeletes = 0;
     this.metaWrites = 0;
     this.appendLogs = 0;
     this.recordLogOutcomes = 0;
@@ -57,16 +53,6 @@ class ProfilingSQLiteRepository extends LocalSQLiteRepository {
   deleteSession(sessionId: string): void {
     this.sessionDeletes += 1;
     super.deleteSession(sessionId);
-  }
-
-  saveTask(task: ParkedTaskRecord): void {
-    this.taskWrites += 1;
-    super.saveTask(task);
-  }
-
-  deleteTask(taskId: string): void {
-    this.taskDeletes += 1;
-    super.deleteTask(taskId);
   }
 
   saveMeta(key: string, value: string): void {
@@ -139,8 +125,6 @@ try {
     currentObjectRows +
     repo.sessionWrites +
     repo.sessionDeletes +
-    repo.taskWrites +
-    repo.taskDeletes +
     repo.metaWrites +
     repo.appendLogs +
     repo.recordLogOutcomes;
@@ -154,8 +138,6 @@ try {
         save_property: repo.propertyWrites.map((item) => `${item.id}.${item.name}`),
         save_session: repo.sessionWrites,
         delete_session: repo.sessionDeletes,
-        save_task: repo.taskWrites,
-        delete_task: repo.taskDeletes,
         save_meta: repo.metaWrites,
         append_log: repo.appendLogs,
         record_log_outcome: repo.recordLogOutcomes

@@ -20,7 +20,6 @@ materialized cache rows at a scope head:
 - `SerializedSession`
 - `SpaceLogEntry`
 - `SpaceSnapshotRecord`
-- `ParkedTaskRecord`
 - counters
 - tombstones
 - `ToolSurfaceProjectionRow`

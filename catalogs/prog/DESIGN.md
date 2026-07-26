@@ -120,8 +120,8 @@ Authority is the same hard surface as the rest of `$programmer`:
 `programmer` flag. A non-programmer who reaches the verb via inheritance gets
 `E_PERM`. Compile errors return `{ok: false, diagnostics: [...]}` because no
 body ran. Runtime errors thrown by the eval body propagate up to the outer
-direct-call transaction, which rolls back property writes, placement changes,
-and parked tasks; the chat layer then renders the error frame. Catching the
+direct-call transaction, which rolls back property writes and placement
+changes; the chat layer then renders the error frame. Catching the
 error and returning a structured map would have committed partial mutations
 (e.g. a `create(...)` followed by a `1/0` would leave the new object behind),
 so the transactional contract is preferred even though it means chat shows a

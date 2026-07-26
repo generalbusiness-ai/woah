@@ -98,8 +98,7 @@ describe("serializedFromCells (the inverse)", () => {
     const cells = cellsFromSerialized(exported);
     const rebuilt = serializedFromCells(cells, {
       objectCounter: exported.objectCounter,
-      sessionCounter: exported.sessionCounter,
-      parkedTaskCounter: exported.parkedTaskCounter
+      sessionCounter: exported.sessionCounter
     });
 
     // Projections recompute from the cells: the actor stands in its room's

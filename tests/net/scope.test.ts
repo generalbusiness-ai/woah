@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
+import { SCHEDULE_CLOCK_INPUT } from "../../src/core/scheduling";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { replayPageVersion } from "../../src/net/replay-pages";
 
@@ -696,5 +697,392 @@ describe("creates over net: the allocation counter + collision guard (client-she
     expect(reply.mismatched_reads).toEqual([{ kind: "lifecycle", object: `obj_${SCOPE}_3` }]);
     // The existing object is untouched.
     expect(seq.store.get(`object_lineage:obj_${SCOPE}_3`)?.value).toMatchObject({ parent: "#thing" });
+  });
+});
+
+// CO16.2 — schedule/cancellation effects. These are authority-bearing but are
+// NOT writes: they carry their own provenance and their own validation path,
+// and the scope checks every rule itself rather than trusting the submitter.
+// Each case below is one a compromised or buggy planner could otherwise win.
+describe("scheduled-turn effects (CO16.2)", () => {
+  const NOW = 1_700_000_000_000;
+  const LEAD = 60_000;
+
+  /** Materialize a wizard-flagged object through an ordinary accepted turn,
+   * so the `always` gate reads the same authority cells everything else does
+   * rather than a hand-installed row. */
+  function seedWizard(seq: ScopeSequencer, ref: string): void {
+    const reply = seq.submit(submitFor(seq, transcript({
+      creates: [{
+        object: ref,
+        name: ref,
+        parent: "$root",
+        owner: ref,
+        anchor: null,
+        location: null,
+        flags: { wizard: true },
+        writer: WRITER
+      }]
+    }), `seed-${ref}`));
+    expect(reply.status).toBe("accepted");
+  }
+
+  function armed(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "#thing:tick",
+      at: NOW + LEAD,
+      idlePolicy: "while_active" as const,
+      call: { actor: "#actor", target: "#thing", verb: "tick", args: [] },
+      armed_by: WRITER,
+      ...overrides
+    };
+  }
+
+  /** Materialize the schedule target in this scope. CO16.1 is same-scope
+   * only, and the scope proves that by holding the target itself rather than
+   * trusting a routing hint — so a target it has never seen is refused. */
+  const seededTargets = new WeakSet<ScopeSequencer>();
+  function seedTarget(seq: ScopeSequencer): void {
+    if (seededTargets.has(seq)) return;
+    seededTargets.add(seq);
+    const reply = seq.submit(submitFor(seq, transcript({
+      creates: [{
+        object: "#thing",
+        name: "Thing",
+        parent: "$thing",
+        owner: "#actor",
+        anchor: null,
+        location: null,
+        flags: {},
+        writer: WRITER
+      }]
+    }), "seed-thing"));
+    expect(reply.status).toBe("accepted");
+  }
+
+  function armingTurn(seq: ScopeSequencer, partial: Partial<EffectTranscript>, key: string) {
+    seedTarget(seq);
+    // Use the SHARED constant, never a literal: the producer and the validator
+    // disagreeing on this name is exactly the bug these tests missed once.
+    return submitFor(seq, transcript({ logicalInputs: [{ name: SCHEDULE_CLOCK_INPUT, value: NOW }], ...partial }), key);
+  }
+
+  it("accepts a well-formed schedule and lands it in the pending queue", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+    expect(reply.status).toBe("accepted");
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:tick"]);
+    expect(seq.peekDue(NOW + LEAD)[0].idle_policy).toBe("while_active");
+  });
+
+  it("discards arming-frame provenance rather than storing it (CO16.4)", () => {
+    // The whole point of validating `armed_by` and then dropping it: nothing
+    // about the arming frame's authority may survive into the fired turn.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+    const row = seq.peekDue(NOW + LEAD)[0];
+    expect(JSON.stringify(row)).not.toContain("progr");
+    expect(JSON.stringify(row)).not.toContain("callerPerms");
+  });
+
+  it("refuses a schedule with no arming-frame provenance", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(armingTurn(seq, { schedules: [armed({ armed_by: undefined })] }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status !== "rejected") return;
+    expect(reply.reason).toBe("schedule_unauthorized");
+    expect(reply.retryable).toBe(false);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("refuses an id outside the arming object's namespace (CO16.3)", () => {
+    // Without this rule, any verb in the scope could upsert over — or cancel —
+    // another object's timer: a same-scope DoS with no audit signal.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(armingTurn(seq, { schedules: [armed({ id: "#victim:tick" })] }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status !== "rejected") return;
+    expect(reply.reason).toBe("schedule_unauthorized");
+    expect(String(reply.detail?.schedule)).toMatch(/namespace/);
+  });
+
+  it("gates idle_policy \"always\" on the arming frame's wizard authority (CO16.6)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const denied = seq.submit(armingTurn(seq, { schedules: [armed({ idlePolicy: "always" })] }, "s1"));
+    expect(denied.status).toBe("rejected");
+    if (denied.status === "rejected") expect(String(denied.detail?.schedule)).toMatch(/always/);
+
+    // The same effect from a wizard-owned frame is exactly how a user-facing
+    // one-shot reaches `always` through a $scheduling verb.
+    const wizSeq = new ScopeSequencer(SCOPE, EPOCH);
+    seedWizard(wizSeq, "$scheduling");
+    const allowed = wizSeq.submit(armingTurn(wizSeq, {
+      schedules: [armed({ idlePolicy: "always", armed_by: { ...WRITER, progr: "$scheduling" } })]
+    }, "s2"));
+    expect(allowed.status).toBe("accepted");
+    expect(wizSeq.peekDue(NOW + LEAD)[0].idle_policy).toBe("always");
+  });
+
+  it("enforces the 60s minimum lead time against the turn's own recorded clock", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(armingTurn(seq, { schedules: [armed({ at: NOW + 5_000 })] }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/lead time/);
+  });
+
+  it("fails closed when the arming turn recorded no clock reading", () => {
+    // No recorded `now` means the lead time cannot be checked against what the
+    // planner computed against. Unvalidatable is not the same as valid.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(submitFor(seq, transcript({ schedules: [armed()] }), "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/clock reading/);
+  });
+
+  it("refuses times beyond the 365-day horizon", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const beyond = NOW + 366 * 24 * 60 * 60 * 1000;
+    const reply = seq.submit(armingTurn(seq, { schedules: [armed({ at: beyond })] }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/horizon/);
+  });
+
+  it("upserts a stable key instead of accumulating duplicates", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+    seq.submit(armingTurn(seq, { schedules: [armed({ at: NOW + LEAD + 1_000 })] }, "s2"));
+    const rows = seq.peekDue(NOW + LEAD + 5_000);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].at_logical_time).toBe(NOW + LEAD + 1_000);
+  });
+
+  it("applies cancellations atomically with the turn, and only within the caller's namespace", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+
+    const foreign = seq.submit(armingTurn(seq, {
+      cancellations: [{ id: "#thing:tick", armed_by: { ...WRITER, thisObj: "#other" } }]
+    }, "s2"));
+    expect(foreign.status).toBe("rejected");
+    expect(seq.peekDue(NOW + LEAD)).toHaveLength(1);
+
+    const own = seq.submit(armingTurn(seq, { cancellations: [{ id: "#thing:tick", armed_by: WRITER }] }, "s3"));
+    expect(own.status).toBe("accepted");
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("refuses an id that appears in both schedules and cancellations", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = seq.submit(armingTurn(seq, {
+      schedules: [armed()],
+      cancellations: [{ id: "#thing:tick", armed_by: WRITER }]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/both/);
+  });
+
+  it("arms nothing when the turn is rejected for an unrelated reason", () => {
+    // CO16.2's atomicity claim, from the other side: a schedule recorded by a
+    // turn that does not commit must not exist.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const submit = armingTurn(seq, { schedules: [armed()] }, "s1");
+    const stale = { ...submit, base: { seq: 99, hash: "nope", generation: 99 } };
+    const reply = seq.submit(stale);
+    expect(reply.status).toBe("rejected");
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("bounds the queue by per-object count and by serialized bytes (CO16.7)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    // 32 entries for one object is the cap; the 33rd is refused.
+    for (let i = 0; i < 32; i += 1) {
+      const reply = seq.submit(armingTurn(seq, { schedules: [armed({ id: `#thing:t${i}` })] }, `fill-${i}`));
+      expect(reply.status).toBe("accepted");
+    }
+    const overCount = seq.submit(armingTurn(seq, { schedules: [armed({ id: "#thing:t32" })] }, "over"));
+    expect(overCount.status).toBe("rejected");
+    if (overCount.status === "rejected") expect(String(overCount.detail?.schedule)).toMatch(/per-object cap/);
+
+    // Counts alone would not bound storage: args are author-supplied.
+    const fat = new ScopeSequencer(SCOPE, EPOCH);
+    const huge = seq.submit(armingTurn(fat, {
+      schedules: [armed({ call: { actor: "#actor", target: "#thing", verb: "tick", args: ["x".repeat(9000)] } })]
+    }, "fat"));
+    expect(huge.status).toBe("rejected");
+    if (huge.status === "rejected") expect(String(huge.detail?.schedule)).toMatch(/per-entry cap/);
+  });
+
+  it("applies and bounds the queue the same way on a durable store", () => {
+    // The in-memory sequencer keeps the queue in a Map; a durable scope keeps
+    // it in the store's own row family. Both paths must enforce and apply
+    // identically, or the caps would be a development-only fiction.
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store });
+    const ok = seq.submit(armingTurn(seq, { schedules: [armed()] }, "d1"));
+    expect(ok.status).toBe("accepted");
+    expect(store.readScheduled().map((row) => row.id)).toEqual(["#thing:tick"]);
+
+    const foreign = seq.submit(armingTurn(seq, { schedules: [armed({ id: "#victim:tick" })] }, "d2"));
+    expect(foreign.status).toBe("rejected");
+    expect(store.readScheduled()).toHaveLength(1);
+
+    const cancelled = seq.submit(armingTurn(seq, { cancellations: [{ id: "#thing:tick", armed_by: WRITER }] }, "d3"));
+    expect(cancelled.status).toBe("accepted");
+    expect(store.readScheduled()).toEqual([]);
+  });
+
+  it("defers while_active entries in an unattended scope, and never drops them (CO16.6)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    // An empty session_subscribers list is the scope saying "nobody is here".
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+
+    const idle = seq.deliverableDue(NOW + LEAD);
+    expect(idle.deliverable).toEqual([]);
+    expect(idle.parked.map((row) => row.id)).toEqual(["#thing:tick"]);
+    // Deferred, not discarded: the entry is still queued for when someone
+    // arrives. Dropping it would be the silent failure this design removes.
+    expect(seq.peekDue(NOW + LEAD)).toHaveLength(1);
+
+    // Someone attaches; the same entry becomes deliverable.
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [{ session: "s", actor: "#actor" }] as never, op: "set" as const, writer: WRITER }]
+    }), "someone-here"));
+    expect(seq.deliverableDue(NOW + LEAD).deliverable.map((row) => row.id)).toEqual(["#thing:tick"]);
+  });
+
+  it("fires always entries into an unattended scope — that is what they are for", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seedWizard(seq, "$scheduling");
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ idlePolicy: "always", armed_by: { ...WRITER, progr: "$scheduling" } })]
+    }, "s1"));
+    const due = seq.deliverableDue(NOW + LEAD);
+    expect(due.deliverable.map((row) => row.id)).toEqual(["#thing:tick"]);
+    expect(due.parked).toEqual([]);
+  });
+
+  it("fails OPEN when the scope publishes no audience", () => {
+    // An absent session_subscribers cell means "this scope does not publish an
+    // audience", not "nobody is present". Firing when nobody is watching costs
+    // one turn; never firing is the failure mode worth avoiding.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.submit(armingTurn(seq, { schedules: [armed()] }, "s1"));
+    expect(seq.deliverableDue(NOW + LEAD).deliverable).toHaveLength(1);
+  });
+
+  it("pops only the deliverable set, leaving idle-parked entries queued", () => {
+    // dueTurns is destructive. Popping everything due and filtering afterwards
+    // would silently discard exactly the entries the idle policy defers.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seedWizard(seq, "$scheduling");
+    seq.submit(submitFor(seq, transcript({
+      writes: [{ cell: { kind: "prop" as const, object: SCOPE, name: "session_subscribers" }, value: [] as never, op: "set" as const, writer: WRITER }]
+    }), "empty-room"));
+    seq.submit(armingTurn(seq, { schedules: [armed({ id: "#thing:idle" })] }, "s1"));
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ id: "#thing:always", idlePolicy: "always", armed_by: { ...WRITER, progr: "$scheduling" } })]
+    }, "s2"));
+
+    const { deliverable } = seq.deliverableDue(NOW + LEAD);
+    const popped = seq.dueTurns(NOW + LEAD, undefined, new Set(deliverable.map((row) => row.id)));
+    expect(popped.map((row) => row.id)).toEqual(["#thing:always"]);
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:idle"]);
+  });
+
+  it("refuses a target created in this turn but anchored outside, under production's own classifier", () => {
+    // PRODUCTION's scopeOf is `hints.get(object) ?? this.scope` — it answers
+    // "local" for everything it has no routing hint for, and create anchors
+    // are never hinted. So a check that asks it whether a foreign anchor is
+    // foreign gets "no". The previous version of this test supplied a
+    // classifier that returned the foreign scope, which production does not
+    // have, and the hole shipped behind a green test.
+    const productionLikeScopeOf = (_object: string) => SCOPE;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: productionLikeScopeOf });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#foreign",
+        name: "Foreign",
+        parent: "$thing",
+        owner: "#actor",
+        // An anchor this scope has never seen and does not hold.
+        anchor: "#elsewhere",
+        location: null,
+        flags: {},
+        writer: WRITER
+      }],
+      schedules: [armed({
+        id: "#thing:foreign",
+        call: { actor: "#actor", target: "#foreign", verb: "tick", args: [] }
+      })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/anchored outside/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("allows an unanchored create — it lands wherever it commits", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#fresh", name: "Fresh", parent: "$thing", owner: "#actor",
+        anchor: null, location: null, flags: {}, writer: WRITER
+      }],
+      schedules: [armed({ id: "#thing:fresh", call: { actor: "#actor", target: "#fresh", verb: "tick", args: [] } })]
+    }, "s1"));
+    expect(reply.status).toBe("accepted");
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:fresh"]);
+  });
+
+  it("allows a create anchored to an object this scope actually holds", () => {
+    // #thing is materialized here by the harness, so anchoring to it is local
+    // by authoritative evidence rather than by a classifier's default.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#child", name: "Child", parent: "$thing", owner: "#actor",
+        anchor: "#thing", location: null, flags: {}, writer: WRITER
+      }],
+      schedules: [armed({ id: "#thing:child", call: { actor: "#actor", target: "#child", verb: "tick", args: [] } })]
+    }, "s1"));
+    expect(reply.status).toBe("accepted");
+  });
+
+  it("follows a same-turn anchor chain, and terminates on a cycle", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
+    // #a anchors to #b, #b is unanchored: the chain resolves here.
+    const chained = seq.submit(armingTurn(seq, {
+      creates: [
+        { object: "#a", name: "A", parent: "$thing", owner: "#actor", anchor: "#b", location: null, flags: {}, writer: WRITER },
+        { object: "#b", name: "B", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {}, writer: WRITER }
+      ],
+      schedules: [armed({ id: "#thing:a", call: { actor: "#actor", target: "#a", verb: "tick", args: [] } })]
+    }, "chain"));
+    expect(chained.status).toBe("accepted");
+
+    // #x anchors to #y and #y back to #x: no local evidence anywhere, and the
+    // walk must terminate rather than spin.
+    const cyclic = seq.submit(armingTurn(seq, {
+      creates: [
+        { object: "#x", name: "X", parent: "$thing", owner: "#actor", anchor: "#y", location: null, flags: {}, writer: WRITER },
+        { object: "#y", name: "Y", parent: "$thing", owner: "#actor", anchor: "#x", location: null, flags: {}, writer: WRITER }
+      ],
+      schedules: [armed({ id: "#thing:x", call: { actor: "#actor", target: "#x", verb: "tick", args: [] } })]
+    }, "cycle"));
+    expect(cyclic.status).toBe("rejected");
+    if (cyclic.status === "rejected") expect(String(cyclic.detail?.schedule)).toMatch(/anchored outside/);
+  });
+
+  it("refuses more schedules in one turn than the per-turn cap", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));
+    const reply = seq.submit(armingTurn(seq, { schedules: many }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/per-turn cap/);
   });
 });

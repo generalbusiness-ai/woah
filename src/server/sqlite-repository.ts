@@ -4,7 +4,6 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   LogReadResult,
   ObjectRepository,
-  ParkedTaskRecord,
   SerializedObject,
   SerializedProperty,
   SerializedSession,
@@ -27,7 +26,6 @@ import {
   SQL_SCHEMA_SCRIPT,
   sqlGroupBy as groupBy,
   stringifySqlValue as stringifyValue,
-  taskFromSqlRow as taskFromRow,
   verbFlagsJson,
   verbFromSqlRow as verbFromRow
 } from "../core/sql-shape";
@@ -98,20 +96,17 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     ]) as [ObjRef, SpaceLogEntry[]][];
 
     const snapshots = (this.db.prepare("SELECT * FROM space_snapshot ORDER BY space_id, seq").all() as Row[]).map(snapshotFromRow);
-    const parkedTasks = (this.db.prepare("SELECT * FROM task ORDER BY id").all() as Row[]).map(taskFromRow);
     const tombstones = (this.db.prepare("SELECT id FROM tombstone ORDER BY id").all() as Row[]).map((row) => String(row.id));
     const meta = Object.fromEntries((this.db.prepare("SELECT key, value FROM world_meta").all() as Row[]).map((row) => [row.key, row.value]));
 
     return {
       version: 1,
       objectCounter: Number(meta.objectCounter ?? meta.taskCounter ?? 1),
-      parkedTaskCounter: Number(meta.parkedTaskCounter ?? 1),
       sessionCounter: Number(meta.sessionCounter ?? 1),
       objects,
       sessions,
       logs,
       snapshots,
-      parkedTasks,
       tombstones
     };
   }
@@ -125,7 +120,6 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       const insertMeta = this.db.prepare("INSERT INTO world_meta(key, value) VALUES (?, ?)");
       insertMeta.run("version", String(world.version));
       insertMeta.run("objectCounter", String(world.objectCounter));
-      insertMeta.run("parkedTaskCounter", String(world.parkedTaskCounter));
       insertMeta.run("sessionCounter", String(world.sessionCounter));
 
       const insertObject = this.db.prepare("INSERT INTO object(id, name, parent, owner, location, anchor, flags, created, modified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -172,11 +166,6 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       const insertSnapshot = this.db.prepare("INSERT INTO space_snapshot(space_id, seq, ts, state, hash) VALUES (?, ?, ?, ?, ?)");
       for (const snapshot of world.snapshots) {
         insertSnapshot.run(snapshot.space_id, snapshot.seq, snapshot.ts, stringifyValue(snapshot.state), snapshot.hash);
-      }
-
-      const insertTask = this.db.prepare("INSERT INTO task(id, parked_on, state, resume_at, awaiting_player, correlation_id, serialized, created, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-      for (const task of world.parkedTasks) {
-        insertTask.run(task.id, task.parked_on, task.state, task.resume_at, task.awaiting_player, task.correlation_id, stringifyValue(task.serialized), task.created, task.origin);
       }
 
       const insertTombstone = this.db.prepare("INSERT OR IGNORE INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)");
@@ -451,34 +440,6 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
   loadExpiredSessions(now: number): SerializedSession[] {
     return (this.db.prepare("SELECT * FROM session ORDER BY id").all() as Row[]).map(sessionFromRow).filter((session) => (session.expiresAt !== undefined && session.expiresAt <= now) || (session.lastDetachAt !== undefined && session.lastDetachAt !== null && session.lastDetachAt <= now));
-  }
-
-  saveTask(task: ParkedTaskRecord): void {
-    this.db
-      .prepare("INSERT OR REPLACE INTO task(id, parked_on, state, resume_at, awaiting_player, correlation_id, serialized, created, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(task.id, task.parked_on, task.state, task.resume_at, task.awaiting_player, task.correlation_id, stringifyValue(task.serialized), task.created, task.origin);
-  }
-
-  deleteTask(id: string): void {
-    this.db.prepare("DELETE FROM task WHERE id = ?").run(id);
-  }
-
-  loadTask(id: string): ParkedTaskRecord | null {
-    const row = this.db.prepare("SELECT * FROM task WHERE id = ?").get(id) as Row | undefined;
-    return row ? taskFromRow(row) : null;
-  }
-
-  loadDueTasks(now: number): ParkedTaskRecord[] {
-    return (this.db.prepare("SELECT * FROM task WHERE state = 'suspended' AND resume_at <= ? ORDER BY resume_at, created, id").all(now) as Row[]).map(taskFromRow);
-  }
-
-  loadAwaitingReadTasks(player: ObjRef): ParkedTaskRecord[] {
-    return (this.db.prepare("SELECT * FROM task WHERE state = 'awaiting_read' AND awaiting_player = ? ORDER BY created, id").all(player) as Row[]).map(taskFromRow);
-  }
-
-  earliestResumeAt(): number | null {
-    const row = this.db.prepare("SELECT MIN(resume_at) AS resume_at FROM task WHERE state = 'suspended' AND resume_at IS NOT NULL").get() as Row | undefined;
-    return row?.resume_at === null || row?.resume_at === undefined ? null : Number(row.resume_at);
   }
 
   saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void {

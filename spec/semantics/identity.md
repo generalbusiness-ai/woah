@@ -111,7 +111,7 @@ The lifecycle has three steps, in this order:
 2. If other connections remain on the same session, broadcast continues to them; the session stays *attached*.
 3. If this was the last connection: set `session.last_detach_at = now`, and ensure `expires_at` is no earlier than `now + grace`. The session enters *detached* state. No reap yet.
 
-`READ` tasks waiting for input from this player ([tasks.md §16.6](tasks.md#166-read-tasks)) continue to wait — they belong to the actor, not the connection. They are killed at session reap (§I6.3), not connection close.
+Scheduled turns armed on behalf of this actor ([scheduling.md](scheduling.md)) are unaffected — they belong to the scope and to the actor, not to the connection, and fire on schedule whether or not anyone is attached. Note the consequence for anything that reports through `tell`: see [§SC6](scheduling.md#sc6-reporting-results-and-the-silence).
 
 ### I6.2 Grace period
 

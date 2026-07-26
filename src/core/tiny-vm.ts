@@ -36,71 +36,10 @@ type VmFrame = {
   memoryUsed: number;
 };
 
-export type SerializedVmContext = {
-  space: ObjRef;
-  seq: number;
-  session?: string | null;
-  actor: ObjRef;
-  player: ObjRef;
-  caller: ObjRef;
-  callerPerms: ObjRef;
-  progr: ObjRef;
-  thisObj: ObjRef;
-  verbName: string;
-  definer: ObjRef;
-  message: Message;
-  observations?: Observation[];
-};
-
-export type SerializedVmFrame = {
-  ctx: SerializedVmContext;
-  bytecode: TinyBytecode;
-  args: WooValue[];
-  stack: WooValue[];
-  locals: WooValue[];
-  handlers: VmHandler[];
-  pc: number;
-  ticksRemaining: number;
-  startedAt: number;
-  activeWallMs?: number;
-  memoryUsed: number;
-};
-
-export type SerializedVmTask = {
-  version: 1;
-  frames: SerializedVmFrame[];
-};
-
 export type VmRunResult = {
   result: WooValue;
   observations: Observation[];
 };
-
-export class VmSuspendSignal {
-  readonly kind = "vm_suspend";
-
-  constructor(
-    readonly seconds: number,
-    readonly task: SerializedVmTask
-  ) {}
-}
-
-export class VmReadSignal {
-  readonly kind = "vm_read";
-
-  constructor(
-    readonly player: ObjRef,
-    readonly task: SerializedVmTask
-  ) {}
-}
-
-export function isVmSuspendSignal(value: unknown): value is VmSuspendSignal {
-  return value instanceof VmSuspendSignal;
-}
-
-export function isVmReadSignal(value: unknown): value is VmReadSignal {
-  return value instanceof VmReadSignal;
-}
 
 const DEFAULT_TICKS = 100_000;
 const DEFAULT_MEMORY = 4 * 1024 * 1024;
@@ -210,34 +149,16 @@ export const BUILTIN_NAMES = [
   // isa() so a feature-composed programmer (kept under $agent, with $programmer
   // attached as a feature) resolves the same as a legacy $programmer descendant.
   // Appended last to keep every existing bytecode index stable.
-  "has_surface"
+  "has_surface",
+  // APPENDED, never inserted: persisted bytecode addresses this table by
+  // INDEX, so putting these anywhere but the end silently re-points every
+  // later name in an aged world's compiled verbs. `has_surface` shipped on
+  // main first and keeps its index; these three follow it.
+  "schedule", "schedule_at", "cancel_schedule"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
   return (await runVmFrames([makeFrame(ctx, bytecode, args)])).result;
-}
-
-export function createSerializedTinyVmTask(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): SerializedVmTask {
-  return serializeVmFrames([makeFrame(ctx, bytecode, args)]);
-}
-
-export async function runSerializedTinyVmTask(world: CallContext["world"], task: SerializedVmTask, observations: Observation[] = []): Promise<VmRunResult> {
-  if (task.version !== 1) throw wooError("E_VERSION", "unsupported serialized VM task version", task.version);
-  return await runVmFrames(task.frames.map((item) => hydrateVmFrame(world, item, observations)));
-}
-
-export async function runSerializedTinyVmTaskWithInput(
-  world: CallContext["world"],
-  task: SerializedVmTask,
-  input: WooValue,
-  observations: Observation[] = []
-): Promise<VmRunResult> {
-  const resumed = structuredClone(task);
-  const top = resumed.frames[resumed.frames.length - 1];
-  if (!top) throw wooError("E_INTERNAL", "serialized VM task has no frames");
-  if (top.stack.length >= top.bytecode.max_stack) throw wooError("E_RANGE", "stack overflow");
-  top.stack.push(cloneValue(input));
-  return await runSerializedTinyVmTask(world, resumed, observations);
 }
 
 async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
@@ -740,24 +661,6 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         }
         case "YIELD":
           break;
-        case "FORK": {
-          const forkArgs = popArgs(numeric(operand, "argc"));
-          const verbName = assertString(pop());
-          const obj = assertObj(pop());
-          const seconds = numeric(pop(), "fork delay");
-          push(current.ctx.world.scheduleFork(current.ctx, seconds, obj, verbName, forkArgs));
-          break;
-        }
-        case "SUSPEND": {
-          const seconds = numeric(pop(), "suspend delay");
-          push(0);
-          throw new VmSuspendSignal(seconds, serializeVmFrames(frames));
-        }
-        case "READ": {
-          const player = assertObj(pop());
-          throw new VmReadSignal(player, serializeVmFrames(frames));
-        }
-
         case "TRY_PUSH": {
           const errorsValue = operand2 === undefined ? [] : literal(current.bytecode, operand2);
           const errors = Array.isArray(errorsValue) ? errorsValue.map((value) => assertString(value)) : [];
@@ -768,12 +671,22 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           if (!current.handlers.pop()) throw wooError("E_RANGE", "handler stack underflow");
           break;
 
+        // Tombstones. These opcodes existed, never worked (nothing resumed a
+        // parked task), and were removed with the model. A verb persisted
+        // before the removal still carries them, so name what happened
+        // instead of reporting a generic unknown-opcode fault.
+        case "FORK":
+        case "SUSPEND":
+        case "READ":
+          throw wooError(
+            "E_VERSION",
+            `${op} was removed with the parked-task model; recompile this verb using schedule() (spec/semantics/scheduling.md)`,
+            op
+          );
         default:
           throw wooError("E_INVARG", `unknown VM opcode: ${op}`);
       }
     } catch (err) {
-      if (isVmSuspendSignal(err)) throw err;
-      if (isVmReadSignal(err)) throw err;
       const error = attachVmTrace(normalizeVmError(err), frames, currentPc);
       // Control signals bypass woocode `except` and escape the VM (P1.2): a
       // sparse-planning state miss must ALWAYS reach the gateway's repair path,
@@ -967,6 +880,30 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return Math.round(numeric(builtinArgs[0], "round argument"));
       case "abs":
         return Math.abs(numeric(builtinArgs[0], "abs argument"));
+      case "schedule":
+      case "schedule_at": {
+        // schedule(target, verb, args, delay_ms|at_ms, opts?)
+        const [target, verbName, verbArgs, when, opts] = builtinArgs;
+        // Never read a clock here: recordScheduleRequest owns the turn's one
+        // scheduling clock reading, so a relative delay is resolved there.
+        const delayMs = name === "schedule" ? numeric(when, "delay_ms") : undefined;
+        const atMs = name === "schedule_at" ? numeric(when, "at_ms") : undefined;
+        const options = opts === undefined || opts === null ? {} : assertMap(opts);
+        const key = options.key === undefined || options.key === null ? undefined : assertString(options.key);
+        const idlePolicy = options.idle_policy === undefined || options.idle_policy === null
+          ? undefined
+          : (assertString(options.idle_policy) as "while_active" | "always");
+        return frame.ctx.world.recordScheduleRequest(
+          frame.ctx,
+          assertObj(target),
+          assertString(verbName),
+          Array.isArray(verbArgs) ? (verbArgs as WooValue[]) : [],
+          { ...(delayMs !== undefined ? { delayMs } : {}), ...(atMs !== undefined ? { atMs } : {}) },
+          { ...(key !== undefined ? { key } : {}), ...(idlePolicy !== undefined ? { idlePolicy } : {}) }
+        );
+      }
+      case "cancel_schedule":
+        return frame.ctx.world.recordScheduleCancellation(frame.ctx, assertString(builtinArgs[0]));
       case "now":
         return frame.ctx.world.logicalNow("now");
       case "create": {
@@ -1479,78 +1416,6 @@ function validateRuntimeBytecode(bytecode: TinyBytecode): void {
   if (!Number.isInteger(bytecode.max_stack) || bytecode.max_stack < 0 || bytecode.max_stack > MAX_RUNTIME_STACK) {
     throw wooError("E_COMPILE", `bytecode max_stack exceeds limit ${MAX_RUNTIME_STACK}`);
   }
-}
-
-function serializeVmFrames(frames: VmFrame[]): SerializedVmTask {
-  return {
-    version: 1,
-    frames: frames.map(serializeVmFrame)
-  };
-}
-
-function serializeVmFrame(frame: VmFrame): SerializedVmFrame {
-  return {
-    ctx: {
-        space: frame.ctx.space,
-        seq: frame.ctx.seq,
-        session: frame.ctx.session,
-      actor: frame.ctx.actor,
-      player: frame.ctx.player,
-      caller: frame.ctx.caller,
-      callerPerms: frame.ctx.callerPerms,
-      progr: frame.ctx.progr,
-      thisObj: frame.ctx.thisObj,
-      verbName: frame.ctx.verbName,
-      definer: frame.ctx.definer,
-      message: cloneValue(frame.ctx.message as unknown as WooValue) as unknown as Message,
-      observations: cloneValue(frame.ctx.observations as unknown as WooValue) as unknown as Observation[]
-    },
-    bytecode: cloneValue(frame.bytecode as unknown as WooValue) as unknown as TinyBytecode,
-    args: cloneValue(frame.args as WooValue) as WooValue[],
-    stack: cloneValue(frame.stack as WooValue) as WooValue[],
-    locals: cloneValue(frame.locals as WooValue) as WooValue[],
-    handlers: cloneValue(frame.handlers as unknown as WooValue) as unknown as VmHandler[],
-    pc: frame.pc,
-    ticksRemaining: frame.ticksRemaining,
-    startedAt: frame.startedAt,
-    activeWallMs: frame.activeWallMs + Math.max(0, Date.now() - frame.startedAt),
-    memoryUsed: frame.memoryUsed
-  };
-}
-
-function hydrateVmFrame(world: CallContext["world"], frame: SerializedVmFrame, observations: Observation[]): VmFrame {
-  const ctx: CallContext = {
-      world,
-      space: frame.ctx.space,
-      seq: frame.ctx.seq,
-      session: frame.ctx.session ?? null,
-    actor: frame.ctx.actor,
-    player: frame.ctx.player,
-    caller: frame.ctx.caller,
-    callerPerms: frame.ctx.callerPerms ?? frame.ctx.progr,
-    progr: frame.ctx.progr,
-    thisObj: frame.ctx.thisObj,
-    verbName: frame.ctx.verbName,
-    definer: frame.ctx.definer,
-    message: cloneValue(frame.ctx.message as unknown as WooValue) as unknown as Message,
-    observations,
-    observe: (event) => {
-      observations.push({ ...event, source: event.source ?? frame.ctx.space });
-    }
-  };
-  return {
-    ctx,
-    bytecode: cloneValue(frame.bytecode as unknown as WooValue) as unknown as TinyBytecode,
-    args: cloneValue(frame.args as WooValue) as WooValue[],
-    stack: cloneValue(frame.stack as WooValue) as WooValue[],
-    locals: cloneValue(frame.locals as WooValue) as WooValue[],
-    handlers: cloneValue(frame.handlers as unknown as WooValue) as unknown as VmHandler[],
-    pc: frame.pc,
-    ticksRemaining: frame.ticksRemaining,
-    startedAt: Date.now(),
-    activeWallMs: frame.activeWallMs ?? 0,
-    memoryUsed: frame.memoryUsed
-  };
 }
 
 function tickWeight(op: string): number {
