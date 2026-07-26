@@ -2068,7 +2068,7 @@ export class ScopeSequencer {
       // scope, and merely appearing in this transcript proves nothing. The
       // earlier check accepted any created id and armed foreign targets.
       const createdHere = (submit.transcript.creates ?? []).find((create) => create.object === request.call.target);
-      const createLandsHere = createdHere !== undefined && this.createResolvesToThisScope(createdHere);
+      const createLandsHere = createdHere !== undefined && this.createResolvesToThisScope(createdHere, transcript);
       const targetKnownHere =
         this.store.get(cellKey("object_lineage", request.call.target)) !== undefined || createLandsHere;
       if (!targetKnownHere) {
@@ -2173,18 +2173,31 @@ export class ScopeSequencer {
    * which may be another scope entirely. Unknown anchors fail CLOSED: this is
    * the check that keeps a foreign object out of the local queue.
    */
-  private createResolvesToThisScope(create: NonNullable<EffectTranscript["creates"]>[number]): boolean {
+  private createResolvesToThisScope(
+    create: NonNullable<EffectTranscript["creates"]>[number],
+    transcript: EffectTranscript,
+    seen: ReadonlySet<string> = new Set()
+  ): boolean {
     const anchor = create.anchor;
+    // Unanchored creates are self-hosted: they land wherever they are
+    // committed, which is here.
     if (anchor === null || anchor === undefined) return true;
-    if (this.options.scopeOf) {
-      try {
-        return this.options.scopeOf(anchor) === this.scope;
-      } catch {
-        return false;
-      }
-    }
-    // With no classifier the only honest local evidence is holding the anchor.
-    return this.store.get(cellKey("object_lineage", anchor)) !== undefined;
+
+    // Deliberately NOT `scopeOf`. That classifier answers with the
+    // committing scope for anything it holds no routing hint for, and
+    // create anchors are never added to those hints — so asking it whether
+    // a foreign anchor is foreign returns "no" in production, which is how
+    // the previous version of this check passed a test and shipped a hole.
+    // Only authoritative local evidence counts.
+    if (this.store.get(cellKey("object_lineage", anchor)) !== undefined) return true;
+
+    // An anchor created by this same turn is legitimate if THAT create
+    // itself lands here. Recursive, with a visited set so a cyclic anchor
+    // chain terminates as "not local" rather than spinning.
+    if (seen.has(anchor)) return false;
+    const anchorCreate = (transcript.creates ?? []).find((entry) => entry.object === anchor);
+    if (anchorCreate === undefined) return false;
+    return this.createResolvesToThisScope(anchorCreate, transcript, new Set([...seen, anchor]));
   }
 
   /** Attribution captured from the ARMING turn, for the durable row. */

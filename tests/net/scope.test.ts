@@ -995,20 +995,22 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:idle"]);
   });
 
-  it("refuses a target created in this turn but anchored into another scope", () => {
-    // Same-turn local creates stay schedulable, but presence in the
-    // transcript is not membership: created cells route by ANCHOR, so an
-    // object anchored under a foreign object belongs to that scope. The
-    // earlier check accepted any created id and armed foreign targets.
-    const seq = new ScopeSequencer(SCOPE, EPOCH, {
-      scopeOf: (object: string) => (object === "#elsewhere" ? "other_room" : SCOPE)
-    });
+  it("refuses a target created in this turn but anchored outside, under production's own classifier", () => {
+    // PRODUCTION's scopeOf is `hints.get(object) ?? this.scope` — it answers
+    // "local" for everything it has no routing hint for, and create anchors
+    // are never hinted. So a check that asks it whether a foreign anchor is
+    // foreign gets "no". The previous version of this test supplied a
+    // classifier that returned the foreign scope, which production does not
+    // have, and the hole shipped behind a green test.
+    const productionLikeScopeOf = (_object: string) => SCOPE;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: productionLikeScopeOf });
     const reply = seq.submit(armingTurn(seq, {
       creates: [{
         object: "#foreign",
         name: "Foreign",
         parent: "$thing",
         owner: "#actor",
+        // An anchor this scope has never seen and does not hold.
         anchor: "#elsewhere",
         location: null,
         flags: {},
@@ -1024,26 +1026,56 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(seq.peekDue(NOW + LEAD)).toEqual([]);
   });
 
-  it("allows a target created in this turn that lands here", () => {
-    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+  it("allows an unanchored create — it lands wherever it commits", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
     const reply = seq.submit(armingTurn(seq, {
       creates: [{
-        object: "#fresh",
-        name: "Fresh",
-        parent: "$thing",
-        owner: "#actor",
-        anchor: null,
-        location: null,
-        flags: {},
-        writer: WRITER
+        object: "#fresh", name: "Fresh", parent: "$thing", owner: "#actor",
+        anchor: null, location: null, flags: {}, writer: WRITER
       }],
-      schedules: [armed({
-        id: "#thing:fresh",
-        call: { actor: "#actor", target: "#fresh", verb: "tick", args: [] }
-      })]
+      schedules: [armed({ id: "#thing:fresh", call: { actor: "#actor", target: "#fresh", verb: "tick", args: [] } })]
     }, "s1"));
     expect(reply.status).toBe("accepted");
     expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:fresh"]);
+  });
+
+  it("allows a create anchored to an object this scope actually holds", () => {
+    // #thing is materialized here by the harness, so anchoring to it is local
+    // by authoritative evidence rather than by a classifier's default.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#child", name: "Child", parent: "$thing", owner: "#actor",
+        anchor: "#thing", location: null, flags: {}, writer: WRITER
+      }],
+      schedules: [armed({ id: "#thing:child", call: { actor: "#actor", target: "#child", verb: "tick", args: [] } })]
+    }, "s1"));
+    expect(reply.status).toBe("accepted");
+  });
+
+  it("follows a same-turn anchor chain, and terminates on a cycle", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: (_object: string) => SCOPE });
+    // #a anchors to #b, #b is unanchored: the chain resolves here.
+    const chained = seq.submit(armingTurn(seq, {
+      creates: [
+        { object: "#a", name: "A", parent: "$thing", owner: "#actor", anchor: "#b", location: null, flags: {}, writer: WRITER },
+        { object: "#b", name: "B", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {}, writer: WRITER }
+      ],
+      schedules: [armed({ id: "#thing:a", call: { actor: "#actor", target: "#a", verb: "tick", args: [] } })]
+    }, "chain"));
+    expect(chained.status).toBe("accepted");
+
+    // #x anchors to #y and #y back to #x: no local evidence anywhere, and the
+    // walk must terminate rather than spin.
+    const cyclic = seq.submit(armingTurn(seq, {
+      creates: [
+        { object: "#x", name: "X", parent: "$thing", owner: "#actor", anchor: "#y", location: null, flags: {}, writer: WRITER },
+        { object: "#y", name: "Y", parent: "$thing", owner: "#actor", anchor: "#x", location: null, flags: {}, writer: WRITER }
+      ],
+      schedules: [armed({ id: "#thing:x", call: { actor: "#actor", target: "#x", verb: "tick", args: [] } })]
+    }, "cycle"));
+    expect(cyclic.status).toBe("rejected");
+    if (cyclic.status === "rejected") expect(String(cyclic.detail?.schedule)).toMatch(/anchored outside/);
   });
 
   it("refuses more schedules in one turn than the per-turn cap", () => {

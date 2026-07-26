@@ -3374,10 +3374,16 @@ export class NetScopeDO {
           // trace that a deadline did not fire.
           flushedFailures = this.flushStagedScheduledFailures();
         });
-        // Announce only what actually committed.
+        // Announce only what actually committed, then deliver it HERE. The
+        // live queue is drained at the top of an alarm, and this runs in the
+        // deferred drain after that — so leaving it queued means waiting for
+        // the next wake, which a quiet scope may never have and an evicted
+        // one certainly will not. armLiveAlarm stays as the safety net for
+        // announces made outside this path.
         for (const entry of flushedFailures) {
           this.announceScheduledFailure(entry.turn, entry.outcome, entry.detail, entry.firedAt);
         }
+        if (flushedFailures.length > 0) await this.drainPendingLive();
         sqlMs += Date.now() - sqlStarted;
         // Phase 0/CO10 observability for the Phase-3 invariant: rows a
         // pass considered must stay bounded as the backlog grows (the

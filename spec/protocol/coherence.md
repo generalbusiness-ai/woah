@@ -1325,9 +1325,16 @@ Validation at commit:
   or this same turn creates it *and that create lands here*. Created cells
   route by the create's anchor, so an object anchored under something in
   another scope belongs to that scope; accepting any created id would arm
-  foreign targets. Delegating this to a routing classifier does not work —
-  a Scope DO answers "this scope" for every target it has no hint for, and
-  routing hints never carry schedule targets. Cross-scope scheduling is not
+  foreign targets.
+
+  This MUST be decided from authoritative local evidence — a lineage cell
+  the scope holds, or an anchor chain within the same transcript that
+  terminates in one (or in an unanchored, therefore self-hosted, create).
+  A routing classifier cannot answer it: a Scope DO reports "this scope"
+  for every object it holds no hint for, and routing hints never carry
+  schedule targets or create anchors, so asking one whether a foreign
+  anchor is foreign returns "no". An anchor with no local evidence fails
+  closed. Cross-scope scheduling is not
   a primitive (CO16.4); waking another scope is an ordinary committed turn
   submitted by the fired verb.
 - `at_logical_time` MUST be at least the minimum lead time (CO16.6) beyond

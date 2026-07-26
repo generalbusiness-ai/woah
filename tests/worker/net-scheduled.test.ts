@@ -353,9 +353,17 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-seen", Date.now() + 30) });
 
     await sleep(60);
-    await scopeDO.alarm();
-    await scope.settle();
-    // The live queue drains on a fresh alarm; the announce must have armed it.
+    // Drive the DO the way the platform does: fire an alarm only while one is
+    // actually ARMED. Firing a second alarm unconditionally — which the first
+    // version of this test did — passes even with armLiveAlarm() deleted,
+    // because the live queue drains on any alarm from any source. Under the
+    // bug no alarm is pending after the announce, this loop stops, and the
+    // observation is never delivered.
+    // ONE alarm. A failure discovered during this alarm must be delivered in
+    // this alarm — not left for a later wake that a quiet or evicted scope may
+    // never have. Firing a second alarm here (as the first version of this
+    // test did) passes even with the delivery removed, because the live queue
+    // drains at the top of any alarm from any source.
     await scopeDO.alarm();
     await scope.settle();
 
@@ -481,15 +489,17 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(scheduledRows(scope.state).map((row) => row.id)).toEqual(["sched-parked"]);
 
     scope.alarms.length = 0;
-    const before = Date.now();
     const accepted = await acceptedSubmit(scopeDO, env, scope);
     expect(accepted).toBe(true);
 
     // The acceptance must arm for NOW, not for the next FUTURE row — the
     // parked entry is overdue, which is the whole point.
+    // The discriminating fact, and not a wall-clock window: with only an
+    // OVERDUE row queued, the future-selection path returns null and clears
+    // the alarm outright, so a numeric alarm at-or-before now can only come
+    // from the dueNow branch. A ±ms tolerance would be flaky; this is exact.
     const armed = scope.alarms.filter((at): at is number => typeof at === "number");
-    expect(armed.length).toBeGreaterThan(0);
-    expect(armed.some((at) => at <= before + 5)).toBe(true);
+    expect(armed.some((at) => at <= Date.now())).toBe(true);
   });
 
   it("a later planner subscription arms an immediate wake for parked overdue turns", async () => {
