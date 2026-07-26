@@ -123,6 +123,13 @@ three places. Entering and editing now work; **leaving does not**.
    `authority.prefetch: [{ ref: "the_verb_editor" }, { arg: 0 }]`. Because the
    editor is named in the verb body rather than passed in, no derived prefetch
    root could reach it; the literal form was added for exactly this shape.
+   **Aged worlds:** the gateway resolves the prefetch from the PERSISTED verb
+   page, and deployment alone never updates durable definitions
+   (spec/operations/net-cutover.md) — an already-installed world keeps failing
+   until the operator runs the signed definition repair:
+   `npm run repair:net-definitions -- <worker-base-url> '$programmer:edit_verb'`.
+   `tests/worker/net-verb-editor-aged.test.ts` proves the aged failure, the
+   repair, its idempotence, and the repaired entry/leave loop.
 2. *Fixed.* Entering moved the actor's body but not its session: for a
    space-like destination `updatePresence` sets `activeScope` as a side effect,
    so the CA8 `session_scope` event was recorded as a no-op, and over Net only
