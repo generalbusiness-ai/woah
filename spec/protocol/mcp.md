@@ -126,10 +126,17 @@ Names are deterministic within a listing. The base form is
 `<sanitized-object>__<sanitized-verb>`; a numeric suffix resolves collisions.
 Tools are sorted by canonical object then verb before collision assignment,
 except that **the session actor's own object sorts ahead of the alphabetical
-remainder**. The actor's own verbs are how it acts at all, so they must never
-fall past the page cap behind the objects that happen to share its space: a
-client that reads only the first page still receives the complete set of tools
-on the actor itself. This ordering is the only privileged position in the
+remainder**. The actor's own verbs are how it acts at all, so they must never be
+displaced past the page cap by objects that merely happen to share its space:
+the actor's tools occupy the first dynamic slots of the first page, after the
+stable controls.
+
+This is a guarantee of **precedence, not completeness**. Nothing bounds how many
+verbs a class chain and its features can contribute, so a suit larger than one
+page still spans pages; what the ordering guarantees is that the overflow is the
+actor's own tail rather than an arbitrary subset displaced by unrelated objects.
+A client that pages only once therefore sees the actor's tools first and, while
+the suit fits, all of them. This ordering is the only privileged position in the
 listing; it changes rank, not membership or authority.
 The description contains the first source comment paragraph and canonical call
 form. `inputSchema` is derived from `arg_spec.args`/`params` and optional type

@@ -100,7 +100,7 @@
             "look asks the target to describe itself with look_self; room output is composed by the room."
           ],
           "self": [
-            "You are an object in the world, and you act as that object. Tools named <you>__<verb> are verbs on your own body: take, drop, wait, home, and whatever else you carry.",
+            "You are an object in the world, and you act as that object. Tools named <you>__<verb> are verbs on your own body — typically help, home, and inventory, plus whatever else your classes and features give you. List your tools to see the actual set; only verbs written in woocode are published, so some in-world verbs on you have no tool.",
             "Those verbs are not part of the protocol. They come from the classes you inherit from and from features attached to you — a feature is a surface you carry rather than inherit, and it counts the same — so two actors standing in the same room can hold different tools. Your set changes when your class or your features change, and the server then sends notifications/tools/list_changed.",
             "Everything else you can reach is named the same way: <object>__<verb> is a verb on that object. See also: tools, building. (For the self <text> speech verb, see: speech.)"
           ],
@@ -112,16 +112,16 @@
             "When the set changes the server sends notifications/tools/list_changed. List tools again before your next decision. See also: self, focus, wait."
           ],
           "focus": [
-            "focus is an in-world working set, not an MCP control plane. <you>__focus(target) adds a visible object to it, <you>__unfocus(target) removes it, and <you>__focus_list() shows it.",
-            "It does not change which tools you can reach. Your reachable set stays your own object, the space you are in, what is visible there, and what you carry. To use another object's verbs, move to it or take it, then list tools again. There is no woo_focus, woo_unfocus, or focus_list tool. See also: tools."
+            "There is no focus protocol on the tool surface: no woo_focus, no woo_unfocus, no focus_list, and no focus tool on yourself either. Those verbs exist in the world, but only as native verbs, and native verbs are never published as tools.",
+            "Nothing would change if they were. Your reachable set is your own object, the space you are in, what is visible there, and what you carry — a working set does not widen it. To use another object's verbs, move to it or take it, then list tools again. See also: tools."
           ],
           "wait": [
             "woo_wait(timeout_ms, limit) drains observations queued for your session. It returns at once if events are already waiting, otherwise it holds until timeout_ms elapses or limit events arrive.",
-            "This is how you hear what other actors do — speech, arrivals and departures, taken and dropped, and anything else that happens between your own calls. The same drain is also reachable as the verb tool <you>__wait(timeout_ms, limit). See also: tools."
+            "This is how you hear what other actors do — speech, arrivals and departures, taken and dropped, and anything else that happens between your own calls. woo_wait is the only way to do it: the in-world wait verb is native, and native verbs are not published as tools. See also: tools."
           ],
           "building": [
-            "Authoring has two independent gates. A surface supplies the tools: $builder adds create, chparent, recycle, set_property, inspect, and search; $programmer adds install_verb, list_verb, set_verb_info, edit_verb, eval, and trace. You hold a surface either by inheriting it through your class chain or by carrying it as an attached feature — both count. The programmer flag supplies the authority — without it those tools are still listed but every one of them raises E_PERM.",
-            "You cannot grant yourself either gate. A human account provisions an agent with create_agent(name, purpose, programmer), and grants or withdraws the flag with promote_agent_to_programmer(actor_id) and demote_agent_from_programmer(actor_id), within its quota.",
+            "Authoring has two independent gates. A surface supplies the tools: $builder adds create, chparent, recycle, set_property, inspect, and search; $programmer adds install_verb, list_verb, set_verb_info, edit_verb, and eval. You hold a surface either by inheriting it through your class chain or by carrying it as an attached feature — both count. The programmer flag supplies the authority — without it those tools are still listed but every one of them raises E_PERM.",
+            "You cannot grant yourself either gate, and you cannot reach for a tool to ask: the verbs that provision an agent and set the flag — create_agent, promote_agent_to_programmer, demote_agent_from_programmer — belong to the human who owns your account, and they are native, so they are not published as tools to anyone. Ask the account owner.",
             "install_verb(id, descriptor, source) writes a verb in one call and returns diagnostics; pass opts.dry_run to check without writing. edit_verb(id, descriptor) moves you into a verb editor space whose commands are view, insert, delete, replace, dry_run, save, pause, and abort — look around once you are there. See also: self."
           ]
         }

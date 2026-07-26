@@ -27,6 +27,9 @@ import { signInternalRequest } from "../../src/worker/internal-auth";
 
 const SECRET = "net-mcp-agent-surface-secret";
 const STRANDED_ACTOR = "zz_stranded_agent";
+// Mirrors MCP_STANDARD_TOOL_PAGE and MCP_TOOL_DEFS.length in gateway-do.ts.
+const MCP_PAGE = 128;
+const MCP_STATIC_TOOLS = 3;
 
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
@@ -148,8 +151,8 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     expect(ownTools.length, `page 1 held no ${STRANDED_ACTOR}__* tools: ${firstPageNames.join(", ")}`)
       .toBeGreaterThan(0);
 
-    // The whole suit, not an alphabetical prefix of it: page 1 must carry every
-    // own-tool the full (paged-through) listing advertises.
+    // Page through the rest so the ordering claim can be checked against the
+    // complete listing.
     const allNames: string[] = [...firstPageNames];
     let cursor: string | undefined = firstPage.body?.result?.nextCursor;
     // The premise of the whole assertion: this world really does page. If the
@@ -165,18 +168,30 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
       allNames.push(...(page.body?.result?.tools?.map((tool: { name: string }) => tool.name) ?? []));
       cursor = page.body?.result?.nextCursor;
     }
-    const allOwnTools = allNames.filter((name) => name.startsWith(`${STRANDED_ACTOR}__`));
-    expect(new Set(ownTools)).toEqual(new Set(allOwnTools));
-
     // Guard the premise: an object sorting BEFORE the actor is present, so the
     // test would actually have failed under plain alphabetical ordering.
     expect(allNames.some((name) => name.startsWith("the_"))).toBe(true);
 
-    // The actor's own tools lead the dynamic block — the static woo_* controls
-    // come first, then the suit, then everything else.
-    const firstDynamic = firstPageNames.findIndex((name) => !name.startsWith("woo_"));
-    expect(firstDynamic).toBeGreaterThanOrEqual(0);
-    expect(firstPageNames[firstDynamic].startsWith(`${STRANDED_ACTOR}__`)).toBe(true);
+    // PRECEDENCE is the actual guarantee (spec M2.2): the actor's tools are a
+    // contiguous block at the head of the dynamic listing, directly after the
+    // stable woo_* controls. Completeness on page 1 is a *consequence* that
+    // holds only while the suit fits — nothing bounds how many verbs a class
+    // chain plus features can contribute, so asserting "page 1 always holds the
+    // whole suit" would be asserting something the design cannot deliver.
+    const isOwn = (name: string) => name.startsWith(`${STRANDED_ACTOR}__`);
+    const dynamic = allNames.filter((name) => !name.startsWith("woo_"));
+    const allOwnTools = dynamic.filter(isOwn);
+    expect(allOwnTools.length).toBeGreaterThan(0);
+    expect(
+      dynamic.slice(0, allOwnTools.length),
+      "the actor's tools are not the contiguous head of the dynamic listing"
+    ).toEqual(allOwnTools);
+
+    // ...and in this world the suit does fit, so page 1 carries all of it. If a
+    // future demo actor outgrows one page this assertion is the one to relax —
+    // the precedence check above is the contract.
+    expect(allOwnTools.length).toBeLessThan(MCP_PAGE - MCP_STATIC_TOOLS);
+    expect(new Set(ownTools)).toEqual(new Set(allOwnTools));
 
     // --- L1.3: help topics name only tools that exist --------------------
     const liveToolNames = new Set(allNames);
@@ -194,10 +209,20 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
       return JSON.stringify(result.body);
     };
 
-    // Every woo_*-shaped token any topic mentions must be a real static tool.
-    // This is the assertion that would have caught woo_focus/woo_unfocus.
-    // A topic is allowed to name an absent tool only to deny it exists, so
-    // sentences opening "There is no ..." are dropped before scanning.
+    // No topic may name a tool that is not on the live surface. Two kinds of
+    // claim, and BOTH must be checked — an earlier version of this test scanned
+    // only the woo_* kind and therefore shipped four false <you>__* claims:
+    //
+    //   woo_*        the static protocol controls;
+    //   <you>__verb  a verb tool on the session actor. Note that being a verb
+    //                on the actor is NOT enough to be a tool: only bytecode
+    //                pages are advertised, so every native verb (focus,
+    //                unfocus, focus_list, wait) has no tool at all.
+    //
+    // `<object>__<verb>` is naming guidance rather than a claim — its verb half
+    // is a placeholder, so the pattern below does not match it. A topic is
+    // allowed to name an absent tool only to deny it exists, so sentences
+    // containing "There is no" are dropped before scanning.
     const scanned = ["focus", "wait", "tools", "self", "suit", "me", "building", "index", "commands"];
     for (const topic of scanned) {
       const rendered = await helpTopic(topic);
@@ -207,6 +232,13 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
         .join(" ");
       for (const name of claims.match(/\bwoo_[a-z_]+/g) ?? []) {
         expect(liveToolNames.has(name), `help "${topic}" names absent tool ${name}`).toBe(true);
+      }
+      for (const match of claims.matchAll(/<(?:you|object)>__([a-z][a-z0-9_]*)/g)) {
+        const claimed = `${STRANDED_ACTOR}__${match[1]}`;
+        expect(
+          liveToolNames.has(claimed),
+          `help "${topic}" claims a verb tool <you>__${match[1]} that the surface does not publish`
+        ).toBe(true);
       }
     }
 
@@ -239,7 +271,7 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
 
     // The specific v0.1.1 defects, stated positively.
     const focus = await helpTopic("focus");
-    expect(focus).toContain("There is no woo_focus");
+    expect(focus).toContain("no woo_focus");
     expect(focus).not.toContain("Use woo_focus(");
     const wait = await helpTopic("wait");
     expect(wait).toContain("woo_wait(timeout_ms, limit)");
@@ -248,6 +280,11 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
       expect(await helpTopic(topic)).toContain("<object>__<verb>");
     }
 
+    // Drain deferred work before closing the fake storage. Without this the
+    // test still passes, but queued fanout/outbox tasks resume against closed
+    // databases — logging "database is not open" and net_deferred_task_error,
+    // and leaking async work into whatever runs next in this worker.
+    await settleAll();
     for (const st of states) st.close();
   });
 });

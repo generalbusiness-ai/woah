@@ -150,14 +150,26 @@ seeds `$help` with:
   `woo_unfocus(<object>)`, and `focus_list`. **None of these exist on the MCP
   surface.** `docs/agents/tools-and-actions.md:93` states Net deliberately
   publishes no focus wrappers. (`$actor:focus/unfocus/focus_list` do exist as
-  native verbs — `bootstrap.ts:1367–1379`. **Correction, established while
-  implementing L1.3:** all three *are* `toolExposed: true`, so they appear as
-  `<actor>__focus`/`__unfocus`/`__focus_list`. The earlier claim here that they
-  are not tool-exposed was wrong. The topic is still misleading, but for a
-  sharper reason: the tools exist under different names, and calling them
-  changes nothing an agent cares about, because `mcpContextObjects`
-  (`gateway-do.ts:5101`) never consults `focus_list` when building structural
-  context. Per `spec/protocol/mcp.md` §152 focus "is not an MCP control plane".)
+  native verbs — `bootstrap.ts:1367–1379`. The original wording "not
+  tool-exposed" is imprecise but its **conclusion is correct**: no focus tool
+  reaches the surface. The three verbs do carry `toolExposed: true`, but that
+  flag is not sufficient. `mcpObjectToolDrafts` advertises only cells whose
+  `kind === "verb_bytecode"` (`gateway-do.ts:5320`), and a native verb has no
+  bytecode page, so it is never published under any name. `tests/worker/
+  net-mcp.test.ts:485` already asserted no `__focus` tool exists. Empirically the
+  demo actor's entire published suit is `examine_detailed`, `help`, `home`,
+  `inventory`, `set_description`, `ways`, `who_all` — no `focus`, no `wait`.
+  Focus would not help even if published: `mcpContextObjects`
+  (`gateway-do.ts:5101`) never consults `focus_list`, and `spec/protocol/mcp.md`
+  §152 says focus "is not an MCP control plane".
+
+  **This bit me.** A first pass at L1.3 replaced the three bogus `woo_focus`
+  claims with four equally bogus `<you>__focus/__unfocus/__focus_list/__wait`
+  claims, plus a hidden (`tool_exposed: false`) `trace` in `building` — the same
+  defect class, re-introduced while fixing it, and invisible to a test that
+  scanned only `woo_*` names. The rule to carry forward: **`tool_exposed` is
+  necessary but not sufficient; a verb reaches an agent only if it is
+  bytecode-backed AND exposed.** Coverage now checks both claim shapes — see §8.
 - topic **`wait`**: calls the tool `wait(<timeout_ms>, <limit>)`. It is
   `woo_wait`.
 - topic **`building`**: "Use the programmer MCP tools or enter the verb editor

@@ -44,10 +44,22 @@ cosmetic docs bug. Two constraints follow:
 - **Never name a tool that does not exist.** v0.1.1 told agents to call
   `woo_focus`, `woo_unfocus`, and `focus_list`, none of which are on the
   surface, and named `wait` rather than `woo_wait`.
-  `tests/worker/net-mcp-agent-surface.test.ts` now asserts every `woo_*` token
-  in these topics against the live `tools/list` names, so the topics cannot rot
-  again without failing the build. A topic may name an absent tool only to deny
-  it exists ("There is no `woo_focus`...").
+
+  A tool exists only if its verb is **bytecode-backed and `tool_exposed`**.
+  Both halves matter and each has already caused a wrong topic: every `$actor`
+  native (`focus`, `unfocus`, `focus_list`, `wait`) carries
+  `tool_exposed: true` yet is never published, because `mcpObjectToolDrafts`
+  advertises only `verb_bytecode` cells; and `$programmer:trace` is ordinary
+  woocode but `tool_exposed: false`, so it is equally unreachable.
+
+  Coverage matches the two shapes a claim can take.
+  `tests/worker/net-mcp-agent-surface.test.ts` checks both `woo_*` tokens and
+  `<you>__verb` claims against the live `tools/list` names; the
+  "help topics only name prog-catalog verbs that are tool-exposed" case in
+  `tests/catalogs.test.ts` catches verbs named in prose. A topic may name an
+  absent tool only to deny it exists, in a sentence containing
+  "There is no ..." — that phrasing is what the scanner uses to tell a denial
+  from a claim, so keep denials in one such sentence.
 - **Editing the manifest is not enough for deployed worlds.** Seed-hook
   properties are *initial* values; `reconcileSeedObject` never overwrites an
   existing own property. A topic-text change therefore needs a boot migration
