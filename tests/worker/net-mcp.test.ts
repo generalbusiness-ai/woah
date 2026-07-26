@@ -331,7 +331,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     // Actor resolution remains explicit in initialize instructions and in the
     // contextual discovery descriptors; native actor controls are not
     // advertised as dynamic Net tools because they have no portable bytecode.
-    const tools = await call(aliceSession, "woo_list_reachable_tools", { scope: "all", limit: 200 });
+    const tools = await call(aliceSession, "woo_list_reachable_tools", { limit: 200 });
     const list = tools.result?.structuredContent?.result?.tools ?? [];
     const self = list.find((tool: any) => tool?.object === alice);
     expect(self?.object, JSON.stringify(list.slice(0, 12))).toBe(alice);

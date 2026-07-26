@@ -997,11 +997,20 @@ One write path per fact (CO9), concretized:
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the
     AUTHENTICATED apikey actor — before planning. Omitted `route` defaults to
-    `sequenced`. A requested `direct` route is allowed only when the resolved
-    verb declares `direct_callable:true`; unresolved metadata fails closed with
-    `E_DIRECT_DENIED`. Either route carries the session read so the committing
-    scope's authorize revalidates end-to-end (the gateway authenticates; scopes
-    authorize). `target`
+    `sequenced`. **The planning scope then tightens the requested route:** a
+    `cluster:*` (private authority) scope is forced to `direct` — the committing
+    Scope head sequences it, since a cluster root is an actor, not a `$space`
+    replay log with `next_seq`/subscribers/presence. A `room:*` (shared) scope
+    keeps the requested route: sequenced by default via the in-world
+    `$space:call`, but an explicit `direct` request is honored. A scope that
+    classifies to neither (e.g. `catalog`) is not client-plannable and is
+    refused. Either way a requested/forced `direct` route is allowed only when
+    the resolved verb declares `direct_callable:true`; unresolved metadata fails
+    closed with `E_DIRECT_DENIED`, and `world.directCall` re-enforces it, so a
+    non-direct-callable verb in a cluster still returns `E_DIRECT_DENIED` — a
+    cluster is not a substitute sequencing space. Either route carries the
+    session read so the committing scope's authorize revalidates end-to-end (the
+    gateway authenticates; scopes authorize). `target`
     is a concrete runtime object id, not a catalog-manifest reference:
     installed-alias forms such as `tasks:the_taskboard` have already
     resolved to their concrete seed id before runtime. A concrete object

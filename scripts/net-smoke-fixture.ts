@@ -155,6 +155,24 @@ export async function buildLaneFixture() {
   const placedB = await world.directCall("lane-genesis-place-b", actorB, actorB, "moveto", ["net_lane_room"], { sessionId: sessionB.id });
   if (placedB.op !== "result") throw new Error(`fixture placement B failed: ${JSON.stringify(placedB)}`);
 
+  // A fresh, fully anchored programmer family (the P1/P2 workerd proof). A human,
+  // its $account, and one owned $agent minted UNpromoted, so the workerd lane
+  // promotes it over /net-api/turn and authors through the real MCP surface. The
+  // account anchors to the human (bindHumanToAccount) and the agent to the human
+  // authority root, so the whole family co-locates in cluster:<progHuman> — a
+  // supported family. The agent gets a self-routing n1_ key (cold-gateway home
+  // resolution); the human a legacy key (a root resolves at cluster:<self>).
+  const progStart = await world.beginSignup("prog@net-lane.dev", "password123");
+  const progHuman = world.verifySignup(progStart.verification_token).actor;
+  const progAccount = world.propOrNull(progHuman, "account") as string;
+  world.setProp(progAccount, "programmer_grant_quota", 10);
+  world.ensureApiKey("$wiz", progHuman, "prog-human-key", "prog-human-secret", "prog-human");
+  const progProv = (await world.directCall("prog-provision", progHuman, progHuman, "create_agent", ["LaneProgBot", "", false])) as { result: { actor_id: string } };
+  const progAgent = progProv.result.actor_id;
+  const progAgentKey = world.createApiKeyForOwner(progHuman, progAgent, "lane-prog-bot");
+  const progAgentToken = `apikey:${progAgentKey.id}:${progAgentKey.secret}`;
+  const progCluster = `cluster:${progHuman}`;
+
   const cluster = `cluster:${actor}`;
   const clusterB = `cluster:${actorB}`;
   const allPartitions = partitionCells(cellsFromSerialized(world.exportWorld()));
@@ -164,7 +182,7 @@ export async function buildLaneFixture() {
   allPartitions.set(CATALOG_SCOPE, [...(allPartitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
   // The lanes drive exactly these partitions; the bundled world's other
   // partitions (other rooms/guests) are not part of the scenario.
-  const partitions: Array<[string, NetCellInput[]]> = [ROOM, ANNEX, cluster, clusterB, CATALOG_SCOPE].map((scope) => {
+  const partitions: Array<[string, NetCellInput[]]> = [ROOM, ANNEX, cluster, clusterB, progCluster, CATALOG_SCOPE].map((scope) => {
     const cells = allPartitions.get(scope);
     if (!cells || cells.length === 0) throw new Error(`fixture partition ${scope} is empty`);
     return [scope, cells];
@@ -340,6 +358,10 @@ export async function buildLaneFixture() {
     partitions,
     cluster,
     clusterB,
+    progCluster,
+    progHuman,
+    progAgent,
+    progAgentToken,
     actor,
     actorB,
     turnRequest,
@@ -365,7 +387,11 @@ if (invokedAsMain && process.argv.includes("--dump")) {
         actor: fixture.actor,
         actorB: fixture.actorB,
         cluster: fixture.cluster,
-        clusterB: fixture.clusterB
+        clusterB: fixture.clusterB,
+        progCluster: fixture.progCluster,
+        progHuman: fixture.progHuman,
+        progAgent: fixture.progAgent,
+        progAgentToken: fixture.progAgentToken
       };
       // The dump is ~1MB and stdout is a non-blocking PIPE under
       // execFile: a bare write + process.exit truncates at the 64KB pipe

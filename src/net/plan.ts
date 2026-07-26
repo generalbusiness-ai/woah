@@ -248,6 +248,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         require_ordered_children_projection: true,
         require_replay_page_projection: true,
         record_authoring_cell_writes: true,
+        // Net profile: provisioning audit is the commit record, never a
+        // catalog $system.wizard_actions write (audit.md AU1).
+        suppress_provisioning_audit: true,
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
         ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
           ? { ordered_children: input.planningOrderedChildren.map((o) => ({ container: o.container, parent: o.parent, rows: o.rows })) }

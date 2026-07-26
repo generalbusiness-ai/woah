@@ -28,10 +28,20 @@ async function mintWizSession(world: ReturnType<typeof createWorld>) {
 }
 
 describe("$builder:@recycle (LambdaCore #630 port)", () => {
-  it("makes $wiz a $programmer descendant after install", () => {
+  it("gives $wiz the authoring surface as a feature, not by reparenting", () => {
     const world = createWorld();
-    expect(world.isDescendantOf("$wiz", "$programmer")).toBe(true);
-    expect(world.isDescendantOf("$wiz", "$builder")).toBe(true);
+    // The wizard identity keeps its substrate kind and composes the surface on
+    // as a feature (plan §4.4) — it is not a $programmer *descendant*.
+    expect(world.object("$wiz").parent).toBe("$player");
+    expect(world.isDescendantOf("$wiz", "$programmer")).toBe(false);
+    const features = world.getProp("$wiz", "features");
+    expect(Array.isArray(features) && features.includes("$programmer")).toBe(true);
+    // Surface membership still resolves for both the programmer and the
+    // inherited builder surface through the feature chain.
+    expect(world.actorHasSurface("$wiz", "$programmer")).toBe(true);
+    expect(world.actorHasSurface("$wiz", "$builder")).toBe(true);
+    // And the catalog published its surface reference as data.
+    expect(world.propOrNull("$system", "programmer_surface")).toBe("$programmer");
   });
 
   it("recycles a wizard-owned object resolved from inventory", async () => {

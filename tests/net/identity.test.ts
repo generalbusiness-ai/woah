@@ -78,6 +78,98 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect([...plan.partitions.keys()]).toContain(`cluster:${actor}`);
   });
 
+  it("carries an actor's composed programmer surface (features) across the cutover", async () => {
+    const { world, actor } = oldWorld();
+    // Compose the programmer surface onto the carried actor.
+    world.setObjectFlags("$wiz", actor, { programmer: true });
+    expect(world.actorHasSurface(actor, "$programmer")).toBe(true);
+
+    const identity = exportIdentity(world.exportWorld());
+    const carried = identity.actors.find((entry) => entry.id === actor);
+    expect(carried?.props.features).toEqual(["$programmer"]);
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    // The surface survives the graft: flag AND feature, not flag alone.
+    expect(plan.world.object(actor).flags.programmer).toBe(true);
+    expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
+  });
+
+  it("drops a carried feature ref that does not reinstall, keeping resolvable ones", async () => {
+    const { world, actor } = oldWorld();
+    // A custom feature (world furniture, not carried) alongside the bundled
+    // programmer surface. Attach both directly.
+    world.createObject({ id: "custom_feature", name: "Custom", parent: "$thing", owner: "$wiz" });
+    world.setObjectFlags("$wiz", actor, { programmer: true }); // composes $programmer
+    world.setProp(actor, "features", [...(world.getProp(actor, "features") as string[]), "custom_feature"]);
+    expect(world.getProp(actor, "features")).toEqual(["$programmer", "custom_feature"]);
+
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+
+    // $programmer reinstalled and resolves; custom_feature (not carried) is
+    // dropped rather than left dangling.
+    expect(plan.world.objects.has("custom_feature")).toBe(false);
+    expect(plan.world.getProp(actor, "features")).toEqual(["$programmer"]);
+    expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
+  });
+
+  it("carries the authority anchor so a co-located identity family lands in one cluster", async () => {
+    const old = createWorld();
+    const human = old.auth("guest:auth-human").actor;
+    old.createObject({ id: "acct_auth", parent: "$account", owner: "$wiz", name: "auth" });
+    old.setProp("acct_auth", "email", "auth@example.com" as never);
+    old.setProp(human, "account", "acct_auth" as never);
+    old.ensureApiKey("$wiz", human, "auth-human-key", "auth-human-secret", "human");
+    const agent = old.createObject({ id: "agent_auth", parent: "$agent", owner: human, name: "agent" }).id;
+    old.ensureApiKey("$wiz", agent, "auth-agent-key", "auth-agent-secret", "agent");
+    // Anchor the account and the owned agent to the human authority root.
+    old.object("acct_auth").anchor = human;
+    old.object(agent).anchor = human;
+
+    const identity = exportIdentity(old.exportWorld());
+    // The anchor rides the export.
+    expect(identity.actors.find((a) => a.id === "acct_auth")?.anchor).toBe(human);
+    expect(identity.actors.find((a) => a.id === agent)?.anchor).toBe(human);
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    // Human, account, and agent all partition into cluster:<human> — one
+    // authoritative scope, so a promote/demote turn touching agent + account can
+    // commit atomically without a catalog write.
+    const scopeOf = (id: string): string | undefined =>
+      [...plan.partitions.entries()].find(([, cells]) => cells.some((c) => c.object === id))?.[0];
+    expect(scopeOf(human)).toBe(`cluster:${human}`);
+    expect(scopeOf("acct_auth")).toBe(`cluster:${human}`);
+    expect(scopeOf(agent)).toBe(`cluster:${human}`);
+  });
+
+  it("the real provisioning path anchors the account and agents to the human authority root", async () => {
+    const world = createWorld();
+    const start = await world.beginSignup("family@example.com", "password123");
+    const verify = world.verifySignup(start.verification_token);
+    const human = verify.actor as string;
+    const account = world.propOrNull(human, "account") as string;
+    world.setProp(account, "programmer_grant_quota", 10);
+    // Signup anchored the account to the human — that anchor IS the family's
+    // authority root (no duplicate authority_root prop).
+    expect(world.object(account).anchor).toBe(human);
+
+    // create_agent anchors the new agent to the same root.
+    const prov = (await world.directCall("prov", human, human, "create_agent", ["FamilyBot", "", true])) as unknown as {
+      op: string; result: { actor_id: string };
+    };
+    const agent = prov.result.actor_id;
+    expect(world.object(agent).anchor).toBe(human);
+
+    // The whole family carries into cluster:<human>.
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    const scopeOf = (id: string): string | undefined =>
+      [...plan.partitions.entries()].find(([, cells]) => cells.some((c) => c.object === id))?.[0];
+    expect(scopeOf(human)).toBe(`cluster:${human}`);
+    expect(scopeOf(account)).toBe(`cluster:${human}`);
+    expect(scopeOf(agent)).toBe(`cluster:${human}`);
+  });
+
   it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
     // The reviewer's repro shape: the primary is z_human, but an agent
     // whose id sorts FIRST is also bound — a rebuild-from-first-sorted

@@ -36,7 +36,7 @@ filtering, or smaller pages:
 
 ```
 woo_list_reachable_tools(
-  scope?: "active" | "here" | "object" | "space" | "all",
+  scope?: "active" | "here" | "object" | "space",
   object?: string,
   query?: string,
   limit?: int,

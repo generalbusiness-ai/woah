@@ -2,27 +2,51 @@
 
 woah's authoring surface is split into two roles, ported directly from
 LambdaCore: **builder** (shape the object graph and data) and
-**programmer** (author executable behavior). Both are ordinary player
-classes, not special harness objects. An actor whose parent chain
-includes `$builder` sees builder tools on themselves; an actor whose
-parent chain includes `$programmer` sees programmer tools on
-themselves. There is no separate "tool object" to focus.
+**programmer** (author executable behavior). Both are persistent
+classes, not special harness objects — and they double as attachable
+*features*. An actor **carries** a surface either by descending from it
+(the classic player-class shape) or by having it attached as a feature.
+Either way, it sees the surface's tools on itself; there is no separate
+"tool object" to focus.
 
 ```
 $player
   └─ $builder       (shape: create, chparent, recycle, set_property, inspect, search)
        └─ $programmer (code: install_verb, set_verb_info, edit_verb, eval, trace, ...)
+
+agent_42 isa $agent          (kind stays put)
+agent_42.features = [$programmer]   (surface composed on)
 ```
 
-Promote an actor by reparenting:
+Promote an actor by attaching the surface — its kind never changes. The
+normal path is a provisioning verb on the owning `$human`, which attaches
+the surface, sets the `programmer` flag, and consumes quota together:
 
 ```
-woo_call("$builder", "chparent", ["<actor>", "$programmer", {}])
+$human:promote_agent_to_programmer(<agent>)
 ```
 
-(That move, like all reparents, is a builder operation gated on the
-caller; only a wizard can reparent another actor into the
-`$programmer` line.)
+or provision it programmer-ready in one step with
+`$human:create_agent(name, purpose, true)`. Do **not** reparent an actor
+into `$programmer`: that would strip the ancestry that records what kind
+of principal it is (`$agent`, `$human`). Demote with
+`$human:demote_agent_from_programmer(<agent>)`, which removes the surface,
+clears the flag, and frees the quota slot.
+
+> **Surface note.** These provisioning verbs are native account-management
+> operations, not woocode tools. Promote/demote runs in-memory, on local-SQLite,
+> and over the Net through the `/net-api/turn` doorway. A fresh signup anchors
+> the whole family (account + human + agents) into one cluster, so the account
+> counter and the agent flag commit atomically. On the live Net profile this is
+> supported only for a fully anchored family (fresh signup, cutover import, or a
+> family repaired before cutover); a family deployed BEFORE anchoring stays split
+> — a new agent alone does not repair it — and its promote/demote refuses cleanly
+> (`E_CATALOG_MUTATION`) rather than half-applying. See
+> [provisioning.md](../../spec/identity/provisioning.md) for the exact boundary
+> and the local-SQLite repair migration. Because the verbs are **native**, the
+> Net MCP gateway — which advertises only bytecode-backed, `tool_exposed` verb
+> pages — does not expose them as MCP tools, so `woo_call` cannot reach them over
+> Net; drive them through `/net-api/turn` or the account surface instead.
 
 ## Why two classes
 
@@ -33,10 +57,12 @@ install code. Programmer authority is the dangerous surface because
 installed verbs capture `progr` — the verb's owner at install time —
 and that's the authority future calls run under.
 
-Class membership controls the *visible* tool surface. The
-`programmer` and `wizard` flags remain the hard authority facts:
-without the programmer flag, `$programmer`'s source-authoring verbs
-return `E_PERM` even though they're listed as tools.
+Carrying a surface controls the *visible* tool set. The `programmer`
+and `wizard` flags remain the hard authority facts: without the
+programmer flag, `$programmer`'s source-authoring verbs return `E_PERM`
+even though they're listed as tools. Surface and flag are independent —
+a surface without the flag lists tools that refuse every mutation, and
+the flag without a surface produces no tools at all.
 
 ## Two ways to drive both surfaces
 
@@ -133,20 +159,25 @@ woocode:
 ```
 if (!has_flag(actor, "wizard")) {
   if (actor == $programmer) { raise E_PERM; }
-  if (!isa(actor, $programmer)) { raise E_PERM; }
+  if (!has_surface(actor, $programmer)) { raise E_PERM; }
   if (!has_flag(actor, "programmer")) { raise E_PERM; }
 }
+set_task_perms(actor);
 ```
 
 So you need **all** of:
 
 1. The actor is a wizard, **OR**
-2. The actor is a *descendant* of `$programmer` (not `$programmer`
-   itself), **AND**
+2. The actor *carries* the `$programmer` surface — through ancestry or
+   an attached feature, which `has_surface` checks — but is not the
+   `$programmer` class object itself, **AND**
 3. The actor has the `programmer` flag.
 
-Builder verbs check actor surface (descends from `$builder`) plus
-ownership of the affected object (or wizard).
+The `set_task_perms(actor)` line then drops the wrapper's authority from
+the `$wiz` verb owner down to the actor, so the substrate enforces the
+actor's own ownership on everything that follows. Builder verbs use the
+same shape with `has_surface(actor, $builder)` and object ownership, but
+without the `programmer`-flag requirement.
 
 ## Target resolution
 

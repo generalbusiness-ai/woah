@@ -104,6 +104,23 @@ hierarchy retained for kind (matching how `$guest` is a class even
 when "guest" could have been just a flag — the pool allocator needs
 to mint a specific kind).
 
+**Authoring surface via feature, not ancestry.** The builder/programmer
+authoring *verbs* live on the prog catalog's `$builder`/`$programmer`
+classes, but an actor gains them without leaving its kind: the surface
+class is attached as a [feature](../semantics/features.md), and the
+dispatcher resolves it through the actor's feature chain. Kind stays in
+the actor's own ancestry (`agent_42 isa $agent`), capability stays in the
+flag, and the visible surface is a third, independent axis. The single
+predicate `has_surface(actor, class)` — true when `class` is on the
+actor's parent chain (legacy `$programmer`/`$builder` descendants) or is
+reachable through an attached feature — decides surface membership for
+both the DSL wrapper guards and the substrate authoring helpers, so the
+two promotion shapes resolve identically. An actor must never be
+reparented out of its kind class to gain an authoring surface; that
+destroys the ancestry that records what kind of principal it is. This
+includes `$wiz`: it keeps `$wiz isa $player` and carries the programmer
+surface as a feature like any other actor.
+
 Capability defaults additionally follow attached features
 ([features.md](../semantics/features.md)) and team memberships
 ([teams.md](teams.md)). The `wizard` and `programmer` flags are the
@@ -351,6 +368,82 @@ expected slot without per-account wizard work.
 strip programmer from their own agents. Demoting decrements the
 `account.programmer_agent_count` counter and frees a slot for
 `promote`/`create_agent` to consume.
+
+**Surface attach/remove is part of the transition.** `create_agent`
+(with `programmer = true`), `promote_agent_to_programmer`, and
+`demote_agent_from_programmer` mutate three pieces of state together: the
+`programmer` flag on the agent, the attached authoring surface (AP4), and
+the `account.programmer_agent_count`. The surface class is read from
+`$system.programmer_surface`, a reference the prog catalog publishes as
+catalog data; core never names the surface class. When that property is
+unpublished (prog not installed), provisioning sets the flag and quota
+only and the actor simply has no authoring surface. `revoke_agent` also
+removes the surface when it clears the flag.
+
+**Audit is profile-materialized, not a separate observation.** The transition
+emits one structured provisioning audit event (caller, target agent, account,
+desired state, transition-vs-repair) through a profile adapter. The in-memory
+and local-SQLite profiles materialize it into `$system.wizard_actions`. The Net
+profile materializes NOTHING extra: the canonical Net audit is the durable
+commit record minted from the committed transcript (its verb, arguments,
+principal, and trace), so writing `$system.wizard_actions` — a catalog cell — is
+deliberately suppressed rather than committed as a forbidden catalog mutation.
+There is no separate provisioning observation on the wire.
+
+The transition is atomic — all three commit in one authoritative turn or
+none do. Because the flag/surface live on the agent and the counter lives
+on the `$account`, `promote`/`demote`/`revoke` first assert the agent and
+its account are co-resident in one authority scope; when they are not,
+the operation refuses with `E_CROSS_HOST_WRITE` rather than half-applying
+the transition across a host boundary. A cross-scope promote/demote
+protocol is deferred; until it exists the co-resident case is the
+supported one. `create_agent` provisions the agent in the calling human's
+scope, so it is co-resident by construction.
+
+> **Net status (supported via the turn doorway).** On the Net (Cloudflare)
+> profile a live promote/demote path IS supported over `/net-api/turn`. The
+> co-resident precondition is constructed: `create_agent` anchors a human-owned
+> agent to the human authority root, so the account, its human, and its owned
+> agents share one cluster, and the transition commits atomically there. The
+> programmer flag commits through the `object_lineage` lineage seam and the
+> verbs are tracked native primitives (a transcript-complete turn); the
+> committing scope's audit record IS the provisioning audit, so no `$system`
+> catalog cell is written. These verbs remain NATIVE, so the Net MCP
+> gateway — which advertises only bytecode-backed `tool_exposed` pages — does
+> not surface them as MCP tools; drive them through `/net-api/turn` (or the
+> account surface), not `tools/call`.
+>
+> **Supported scope (explicit).** Net promote/demote is supported only for a
+> FULLY ANCHORED authority family — one whose `$account` (not just its agents) is
+> anchored into the human's cluster, so the account counter and the agent flag
+> commit in the SAME scope. That holds for: a fresh signup (`bindHumanToAccount`
+> anchors the account to its human), a cutover import (the identity export
+> carries each object's `anchor`, §8), and a family the local-boot repair
+> migration co-located BEFORE export. The unit of support is the FAMILY, not the
+> agent: minting a new agent does not by itself make an unanchored-account family
+> supported (see below).
+>
+> **A new agent under a legacy account is NOT supported.** `create_agent` anchors
+> a new human-owned agent to the human authority root (`authorityRootOf` falls
+> back to the human when the account is anchorless), so the agent lands in
+> `cluster:<human>` — but if the account was provisioned BEFORE anchoring it
+> stays catalog-scoped, and the family is still split. Re-provisioning the agent
+> therefore CANNOT repair a legacy family; the account must be anchored too.
+>
+> **Not auto-repaired on Net (deliberate limitation).** A family already deployed
+> and partitioned before anchoring is NOT silently migrated on the live Net
+> profile. Re-anchoring already-partitioned cells is a recursive
+> cross-Durable-Object host migration (a spec-version scope migration,
+> [migrations.md M6](../operations/migrations.md#m6-world-level-spec-versioning)),
+> which is deferred. Until then a split family's promote/demote **refuses cleanly
+> and never half-applies**: the account's `programmer_agent_count` write lands in
+> the catalog scope, which an ordinary turn cannot mutate, so the committing
+> gateway rejects the whole turn with `E_CATALOG_MUTATION` (HTTP 400) and nothing
+> commits. The operator's remedy is to repair the WHOLE family — anchor the
+> account and its agents — and re-import through cutover; the local-boot repair
+> migration (`2026-07-25-authority-family-colocation`) does this on the source's
+> in-memory / local-SQLite (single-host) image before export. Re-provisioning the
+> agent alone does not suffice.
 
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,

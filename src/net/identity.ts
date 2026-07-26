@@ -72,6 +72,12 @@ export function materializeCustomerAttributions(world: WooWorld): string[] {
  *   accounts, so the original mapping carries (export filters it to
  *   exported actors; import verifies resolution). `actors` carries too,
  *   filtered the same way;
+ * - `features` / `features_version`: an actor's composed authoring surface
+ *   is capability, not cosmetic room state. A programmer agent
+ *   (`$agent` + attached `$programmer` feature) that lost its features at
+ *   cutover would keep the `programmer` flag but silently drop the surface —
+ *   a flag-without-surface break. The feature refs are catalog classes that
+ *   reinstall fresh, so they resolve after the graft;
  * - `api_keys`: the actor is now the credential authority. Import merges
  *   this map monotonically so an aged carry cannot overwrite a newer
  *   revocation in the destination. */
@@ -87,6 +93,8 @@ const IDENTITY_PROPS = [
   "primary_actor",
   "actors",
   "last_seen_at",
+  "features",
+  "features_version",
   "api_keys"
 ] as const;
 
@@ -98,6 +106,12 @@ export type IdentityActorExport = {
   parent: string;
   name: string;
   owner: string;
+  /** Authority anchor (an object field, not a prop): the actor that roots this
+   * object's authority scope. Carried so a co-located identity family (account
+   * + owned agents anchored to their human) reconstructs its single-cluster
+   * placement after the graft; without it they would rehome anchorless and
+   * split across catalog + per-agent clusters. Absent for an anchorless root. */
+  anchor?: string;
   /** Permission/deactivation flags verbatim (actorCanAuthenticate inputs). */
   flags: Record<string, unknown>;
   /** Present identity properties from the closed allow-list. */
@@ -243,6 +257,12 @@ export function exportIdentity(serialized: SerializedWorld): IdentityExport {
       parent: obj.parent,
       name: obj.name,
       owner: obj.owner,
+      // The authority anchor is object-lineage state, not a property, and it
+      // determines the carried object's Net scope (topology.ts scopeNameOf). An
+      // identity family co-located under a human authority root (account +
+      // owned agents anchored to the human) must keep that anchor across the
+      // carry, or it would re-diverge to catalog/self-cluster on import.
+      ...(obj.anchor ? { anchor: obj.anchor } : {}),
       flags: (obj.flags ?? {}) as Record<string, unknown>,
       props
     });
@@ -291,6 +311,10 @@ export async function importIdentity(
 ): Promise<{ actors: number; api_keys: number; unattributed: string[] }> {
   const exportedIds = new Set(identity.actors.map((actor) => actor.id));
   const dangling: string[] = [];
+  // Carried feature refs that did not resolve in the fresh install; dropped
+  // (not fatal) so cutover is never blocked by a non-reinstallable custom
+  // feature, but surfaced so an operator can see a capability was not carried.
+  const droppedFeatures: string[] = [];
 
   // §8: imported actors REHOME to the catalog-defined start location —
   // the same `$system.guest_initial_room` convention that places fresh
@@ -361,6 +385,10 @@ export async function importIdentity(
         parent: actor.parent,
         owner: actor.owner,
         flags: actor.flags as never,
+        // Anchor is set at creation and never patched (world.ts) — it must ride
+        // the create call, not a later setProp, to reconstruct the authority
+        // family's single-cluster placement. Verified below to resolve.
+        ...(actor.anchor ? { anchor: actor.anchor } : {}),
         ...(embodied && start !== null ? { location: start } : {})
       });
     } else {
@@ -373,6 +401,23 @@ export async function importIdentity(
       }
     }
     for (const [name, value] of Object.entries(actor.props)) {
+      if (name === "features" && Array.isArray(value)) {
+        // A carried feature ref must resolve in the freshly installed world.
+        // Bundled surface classes (e.g. $programmer) reinstall and resolve; a
+        // custom/live feature absent from the fresh install is dropped rather
+        // than imported as a dangling capability (it rehomes to defaults, like
+        // any uncarried world state). Catalogs are installed before this import.
+        const resolved = value.filter((ref) => typeof ref === "string" && world.objects.has(ref));
+        if (resolved.length !== value.length) {
+          for (const ref of value) {
+            if (typeof ref !== "string" || !world.objects.has(ref)) {
+              droppedFeatures.push(`${actor.id}: feature ${String(ref)} does not resolve in the fresh install`);
+            }
+          }
+        }
+        world.setProp(actor.id, name, resolved as never);
+        continue;
+      }
       if (name === "api_keys") {
         const carried =
           value && typeof value === "object" && !Array.isArray(value)
@@ -481,9 +526,18 @@ export async function importIdentity(
     if (typeof primary === "string" && primary.length > 0 && !liveChainReaches(world, primary, "$actor")) {
       dangling.push(`${actor.id}: primary_actor ${primary} is not a live $actor descendant`);
     }
+    // A carried authority anchor must resolve to a live actor — a dangling
+    // anchor would misroute the object's Net scope (topology.ts scopeNameOf
+    // throws E_LINEAGE when the anchor walk leaves the lineage set), so abort.
+    if (typeof actor.anchor === "string" && actor.anchor.length > 0 && !liveChainReaches(world, actor.anchor, "$actor")) {
+      dangling.push(`${actor.id}: authority anchor ${actor.anchor} is not a live $actor descendant`);
+    }
   }
   if (dangling.length > 0) {
     throw new Error(`identity import verification failed (${dangling.length} dangling refs):\n  ${dangling.join("\n  ")}`);
+  }
+  if (droppedFeatures.length > 0) {
+    console.warn(`identity import dropped ${droppedFeatures.length} non-reinstallable feature ref(s):\n  ${droppedFeatures.join("\n  ")}`);
   }
   return { actors: identity.actors.length, api_keys: Object.keys(identity.api_keys).length, unattributed };
 }
