@@ -41,6 +41,12 @@ export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAft
 
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
+  // Net planning profile: install a no-op provisioning-audit sink so a
+  // provisioning turn (promote/demote) does NOT write $system.wizard_actions —
+  // a forbidden catalog mutation over the Net. The canonical Net audit is the
+  // record minted from the committed transcript; only the in-memory/local
+  // profile materializes into wizard_actions (audit.md AU1).
+  suppress_provisioning_audit?: boolean;
   // CA11.2 occupancy-transition: the planning world's per-cell provenance, so the
   // movement-boundary check (world.movetoActorChecked) can tell whether a move
   // DESTINATION's lineage was admitted from an owner-authoritative row or from a
@@ -177,6 +183,7 @@ export async function runShadowTurnCallOnWorldTranscript(
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallTranscriptRun> {
   if (options.onMetric) world.setMetricsHook(options.onMetric);
+  if (options.suppress_provisioning_audit) world.setProvisioningAuditSink(() => {});
   const recorder = new InMemoryTurnRecorder();
   const guarded = options.allowed_atom_hashes != null;
   world.setTurnRecorder(guarded

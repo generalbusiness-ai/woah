@@ -899,6 +899,7 @@ const VALID_BUILTINS = new Set([
   "chparent",
   "has_flag",
   "isa",
+  "has_surface",
   "is_recycled",
   "directory_reconcile_corenames",
   "random",

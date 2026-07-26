@@ -82,7 +82,7 @@ survive gateway eviction.
 Use standard `tools/list`, or call:
 
 ```
-woo_list_reachable_tools(scope: "all", limit: 200)
+woo_list_reachable_tools(limit: 200)
 ```
 
 The result contains paged descriptors with tool name, object, verb, aliases,

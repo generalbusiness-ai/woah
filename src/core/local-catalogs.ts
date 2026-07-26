@@ -74,6 +74,7 @@ const LOCAL_CATALOG_PINBOARD_FREE_COORDS_MIGRATION = "2026-05-01-pinboard-free-c
 const LOCAL_CATALOG_DUBSPACE_SOURCE_PRESENCE_MIGRATION = "2026-05-01-dubspace-source-presence";
 const LOCAL_CATALOG_PINBOARD_SOURCE_PRESENCE_MIGRATION = "2026-05-01-pinboard-source-presence";
 const LOCAL_CATALOG_PINBOARD_PINS_MODEL_MIGRATION = "2026-05-02-pinboard-pins-model";
+const LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION = "2026-07-25-authority-family-colocation";
 const LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION = "2026-05-02-pinboard-notes-to-pins";
 const LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION = "2026-05-02-pinboard-v02-repair";
 const LOCAL_CATALOG_PINBOARD_V02_DATA_REPAIR_MIGRATION = "2026-05-02-pinboard-v02-data-repair";
@@ -108,12 +109,13 @@ const LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION = "2026-05
 // :moveto override that disperses the note when dropped into a $space.
 const LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION = "2026-05-09-note-read-command-repair";
 const LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION = "2026-05-09-dispensed-note-moveto-repair";
-// LambdaCore inheritance: $wiz isa $programmer isa $builder isa $player. woo
-// bootstrap creates $wiz with parent $player because $builder/$programmer
-// live in the prog catalog. Once prog is installed, this migration anchors
-// $wiz onto $programmer so command-shaped builder/programmer verbs
-// (e.g. $builder:@recycle) resolve via normal parent-chain verb lookup.
-const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer-parent";
+// The wizard identity carries the authoring surface through *composition*: its
+// kind stays in substrate ancestry ($wiz isa $player) and the prog catalog
+// attaches its surface class as a feature. Historical worlds instead reparented
+// $wiz onto the surface class, putting a catalog class in $wiz's ancestry — the
+// reparent-as-promotion pattern the programmer-surface model eliminates. This
+// migration walks those worlds forward; see runWizProgrammerSurfaceMigration.
+const LOCAL_CATALOG_WIZ_PROGRAMMER_SURFACE_MIGRATION = "2026-07-24-wiz-programmer-surface";
 // $task_registry now tracks every minted $task in `_tracked_tasks` so
 // `:listing` can find them after they've been claimed (and moved out of
 // `contents(this)`). Existing registries have tasks in contents but an
@@ -265,7 +267,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION, only: "demoworld" },
   { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
-  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
+  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_SURFACE_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION, only: "tasks" },
   { id: LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION, only: "tasks" },
   { id: LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION, only: "tasks" },
@@ -555,7 +557,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runDemoworldGardenConversationalFeatureMigration(world, names);
   run(LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
-  runWizProgrammerParentMigration(world, names);
+  runWizProgrammerSurfaceMigration(world, names);
   runTasksTrackedBackfillMigration(world, names);
   runTaskRegistryRoomParentMigration(world, names);
   runTasksTaskboardRenameMigration(world, names);
@@ -821,26 +823,62 @@ function runDropSessionIdPropertyMigration(world: WooWorld): void {
   markMigrationApplied(world, LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION);
 }
 
-function runWizProgrammerParentMigration(world: WooWorld, names: readonly string[]): void {
-  if (migrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION)) return;
-  // Only act when prog is in the migration scope (avoids reaching into $wiz's
-  // ancestry on hosts that haven't taken the prog catalog yet).
-  if (!names.includes("prog")) return;
-  if (!world.objects.has("$wiz") || !world.objects.has("$programmer")) {
-    markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION);
+// Walk historical worlds onto the programmer-surface shape. Early prog installs
+// reparented $wiz under the surface class so the wizard identity inherited the
+// authoring verbs; that placed a catalog class in $wiz's kind ancestry, which
+// the surface model forbids. This repair returns $wiz to its substrate kind
+// ($player — a substrate seed) and re-expresses the surface as a feature by
+// replaying the prog manifest's own set_property/attach_feature seed_hooks.
+// Reading the target shape from manifest data keeps this migration free of any
+// catalog class identifier: it never names the surface class directly. $wiz
+// resolves the authoring verbs through its own attached feature exactly as any
+// feature-composed programmer does. Idempotent: reruns and partial-failure
+// recovery are safe because every step re-checks current state before writing.
+function runWizProgrammerSurfaceMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_SURFACE_MIGRATION)) return;
+  if (!names.includes("prog") || !localCatalogInstalled(world, "prog")) {
+    markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_SURFACE_MIGRATION);
     return;
   }
-  if (world.isDescendantOf("$wiz", "$programmer")) {
-    markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION);
-    return;
+  // Return $wiz to its substrate kind. On fresh worlds $wiz is already $player
+  // (bootstrap), so this is a no-op; on historical worlds it undoes the old
+  // reparent onto the surface class. The cycle guard mirrors chparent's own.
+  if (
+    world.objects.has("$wiz") &&
+    world.objects.has("$player") &&
+    world.object("$wiz").parent !== "$player" &&
+    !world.isDescendantOf("$player", "$wiz")
+  ) {
+    world.chparentAuthoredObject("$wiz", "$wiz", "$player");
   }
-  // chparentAuthoredObject runs the same gates as a wizard would: $wiz owns
-  // $wiz, $wiz can author its own parent change, and the cycle check confirms
-  // $programmer doesn't already inherit from $wiz. The reparent is the whole
-  // migration — descendants of $wiz pick up $programmer's verbs through the
-  // ordinary inheritance chain.
-  world.chparentAuthoredObject("$wiz", "$wiz", "$programmer");
-  markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION);
+  // Replay the structural seed_hooks so $system.programmer_surface is published
+  // and the surface feature is attached to $wiz — reading both from the
+  // manifest rather than naming the class here.
+  for (const hook of LOCAL_CATALOGS.get("prog")?.seed_hooks ?? []) {
+    if (
+      hook.kind === "set_property" &&
+      typeof hook.object === "string" &&
+      typeof hook.property === "string" &&
+      world.objects.has(hook.object) &&
+      world.propOrNull(hook.object, hook.property) !== hook.value
+    ) {
+      world.setProp(hook.object as ObjRef, hook.property, hook.value as WooValue);
+    } else if (
+      hook.kind === "attach_feature" &&
+      typeof hook.consumer === "string" &&
+      typeof hook.feature === "string" &&
+      world.objects.has(hook.consumer) &&
+      world.objects.has(hook.feature)
+    ) {
+      const raw = world.propOrNull(hook.consumer, "features");
+      const features = Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+      if (!features.includes(hook.feature as ObjRef)) {
+        world.setProp(hook.consumer as ObjRef, "features", [...features, hook.feature as ObjRef]);
+        world.setProp(hook.consumer as ObjRef, "features_version", Number(world.propOrNull(hook.consumer, "features_version") ?? 0) + 1);
+      }
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_SURFACE_MIGRATION);
 }
 
 // Reparent the $task_registry CLASS from $space onto $room so registries
@@ -1988,6 +2026,18 @@ function markMigrationApplied(world: WooWorld, id: string): void {
 export function runHostScopedDataMigrations(world: WooWorld, host = "host"): void {
   if (world.objects.has("$pin") && world.objects.has("$pinboard")) {
     runPinboardNotesToPinsDataPlan(world, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION, "host", host);
+  }
+  // Co-locate legacy anchorless authority families (account + owned agents)
+  // into one cluster so a promote/demote quota transition stays single-scope.
+  // Local-boot / single-host only; Net placement comes from install/cutover.
+  // Idempotent (each object gates on a null anchor). The ledger records only an
+  // actual repair (the mark-on-work pattern): a core-only or already-anchored
+  // world walks, finds nothing, changes nothing, and stays a true no-op — so a
+  // later imported legacy family is still caught on its first boot.
+  if (world.objects.has("$account") && !migrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION)) {
+    if (world.repairAuthorityFamilyColocation() > 0) {
+      markMigrationApplied(world, LOCAL_AUTHORITY_FAMILY_COLOCATION_MIGRATION);
+    }
   }
   // $note descendants (dispensed notes, pins, tasks) often live on
   // self-hosted slices. Walk text: list<str> → str here so the host's

@@ -143,9 +143,17 @@ export const BUILTIN_NAMES = [
   // for one event type via class-then-features precedence, or null. The acts
   // kernel validates act payloads against it. Appended last; keeps indices.
   "event_schema",
+  // Surface membership predicate: has_surface(actor, class) is true when the
+  // actor carries the authoring surface `class` through its parent chain OR
+  // through an attached feature. Catalog authoring guards call this instead of
+  // isa() so a feature-composed programmer (kept under $agent, with $programmer
+  // attached as a feature) resolves the same as a legacy $programmer descendant.
+  // Appended last to keep every existing bytecode index stable.
+  "has_surface",
   // APPENDED, never inserted: persisted bytecode addresses this table by
   // INDEX, so putting these anywhere but the end silently re-points every
-  // later name in an aged world's compiled verbs.
+  // later name in an aged world's compiled verbs. `has_surface` shipped on
+  // main first and keeps its index; these three follow it.
   "schedule", "schedule_at", "cancel_schedule"
 ];
 
@@ -1052,6 +1060,13 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "event_schema": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "event_schema expects object and type");
         return frame.ctx.world.eventSchemaFor(assertObj(builtinArgs[0]), assertString(builtinArgs[1] ?? "")) as unknown as WooValue;
+      }
+      case "has_surface": {
+        // Surface membership = ancestry OR attached-feature chain. The actor is
+        // the local calling actor and the surface class is a bundled seed, so
+        // the resolution is local (matching the substrate's own surface guards).
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "has_surface expects actor and surface class");
+        return frame.ctx.world.actorHasSurface(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]));
       }
       case "is_recycled": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_recycled expects one object");

@@ -147,6 +147,7 @@ Cache hit cost is unchanged; cache invalidation is one extra integer comparison.
 | **Default behavior** | A feature providing reasonable defaults (`$verbose_describe` adds an opinionated `:describe`). |
 | **Authority delegation** | A wizard-owned feature whose verbs run with wizard authority; attaching it to a non-wizard object grants it specific elevated capabilities. Use carefully. |
 | **Trait composition** | Multiple small features attached together: `[$conversational, $gendered, $mail_recipient]`. Lookup walks them in order. |
+| **Surface composition (dual-use class)** | A persistent *class* object serves double duty: it is the ancestor for legacy descendants **and** an attachable feature that composes its verbs onto an actor of a different kind. The prog catalog's `$programmer` is attached to an `$agent` so the agent gains the authoring surface without being reparented out of `$agent` — see [provisioning.md AP4](../identity/provisioning.md#ap4-class-model-normative). Any persistent object is a legal feature (FT5); a class object is permitted here, avoiding a second copy of every wrapper verb. Because parent-chain lookup wins over features (FT2), the class's own verbs never shadow the consumer's kind behavior, and a surface verb is reachable only when the consumer's kind does not already define that name. |
 
 ---
 

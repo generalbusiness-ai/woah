@@ -269,6 +269,71 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
   },
+  human_promote_agent_to_programmer: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "human_promote_agent_to_programmer",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "human/agent lineage and ownership",
+      "human.account and account binding",
+      "account.programmer_grant_quota",
+      "account.programmer_agent_count",
+      "$system.programmer_surface",
+      "agent.features and features_version",
+      "agent ancestry (surface composability)"
+    ],
+    writes: [
+      "agent lineage (programmer flag, via the object_lineage seam)",
+      "agent.features",
+      "agent.features_version",
+      "account.programmer_agent_count"
+    ],
+    emits: ["cell_write"],
+    open_seed: {
+      object_property_names: [
+        "account",
+        "programmer_grant_quota",
+        "programmer_agent_count",
+        "features",
+        "features_version"
+      ],
+      catalog_property_names: ["programmer_surface"]
+    },
+    note: "Human self-service promote. Flips the agent's programmer flag through the object_lineage lineage seam (a recorded lineage replacement), attaches the published programmer surface as a feature, and increments the account programmer count — all recorded lineage/property writes, co-resident in the human authority cluster. The audit is the durable commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1)."
+  },
+  human_demote_agent_from_programmer: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "human_demote_agent_from_programmer",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "human/agent lineage and ownership",
+      "human.account and account binding",
+      "account.programmer_agent_count",
+      "$system.programmer_surface",
+      "agent.features and features_version"
+    ],
+    writes: [
+      "agent lineage (programmer flag, via the object_lineage seam)",
+      "agent.features",
+      "agent.features_version",
+      "account.programmer_agent_count"
+    ],
+    emits: ["cell_write"],
+    open_seed: {
+      object_property_names: [
+        "account",
+        "programmer_agent_count",
+        "features",
+        "features_version"
+      ],
+      catalog_property_names: ["programmer_surface"]
+    },
+    note: "Human self-service demote: the inverse of promote. Clears the agent's programmer flag through the lineage seam, removes the programmer surface feature, and decrements the account programmer count — all recorded, co-resident. Audit is the commit record; no catalog $system write on Net."
+  },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "catalog_registry_install",

@@ -513,10 +513,11 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     old.setProp(human, "deactivated_at", Date.now() as never);
     old.ensureApiKey("$wiz", human, "v3-human-key", "v3-human-secret", "deactivated actor");
     // An AGENT owned by a deactivated owner (the reviewer's "apikey for a
-    // deactivated agent" — here via the owner chain).
-    const owner = old.auth("guest:v3-owner").actor;
-    old.setProp(owner, "deactivated_at", Date.now() as never);
-    const agent = old.createObject({ id: "agent_v3", parent: "$agent", owner, name: "agent" }).id;
+    // deactivated agent" — here via the owner chain). The owner is the carried,
+    // deactivated human above (the production shape: agents are owned by the
+    // $human that provisioned them, whose deactivated state carries with the
+    // identity export). The owner-chain check reads owner from object_lineage.
+    const agent = old.createObject({ id: "agent_v3", parent: "$agent", owner: human, name: "agent" }).id;
     old.ensureApiKey("$wiz", agent, "v3-agent-key", "v3-agent-secret", "agent of deactivated owner");
     const identity = exportIdentity(old.exportWorld());
 
@@ -567,6 +568,67 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(((await deactivatedOwner.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
       "identity_deactivated"
     );
+    await closeStates(states);
+  }, 30_000);
+
+  it("owner-from-lineage: a non-$wiz-owned carried agent authenticates; owner is read from object_lineage, never property_cell:<agent>:owner", async () => {
+    const old = createWorld();
+    // An ACTIVE human with an account, owning an agent (a non-$wiz owner — the
+    // path the owner-cell fix, finding #4, restored).
+    const human = old.auth("guest:ownlin-human").actor;
+    old.createObject({ id: "acct_ownlin", parent: "$account", owner: "$wiz", name: "ownlin" });
+    old.setProp("acct_ownlin", "email", "ownlin@example.com" as never);
+    old.setProp(human, "account", "acct_ownlin" as never);
+    old.ensureApiKey("$wiz", human, "ownlin-human-key", "ownlin-human-secret", "human");
+    const agent = old.createObject({ id: "agent_ownlin", parent: "$agent", owner: human, name: "agent" }).id;
+    old.ensureApiKey("$wiz", agent, "ownlin-agent-key", "ownlin-agent-secret", "agent");
+    const identity = exportIdentity(old.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+
+    // Ownership is serialized ONLY in object_lineage; there is no
+    // property_cell:<agent>:owner cell for the eligibility check to read. So an
+    // owner read that goes to property_cell would resolve NOTHING — the check
+    // must (and now does) read from lineage.
+    const allCells = [...plan.partitions.values()].flat();
+    const ownerProp = allCells.find((c) => c.kind === "property_cell" && c.object === agent && c.name === "owner");
+    expect(ownerProp, "property_cell:<agent>:owner must never be emitted").toBeUndefined();
+    const lineage = allCells.find((c) => c.kind === "object_lineage" && c.object === agent);
+    expect((lineage?.value as { owner?: string } | undefined)?.owner).toBe(human);
+
+    // And end-to-end: the agent authenticates (its non-$wiz owner resolves).
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    let gateway: NetGatewayDO;
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, cells] of plan.partitions) {
+      const st = netState(`ownlin-scope-${scope}`);
+      states.push(st);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const seeded = await instance.fetch(await signInternalRequest(scopeEnv, new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
+      })));
+      expect(seeded.ok, `seed ${scope}`).toBe(true);
+      scopeDOs.set(scope, instance);
+    }
+    const gwState = netState("ownlin-gateway");
+    states.push(gwState);
+    gateway = new NetGatewayDO(gwState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+    const minted = await gateway.fetch(new Request("https://do/net-api/session", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer apikey:ownlin-agent-key:ownlin-agent-secret" },
+      body: JSON.stringify({ ttl_ms: 60_000 })
+    }));
+    expect(minted.status, JSON.stringify(await minted.clone().json())).toBe(200);
     await closeStates(states);
   }, 30_000);
 

@@ -1263,6 +1263,13 @@
       "property": "ambiguous_match_ref",
       "value": "$ambiguous_match",
       "mode": "set_if_missing"
+    },
+    {
+      "kind": "set_property",
+      "object": "$system",
+      "property": "dull_command_definers",
+      "value": ["$room"],
+      "mode": "append_unique"
     }
   ]
 }

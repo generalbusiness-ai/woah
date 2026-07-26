@@ -1,137 +1,135 @@
 {
-  "src/core/bootstrap.ts": {
-    "$guest": 7,
-    "$player": 27,
-    "$match": 2,
-    "$ambiguous_match": 2,
-    "$failed_match": 2,
-    "$root": 17,
+  "src/client/main.ts": {
+    "$channel": 1,
+    "$chatroom": 2,
+    "$delay": 1,
+    "$drum_loop": 1,
+    "$dubspace": 2,
+    "$filter": 1,
+    "$loop_slot": 1,
+    "$note": 2,
+    "$pin": 2,
     "$room": 3,
-    "$prog": 1,
-    "$builder": 1,
-    "$space": 16,
-    "$actor": 15,
+    "$scene": 1,
+    "$space": 4
+  },
+  "src/core/bootstrap.ts": {
     "$account": 19,
-    "$human": 12,
+    "$actor": 15,
     "$agent": 12,
+    "$ambiguous_match": 2,
+    "$block": 1,
+    "$failed_match": 2,
+    "$guest": 7,
+    "$human": 12,
+    "$match": 2,
+    "$player": 27,
+    "$room": 2,
+    "$root": 17,
     "$sequenced_log": 6,
-    "$thing": 13,
-    "$block": 1
+    "$space": 16,
+    "$thing": 13
   },
   "src/core/dsl-compiler.ts": {
     "$root": 1
   },
   "src/core/local-catalogs.ts": {
-    "$note": 12,
-    "$dispensed_note": 4,
-    "$space": 6,
-    "$programmer": 8,
-    "$builder": 3,
-    "$player": 4,
-    "$task_registry": 16,
-    "$task": 28,
-    "$room": 14,
-    "$taskspace": 9,
     "$chatroom": 1,
+    "$conversational": 14,
+    "$dispensed_note": 4,
+    "$dubspace": 3,
+    "$exit": 4,
+    "$horoscope_note": 5,
+    "$note": 12,
     "$pin": 7,
     "$pinboard": 8,
-    "$exit": 4,
-    "$transparent": 11,
-    "$conversational": 14,
+    "$player": 9,
+    "$room": 14,
     "$semitransparent": 1,
-    "$dubspace": 3,
-    "$horoscope_note": 5
+    "$space": 6,
+    "$task": 28,
+    "$task_registry": 16,
+    "$taskspace": 9,
+    "$transparent": 11,
+    "$account": 1
   },
   "src/core/repository.ts": {
     "$sequenced_log": 2,
     "$space": 1
   },
   "src/core/tiny-vm.ts": {
+    "$actor": 1,
+    "$agent": 1,
     "$builder": 3,
-    "$programmer": 2,
-    "$root": 1,
     "$player": 1,
-    "$actor": 1
+    "$programmer": 4,
+    "$root": 1
   },
   "src/core/world.ts": {
-    "$actor": 25,
-    "$help_db_main": 1,
-    "$agent": 12,
-    "$guest": 14,
-    "$horoscope_note": 1,
-    "$root": 5,
+    "$account": 4,
+    "$actor": 26,
+    "$agent": 16,
+    "$ambiguous_match": 2,
     "$block": 3,
-    "$account": 3,
-    "$human": 10,
-    "$space": 20,
-    "$player": 12,
-    "$room": 2,
-    "$recycle_handler_error": 3,
-    "$sequenced_log": 1,
-    "$thing": 2,
-    "$programmer": 2,
-    "$loop_class": 1,
-    "$help": 1,
-    "$prog": 1,
-    "$builder": 1,
-    "$transparent": 1,
+    "$builder": 3,
     "$conversational": 1,
     "$failed_match": 5,
-    "$xxx": 1,
-    "$note": 1,
+    "$guest": 14,
+    "$help": 1,
+    "$help_db_main": 1,
+    "$horoscope_note": 1,
+    "$human": 14,
+    "$loop_class": 1,
     "$match": 1,
-    "$ambiguous_match": 2
+    "$note": 1,
+    "$player": 14,
+    "$programmer": 7,
+    "$recycle_handler_error": 3,
+    "$room": 2,
+    "$root": 6,
+    "$sequenced_log": 1,
+    "$space": 20,
+    "$thing": 2,
+    "$transparent": 1,
+    "$xxx": 1
   },
   "src/net/identity.ts": {
-    "$actor": 16,
-    "$agent": 1,
-    "$account": 9
+    "$account": 9,
+    "$actor": 18,
+    "$agent": 2,
+    "$programmer": 2
   },
   "src/net/install.ts": {
-    "$guest": 3,
     "$actor": 1,
+    "$guest": 3,
     "$space": 1
   },
   "src/net/route.ts": {
     "$space": 1
   },
   "src/net/scope.ts": {
-    "$space": 1,
-    "$sequenced_log": 1
+    "$sequenced_log": 1,
+    "$space": 1
   },
   "src/net/topology.ts": {
     "$actor": 2,
-    "$root": 3,
-    "$space": 2,
-    "$sequenced_log": 1,
+    "$chatroom": 2,
     "$guest": 2,
     "$player": 1,
-    "$chatroom": 2,
-    "$room": 1
+    "$room": 1,
+    "$root": 3,
+    "$sequenced_log": 1,
+    "$space": 2
   },
   "src/worker/net/client-auth.ts": {
     "$account": 1
   },
   "src/worker/net/gateway-do.ts": {
-    "$human": 3,
     "$account": 4,
-    "$guest": 1,
     "$agent": 3,
+    "$guest": 1,
+    "$human": 3,
     "$room": 1,
-    "$space": 1
-  },
-  "src/client/main.ts": {
-    "$dubspace": 2,
-    "$chatroom": 2,
-    "$room": 3,
-    "$loop_slot": 1,
-    "$channel": 1,
-    "$filter": 1,
-    "$delay": 1,
-    "$drum_loop": 1,
-    "$scene": 1,
-    "$pin": 2,
-    "$note": 2,
-    "$space": 4
+    "$space": 2
   }
 }

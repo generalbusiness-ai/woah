@@ -579,6 +579,7 @@ describe("builtin index stability", () => {
       "rank_between",
       "ordered_neighbors",
       "event_schema",
+      "has_surface",
       "schedule",
       "schedule_at",
       "cancel_schedule"

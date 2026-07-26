@@ -67,6 +67,11 @@ export type FixtureDump = {
   actorB: string;
   cluster: string;
   clusterB: string;
+  /** The fresh anchored programmer family (P1/P2 workerd proof). */
+  progCluster: string;
+  progHuman: string;
+  progAgent: string;
+  progAgentToken: string;
 };
 
 /** Build the shared world fixture in a tsx SUBPROCESS and return its

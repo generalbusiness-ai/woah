@@ -1,8 +1,13 @@
 # Prog Demo
 
 The programmer experience is an in-world authoring surface for agents and
-people. It keeps LambdaCore's `$builder` / `$programmer` authority split while
-making both surfaces ordinary player classes.
+people. It keeps LambdaCore's `$builder` / `$programmer` authority split. The
+surface objects are persistent classes that double as attachable *features*: an
+actor gains the tools by having the surface composed onto it, not by being
+reparented into it. Kind stays in the actor's own ancestry (`$agent` stays an
+`$agent`), and the surface is an independent axis — see
+[provisioning.md AP4](../../spec/identity/provisioning.md#ap4-class-model-normative)
+and [features.md FT8](../../spec/semantics/features.md#ft8-patterns).
 
 ## Classes
 
@@ -22,18 +27,29 @@ product surface.
 
 ## Surfaces
 
-- `$builder < $player` exposes object/data operations on actors inheriting from
-  it: inspect, search, create, chparent, recycle, and set_property.
-- `$programmer < $builder` exposes source/metadata operations on actors
-  inheriting from it: inspect, resolve_verb, list_verb, search, install_verb,
-  set_verb_info, set_property_info, edit_verb, and trace.
+- `$builder` exposes object/data operations to actors that *carry* it — through
+  ancestry (legacy `$builder` descendants) or as an attached feature: inspect,
+  search, create, chparent, recycle, and set_property.
+- `$programmer < $builder` exposes source/metadata operations to actors that
+  carry it: inspect, resolve_verb, list_verb, search, install_verb,
+  set_verb_info, set_property_info, edit_verb, and trace. Attaching
+  `$programmer` provides the builder surface too, since it inherits `$builder`.
 
-Builder authority is delegable without programmer authority. Programmer
-authority is still gated by the actor's programmer or wizard flag because
-installed verbs capture `progr` and change future execution authority. Class
-membership controls the visible tool surface; progbit/wizbit remain the hard
-authority facts. The core builtins check the wrapper verb's actual definer, so
-the runtime does not need catalog-specific object names baked into source code.
+Every wrapper guards with `has_surface(actor, <surface>)`, which is true when
+the actor carries the surface through either path, so a feature-composed actor
+and a legacy descendant resolve identically. Builder authority is delegable
+without programmer authority. Programmer authority is still gated by the actor's
+`programmer` or `wizard` flag because installed verbs capture `progr` and change
+future execution authority. The surface controls the *visible* tool set;
+progbit/wizbit remain the hard authority facts. Wrappers drop task permissions
+to the actor (`set_task_perms(actor)`) after the guard, so substrate operations
+run as the actor rather than the `$wiz` verb owner.
+
+Promotion is a feature attach, never a reparent. The catalog publishes its
+surface reference to `$system.programmer_surface`; the AP6 provisioning verbs
+read that property and attach/remove the surface atomically with the flag and
+quota. The wizard identity `$wiz` carries `$programmer` the same way — as a
+feature — and keeps `$wiz isa $player`.
 
 Builder `create(parent, opts?)` creates objects owned by the invoking actor.
 There is no `owner` option in the builder surface. Creating on behalf of another

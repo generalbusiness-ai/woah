@@ -3798,6 +3798,10 @@ export class NetGatewayDO {
       const cell = this.ensureView().get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
       return cell && "value" in cell ? cell.value : undefined;
     };
+    // Ownership is serialized into the object_lineage cell (src/net/bridge.ts),
+    // not a property_cell — a `property_cell:<obj>:owner` is never emitted, so
+    // owner MUST be read from lineage. Reading it via `prop(obj, "owner")` would
+    // always resolve nothing and refuse every non-$wiz-owned agent.
     const lineage = (object: string): { parent?: string | null; owner?: string } | undefined =>
       this.ensureView().get(cellKey("object_lineage", object))?.value as {
         parent?: string | null;
@@ -3869,13 +3873,15 @@ export class NetGatewayDO {
     if (rosterRefusal) return rosterRefusal;
     const requestedRosterVisibility = body.roster_visible;
     const rosterVisible = requestedRosterVisibility !== false;
-    // The mint needs the actor's lineage (cluster-scope derivation) in
-    // view; the CO15 `cluster:<actor>` convention names the pull
-    // destination without needing lineage first (the planScheduled
-    // idiom). Best-effort: sessionOpen's own E_MISSING_STATE names the
-    // failure when the pull could not land.
+    // The mint needs the actor's lineage (cluster-scope derivation) in view. A
+    // self-routing apikey names the actor's home cluster directly — an anchored
+    // agent's cells live in its authority root's cluster, NOT `cluster:<agent>`,
+    // so the CO15 `cluster:<actor>` convention would warm an empty scope and
+    // sessionOpen would fail E_MISSING_STATE. Fall back to that convention for
+    // legacy/unrouted keys (an unanchored actor IS its own cluster root).
+    const homeScope = (options.apiKeyId && routedApiKeyScope(options.apiKeyId)) || `cluster:${actor}`;
     await this.warmScopes(
-      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      [CATALOG_SCOPE, { scope: homeScope, objects: [actor] }],
       "net_client_pull_miss_failed"
     );
     // Identity eligibility at EVERY mint (the one gate every credential
@@ -3989,7 +3995,8 @@ export class NetGatewayDO {
     // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
     // gateway refuses session-less turns up front (named). Both direct and
     // sequenced calls carry the session read, so the committing scope still
-    // revalidates it end-to-end.
+    // revalidates it end-to-end. The planning-scope override below forces
+    // direct for a cluster root and keeps the requested route for a room.
     const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
     if (!session) {
       return json(
@@ -4022,10 +4029,15 @@ export class NetGatewayDO {
     if (!target || !verb) {
       return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
     }
-    const route = body.route === undefined ? "sequenced" : body.route;
-    if (route !== "direct" && route !== "sequenced") {
+    // The client may request an explicit route; the default is sequenced. The
+    // planning-scope override below tightens this per topology (a cluster root
+    // cannot host an in-world sequencer), while a room preserves the explicit
+    // direct request (metadata-gated by direct_callable further down).
+    const requestedRoute = body.route === undefined ? "sequenced" : body.route;
+    if (requestedRoute !== "direct" && requestedRoute !== "sequenced") {
       return json({ error: { code: "E_INVARG", message: "turn route must be direct or sequenced" } }, 400);
     }
+    let route: "direct" | "sequenced" = requestedRoute;
     // Catalog-qualified names are manifest syntax, resolved by the catalog
     // installer before objects reach the runtime. Rejecting one here is also
     // required for key safety: every net cell-key parser treats `:` as a
@@ -4066,6 +4078,20 @@ export class NetGatewayDO {
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
     const planningScope = await this.clientPlanningScope(anchorObject, actor);
+    // Planning-scope route override (topology tightens the client's request):
+    // a private authority CLUSTER must invoke DIRECT — the committing Scope head
+    // sequences it, and a cluster root is an actor, not a $space with
+    // next_seq/subscribers/presence, so it cannot host an in-world sequencer. A
+    // shared ROOM keeps the requested route: sequenced by default, but an
+    // explicit direct request is honored (and still metadata-gated by
+    // direct_callable below, and re-enforced by world.directCall). Catalog (or
+    // any other classification) is not client-plannable and is refused, never
+    // silently coerced into either route.
+    if (planningScope.startsWith("cluster:")) {
+      route = "direct";
+    } else if (!planningScope.startsWith("room:")) {
+      return json({ error: { code: "E_INVARG", message: "client turn cannot plan at this scope", detail: { field: "scope", reason: "unplannable_scope", scope: planningScope } } }, 400);
+    }
     const targetAuthorityScope = this.clientTargetAuthorityScope(target, anchorObject, actor, planningScope);
     // Phase 4: warm the TURN'S TARGET at its own authority and the anchor
     // at the planning scope. A room relation may contain a self-hosted
@@ -4342,7 +4368,14 @@ export class NetGatewayDO {
     const live = this.ensureView().get(cellKey("object_live", actor))?.value as
       | { location?: string | null }
       | undefined;
-    return typeof live?.location === "string" && live.location.length > 0 ? live.location : actor;
+    const location = typeof live?.location === "string" && live.location.length > 0 ? live.location : null;
+    // A located-nowhere actor plans at its OWN cluster (CO14). `$nowhere` is the
+    // catalog-scoped universal home, and any `$`-prefixed location is
+    // catalog-delivered seed substrate — neither is a plannable anchor, so fall
+    // back to the actor itself rather than routing the turn into the catalog
+    // scope (which is not client-plannable).
+    if (!location || location.startsWith("$")) return actor;
+    return location;
   }
 
   /**
@@ -5018,7 +5051,14 @@ export class NetGatewayDO {
       );
       for (const row of present) if (this.mcpQueues.has(row.member)) candidates.add(row.member);
       for (const [session, state] of this.mcpQueues) {
-        if (body.scope === `cluster:${state.actor}`) candidates.add(session);
+        // An anchored agent's cells live in its AUTHORITY ROOT's cluster, so a
+        // fanout from that cluster (e.g. a demote committed in cluster:<human>)
+        // affects its session even though `body.scope !== cluster:<agent>`. Match
+        // the session actor's home cluster derived from view lineage (the anchor
+        // walk), which reduces to `cluster:<actor>` for an unanchored root. Falls
+        // back safely: an actor whose lineage this shard has not warmed classifies
+        // to a non-cluster scope and simply does not match.
+        if (body.scope === this.ownerScopeFor(state.actor)) candidates.add(session);
       }
     }
     for (const session of candidates) {
@@ -6716,6 +6756,18 @@ export class NetGatewayDO {
       }
       return [];
     }
+    // `{arg: N}`: the object-valued positional argument itself is the
+    // prefetch target. A verb that operates on an object passed by the
+    // caller (promote/demote an agent, gift an item) names the arg here so
+    // its authority cells — flags, features, owned-object lineage — are warm
+    // before planning, rather than defaulting silently (a property read of an
+    // unwarmed instance returns the class default, never an E_MISSING_STATE
+    // the repair loop could act on). This is the arg-value analogue of the
+    // `target`/`actor`/`scope` roots.
+    if (typeof map.arg === "number" && Number.isInteger(map.arg) && map.arg >= 0) {
+      const ref = call.args[map.arg];
+      return typeof ref === "string" && ref.trim().length > 0 ? [ref.trim()] : [];
+    }
     if (!Array.isArray(map.path) || map.path.length === 0 || typeof map.path[0] !== "string") return [];
     let cursor: unknown = this.netAuthorityPrefetchRoot(map.path[0], call);
     for (const rawPart of map.path.slice(1)) {
@@ -8202,7 +8254,12 @@ function rejectForeignMcpOrigin(request: Request, target: URL): Response | null 
   return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
 }
 
-type NetMcpToolScope = "active" | "here" | "object" | "space" | "all";
+// "all" is intentionally NOT a scope. It had no branch in mcpToolPage and
+// silently fell through to the local structural closure (identical to
+// "active"), implying a global tool enumeration that Big-World forbids
+// (spec/semantics/distribution.md). Removed so a caller asking for "all" gets a
+// clear error instead of a misleading partial view.
+type NetMcpToolScope = "active" | "here" | "object" | "space";
 
 type NetMcpToolDraft = {
   object: string;
@@ -8237,8 +8294,8 @@ function mcpRecord(value: unknown): Record<string, unknown> {
 
 function mcpToolScope(value: unknown): NetMcpToolScope {
   if (value === undefined || value === null || value === "") return "active";
-  if (value === "active" || value === "here" || value === "object" || value === "space" || value === "all") return value;
-  throw new Error("scope must be one of active, here, object, space, all");
+  if (value === "active" || value === "here" || value === "object" || value === "space") return value;
+  throw new Error("scope must be one of active, here, object, space");
 }
 
 function mcpLimit(value: unknown, fallback: number, cap: number): number {
@@ -8366,7 +8423,7 @@ const MCP_TOOL_DEFS = [
     inputSchema: {
       type: "object",
       properties: {
-        scope: { type: "string", enum: ["active", "here", "object", "space", "all"] },
+        scope: { type: "string", enum: ["active", "here", "object", "space"] },
         object: { type: "string" },
         query: { type: "string" },
         limit: { type: "number" },
