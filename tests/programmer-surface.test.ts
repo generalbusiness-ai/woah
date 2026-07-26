@@ -396,4 +396,22 @@ describe("programmer surface (feature-composed)", () => {
     const call = (await world.directCall("cv", agent, obj, "v", [])) as CallResult;
     expect((call as any).result).toBe(1);
   });
+
+  it("commits the next version when a verb install names the CURRENT expected_version (§8.9)", async () => {
+    const world = createWorld();
+    const { human } = await provisionHuman(world, "cas@example.com");
+    const agent = await createAgent(world, human, "casbot", true);
+    const created = (await world.directCall("mk", agent, agent, "create", ["$thing", { name: "CAS" }])) as CallResult;
+    const obj = (created as any).result.id as string;
+    const v1 = (await world.directCall("iv", agent, agent, "install_verb", [obj, "v", "verb :v() rxd { return 1; }", {}])) as CallResult;
+    expect((v1 as any).result.version).toBe(1);
+    // Naming the current version (1) is a successful compare-and-swap → v2.
+    const v2 = (await world.directCall("iv2", agent, agent, "install_verb", [
+      obj, "v", "verb :v() rxd { return 2; }", { expected_version: 1 }
+    ])) as CallResult;
+    expect((v2 as any).result.ok, JSON.stringify(v2).slice(0, 300)).toBe(true);
+    expect((v2 as any).result.version).toBe(2);
+    const call = (await world.directCall("cv", agent, obj, "v", [])) as CallResult;
+    expect((call as any).result).toBe(2);
+  });
 });
