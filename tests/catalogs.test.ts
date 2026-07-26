@@ -376,6 +376,186 @@ describe("local catalogs", () => {
     expect(feats.filter((f) => f === "$programmer").length).toBe(1);
   });
 
+  // help v0.1.1 seeded three topics that misdirected every MCP agent that read
+  // them: `focus` named woo_focus/woo_unfocus/focus_list (no such tools), `wait`
+  // named the tool `wait` rather than woo_wait, and `building` named no path to
+  // authoring authority. Seed-hook properties are initial values only, so the
+  // manifest fix alone reaches fresh worlds and leaves deployed ones misinformed.
+  const HELP_MIGRATION_ID = "2026-07-25-help-mcp-topics";
+  const STALE_FOCUS_TOPIC = [
+    "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
+    "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
+  ];
+  const STALE_WAIT_TOPIC = [
+    "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
+    "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
+  ];
+  const STALE_BUILDING_TOPIC = [
+    "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
+    "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
+  ];
+
+  // Rewind a freshly-installed world to the help v0.1.1 topic shape: the three
+  // stale values restored, the topics this change adds removed, and the ledger
+  // entry cleared so the next install re-runs the migration.
+  function rewindHelpToV011(world: ReturnType<typeof createWorld>): void {
+    const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
+    topics.focus = [...STALE_FOCUS_TOPIC];
+    topics.wait = [...STALE_WAIT_TOPIC];
+    topics.building = [...STALE_BUILDING_TOPIC];
+    for (const added of ["self", "suit", "me", "tools"]) delete topics[added];
+    world.setProp("$help", "topics", topics as never);
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== HELP_MIGRATION_ID);
+    world.setProp("$system", "applied_migrations", ledger);
+  }
+
+  it("rewrites help v0.1.1 topics that named nonexistent MCP tools, and adds the orientation topics", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const topics = world.getProp("$help", "topics") as Record<string, string[]>;
+    // The stale tool names are gone...
+    expect(topics.focus.join(" ")).not.toContain("Use woo_focus(");
+    expect(topics.wait.join(" ")).not.toContain("wait(<timeout_ms>, <limit>)");
+    expect(topics.building.join(" ")).not.toContain("Use the programmer MCP tools");
+    // ...replaced by text that names the real surface.
+    expect(topics.focus.join(" ")).toContain("There is no woo_focus");
+    expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+    expect(topics.building.join(" ")).toContain("promote_agent_to_programmer");
+    // The orientation topics land, aliases included.
+    expect(topics.self.join(" ")).toContain("<object>__<verb>");
+    expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+    expect(topics.suit).toEqual(["*forward*", "self"]);
+    expect(topics.me).toEqual(["*forward*", "self"]);
+    // Unrelated topics are untouched — the migration is surgical, not a
+    // wholesale replacement of the topics map.
+    expect(topics.look.join(" ")).toContain("look (no argument)");
+    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
+  });
+
+  it("leaves help topics an operator has edited alone", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+
+    // An operator who rewrote a topic must not be silently overwritten. The
+    // migration matches the v0.1.1 default byte-for-byte and skips otherwise.
+    const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
+    topics.focus = ["Our house rules for focus."];
+    topics.self = ["Our own orientation text."];
+    world.setProp("$help", "topics", topics as never);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const after = world.getProp("$help", "topics") as Record<string, string[]>;
+    expect(after.focus).toEqual(["Our house rules for focus."]);
+    expect(after.self).toEqual(["Our own orientation text."]);
+    // The topics the operator did not touch are still repaired.
+    expect(after.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+    expect(after.tools.join(" ")).toContain("woo_list_reachable_tools");
+    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
+  });
+
+  it("is idempotent: re-running the help topic migration changes nothing", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+    installLocalCatalogs(world, ["help"]);
+    const afterFirst = JSON.stringify(world.getProp("$help", "topics"));
+
+    // Both idempotency layers: the ledger short-circuit...
+    installLocalCatalogs(world, ["help"]);
+    expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
+
+    // ...and the per-key value gates, with the ledger entry cleared so the
+    // body actually re-executes against already-repaired data.
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== HELP_MIGRATION_ID);
+    world.setProp("$system", "applied_migrations", ledger);
+    installLocalCatalogs(world, ["help"]);
+    expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
+    expect(
+      (world.getProp("$system", "applied_migrations") as string[]).filter((id) => id === HELP_MIGRATION_ID)
+    ).toHaveLength(1);
+  });
+
+  it("repairs a world whose registry still records help v0.1.1", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+    // A deployed world does not just hold stale data — its registry record
+    // still says 0.1.1. Rewind that too, so the boot path takes the bundled
+    // version-upgrade branch (minor bump, no §CT14 migration file required)
+    // rather than the already-current branch the other cases exercise.
+    const installed = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .map((record) => (record.alias === "help" ? { ...record, version: "0.1.1" } : record));
+    world.setProp("$catalog_registry", "installed_catalogs", installed as never);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const topics = world.getProp("$help", "topics") as Record<string, string[]>;
+    expect(topics.focus.join(" ")).toContain("There is no woo_focus");
+    expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
+    // The recorded registry version stays at 0.1.1: runLocalCatalogVersionMigrations
+    // only routes MAJOR edges through updateCatalogManifest, and minor/patch
+    // drift is left to the schema sync, which records a plan result rather than
+    // rewriting installed_catalogs[].version. Pinned deliberately — the boot
+    // migration must not depend on the recorded version advancing, because it
+    // does not. Its gate is the applied_migrations ledger.
+    const after = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .find((record) => record.alias === "help");
+    expect(after?.version).toBe("0.1.1");
+  });
+
+  // AGENTS.md migration discipline: a migration must be test-run on a local
+  // SQLite woo. Seed an aged world, close it, reopen, migrate, close, reopen —
+  // so the repair is proven to survive the storage round trip rather than only
+  // existing in the in-memory object graph.
+  it("repairs the help topics through a real SQLite round trip", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { LocalSQLiteRepository } = await import("../src/server/sqlite-repository");
+    const dir = mkdtempSync(join(tmpdir(), "woo-help-topics-mig-"));
+    const path = join(dir, "world.sqlite");
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      installLocalCatalogs(seedWorld, ["help"]);
+      rewindHelpToV011(seedWorld);
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
+      // The aged state really did persist — otherwise the migration below
+      // would be repairing a world that was never broken.
+      expect((upgradeWorld.getProp("$help", "topics") as Record<string, string[]>).focus.join(" "))
+        .toContain("Use woo_focus(");
+      installLocalCatalogs(upgradeWorld, ["help"]);
+      upgradeRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      const topics = verifyWorld.getProp("$help", "topics") as Record<string, string[]>;
+      expect(topics.focus.join(" ")).toContain("There is no woo_focus");
+      expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+      expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+      expect(verifyWorld.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
+
+      // Rerunning against the already-repaired persisted world is a no-op.
+      const before = JSON.stringify(topics);
+      installLocalCatalogs(verifyWorld, ["help"]);
+      expect(JSON.stringify(verifyWorld.getProp("$help", "topics"))).toBe(before);
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("repairs older demoworld installs where the garden missed $conversational", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);

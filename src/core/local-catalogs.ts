@@ -180,6 +180,18 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION = "2026-05-1
 // it a one-shot repair; future manifest additions require a new migration id.
 // Deployed fix reference: 2026-06-11 E_OBJNF exit_living_room_outline.
 const LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION = "2026-06-11-missing-seed-instances";
+// help v0.1.1 seeded three topics that named tools which do not exist on the
+// MCP surface: `focus` told agents to call woo_focus/woo_unfocus/focus_list
+// (there are none — the real verbs are <actor>__focus and friends, and they do
+// not widen MCP reachability at all), `wait` named the tool `wait` rather than
+// woo_wait, and `building` named no reachable path to authoring authority.
+// Seed-hook properties are *initial* values (see reconcileSeedObject in
+// catalog-installer.ts: existing own properties are never overwritten), so a
+// manifest edit plus a version bump reaches fresh worlds only. Already-installed
+// worlds keep serving the wrong text to every agent that reads help, which is
+// why this needs an explicit one-shot data migration rather than schema drift
+// repair.
+const LOCAL_CATALOG_HELP_MCP_TOPICS_MIGRATION = "2026-07-25-help-mcp-topics";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -282,7 +294,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" },
-  { id: LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION }
+  { id: LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION },
+  { id: LOCAL_CATALOG_HELP_MCP_TOPICS_MIGRATION, only: "help" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -573,6 +586,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   run(LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
   run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
+  runHelpMcpTopicsMigration(world, names);
   // FIX 3: create any seed instances declared in installed bundled catalog
   // manifests that are absent from the live world. Runs over every installed
   // bundled catalog (no `only:` restriction) so the repair is general: a
@@ -821,6 +835,109 @@ function runDropSessionIdPropertyMigration(world: WooWorld): void {
     }
   }
   markMigrationApplied(world, LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION);
+}
+
+const HELP_CATALOG = "help";
+const HELP_TOPICS_PROPERTY = "topics";
+
+// The exact topic values seeded by help v0.1.1 for the three topics this
+// migration repairs. Frozen historical literals: they are the fingerprint that
+// says "still the shipped default, nobody has edited it". A world whose value
+// no longer matches has been changed by an operator or a later catalog, and
+// this migration leaves it alone rather than clobbering that edit.
+const HELP_V011_STALE_TOPICS: Readonly<Record<string, readonly string[]>> = {
+  focus: [
+    "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
+    "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
+  ],
+  wait: [
+    "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
+    "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
+  ],
+  building: [
+    "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
+    "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
+  ]
+};
+
+// Topics the migration adds when they are absent. These are pure additions —
+// help v0.1.1 shipped nothing under these names, so there is no operator edit
+// to preserve and presence alone is the correct skip condition.
+const HELP_ADDED_TOPIC_NAMES: readonly string[] = ["self", "suit", "me", "tools"];
+
+// Locate the help catalog's seeded topic database from the bundled manifest:
+// both which object holds it and the current corrected text. Core deliberately
+// does not name that object — the manifest's `create_instance` hook is the
+// authority, so this stays catalog-agnostic machinery rather than core
+// knowledge of a specific in-world object. It also keeps the manifest the
+// single source of truth for the wording, so a fresh install and a migrated
+// world converge on identical values.
+function bundledHelpSeed(): { object: ObjRef; topics: Record<string, WooValue> } | null {
+  const manifest = LOCAL_CATALOGS.get(HELP_CATALOG);
+  if (!manifest) return null;
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind !== "create_instance") continue;
+    const topics = hook.properties?.[HELP_TOPICS_PROPERTY];
+    if (!topics || typeof topics !== "object" || Array.isArray(topics)) continue;
+    return { object: hook.as, topics: topics as Record<string, WooValue> };
+  }
+  return null;
+}
+
+// Rewrite the three stale MCP-facing help topics on an already-installed
+// world, and add the topics that explain the actor/tool model. Surgical by
+// design: it touches only the three repaired plus four added keys, never the
+// whole topics map, so unrelated topics (including any a catalog or operator
+// added) survive untouched. Idempotent twice over — the ledger short-circuits
+// reruns, and each key is additionally gated on its own current value.
+function runHelpMcpTopicsMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_HELP_MCP_TOPICS_MIGRATION)) return;
+  // Only act when help is in this host's migration scope, and only where the
+  // seed object actually lives. A slice without it has nothing to repair and
+  // must not record the migration as applied on its behalf.
+  if (!names.includes(HELP_CATALOG)) return;
+  const bundled = bundledHelpSeed();
+  if (!bundled) return;
+  const target = bundled.object;
+  if (!world.objects.has(target)) return;
+  // Require an *own* topics value. The seed hook declares no anchor, so the
+  // help database classifies into catalog scope and is gateway-owned; a
+  // satellite carrying only a class stub would otherwise inherit the `{}`
+  // class default here and get a divergent own property written onto it.
+  if (!world.object(target).properties.has(HELP_TOPICS_PROPERTY)) return;
+
+  const current = world.propOrNull(target, HELP_TOPICS_PROPERTY);
+  if (!current || typeof current !== "object" || Array.isArray(current)) {
+    // Nothing sane to merge into. Record it so a malformed world does not
+    // re-attempt the same no-op on every cold init.
+    markMigrationApplied(world, LOCAL_CATALOG_HELP_MCP_TOPICS_MIGRATION);
+    return;
+  }
+
+  const next: Record<string, WooValue> = { ...(current as Record<string, WooValue>) };
+  let changed = false;
+
+  // Replace the stale topics, but only where the stored value is still the
+  // v0.1.1 default byte-for-byte.
+  for (const [name, stale] of Object.entries(HELP_V011_STALE_TOPICS)) {
+    const replacement = bundled.topics[name];
+    if (replacement === undefined) continue;
+    if (!valuesEqual(next[name] as WooValue, stale as unknown as WooValue)) continue;
+    next[name] = replacement;
+    changed = true;
+  }
+
+  // Add the new topics where absent.
+  for (const name of HELP_ADDED_TOPIC_NAMES) {
+    const addition = bundled.topics[name];
+    if (addition === undefined) continue;
+    if (next[name] !== undefined) continue;
+    next[name] = addition;
+    changed = true;
+  }
+
+  if (changed) world.setProp(target, HELP_TOPICS_PROPERTY, next as WooValue);
+  markMigrationApplied(world, LOCAL_CATALOG_HELP_MCP_TOPICS_MIGRATION);
 }
 
 // Walk historical worlds onto the programmer-surface shape. Early prog installs

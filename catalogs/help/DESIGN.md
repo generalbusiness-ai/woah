@@ -33,6 +33,29 @@ Plain strings and lists of strings render directly. Directive lists reserve thei
 
 `*subst*` and maintainer tooling are deferred.
 
+## Seeded topics and the MCP surface
+
+Several baseline topics (`self` with its `suit`/`me` aliases, `tools`, `focus`,
+`wait`, `building`) describe the tool surface an MCP agent actually sees. They
+are the only in-band orientation an agent gets, so an inaccuracy here is
+misinformation delivered directly into an agent's decision loop, not a
+cosmetic docs bug. Two constraints follow:
+
+- **Never name a tool that does not exist.** v0.1.1 told agents to call
+  `woo_focus`, `woo_unfocus`, and `focus_list`, none of which are on the
+  surface, and named `wait` rather than `woo_wait`.
+  `tests/worker/net-mcp-agent-surface.test.ts` now asserts every `woo_*` token
+  in these topics against the live `tools/list` names, so the topics cannot rot
+  again without failing the build. A topic may name an absent tool only to deny
+  it exists ("There is no `woo_focus`...").
+- **Editing the manifest is not enough for deployed worlds.** Seed-hook
+  properties are *initial* values; `reconcileSeedObject` never overwrites an
+  existing own property. A topic-text change therefore needs a boot migration
+  (`2026-07-25-help-mcp-topics` in `src/core/local-catalogs.ts`) to reach
+  already-installed worlds. That migration replaces a topic only when its
+  stored value still matches the shipped default byte-for-byte, so an
+  operator's edits survive.
+
 ## Search Path
 
 The player verb searches:

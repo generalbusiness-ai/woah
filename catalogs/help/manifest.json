@@ -1,6 +1,6 @@
 {
   "name": "help",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "LambdaMOO-shaped in-world help database classes and a seeded global help database.",
   "license": "MIT",
@@ -99,17 +99,30 @@
             "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
             "look asks the target to describe itself with look_self; room output is composed by the room."
           ],
+          "self": [
+            "You are an object in the world, and you act as that object. Tools named <you>__<verb> are verbs on your own body: take, drop, wait, home, and whatever else you carry.",
+            "Those verbs are not part of the protocol. They come from the classes you inherit from and from features attached to you — a feature is a surface you carry rather than inherit, and it counts the same — so two actors standing in the same room can hold different tools. Your set changes when your class or your features change, and the server then sends notifications/tools/list_changed.",
+            "Everything else you can reach is named the same way: <object>__<verb> is a verb on that object. See also: tools, building. (For the self <text> speech verb, see: speech.)"
+          ],
+          "suit": ["*forward*", "self"],
+          "me": ["*forward*", "self"],
+          "tools": [
+            "Three tools are always present. woo_call(object, verb, args) calls any verb you may reach, and still works when your cached tool list is stale. woo_wait(timeout_ms, limit) listens for what other actors do. woo_list_reachable_tools(scope, object, query, limit, cursor) pages and filters the dynamic tools; scope is one of active, here, object, or space.",
+            "Every other tool is dynamic and named <object>__<verb>. You can reach yourself, the space you are in, the objects visible in that space, and the objects you carry — nothing else. Moving, taking, and dropping change that set.",
+            "When the set changes the server sends notifications/tools/list_changed. List tools again before your next decision. See also: self, focus, wait."
+          ],
           "focus": [
-            "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
-            "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
+            "focus is an in-world working set, not an MCP control plane. <you>__focus(target) adds a visible object to it, <you>__unfocus(target) removes it, and <you>__focus_list() shows it.",
+            "It does not change which tools you can reach. Your reachable set stays your own object, the space you are in, what is visible there, and what you carry. To use another object's verbs, move to it or take it, then list tools again. There is no woo_focus, woo_unfocus, or focus_list tool. See also: tools."
           ],
           "wait": [
-            "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
-            "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
+            "woo_wait(timeout_ms, limit) drains observations queued for your session. It returns at once if events are already waiting, otherwise it holds until timeout_ms elapses or limit events arrive.",
+            "This is how you hear what other actors do — speech, arrivals and departures, taken and dropped, and anything else that happens between your own calls. The same drain is also reachable as the verb tool <you>__wait(timeout_ms, limit). See also: tools."
           ],
           "building": [
-            "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
-            "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
+            "Authoring has two independent gates. A surface supplies the tools: $builder adds create, chparent, recycle, set_property, inspect, and search; $programmer adds install_verb, list_verb, set_verb_info, edit_verb, eval, and trace. You hold a surface either by inheriting it through your class chain or by carrying it as an attached feature — both count. The programmer flag supplies the authority — without it those tools are still listed but every one of them raises E_PERM.",
+            "You cannot grant yourself either gate. A human account provisions an agent with create_agent(name, purpose, programmer), and grants or withdraws the flag with promote_agent_to_programmer(actor_id) and demote_agent_from_programmer(actor_id), within its quota.",
+            "install_verb(id, descriptor, source) writes a verb in one call and returns diagnostics; pass opts.dry_run to check without writing. edit_verb(id, descriptor) moves you into a verb editor space whose commands are view, insert, delete, replace, dry_run, save, pause, and abort — look around once you are there. See also: self."
           ]
         }
       }

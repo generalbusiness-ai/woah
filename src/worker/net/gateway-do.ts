@@ -5302,11 +5302,18 @@ export class NetGatewayDO {
     objects: Set<string>,
     commandObjects: Set<string>
   ): NetMcpDynamicTool[] {
+    // The actor's own object sorts ahead of the alphabetical remainder. A
+    // client that reads only the first tools/list page must still see the
+    // actor's own verbs — its "suit" — whatever its id happens to be. Plain
+    // localeCompare stranded any actor whose id sorted past the page cap
+    // behind whatever objects happened to share the space.
+    const byObject = (a: string, b: string) =>
+      (a === actor ? 0 : 1) - (b === actor ? 0 : 1) || a.localeCompare(b);
     const drafts: NetMcpToolDraft[] = [];
-    for (const object of [...objects].sort((a, b) => a.localeCompare(b))) {
+    for (const object of [...objects].sort(byObject)) {
       drafts.push(...this.mcpObjectToolDrafts(actor, object, commandObjects.has(object)));
     }
-    drafts.sort((a, b) => a.object.localeCompare(b.object) || a.verb.localeCompare(b.verb));
+    drafts.sort((a, b) => byObject(a.object, b.object) || a.verb.localeCompare(b.verb));
     const used = new Set<string>();
     return drafts.map((draft) => {
       const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
