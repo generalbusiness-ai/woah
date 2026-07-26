@@ -120,11 +120,25 @@ verb $workflow_task:set_status(status) {
   }
 
   this.status = status;
-  emit(this.space, { type: "status_changed", source: this, from, to });
+  this.space:_record_workflow_act("workflow.status_changed",
+                                  { "item": this, "from": from, "to": to });
 }
 ```
 
-The v1 `tasks` catalog does not include `$workflow_task`: it picks the obligation-cursor model instead, where state is the position in an ordered obligation list rather than a named state in a transition graph. A workflow-bearing class is a peer pattern that catalogs may build on top of `$space` when a named-state machine is the better fit.
+The transition is recorded as an Act on the space's sequenced log, governed by [acts.md](../semantics/acts.md) (amended 2026-07-26, before the pattern's first Acts adopter; the original sketch emitted a bespoke `status_changed` observation). The space declares the schema in its catalog's `schemas` block:
+
+```json
+{ "on": "$workflow_space", "type": "workflow.status_changed",
+  "shape": { "item": "obj", "from": "str", "to": "str" } }
+```
+
+The consequences follow from the kernel contract rather than this pattern:
+
+- **Emission authority (ACT3).** The item is not the composer and its location may be an actor, so `:set_status` cannot call `$acts:act` itself. The space exposes an internal, permission-empty `_record_workflow_act(type, payload)` that verifies `caller` is a live item of this space and that `payload.item` names the caller, then invokes `this:act(type, payload)`. Items are anchored to their space, so a sequenced item verb already executes on the space's log. This is the same space-mediated emitter the Tasks v2 migration uses ([notes/2026-07-26-tasks-v2-freeze.md](../../notes/2026-07-26-tasks-v2-freeze.md) §2).
+- **Payload boundary (ACT2).** `actor`, sequence, and time ride the log envelope, never the payload; `from`/`to` are state names from the workflow value, not prose. A transition reason is prose and belongs on an artifact or in a `tell(...)` line, not the Act.
+- **Projections.** Any listing that wants materialized state (WF7's introspection walks, or a per-state board) folds `workflow.status_changed` under the ACT4 projection contract instead of adding a second writer for status roll-ups. `status` itself stays an ordinary property on the item — the workflow pattern predates Acts and keeps working without a projection; the Act makes the transition history durable and foldable.
+
+The v1 `tasks` catalog does not include `$workflow_task`: it picks the obligation-cursor model instead, where state is the position in an ordered obligation list rather than a named state in a transition graph. A workflow-bearing class is a peer pattern that catalogs may build on top of `$space` when a named-state machine is the better fit. (Tasks v2 adopts Acts for its obligation-cursor vocabulary without adopting the workflow state machine; the two remain separate patterns sharing one emission discipline.)
 
 `:transition(to)` is offered as ergonomic sugar — equivalent to `:set_status(to)` but reads better in agent code.
 
