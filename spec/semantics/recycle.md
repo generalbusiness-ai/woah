@@ -36,11 +36,12 @@ storage-row deletion (step 8), and ULID tombstoning persisted across hosts
 (step 9). The §RC3a empty-children safety check rides on the builtin as
 the `force` opt; §RC6.1 wizard-only behavior rides as the `force_reserved`
 opt. The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
-RC3 step 2 (scheduled-turn cancellation) is **not** implemented: the
-parked-task kill it used to perform is deleted along with the mechanism
-(see [tasks.md](tasks.md)), and nothing yet touches the scope's schedule
-queue — there is no queue producer to cancel from. That lands with the
-scheduling work.
+RC3 step 2 (scheduled-turn cancellation) is implemented, but **at the
+scope, not in the builtin**: only the commit scope holds the pending
+queue, so the cancellation happens where the `recycles` entry is applied
+rather than where `recycle()` runs
+([coherence.md §CO16.8](../protocol/coherence.md#co168-lifecycle)). The
+host-local builtin therefore has nothing to do for this step.
 Status remains `partial` because `$system.recycle_tick_budget` and the
 cross-host steps in §RC3.1 / §RC10 (cluster co-location enforcement when
 the cluster spans hosts, fire-after-commit Directory reconciliation, and

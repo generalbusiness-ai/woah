@@ -1230,9 +1230,9 @@ One write path per fact (CO9), concretized:
 
 > Status: **implemented** — CO16.1–CO16.7 and the failure record of
 > CO16.8/CO16.9, end to end from the `schedule` builtins through the
-> transcript to delivery. **Not yet implemented:** the CO16.8 *lifecycle*
-> cancellations (recycle, scope retirement) and the CO16.9 live
-> introspection route. Design rationale in
+> transcript to delivery, plus recycle cancellation. **Not yet
+> implemented:** cancellation on scope retirement (CO17 is itself draft)
+> and the CO16.9 live introspection route. Design rationale in
 > `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
 > [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
 > where the two differ, this governs.
@@ -1612,8 +1612,15 @@ fully reconstructible from durable storage alone. See
 
 ### CO16.8 Lifecycle
 
-- **Target recycled** → its pending entries are cancelled. Bounded by the
-  per-scope cap, so a scan, not an index.
+- **Target recycled** → the scope cancels its pending entries in the same
+  transaction as the recycle, in **both directions**: entries that would
+  fire *at* the object, and entries the object *armed* on something else.
+  Leaving either behind means a timer that wakes a tombstone, or one that
+  outlives the only thing that could have cancelled it. The scope does
+  this rather than the recycling verb because only the scope holds the
+  queue — woocode cannot enumerate pending entries and so cannot cancel
+  what it cannot see. Bounded by the per-scope cap, so a scan, not an
+  index.
 - **Target moved out of scope** → the entry fires, the turn cannot resolve
   the target, the failure is recorded per the rule below, entry dropped.
   Silently following an object across scopes would be the cross-scope

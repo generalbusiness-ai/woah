@@ -1173,6 +1173,20 @@ export class ScopeSequencer {
       else this.store.delete(key);
     }
     this.headState = nextHead;
+    // CO16.8 lifecycle: a recycled object's pending entries go with it, in
+    // this same transaction. The SCOPE does this rather than the recycling
+    // verb because only the scope holds the queue — woocode cannot enumerate
+    // it and so cannot cancel what it cannot see. Both directions are covered:
+    // entries that would FIRE at the object, and entries the object ARMED on
+    // something else. Leaving either behind means a timer that wakes a
+    // tombstone, or one that outlives the only thing that could cancel it.
+    for (const recycle of submit.transcript.recycles ?? []) {
+      for (const row of this.pendingScheduleRows()) {
+        const separator = row.id.indexOf(":");
+        const owner = separator < 0 ? "" : row.id.slice(0, separator);
+        if (row.call.target === recycle.object || owner === recycle.object) this.cancel(row.id);
+      }
+    }
     // CO16.2: apply the queue effects ATOMICALLY with the turn's writes.
     // Cancellations run before schedules so a turn that cancels one id and
     // arms another in the same breath cannot have the cancel clobber a fresh
@@ -2208,6 +2222,13 @@ export class ScopeSequencer {
     };
   }
 
+  /** Every pending row. Bounded by the per-scope cap (CO16.7), so this is a
+   * bounded read rather than an unbounded scan — which is what lets recycle
+   * cancellation be a scan and need no secondary index. */
+  private pendingScheduleRows(): ScheduledTurn[] {
+    return this.options.durable ? this.options.durable.readScheduled() : [...this.scheduled.values()];
+  }
+
   /** Current queue shape for the CO16.7 caps. Bounded by the per-scope cap,
    * so this is a bounded read, not an unbounded scan. */
   private pendingScheduleSummary(): {
@@ -2216,7 +2237,7 @@ export class ScopeSequencer {
     perObject: Map<string, number>;
     byId: Map<string, { bytes: number; owner: string }>;
   } {
-    const rows = this.options.durable ? this.options.durable.readScheduled() : [...this.scheduled.values()];
+    const rows = this.pendingScheduleRows();
     const perObject = new Map<string, number>();
     const byId = new Map<string, { bytes: number; owner: string }>();
     let bytes = 0;
