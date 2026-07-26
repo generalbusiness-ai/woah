@@ -34,15 +34,19 @@ of principal it is (`$agent`, `$human`). Demote with
 clears the flag, and frees the quota slot.
 
 > **Surface note.** These provisioning verbs are native account-management
-> operations, not woocode tools. Promote/demote is supported on every profile:
-> in-memory, local-SQLite, and over the Net through the `/net-api/turn`
-> doorway. `create_agent` anchors a human-owned agent to the human authority
-> root, so the account, human, and agent share one cluster and the transition
-> commits atomically there (legacy families are co-located by a local-boot
-> repair migration). Because the verbs are **native**, the Net MCP gateway —
-> which advertises only bytecode-backed, `tool_exposed` verb pages — does not
-> expose them as MCP tools, so `woo_call` cannot reach them over Net; drive
-> them through `/net-api/turn` or the account surface instead.
+> operations, not woocode tools. Promote/demote runs in-memory, on local-SQLite,
+> and over the Net through the `/net-api/turn` doorway. A fresh signup anchors
+> the whole family (account + human + agents) into one cluster, so the account
+> counter and the agent flag commit atomically. On the live Net profile this is
+> supported only for a fully anchored family (fresh signup, cutover import, or a
+> family repaired before cutover); a family deployed BEFORE anchoring stays split
+> — a new agent alone does not repair it — and its promote/demote refuses cleanly
+> (`E_CATALOG_MUTATION`) rather than half-applying. See
+> [provisioning.md](../../spec/identity/provisioning.md) for the exact boundary
+> and the local-SQLite repair migration. Because the verbs are **native**, the
+> Net MCP gateway — which advertises only bytecode-backed, `tool_exposed` verb
+> pages — does not expose them as MCP tools, so `woo_call` cannot reach them over
+> Net; drive them through `/net-api/turn` or the account surface instead.
 
 ## Why two classes
 

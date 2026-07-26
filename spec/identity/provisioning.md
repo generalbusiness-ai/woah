@@ -413,28 +413,37 @@ scope, so it is co-resident by construction.
 > not surface them as MCP tools; drive them through `/net-api/turn` (or the
 > account surface), not `tools/call`.
 >
-> **Supported scope (explicit).** Net promote/demote is supported for authority
-> families placed under the anchoring regime: fresh installs, cutover imports
-> (the identity export carries each object's `anchor`, §8), and any agent minted
-> by `create_agent` from this version forward. For those the family is
-> co-resident in one cluster by construction and the transition is atomic.
+> **Supported scope (explicit).** Net promote/demote is supported only for a
+> FULLY ANCHORED authority family — one whose `$account` (not just its agents) is
+> anchored into the human's cluster, so the account counter and the agent flag
+> commit in the SAME scope. That holds for: a fresh signup (`bindHumanToAccount`
+> anchors the account to its human), a cutover import (the identity export
+> carries each object's `anchor`, §8), and a family the local-boot repair
+> migration co-located BEFORE export. The unit of support is the FAMILY, not the
+> agent: minting a new agent does not by itself make an unanchored-account family
+> supported (see below).
+>
+> **A new agent under a legacy account is NOT supported.** `create_agent` anchors
+> a new human-owned agent to the human authority root (`authorityRootOf` falls
+> back to the human when the account is anchorless), so the agent lands in
+> `cluster:<human>` — but if the account was provisioned BEFORE anchoring it
+> stays catalog-scoped, and the family is still split. Re-provisioning the agent
+> therefore CANNOT repair a legacy family; the account must be anchored too.
 >
 > **Not auto-repaired on Net (deliberate limitation).** A family already deployed
-> and partitioned BEFORE anchoring — an account left catalog-scoped and an agent
-> self-clustered — is NOT silently migrated on the live Net profile. Re-anchoring
-> already-partitioned cells is a recursive cross-Durable-Object host migration (a
-> spec-version scope migration,
+> and partitioned before anchoring is NOT silently migrated on the live Net
+> profile. Re-anchoring already-partitioned cells is a recursive
+> cross-Durable-Object host migration (a spec-version scope migration,
 > [migrations.md M6](../operations/migrations.md#m6-world-level-spec-versioning)),
-> which is deferred. Until then such a family's promote/demote **refuses cleanly
-> and never half-applies**: the transition cannot commit because the account's
-> cells are catalog-scoped and the agent's are in a different cluster, so the
-> committing scope rejects it (a catalog-mutation / cross-scope rejection over
-> Net; `E_CROSS_HOST_WRITE` at the co-residency pre-check on a single-host
-> profile). The operator's remedy is to re-provision the agent (mint a fresh
-> anchored agent with `create_agent`) or re-import through cutover. The local-boot
-> repair migration
-> (`2026-07-25-authority-family-colocation`) co-locates legacy families
-> automatically ONLY on the in-memory / local-SQLite (single-host) profiles.
+> which is deferred. Until then a split family's promote/demote **refuses cleanly
+> and never half-applies**: the account's `programmer_agent_count` write lands in
+> the catalog scope, which an ordinary turn cannot mutate, so the committing
+> gateway rejects the whole turn with `E_CATALOG_MUTATION` (HTTP 400) and nothing
+> commits. The operator's remedy is to repair the WHOLE family — anchor the
+> account and its agents — and re-import through cutover; the local-boot repair
+> migration (`2026-07-25-authority-family-colocation`) does this on the source's
+> in-memory / local-SQLite (single-host) image before export. Re-provisioning the
+> agent alone does not suffice.
 
 **Quota reductions vs. existing flags.** When a wizard lowers
 `programmer_grant_quota` below the current count of programmer agents,
