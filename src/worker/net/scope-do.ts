@@ -2076,6 +2076,23 @@ export class NetScopeDO {
     for (const { destination } of subscribers.slice(0, available)) {
       this.pendingLiveDeliveries.push({ destination, body });
     }
+    const dropped = Math.max(0, subscribers.length - available);
+    if (dropped > 0) {
+      this.metric({
+        kind: "net_scope_live_delivery_dropped",
+        scope,
+        status: "error",
+        reason: "queue_cap",
+        dropped,
+        queue_cap: LIVE_DELIVERY_QUEUE_CAP
+      });
+    }
+    // Queueing is not delivering. Without this wake the observation sits in
+    // a volatile buffer until some UNRELATED activity happens to drain it,
+    // and evaporates entirely on DO eviction — so the failure notification
+    // would be lost exactly when the scope is quiet, which is precisely when
+    // a scheduled turn is the only thing that ran.
+    if (this.pendingLiveDeliveries.length > 0) this.armLiveAlarm();
   }
 
   /** Pending failure records, newest first. Read by the live introspection
@@ -3719,13 +3736,6 @@ export class NetScopeDO {
    * it would fire the alarm in a tight loop that can do no useful work.
    * Dispatched rows live in the outbox family, whose retry alarm covers
    * them. */
-  /** Test seam for the CO16.6 acceptance re-arm: exercising it through a
-   * full commit would drag in the whole planning stack for a one-line
-   * scheduling rule. Mirrors exactly what the accepted path does. */
-  rearmForTest(now: number): void {
-    this.rearmAlarm(now, { dueNow: this.store.hasScheduledDue(now) });
-  }
-
   private rearmAlarm(now: number, opts?: { dueNow?: boolean }): void {
     // One indexed MIN over due_at (Phase 3) — re-arming must not read and
     // parse every parked row. `dueNow` is the alarm handler's bounded-

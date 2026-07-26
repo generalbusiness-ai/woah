@@ -995,6 +995,57 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:idle"]);
   });
 
+  it("refuses a target created in this turn but anchored into another scope", () => {
+    // Same-turn local creates stay schedulable, but presence in the
+    // transcript is not membership: created cells route by ANCHOR, so an
+    // object anchored under a foreign object belongs to that scope. The
+    // earlier check accepted any created id and armed foreign targets.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      scopeOf: (object: string) => (object === "#elsewhere" ? "other_room" : SCOPE)
+    });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#foreign",
+        name: "Foreign",
+        parent: "$thing",
+        owner: "#actor",
+        anchor: "#elsewhere",
+        location: null,
+        flags: {},
+        writer: WRITER
+      }],
+      schedules: [armed({
+        id: "#thing:foreign",
+        call: { actor: "#actor", target: "#foreign", verb: "tick", args: [] }
+      })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/anchored outside/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("allows a target created in this turn that lands here", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    const reply = seq.submit(armingTurn(seq, {
+      creates: [{
+        object: "#fresh",
+        name: "Fresh",
+        parent: "$thing",
+        owner: "#actor",
+        anchor: null,
+        location: null,
+        flags: {},
+        writer: WRITER
+      }],
+      schedules: [armed({
+        id: "#thing:fresh",
+        call: { actor: "#actor", target: "#fresh", verb: "tick", args: [] }
+      })]
+    }, "s1"));
+    expect(reply.status).toBe("accepted");
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:fresh"]);
+  });
+
   it("refuses more schedules in one turn than the per-turn cap", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));

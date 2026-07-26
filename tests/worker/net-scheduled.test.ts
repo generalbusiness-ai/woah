@@ -19,6 +19,8 @@ import { FakeDurableObjectState } from "./fake-do";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
+import { CellStore } from "../../src/net/cells";
+import { applyTranscript } from "../../src/net/transcript";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply, ScheduledTurn } from "../../src/net/scope";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
@@ -92,6 +94,53 @@ function plannerStub(): { stub: NetStub; received: Array<{ path: string; body: u
       }
     }
   };
+}
+
+/** Drive a genuinely accepted commit against a scope DO: seed authority, then
+ * submit a small planned transcript through the real /net/submit surface. */
+async function acceptedSubmit(scopeDO: Fetchable, env: NetScopeEnv, _state: ReturnType<typeof netState>): Promise<boolean> {
+  const cells = [
+    { kind: "object_lineage" as const, object: "#actor", value: { parent: null, owner: "#actor", name: "actor", anchor: null, flags: {} } },
+    { kind: "object_lineage" as const, object: "#thing", value: { parent: null, owner: "#actor", name: "thing", anchor: null, flags: {} } },
+    { kind: "property_cell" as const, object: "#thing", name: "label", value: { value: "before" } }
+  ];
+  await call(scopeDO, env, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells });
+  // Mirror the seeded authority so post_state_version matches what the scope
+  // will derive; a derived store cannot hold authoritative cells, hence commit.
+  const store = new CellStore("authority");
+  for (const cell of cells) {
+    store.commit({ ...cell, stamp: { scope_head: "seed", catalog_epoch: EPOCH } } as never);
+  }
+  const writer = { progr: "#actor", thisObj: "#thing", verb: "set_label", definer: "$thing", caller: "#actor", callerPerms: "#actor" };
+  const transcript = {
+    kind: "woo.effect_transcript.shadow.v1",
+    route: "direct",
+    scope: SCOPE,
+    seq: -1,
+    call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
+    reads: [],
+    writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "after", op: "set", writer }],
+    creates: [],
+    moves: [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: `accepted-${Date.now()}`
+  } as unknown as Parameters<typeof applyTranscript>[1];
+  const head = await call<{ head: { seq: number; hash: string; generation: number } }>(scopeDO, env, "/head");
+  const derived = applyTranscript(store, transcript, { scope_head: "x", catalog_epoch: EPOCH });
+  const reply = await call<{ status: string }>(scopeDO, env, "/submit", {
+    kind: "woo.net.commit_submit.v1",
+    scope: SCOPE,
+    base: head.head,
+    idempotency_key: `accept-${Date.now()}`,
+    transcript,
+    post_state_version: derived.postStateVersion,
+    stamp: { scope_head: "x", catalog_epoch: EPOCH }
+  });
+  return reply.status === "accepted";
 }
 
 function failureRows(state: NetScopeDurableState): Array<{ id: string; outcome: string; detail: string; target: string; verb: string }> {
@@ -287,6 +336,58 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
   });
 
+  it("delivers the failure observation to a fanout subscriber", async () => {
+    // Queueing is not delivering. The announce path pushed into a volatile
+    // buffer and never armed the live alarm, so the observation waited for
+    // unrelated activity — or vanished on eviction. Assert RECEIPT.
+    const planner = rejectingPlannerStub();
+    const fanout = plannerStub();
+    const scope = netState(`scope-${SCOPE}-observed`);
+    const env: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => (destination === "gateway:watcher" ? fanout.stub : planner.stub)
+    };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:planner-a", role: "planner" });
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:watcher", role: "fanout" });
+    await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-seen", Date.now() + 30) });
+
+    await sleep(60);
+    await scopeDO.alarm();
+    await scope.settle();
+    // The live queue drains on a fresh alarm; the announce must have armed it.
+    await scopeDO.alarm();
+    await scope.settle();
+
+    const bodies = fanout.received.filter((entry) => entry.path.endsWith("/live") || entry.path.endsWith("/fanout"));
+    expect(JSON.stringify(bodies)).toContain("scheduled_turn_failed");
+    expect(JSON.stringify(bodies)).toContain("sched-seen");
+  });
+
+  it("rolls the outbox delete back when the failure row cannot be written", async () => {
+    // CO16.8's atomicity, proved rather than asserted: if the record cannot be
+    // written, the row that would have been deleted must survive for retry.
+    // Otherwise the deadline's only trace is gone.
+    const planner = rejectingPlannerStub();
+    const scope = netState(`scope-${SCOPE}-rollback`);
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => planner.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:planner-a", role: "planner" });
+    await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-rollback", Date.now() + 30) });
+    await sleep(60);
+
+    // Break the failure table so the insert throws inside the transaction.
+    scope.state.storage.sql.exec("DROP TABLE net_scope_sched_failure");
+
+    await scopeDO.alarm().catch(() => undefined);
+    await scope.settle().catch(() => undefined);
+
+    // The dispatch row is still there: no record, no deletion.
+    const rows = outboxRows(scope.state).filter((row) => row.route === "/plan-scheduled");
+    expect(rows.length).toBeGreaterThan(0);
+  });
+
+
   it("records an abandoned dispatch the same way — never running is not different from failing", async () => {
     // Abandonment takes the lane's full retry budget (8 attempts on an
     // exponential backoff), which is ~30s of wall time — so seed a row that
@@ -364,24 +465,31 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
   });
 
   it("an accepted turn wakes work parked by the idle policy (CO16.6)", async () => {
-    // The re-arm used the default "next FUTURE row" selection, and a parked
-    // entry is by definition OVERDUE — so the rule that the next accepted
-    // turn re-arms parked work never fired for the entries it exists to
-    // serve. The alarm must be armed for NOW, not for the next future row.
+    // Drive a REAL accepted submit. The previous version of this test poked
+    // rearmForTest() directly, so deleting the production re-arm would have
+    // left it green — the exact shape of vacuous test this feature keeps
+    // producing.
     const scope = netState(`scope-${SCOPE}-idle-rearm`);
     const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => plannerStub().stub };
     const scopeDO = new NetScopeDO(scope.state, env);
     await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-parked", Date.now() + 20) });
     await sleep(50);
 
+    // Overdue and parked: no planner is registered, so the alarm leaves it.
+    await scopeDO.alarm();
+    await scope.settle();
+    expect(scheduledRows(scope.state).map((row) => row.id)).toEqual(["sched-parked"]);
+
     scope.alarms.length = 0;
     const before = Date.now();
-    // Any accepted commit; the point is that acceptance re-arms.
-    await call(scopeDO, env, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells: [] }).catch(() => undefined);
-    scopeDO.rearmForTest(before);
+    const accepted = await acceptedSubmit(scopeDO, env, scope);
+    expect(accepted).toBe(true);
 
+    // The acceptance must arm for NOW, not for the next FUTURE row — the
+    // parked entry is overdue, which is the whole point.
     const armed = scope.alarms.filter((at): at is number => typeof at === "number");
-    expect(armed.some((at) => at <= before)).toBe(true);
+    expect(armed.length).toBeGreaterThan(0);
+    expect(armed.some((at) => at <= before + 5)).toBe(true);
   });
 
   it("a later planner subscription arms an immediate wake for parked overdue turns", async () => {

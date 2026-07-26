@@ -2062,11 +2062,19 @@ export class ScopeSequencer {
           return `schedule ${request.id} targets ${request.call.target} in scope ${targetScope}, not ${this.scope}`;
         }
       }
+      // A target created by THIS turn is schedulable — but only if the create
+      // actually lands here. Created cells route by the create's ANCHOR, so an
+      // object anchored under something in another scope belongs to that
+      // scope, and merely appearing in this transcript proves nothing. The
+      // earlier check accepted any created id and armed foreign targets.
+      const createdHere = (submit.transcript.creates ?? []).find((create) => create.object === request.call.target);
+      const createLandsHere = createdHere !== undefined && this.createResolvesToThisScope(createdHere);
       const targetKnownHere =
-        this.store.get(cellKey("object_lineage", request.call.target)) !== undefined ||
-        (submit.transcript.creates ?? []).some((create) => create.object === request.call.target);
+        this.store.get(cellKey("object_lineage", request.call.target)) !== undefined || createLandsHere;
       if (!targetKnownHere) {
-        return `schedule ${request.id} targets ${request.call.target}, which this scope does not hold`;
+        return createdHere !== undefined
+          ? `schedule ${request.id} targets ${request.call.target}, created in this turn but anchored outside ${this.scope}`
+          : `schedule ${request.id} targets ${request.call.target}, which this scope does not hold`;
       }
 
       const bytes = scheduledTurnBytes(this.scheduledTurnFromRequest(request, this.scheduleAttribution(submit)));
@@ -2153,6 +2161,30 @@ export class ScopeSequencer {
       ...(attribution?.principal !== undefined ? { principal: attribution.principal } : {}),
       ...(attribution?.trace !== undefined ? { trace: attribution.trace } : {})
     };
+  }
+
+  /**
+   * Does a create in this transcript actually land in THIS scope?
+   *
+   * Creates route by anchor (the gateway classifies a created cell by the
+   * anchor's scope), so the question is where the anchor lives — not whether
+   * the id appears in the transcript. An unanchored create is self-hosted and
+   * lands here; an anchored one lands wherever its anchor is classified,
+   * which may be another scope entirely. Unknown anchors fail CLOSED: this is
+   * the check that keeps a foreign object out of the local queue.
+   */
+  private createResolvesToThisScope(create: NonNullable<EffectTranscript["creates"]>[number]): boolean {
+    const anchor = create.anchor;
+    if (anchor === null || anchor === undefined) return true;
+    if (this.options.scopeOf) {
+      try {
+        return this.options.scopeOf(anchor) === this.scope;
+      } catch {
+        return false;
+      }
+    }
+    // With no classifier the only honest local evidence is holding the anchor.
+    return this.store.get(cellKey("object_lineage", anchor)) !== undefined;
   }
 
   /** Attribution captured from the ARMING turn, for the durable row. */

@@ -45,6 +45,16 @@ DIRECTORY — routing hints + leased session/presence projection (never authorit
 KV        — epoch-stamped cold-start seeds (read-only fallback)
 ```
 
+**The gateway is inside the deployment trust boundary.** It plans every
+turn and authors every transcript, so the frame provenance a transcript
+carries (`TranscriptWrite.writer`, and the `armed_by` of CO16.2) is
+recorded by the planner, not attested by the VM that ran. A scope
+validates provenance for *consistency* — the naming, the authority flags
+it reads from its own cells — but a planner that fabricated provenance
+could name any frame. Nothing in this layer detects that; see CO11 item 6.
+Transport authentication (protocol/hosts.md §3.3) is what keeps a
+non-gateway from submitting at all.
+
 The **scope is the object home**: an object's cells live in exactly one
 scope at a time (anchor-cluster model; actors and their carried objects
 anchor to the actor's scope per CA6). There is no separate per-host
@@ -634,6 +644,15 @@ Named honestly so they are decisions, not surprises:
    not by a byte/page budget with continuations. A scope large enough to
    need paged repair transfer is the same scope CA13 decomposition
    addresses; paging lands with that work.
+6. **No frame attestation.** Per-frame provenance on writes and on
+   schedule effects (CO16.2) is *recorded by the planner*, so the commit
+   scope can check it for consistency but cannot prove the named frame
+   ran. A faulty or compromised gateway could therefore fabricate a
+   `writer` or an `armed_by` — including one naming a wizard, which would
+   let it arm an `always` schedule. This is bounded today by CO1's trust
+   boundary and transport authentication, not by the commit layer. Closing
+   it needs the executing VM to attest frames, which would change the
+   transcript contract for every mutation, not only for schedules.
 
 ## CO12. Conformance gates
 
@@ -1247,14 +1266,12 @@ set?".
 
 ```ts
 type ScheduledTurnRequest = {
-  kind:            "woo.scheduled_turn_request.v1";
-  id:              string;      // namespaced; see CO16.3
-  scope:           ScopeRef;    // MUST match the committing scope
-  at_logical_time: number;      // UTC epoch ms; MUST be in the future
-  idle_policy:     "while_active" | "always";   // CO16.6
+  id:              string;      // namespaced `<object>:<key>`; see CO16.3
+  at:              number;      // UTC epoch ms; >= arming clock + lead time
+  idlePolicy:      "while_active" | "always";   // CO16.6
   call: {
-    actor:  ActorRef;
-    target: ObjRef;
+    actor:  ActorRef;           // MUST equal the arming turn's actor
+    target: ObjRef;             // MUST be held by the committing scope
     verb:   string;
     args:   WooValue[];
   };
@@ -1296,10 +1313,22 @@ programmer authority is stored survives intact. Provenance answers "was
 this effect legitimate when it was recorded?", not "what may the fired
 turn do?".
 
+There is no `scope` field: the entry belongs to the scope the transcript
+is submitted to, and a field naming it would be a claim to check rather
+than a fact. Same-scope membership is established from the target instead
+(below). There is no `kind` field either — these are transcript members,
+not standalone envelopes.
+
 Validation at commit:
 
-- `scope` MUST match the committing scope. Cross-scope scheduling is not a
-  primitive (CO16.4); waking another scope is an ordinary committed turn
+- The target MUST be **held by this scope**: it has a lineage cell here,
+  or this same turn creates it *and that create lands here*. Created cells
+  route by the create's anchor, so an object anchored under something in
+  another scope belongs to that scope; accepting any created id would arm
+  foreign targets. Delegating this to a routing classifier does not work —
+  a Scope DO answers "this scope" for every target it has no hint for, and
+  routing hints never carry schedule targets. Cross-scope scheduling is not
+  a primitive (CO16.4); waking another scope is an ordinary committed turn
   submitted by the fired verb.
 - `at_logical_time` MUST be at least the minimum lead time (CO16.6) beyond
   the committing turn's recorded wall-clock input, and within the horizon
