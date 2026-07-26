@@ -119,7 +119,7 @@ hand, so nothing else covers that seam.
 `smoke:net-mcp` 0/1 → 14/14. This also unblocks the deployed
 `smoke:walkthrough`, which shares the scenario.
 
-## Open: deployed worlds keep the missing contents rows
+## Closed: deployed worlds are repairable (`repair-contents`)
 
 Bug 2 is fixed going forward. It does **not** repair existing state, and the gap
 is not hypothetical: several bundled catalogs create with an explicit location
@@ -135,15 +135,35 @@ relation row at its container. Consumers are the contents-relation surfaces
 listed above; the affected catalogs largely read their own ordered-edge and
 projection state instead, which is why nothing has visibly failed.
 
-**There is no repair path.** `ScopeSequencer.rebuildRelations()` is the CO13
-bounded repair, it is implemented and unit-tested — and it has **no production
-caller**: no DO route, no operator script, no boot path invokes it. The existing
-`scripts/net-repair-relations.ts` cannot substitute; it deliberately refuses any
-id that is not a bundled static fixture, precisely so user objects are never
-inferred from a bootstrap image.
+`ScopeSequencer.rebuildRelations()` is the CO13 bounded repair and it is
+implemented and unit-tested — but it has **no production caller**, and it could
+not simply be wired up: it DELETES contents rows absent from its local
+derivation, and a row this scope owns whose member is anchored elsewhere
+arrived by `/net/relate` and is invisible to a local cell scan. Wiring it would
+have traded missing rows for deleted ones. The fixture-scoped
+`scripts/net-repair-relations.ts` cannot substitute either; it deliberately
+refuses any id that is not in a bundled image, precisely so user objects are
+never inferred from bootstrap state.
 
-The decision-table answer is a spec-version (`§M6`) walk-forward, and that
-mechanism is itself still deferred. Wiring an operator route that rewrites
-relation state at every scope is a distinct change with its own review and
-deploy risk, so it is deliberately **not** bundled here. It should be decided
-on its own terms.
+`POST /net-install/scope/<name>/repair-contents` (`npm run repair:net-contents`)
+is the answer, and it is **add-only** for exactly the reason above. Design notes
+worth keeping:
+
+- Each scope derives candidates from its OWN `object_live` cells. That is the
+  O(scope size) bound CO13 already sanctions; the operator names SCOPES, which
+  is namespace knowledge, not world knowledge. Nothing enumerates objects.
+- Add-only buys idempotence for free: an identical row reports no change, so a
+  second run advances no head and refans nothing.
+- Ownership uses the same `ownsCellLocally` predicate read validation uses, so
+  the repair cannot mint rows for an object the scope does not sequence.
+- Cross-scope membership rides the ordinary `/net/relate` lane. Anchor topology
+  is caller knowledge, so an unmapped owner is reported, never guessed.
+- **Repair deliveries need their own `(from_scope, seq)` lane.** The receiver
+  gate is `seq <= last` with `last` defaulting to 0, so a repair borrowing the
+  commit seq stream is suppressed outright at head 0 — and worse, borrowing a
+  seq the commit stream has not reached yet would make the receiver DROP the
+  real delta that later lands on it. This was found by the cross-scope test
+  failing, not by inspection.
+
+Proven on real workerd as well as the fake-DO lane: seed an aged scope, repair,
+re-repair, and read the membership back through a cold gateway's own pull.
