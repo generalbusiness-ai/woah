@@ -488,6 +488,14 @@ type VerbEditorSession = {
   kind: "verb";
   descriptor: WooValue;
   slot: number | null;
+  /** How save/dry_run install the buffer. "upsert" replaces the OWN slot
+   * that existed at open, CAS-guarded by expected_version. "define" is the
+   * inherited-override / new-verb shape: no own slot existed at open, so
+   * the install must still find it absent — mode "define"'s existence check
+   * IS the optimistic guard (expected_version stays null; a version CAS
+   * against an absent slot would always conflict, which is exactly the bug
+   * that made every inherited-verb save fail E_VERSION). */
+  install_mode: "upsert" | "define";
   expected_version: number | null;
   buffer: string;
   dirty: boolean;
@@ -2818,7 +2826,12 @@ export class WooWorld {
       throw wooError("E_TYPE", "verb descriptor must be a name string or 1-based slot integer", descriptor);
     }
     const found = this.ownVerbExact(objRef, descriptor);
-    if (!found) throw wooError("E_VERBNF", `${objRef} has no verb named ${descriptor}`, { obj: objRef, descriptor });
+    // `{ obj, name }` is the engine's one E_VERBNF shape for a name-descriptor
+    // miss. It is not cosmetic: the Net sparse planner derives the exact
+    // `verb_bytecode:<obj>:<name>` cell to grow the turn's slice from this
+    // value (src/net/plan.ts sparseMissingKeys). A divergent key spelling made
+    // the miss unrepairable and terminal — see that function's comment.
+    if (!found) throw wooError("E_VERBNF", `${objRef} has no verb named ${descriptor}`, { obj: objRef, name: descriptor });
     return found;
   }
 
@@ -2931,7 +2944,9 @@ export class WooWorld {
     const verb = this.ownVerbResolve(objRef, descriptor);
     this.recordAuthoredVerbRead(objRef, verb);
     if (!this.removeVerb(objRef, verb.name)) {
-      throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, verb: verb.name });
+      // `{ obj, name }`: see ownVerbResolve — the Net planner derives the
+      // missing verb cell from this shape.
+      throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, name: verb.name });
     }
     this.recordAuthoredVerbWrite(objRef, null, verb.name);
   }
@@ -6212,6 +6227,25 @@ export class WooWorld {
     const expectedVersion = optionNullableInt(options, "expected_version");
     const compiled = compileVerb(source);
     const selected = this.selectOwnVerbForInstall(objRef, descriptor, { mode, append });
+    // Replacing an EXISTING verb requires the verb's execution authority:
+    // wizard, or the actor owns the verb — the set_verb_code / set_verb_info
+    // rule. Object authorship (checked above) is NOT sufficient: verb owner
+    // is dispatch's `progr`, so overwriting a verb you do not own on an
+    // object you do would let you replace, and take ownership of, another
+    // principal's code (e.g. a $wiz-installed verb on a programmer-owned
+    // object). Defining a NEW own verb (current absent) needs only the
+    // object authorship already asserted.
+    if (selected.current && !this.isWizard(actor) && selected.current.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${selected.name} owned by ${selected.current.owner}`, {
+        actor, obj: objRef, verb: selected.name, owner: selected.current.owner
+      });
+    }
+    // Net planning: pin the page this install is predicated on (the same
+    // optimistic-conflict read addVerbForActor/setVerbCode record). Without
+    // it the editor-save path produced a transcript with no verb read OR
+    // write, so the install silently never left the committing room's turn.
+    if (selected.current) this.recordAuthoredVerbRead(objRef, selected.current);
+    else this.recordAuthoredVerbAbsence(objRef, selected.name);
     if ((selected.current?.version ?? null) !== expectedVersion && expectedVersion !== null) {
       throw wooError("E_VERSION", "verb version conflict", { expected: expectedVersion, actual: selected.current?.version ?? null });
     }
@@ -6249,7 +6283,12 @@ export class WooWorld {
       kind: "bytecode",
       name: selected.name,
       aliases: selected.current?.aliases ?? [],
-      owner: actor,
+      // An update preserves the verb's owner (set_verb_code semantics —
+      // ownership changes go through set_verb_info's explicit rule); only
+      // a fresh define binds the installing actor. Non-wizards can only
+      // reach an update as the owner, so this matters for wizard edits:
+      // fixing someone's verb must not silently chown it to the wizard.
+      owner: selected.current?.owner ?? actor,
       perms: parsedPerms.perms,
       arg_spec: compiled.metadata?.arg_spec ?? selected.current?.arg_spec ?? {},
       direct_callable: parsedPerms.directCallable,
@@ -6263,6 +6302,11 @@ export class WooWorld {
       version,
       line_map: compiled.line_map ?? {}
     }, { append: selected.append, slot: selected.current ? selected.slot : undefined });
+    // Make the install durable over Net: record the written page so the
+    // transcript carries a verb cell write that rides to the object's
+    // anchor scope (mirrors addVerbForActor / setVerbCode).
+    const installed = this.ownVerbExact(objRef, selected.name);
+    if (installed) this.recordAuthoredVerbWrite(objRef, installed, selected.name);
     propagateVerbPurity(this);
     return summary;
   }
@@ -6350,6 +6394,29 @@ export class WooWorld {
     }
     this.assertEditorObject(editorRef);
     const options = progOptions(opts);
+
+    // Refuse at the door what save/dry_run will refuse anyway (the
+    // verb-owner rule in programmerInstallVerb): opening a buffer the actor
+    // can never install is a trap. An INHERITED verb resolves no own slot
+    // here — saving it defines a new own override, which the object
+    // authorship checked at install time permits. This runs BEFORE the
+    // resume path below: authorization is revalidated against the verb's
+    // CURRENT owner every entry, so a verb chowned away while the session
+    // was paused refuses resume instead of admitting the actor to a buffer
+    // whose save can only fail. The paused session (and its buffer) is left
+    // untouched by the refusal.
+    let ownCurrent: VerbDef | null = null;
+    try {
+      ownCurrent = this.ownVerbResolve(targetRef, descriptor);
+    } catch {
+      ownCurrent = null;
+    }
+    if (ownCurrent && !this.isWizard(ctx.actor) && ownCurrent.owner !== ctx.actor) {
+      throw wooError("E_PERM", `${ctx.actor} cannot edit verb ${targetRef}:${ownCurrent.name} owned by ${ownCurrent.owner}`, {
+        actor: ctx.actor, obj: targetRef, verb: ownCurrent.name, owner: ownCurrent.owner
+      });
+    }
+
     const existing = this.editorSessionOrNull(editorRef, ctx.actor);
     let replacedPrevious: Record<string, WooValue> | null = null;
     if (existing) {
@@ -6378,7 +6445,17 @@ export class WooWorld {
       kind: "verb",
       descriptor: cloneValue(descriptor),
       slot: typeof listed.slot === "number" ? listed.slot : null,
-      expected_version: optionNullableInt(options, "expected_version") ?? (typeof listed.version === "number" ? listed.version : null),
+      // Own slot at open → upsert with a version CAS against THAT slot.
+      // No own slot (inherited verb, or a brand-new name) → define: the
+      // buffer becomes a new own verb, and mode "define"'s absence check
+      // is the optimistic guard. `listed.version` must NOT seed the CAS in
+      // that case — it is the INHERITED verb's version, and comparing it
+      // against the absent own slot made every override save fail
+      // E_VERSION.
+      install_mode: ownCurrent ? "upsert" : "define",
+      expected_version: ownCurrent
+        ? optionNullableInt(options, "expected_version") ?? (typeof listed.version === "number" ? listed.version : null)
+        : null,
       buffer: source,
       dirty: false,
       diagnostics: [],
@@ -6454,6 +6531,7 @@ export class WooWorld {
     const session = this.requireEditorSession(editorRef, ctx.actor);
     const result = assertMap(await this.programmerInstallVerb(ctx.actor, session.target, session.descriptor, session.buffer, {
       dry_run: true,
+      mode: session.install_mode,
       expected_version: session.expected_version
     }, session.surface_class));
     session.diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
@@ -6465,6 +6543,7 @@ export class WooWorld {
   async editorSave(ctx: CallContext, editorRef: ObjRef): Promise<WooValue> {
     const session = this.requireEditorSession(editorRef, ctx.actor);
     const result = assertMap(await this.programmerInstallVerb(ctx.actor, session.target, session.descriptor, session.buffer, {
+      mode: session.install_mode,
       expected_version: session.expected_version
     }, session.surface_class));
     session.diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
@@ -6748,6 +6827,7 @@ export class WooWorld {
       kind: session.kind,
       descriptor: cloneValue(session.descriptor),
       slot: session.slot,
+      install_mode: session.install_mode,
       expected_version: session.expected_version,
       dirty: session.dirty,
       diagnostics: cloneValue(session.diagnostics as WooValue) as WooValue[],
@@ -6767,33 +6847,66 @@ export class WooWorld {
   private async moveEditorActor(ctx: CallContext, destination: ObjRef, previousLocation: ObjRef | null): Promise<void> {
     this.object(destination);
     const actor = ctx.actor;
+    // Capture the session's scope BEFORE any presence update. For a space-like
+    // destination `updatePresence` sets `activeScope` as a side effect of
+    // joining presence, so reading it afterwards reports the destination and
+    // the transition below looks like a no-op. That silent mutation is enough
+    // locally, but over Net only a recorded `session_scope` event becomes the
+    // committed session-cell write (foldSessionEffects), and the MCP session
+    // scope is read from that cell — so without this the actor entered the
+    // editor while its session still pointed at the old room.
+    const sessionRow = ctx.session ? this.sessions.get(ctx.session) : undefined;
+    const editorSession = sessionRow && sessionRow.actor === actor ? sessionRow : null;
+    const priorScope = editorSession?.activeScope ?? null;
     const current = await this.objectLocationChecked(actor, ctx.hostMemo);
-    if (current && current !== destination && this.objects.has(current) && this.isSpaceLike(current)) {
-      await this.updatePresenceChecked(actor, current, false, ctx);
+    // Exit presence is keyed by the moving SESSION's active scope when one
+    // exists (moveto.md M2.1 step 4: an actor may hold several sessions, and
+    // only presence-at-scope is meaningful for exit routing). The physical
+    // location is the fallback for the sessionless object-graph path only —
+    // using it for a secondary session would strip the actor's presence from
+    // the primary session's room.
+    const exitScope = editorSession ? priorScope : current;
+    if (exitScope && exitScope !== destination && this.objects.has(exitScope) && this.isSpaceLike(exitScope)) {
+      await this.updatePresenceChecked(actor, exitScope, false, ctx);
     }
     if (this.isSpaceLike(destination)) {
       await this.updatePresenceChecked(actor, destination, true, ctx);
-    } else if (ctx.session) {
-      const session = this.sessions.get(ctx.session);
-      if (session && session.actor === actor) {
-        // CA8: record the active-scope transition so presence projections +
-        // session-row materialization follow editor movement, not just physical
-        // room movement (see movetoActorChecked).
-        if (session.activeScope !== destination) {
-          this.recordTurnEvent({
-            kind: "session_scope",
-            session: session.id,
-            actor,
-            from: session.activeScope ?? null,
-            to: destination,
-            ...(session.rosterVisible === false ? { rosterVisible: false } : {})
-          });
-        }
-        this.setSessionActiveScope(session, destination);
-        this.persistSession(session);
-      }
     }
-    await this.moveObjectChecked(actor, destination);
+    // Independent of space-likeness. This used to be the `else` of the branch
+    // above, which left the space-like case recording no scope transition at
+    // all: the plain object move below is not the actor-move path that normally
+    // records one (see movetoActorChecked). A space-like editor therefore took
+    // the actor in physically while its session still pointed at the old room,
+    // so the editor's own verbs never entered the session's context. Presence
+    // and active scope now move together, as they do for ordinary room
+    // movement.
+    if (editorSession) {
+      // CA8: record the active-scope transition so presence projections +
+      // session-row materialization follow editor movement, not just physical
+      // room movement (see movetoActorChecked). Compared against the scope
+      // captured above, not the live row, for the reason given there.
+      if (priorScope !== destination) {
+        this.recordTurnEvent({
+          kind: "session_scope",
+          session: editorSession.id,
+          actor,
+          from: priorScope,
+          to: destination,
+          ...(editorSession.rosterVisible === false ? { rosterVisible: false } : {})
+        });
+      }
+      this.setSessionActiveScope(editorSession, destination);
+      this.persistSession(editorSession);
+    }
+    // Primary-session gate (moveto.md M2.1 step 7, same rule as
+    // movetoActorChecked): only the actor's primary session performs the
+    // physical relocate — a secondary session moves its own scope and
+    // presence but must not drag the shared body along. The sessionless
+    // object-graph fallback (seed/install movement) still relocates.
+    const primary = editorSession ? this.primarySessionForActor(actor) : null;
+    if (!editorSession || primary?.id === editorSession.id) {
+      await this.moveObjectChecked(actor, destination);
+    }
     if (previousLocation && previousLocation !== destination && this.objects.has(actor) && this.objects.has(previousLocation) && this.isSpaceLike(previousLocation)) {
       await this.updatePresenceChecked(actor, previousLocation, false, ctx);
     }
@@ -12706,6 +12819,10 @@ function parseVerbEditorSession(value: WooValue): VerbEditorSession {
     kind: "verb",
     descriptor: cloneValue(raw.descriptor),
     slot: typeof raw.slot === "number" && Number.isInteger(raw.slot) ? raw.slot : null,
+    // Sessions persisted before install_mode existed could only save an
+    // OWN slot successfully (the inherited path always E_VERSIONed), so
+    // "upsert" is the faithful default.
+    install_mode: raw.install_mode === "define" ? "define" : "upsert",
     expected_version: typeof raw.expected_version === "number" && Number.isInteger(raw.expected_version) ? raw.expected_version : null,
     buffer: assertString(raw.buffer),
     dirty: raw.dirty === true,
@@ -12724,6 +12841,7 @@ function serializeVerbEditorSession(session: VerbEditorSession): Record<string, 
     kind: session.kind,
     descriptor: cloneValue(session.descriptor),
     slot: session.slot,
+    install_mode: session.install_mode,
     expected_version: session.expected_version,
     buffer: session.buffer,
     dirty: session.dirty,

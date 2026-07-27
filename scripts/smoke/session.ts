@@ -88,7 +88,7 @@ export class SmokeSession {
     // envelope omitted identity: discover a classic guest actor from its
     // control tools. Net must never depend on this path.
     const probing = new SmokeSession(transport, sessionId, "", options.label, rpcTimeoutMs);
-    const tools = await probing.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 });
+    const tools = await probing.callTool("woo_list_reachable_tools", { scope: "active", limit: 200 });
     const list = (tools as any)?.result?.structuredContent?.result?.tools ?? [];
     const selfTool = list.find((tool: any) =>
       typeof tool?.object === "string" &&

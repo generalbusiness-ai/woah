@@ -75,7 +75,7 @@ async function main(): Promise<void> {
 
     const reachable = assertOk("woo_list_reachable_tools", await client.callTool({
       name: "woo_list_reachable_tools",
-      arguments: { scope: "all", limit: 200 }
+      arguments: { scope: "active", limit: 200 }
     }) as ToolResult);
     const tools = (reachable.structuredContent?.result as { tools?: Array<{ object?: string; verb?: string }> } | undefined)?.tools ?? [];
     if (!tools.some((tool) => /^guest_/.test(tool.object ?? ""))) {

@@ -346,7 +346,10 @@ export type SessionAuthDeps = {
  *    instead: actor binding to the calling actor, and not born expired.
  *    Transition-folded turns pass through here too — their value merges
  *    the prior row (plan.ts), whose freshness CO4 step 7 pins via the
- *    folded session read.
+ *    folded session read. When that folded read is FOREIGN and carries no
+ *    owner attestation, the committing room's session_presence checkpoint
+ *    proves it (the same CO14 local proof as rule 3) — recorded here so
+ *    step 7 sees a proved read instead of terminal `rider_unattested`.
  * 2. **Owned session** — this scope holds the cell: validate the
  *    authoritative value (presence, expiry, actor binding).
  * 3. **Foreign session** — the CO2.3 composition (session cells are just
@@ -426,6 +429,33 @@ export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDe
           (existing) => existing.id !== id && validateSessionCell(existing.cell, now) === "ok"
         );
         if (occupied) refuse(id, "actor_occupied", { source: "exclusive_mint" });
+      }
+      // CO14 room-checkpoint proof composed with the write: a transition
+      // turn committing at the session's ACTIVE room both READS the prior
+      // row and WRITES its replacement (the plan-time fold). The written
+      // value validated above settles the auth verdict, but CO4 step 7
+      // still demands proof that the read VALUE is current, and this scope
+      // cannot attest a cell it does not own. The committing room's
+      // owner-sequenced session_presence checkpoint is the sanctioned
+      // equivalent local proof (CO14): record its content version so step 7
+      // compares it against the folded read — a differing version is the
+      // ordinary retryable read_version_mismatch, never a terminal
+      // rider_unattested. This is what lets a room verb move the actor OUT
+      // of the room it commits in (editor pause/save/abort). A commit
+      // anywhere other than the active room finds no checkpoint row and
+      // still requires the ordinary CO2.3 owner attestation.
+      if (!deps.ownsSession(id)) {
+        const foldedRead = sessionReads.find((r) => r.cell.object === id);
+        if (foldedRead && foldedRead.version !== undefined && !attested.has(sessionCellKey(id))) {
+          const projected = deps.readProjectedSession?.(id);
+          if (projected !== undefined) {
+            // The prior row must itself be live and actor-bound: an expired
+            // or foreign-actor session cannot authorize its own transition.
+            const priorVerdict = validateSessionCell(projected, now, transcript.call.actor);
+            if (priorVerdict !== "ok") refuse(id, priorVerdict, { source: "room_presence_projection" });
+            projectedReads.set(sessionCellKey(id), projected.version);
+          }
+        }
       }
       continue;
     }

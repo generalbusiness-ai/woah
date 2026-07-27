@@ -120,15 +120,30 @@ verb $workflow_task:set_status(status) {
   }
 
   this.status = status;
-  emit(this.space, { type: "status_changed", source: this, from, to });
+  this.space:_record_workflow_act("workflow.status_changed",
+                                  { "item": this, "from": from, "to": to });
 }
 ```
 
-The v1 `tasks` catalog does not include `$workflow_task`: it picks the obligation-cursor model instead, where state is the position in an ordered obligation list rather than a named state in a transition graph. A workflow-bearing class is a peer pattern that catalogs may build on top of `$space` when a named-state machine is the better fit.
+The transition is recorded as an Act on the space's sequenced log, governed by [acts.md](../semantics/acts.md) (amended 2026-07-26, before the pattern's first Acts adopter; the original sketch emitted a bespoke `status_changed` observation). The space declares the schema in its catalog's `schemas` block:
+
+```json
+{ "on": "$workflow_space", "type": "workflow.status_changed",
+  "shape": { "item": "obj", "from": "str", "to": "str" } }
+```
+
+The consequences follow from the kernel contract rather than this pattern:
+
+- **Emission authority (ACT3).** The item is not the composer and its location may be an actor, so `:set_status` cannot call `$acts:act` itself. The space exposes an internal, permission-empty `_record_workflow_act(type, payload)` that verifies `caller` is a live item of this space and that `payload.item` names the caller, then invokes `this:act(type, payload)`. Items are anchored to their space, so a sequenced item verb already executes on the space's log. This is the same space-mediated emitter the Tasks v2 migration uses ([notes/2026-07-26-tasks-v2-freeze.md](../../notes/2026-07-26-tasks-v2-freeze.md) §2).
+- **Payload boundary (ACT2).** `actor`, sequence, and time ride the log envelope, never the payload; `from`/`to` are state names from the workflow value, not prose. A transition reason is prose and belongs on an artifact or in a `tell(...)` line, not the Act.
+- **One authority (ACT7).** The item's `status` property is the single authority for current state, and its single writer is the gated recording path. A projection over workflow state is therefore a **relation-checkpoint** ([acts.md §ACT7](../semantics/acts.md#act7-one-authority-per-fact)): its folds may build a watermark and bounded indexes from `workflow.status_changed`, but its reads join the live `status` property — a fold that copies status into rows would be a mirrored second authority and is forbidden. WF7's introspection walks already read the property; a materialized listing checkpoints, it does not mirror.
+- **Completeness (ACT7).** The Act log must be complete for status transitions, so **every** path that writes `status` records the Act in the same turn — including wizard repair. `force_set_status` bypasses the transition gate, not the log: it writes through the same recording path, the envelope actor identifies the wizard, and the wizard audit trail is additional, not a substitute. A status write with no Act is a defect, not an option.
+
+The v1 `tasks` catalog does not include `$workflow_task`: it picks the obligation-cursor model instead, where state is the position in an ordered obligation list rather than a named state in a transition graph. A workflow-bearing class is a peer pattern that catalogs may build on top of `$space` when a named-state machine is the better fit. (Tasks v2 adopts Acts for its obligation-cursor vocabulary without adopting the workflow state machine; the two remain separate patterns sharing one emission discipline.)
 
 `:transition(to)` is offered as ergonomic sugar — equivalent to `:set_status(to)` but reads better in agent code.
 
-Wizard repair: `wiz:force_set_status(item, status)` bypasses the workflow check entirely. Logged as a wizard action.
+Wizard repair: `wiz:force_set_status(item, status)` bypasses the transition gate (rules, roles, `requires`) but **not** the recording path — it writes `status` and records the same `workflow.status_changed` Act in the same turn, keeping the Act stream complete for any checkpoint projection (ACT7). The envelope actor identifies the wizard; the wizard audit log is additional.
 
 ---
 

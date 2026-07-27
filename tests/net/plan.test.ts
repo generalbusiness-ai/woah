@@ -667,6 +667,58 @@ describe("slice-based planning (Phase 1 — the spine)", () => {
     if (sliceReply.status !== "accepted") return;
     expect(sliced.submit.post_state_version).toBe(fullViewOfLarge.submit.post_state_version);
   });
+
+  it("grows the slice for a verb-metadata read on an object that is not the call target", async () => {
+    // A verb that inspects ANOTHER object's verb (the `set_verb_info(target,
+    // "hi", …)` / `list_verb` shape) reads a verb page the seed slice never
+    // holds: the seed covers the actor's and target's class chains, not an
+    // argument's own pages. The engine raises E_VERBNF, and the planner must
+    // translate it into a repairable miss naming
+    // `verb_bytecode:<obj>:<name>` — otherwise it reads as semantic absence
+    // and the turn dies terminally even though the page is right there in the
+    // view. The derivation reads the NAME out of the error value, so this also
+    // pins the engine's `{ obj, name }` E_VERBNF shape.
+    const world = createWorld();
+    const session = world.auth("guest:plan-foreign-verb");
+    const actor = session.actor;
+    world.createObject({ id: "peek_box", name: "Peek Box", parent: "$thing", owner: actor });
+    world.createObject({ id: "other_box", name: "Other Box", parent: "$thing", owner: actor });
+    expect(installVerb(world, "other_box", "hi", `verb :hi() rxd { return 42; }`, null).ok).toBe(true);
+    expect(
+      installVerb(world, "peek_box", "peek", `verb :peek(id) rxd { return verb_info(id, "hi")["name"]; }`, null).ok
+    ).toBe(true);
+
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "foreign-verb",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor,
+        target: "peek_box",
+        verb: "peek",
+        args: ["other_box"]
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "k-foreign-verb",
+      stamp: seq.stamp(),
+      slicePlanning: true
+    });
+    // Reaching a result at all is the proof: the seed slice does not hold
+    // `verb_bytecode:other_box:hi`, so the first attempt raises E_VERBNF and
+    // only a translated, grown re-attempt can return a name. Spelling the
+    // error value's verb key anything the derivation does not read makes this
+    // throw `planning failed: E_VERBNF`.
+    expect(plan.transcript.error, JSON.stringify(plan.transcript.error)).toBeUndefined();
+    expect(plan.transcript.result).toBe("hi");
+    expect(seq.submit(plan.submit).status).toBe("accepted");
+  });
 });
 
 describe("the mini repair loop (CO2.4 + CO6 E_READ_VERSION semantics)", () => {

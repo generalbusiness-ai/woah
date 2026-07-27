@@ -131,6 +131,18 @@ export function deriveRelationDeltas(
       if (typeof member === "string") put(op, "contents", owner, member);
     }
   }
+  // An object CREATED directly into a container is a membership fact with no
+  // move: `object_create` records the placement inline, so nothing in `moves`
+  // or the contents projection names it. Without this the row never reaches a
+  // gateway's mirror, and the new object is absent from every contents-derived
+  // surface — MCP structural context, room presentation, roster hydration —
+  // even though its `object_live.location` is correct. This is the create-time
+  // twin of the move deltas below; both converge on the same row.
+  for (const create of transcript.creates ?? []) {
+    if (typeof create.location === "string" && create.location) {
+      put("add", "contents", create.location, create.object);
+    }
+  }
   for (const move of transcript.moves ?? []) {
     if (move.from) put("remove", "contents", move.from, move.object);
     put("add", "contents", move.to, move.object);

@@ -1440,8 +1440,13 @@ runs the VM:
 - the selected verb's definer row, bytecode, inherited lineage, and class-chain
   rows are present with provenance, and any catalog-declared
   `arg_spec.authority.prefetch` roots have been resolved through generic
-  roots/path/fallback metadata, including argument-derived path segments such as
-  `{ "arg": 0 }`, rather than hardcoded object names;
+  roots/path/fallback metadata — including argument-derived path segments such
+  as `{ "arg": 0 }` and declaration-named literal objects (`{ "ref":
+  "<object>" }`, [cell-authority.md §CA11.2](cell-authority.md#ca112-quasi-static-topology-pre-seeding-cold-start)). The runtime
+  itself embeds no object names: a literal always comes from the verb
+  declaration in the catalog manifest that owns the object, so the transport
+  stays catalog-neutral while a verb can warm a fixed instance (an editor
+  room, a registry) that appears in neither the call nor the actor's context;
 - the transcript validation read set implied by the warm planning pass is backed
   by local cell versions that will be submitted to the selected commit scope, and
   planned-transcript commits carry the bounded actor/session/transcript authority

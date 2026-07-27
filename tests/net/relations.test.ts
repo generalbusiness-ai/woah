@@ -80,6 +80,43 @@ describe("deriveRelationDeltas (CO13)", () => {
     expect(removed.local).toEqual([]);
   });
 
+  it("a create placed directly into a container derives its contents row", () => {
+    // `object_create` records the placement inline — there is no move and no
+    // contents projection write — so without a create-sourced delta the new
+    // object never reaches a gateway's contents mirror. It would then be absent
+    // from every contents-derived surface (MCP structural context, room
+    // presentation) despite a correct object_live.location. This is the exact
+    // failure behind "the builder created it but no tool ever appeared".
+    const t = transcript({
+      creates: [{ object: "#widget", name: "Widget", flags: {}, parent: "$thing", owner: "#alice", anchor: "#alice", location: "#alice", writer: WRITER }]
+    });
+    const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");
+    expect(derived.local.filter((d) => d.row.relation === "contents").map((d) => `${d.op}:${d.row.owner}:${d.row.member}`)).toEqual([
+      "add:#alice:#widget"
+    ]);
+  });
+
+  it("a create with no location derives no contents row", () => {
+    const t = transcript({
+      creates: [{ object: "#loose", name: "Loose", flags: {}, parent: "$thing", owner: "#alice", anchor: null, location: null, writer: WRITER }]
+    });
+    expect(deriveRelationDeltas(t, NO_WRITES, "room:hall").local.filter((d) => d.row.relation === "contents")).toEqual([]);
+  });
+
+  it("a create then move in one turn collapses to the destination row", () => {
+    // Set semantics: the create's add and the move's remove name the same row,
+    // so the turn must not ship a contradictory pair.
+    const t = transcript({
+      creates: [{ object: "#widget", name: "Widget", flags: {}, parent: "$thing", owner: "#alice", anchor: "#alice", location: "#alice", writer: WRITER }],
+      moves: [{ object: "#widget", from: "#alice", to: "room:den", writer: WRITER }]
+    });
+    const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");
+    expect(derived.local.filter((d) => d.row.relation === "contents").map((d) => `${d.op}:${d.row.owner}:${d.row.member}`).sort()).toEqual([
+      "add:room:den:#widget",
+      "remove:#alice:#widget"
+    ]);
+  });
+
   it("moves derive remove-at-source and add-at-destination contents deltas", () => {
     const t = transcript({ moves: [{ object: "#alice", from: "room:hall", to: "room:den" }] });
     const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");

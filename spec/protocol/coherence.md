@@ -130,6 +130,20 @@ that seam:
    rider reads against the attestation; a rider read with no attestation
    rejects `rider_unattested` (terminal, named). The committing scope's
    `owns` predicate scopes what it validates against its own store.
+   **`owns` MUST exclude rider residue.** A ride-along leaves the committing
+   scope holding a COPY of cells anchored elsewhere — including the lifecycle
+   and lineage cells of an object CREATED here but anchored to another scope
+   (the shared/planning scope serializes the mint; the object's own cells ride
+   to its anchor). Reading such a copy as ownership makes the scope claim an
+   object it does not sequence: a later turn committing here that reads any
+   cell of that object which lives only at the anchor takes the local branch,
+   finds it absent, and rejects `read_version_mismatch` with no possible
+   repair — no refresh can move a foreign cell into this store — so the
+   gateway's loop escalates to terminal `E_NONCONVERGENT_READ`. The residue
+   ledger recorded at ride-along time is therefore authoritative for the
+   ownership question as well as for transfer provenance: a cell this scope
+   holds AND has shipped as a rider is foreign, and its reads take the
+   attestation path above.
    The catalog scope has one explicit epoch-validation policy: because CO15
    permits **class-definition cells** to change only with a `catalog_epoch`
    bump, the active epoch itself certifies lineage, property-definition/default,
@@ -140,7 +154,18 @@ that seam:
    live catalog response MUST echo the authority epoch and mismatch fails
    closed. Sessions, identity records, compatibility instances, and every
    non-catalog owner remain per-turn reads of the live authority even when
-   their current scope name is `catalog`. Cross-invocation promises MUST NOT
+   their current scope name is `catalog`. After fetching the round's owner
+   attestations, the gateway MAY compare their cell versions with the
+   transcript before submit. A disagreement is already the exact
+   `read_version_mismatch` the scope would return, so the gateway may skip that
+   provably doomed submit, refresh the named cells, and re-plan. Because no
+   submit occurred, that immediate re-plan MAY reuse an owner attestation from
+   the preflight round only when the entry exactly covers every cell, ordering,
+   and replay version the new transcript requires from that owner. A changed or
+   newly required version MUST fetch a live owner attestation. Scope-returned
+   conflicts do not use this reuse path, and only the scope may accept; this
+   optimization removes rejected/redundant RPCs but creates no acceptance path.
+   Cross-invocation promises MUST NOT
    coalesce authority I/O: they join otherwise-independent platform request
    lineages and can violate the CO2.7 subrequest-depth bound.
    **Ordering reads follow the same rule.** An owner-computed ordering read
@@ -227,11 +252,41 @@ fanout gap; they MUST NOT infer delivery loss from a jump in authority `seq`.
 Rows without `delivery_seq` remain valid during rolling upgrades but provide
 no delivery-gap evidence.
 
+An idempotent fanout re-subscription returns the lane's safely acknowledged
+prefix. The scope computes that resume watermark as the current subscriber
+counter when no row is pending, or one less than the oldest pending stamped
+row. The gateway durably advances only its `delivery_seq` high-water to that
+prefix before pulling the current state backfill; it does not advance the
+authority `seq` high-water. Consequently acknowledged history before the
+subscription boundary cannot appear as a new gap after gateway cache loss,
+while every pending row remains the next contiguous delivery. An unstamped
+pending rolling-upgrade row forces the resume prefix to zero. If a pending
+row arrives while the gateway is awaiting the subscription response, the
+gateway defers gap classification for that scope and compares the first
+interleaved lane position with the returned prefix; state application and
+durable delivery high-water advancement still happen immediately.
+
 ### CO2.6 Materialization miss is not semantic absence
 
 Under sparse execution, a lookup miss for an unmaterialized id MUST surface
 as `E_MISSING_STATE` (acquire closure, retry — CO6), never as `E_OBJNF`.
 Only a full-closure executor may report semantic absence directly.
+
+The translation is derived from the engine error's VALUE, so that value is a
+protocol contract, not a diagnostic convenience. An `E_VERBNF` for a
+name-descriptor miss MUST carry `{ obj, name }`: the planner names
+`verb_bytecode:<obj>:<name>` as the missing key and grows the turn's slice (or
+pulls from the authority) from exactly that. A raiser that spells the verb name
+under some other key makes the miss underivable, and it degrades to semantic
+absence — a verb read on an object the turn did not target then fails
+terminally with the page sitting resident in the gateway view. The affected
+reads are the ones a slice never covers by construction: the seed holds the
+actor's and target's class chains, so any verb-metadata read on an ARGUMENT
+object (`verb_info`, `set_verb_info`, `list_verb` against a passed id) depends
+on this repair. An implementation SHOULD additionally accept the historical
+`descriptor`/`verb` spellings so a future divergence degrades to a repairable
+miss rather than a terminal error. A numeric slot descriptor names no page and
+is deliberately not resolvable this way.
 
 ### CO2.7 Fanout guarantee
 
@@ -727,6 +782,28 @@ One write path per fact (CO9), concretized:
   For namespaces created before this rule, the signed add-only
   `repair-relations` operator operation advances the owner head only when a row
   is missing and refans that delta; replay is an idempotent no-op.
+- **Aged runtime memberships repair per scope, from that scope's own cells.**
+  A namespace that ran before the create-derived rule (above) holds objects
+  whose `object_live.location` is correct while their membership row was never
+  derived at all; replaying the rule cannot reach them, and the fixture-scoped
+  `repair-relations` operation deliberately refuses ids it cannot find in a
+  bundled image. The signed `repair-contents` operator operation closes this:
+  each scope derives candidate rows from its OWN `object_live` cells — the same
+  O(scope size) walk this section already sanctions for the bounded rebuild and
+  for hydration, so no scope enumerates another and no operator enumerates
+  objects. It MUST be **add-only**: a row the scope owns whose member is
+  anchored elsewhere arrived by `/net/relate` and is invisible to a local cell
+  scan, so a full rebuild would delete it. Add-only also makes the operation
+  idempotent — an identical row reports no change, so a second run advances no
+  head and refans nothing. Rows whose owner this scope does not sequence (the
+  same ownership predicate read validation uses, which excludes rider residue)
+  ride the ordinary `/net/relate` lane to the owning scope; because anchor
+  topology is caller knowledge, an owner the caller has not mapped MUST be
+  reported rather than guessed. Repair deliveries MUST carry their own
+  `(from_scope, seq)` lane, never the scope's commit seq stream: the receiver
+  gate is `seq <= last`, so borrowing a commit seq is either suppressed at head
+  0 or consumes a seq the commit stream has not reached, which would make the
+  receiver drop the real delta that later lands on it.
 - **Persisted bootstrap definitions upgrade as ordered catalog events.** A
   runtime deployment does not rewrite definition pages already installed in an
   active world. The signed `repair-definitions` operator operation therefore
@@ -758,8 +835,17 @@ One write path per fact (CO9), concretized:
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
-  parents), ordered-edge writes/moves (`ordered_edge` rows at the current
-  container), and session-scope transitions (presence). The ordered-edge row
+  parents), **creates carrying a location** (a contents add at that
+  container), ordered-edge writes/moves (`ordered_edge` rows at the current
+  container), and session-scope transitions (presence). The create source is
+  not redundant with the other two: `object_create` records placement inline,
+  so an object minted directly INTO a container produces neither a move nor a
+  contents projection write, and without this rule its membership row would
+  never exist — leaving the object absent from every contents-derived surface
+  (structural tool context, room presentation, roster hydration) while its
+  `object_live.location` is perfectly correct. Deltas carry set semantics per
+  `(op, row)`, so a create-then-move within one turn collapses to a single
+  destination row rather than a contradictory pair. The ordered-edge row
   is required when an item's immutable anchor differs from its current
   container: the authored edge cell remains truth at the anchor, while the
   container owner gets a complete bounded ordering without global enumeration.
@@ -950,6 +1036,15 @@ One write path per fact (CO9), concretized:
   that active room uses the ordinary CO2.3 owner attestation. Thus close
   completion removes the proof before returning, and an overdue relation
   cannot extend a session because expiry is checked from its value.
+  The proof applies equally when the same turn also WRITES the session
+  cell — the plan-time transition fold of a room verb that moves the
+  actor out of the committing room (an editor's pause/save/abort). The
+  written replacement validates under the mint/refresh rule as usual;
+  the checkpoint proves only the folded read of the prior row, whose
+  liveness and actor binding are still validated before the proof is
+  recorded. Without this composition such a turn would terminally reject
+  `rider_unattested`, making any room that moves its occupants out on
+  its own verbs (editor rooms) unable to release them.
 
   Ownership witness: the scope holds the cell AND it is not CA3 rider
   residue. Sessions absent entirely → allowed only for
