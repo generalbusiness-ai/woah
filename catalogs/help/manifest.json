@@ -1,6 +1,6 @@
 {
   "name": "help",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "LambdaMOO-shaped in-world help database classes and a seeded global help database.",
   "license": "MIT",
@@ -11,47 +11,88 @@
       "parent": "$thing",
       "description": "Generic help database. It stores static topic values in a topics map, resolves exact and abbreviated topic names, renders compact topic output, and records missed lookups for later documentation work.",
       "properties": [
-        { "name": "topics", "type": "map<str,any>", "default": {}, "perms": "r" },
-        { "name": "missed_topics", "type": "list<map>", "default": [], "perms": "r" }
+        {
+          "name": "topics",
+          "type": "map<str,any>",
+          "default": {},
+          "perms": "r"
+        },
+        {
+          "name": "missed_topics",
+          "type": "list<map>",
+          "default": [],
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
           "name": "find_topics",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["topic?"] },
+          "arg_spec": {
+            "args": [
+              "topic?"
+            ]
+          },
           "source": "verb :find_topics(topic) rxd { return null; /* native: see help_db_find_topics */ }",
-          "implementation": { "kind": "native", "handler": "help_db_find_topics" }
+          "implementation": {
+            "kind": "native",
+            "handler": "help_db_find_topics"
+          }
         },
         {
           "name": "get_topic",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["topic?", "remaining_dbs?"] },
+          "arg_spec": {
+            "args": [
+              "topic?",
+              "remaining_dbs?"
+            ]
+          },
           "source": "verb :get_topic(topic, remaining_dbs) rxd { return null; /* native: see help_db_get_topic */ }",
-          "implementation": { "kind": "native", "handler": "help_db_get_topic" }
+          "implementation": {
+            "kind": "native",
+            "handler": "help_db_get_topic"
+          }
         },
         {
           "name": "dump_topic",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["topic"] },
+          "arg_spec": {
+            "args": [
+              "topic"
+            ]
+          },
           "source": "verb :dump_topic(topic) rxd { return null; /* native: see help_db_dump_topic */ }",
-          "implementation": { "kind": "native", "handler": "help_db_dump_topic" }
+          "implementation": {
+            "kind": "native",
+            "handler": "help_db_dump_topic"
+          }
         },
         {
           "name": "record_miss",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["topic"] },
+          "arg_spec": {
+            "args": [
+              "topic"
+            ]
+          },
           "source": "verb :record_miss(topic) rxd { return null; /* native: see help_db_record_miss */ }",
-          "implementation": { "kind": "native", "handler": "help_db_record_miss" }
+          "implementation": {
+            "kind": "native",
+            "handler": "help_db_record_miss"
+          }
         },
         {
           "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look_self() rxd { return { title: this.name, description: this.description, topics: this:find_topics(\"\") }; }"
         }
       ]
@@ -64,56 +105,111 @@
       "as": "$help",
       "name": "Help",
       "description": "Global help database for first-light worlds. Catalogs and classes can add their own help databases later; this one supplies the baseline commands and conventions.",
-      "properties": {
-        "topics": {
-          "index": ["*index*", "Woo Help"],
-          "help": [
-            "Type help <topic> for a topic, or help index for the topic list.",
-            "Topic names accept abbreviations when they are unambiguous. Leading @ is ignored, so help @help and help help resolve the same way."
-          ],
-          "commands": [
-            "Common commands include look, look <thing>, say <text>, emote <text>, tell <person> <text>, go <exit>, take <thing>, and drop <thing>.",
-            "The exact verbs available come from the object you are in, the objects near you, and your player class."
-          ],
-          "movement": [
-            "Rooms expose exits as verbs such as north, west, southeast, out, or go <exit>.",
-            "Moving through an exit calls the exit object, which moves you and announces the departure and arrival through the source and destination rooms."
-          ],
-          "ways": [
-            "ways lists the exits available from your current room. Each exit shows up as its own verb (north, southeast, out, ...) or can be used via go <exit>.",
-            "See also: movement."
-          ],
-          "look": [
-            "look (no argument) describes the room you are in, who else is here, and what objects are visible.",
-            "look <thing> asks the thing to describe itself. Objects may add their own flavor — look at a person, a couch, the_cockatoo, or any other object you can see."
-          ],
-          "say": [
-            "say <text> speaks aloud to everyone in the current room. Backtick syntax (`person text) directs your line to one listener.",
-            "Variants: emote <action>, pose <text>, quote <text>, self <text>, say_as <style> <text>, tell <person> <text>. See also: speech."
-          ],
-          "speech": [
-            "Speech verbs are live and direct: say, emote, pose, quote, tell, say_as, and self each emit a different observation type so clients can render them distinctly.",
-            "Embedded spaces (the_dubspace, the_pinboard, the_outline) forward speech to the surrounding room so listeners outside still hear it. See also: say, chat."
-          ],
-          "chat": [
-            "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
-            "look asks the target to describe itself with look_self; room output is composed by the room."
-          ],
-          "focus": [
+      "properties": {}
+    },
+    {
+      "kind": "set_property",
+      "object": "$help",
+      "property": "topics",
+      "mode": "merge_map",
+      "value": {
+        "index": [
+          "*index*",
+          "Woo Help"
+        ],
+        "help": [
+          "Type help <topic> for a topic, or help index for the topic list.",
+          "Topic names accept abbreviations when they are unambiguous. Leading @ is ignored, so help @help and help help resolve the same way."
+        ],
+        "commands": [
+          "Common commands include look, look <thing>, say <text>, emote <text>, tell <person> <text>, go <exit>, take <thing>, and drop <thing>.",
+          "The exact verbs available come from the object you are in, the objects near you, and your player class."
+        ],
+        "movement": [
+          "Rooms expose exits as verbs such as north, west, southeast, out, or go <exit>.",
+          "Moving through an exit calls the exit object, which moves you and announces the departure and arrival through the source and destination rooms."
+        ],
+        "ways": [
+          "ways lists the exits available from your current room. Each exit shows up as its own verb (north, southeast, out, ...) or can be used via go <exit>.",
+          "See also: movement."
+        ],
+        "look": [
+          "look (no argument) describes the room you are in, who else is here, and what objects are visible.",
+          "look <thing> asks the thing to describe itself. Objects may add their own flavor — look at a person, a couch, the_cockatoo, or any other object you can see."
+        ],
+        "say": [
+          "say <text> speaks aloud to everyone in the current room. Backtick syntax (`person text) directs your line to one listener.",
+          "Variants: emote <action>, pose <text>, quote <text>, self <text>, say_as <style> <text>, tell <person> <text>. See also: speech."
+        ],
+        "speech": [
+          "Speech verbs are live and direct: say, emote, pose, quote, tell, say_as, and self each emit a different observation type so clients can render them distinctly.",
+          "Embedded spaces (the_dubspace, the_pinboard, the_outline) forward speech to the surrounding room so listeners outside still hear it. See also: say, chat."
+        ],
+        "chat": [
+          "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
+          "look asks the target to describe itself with look_self; room output is composed by the room."
+        ],
+        "self": [
+          "You are an object in the world, and you act as that object. Tools named <you>__<verb> are verbs on your own body — typically help, home, and inventory, plus whatever else your classes and features give you. List your tools to see the actual set; only verbs written in woocode are published, so some in-world verbs on you have no tool.",
+          "Those verbs are not part of the protocol. They come from the classes you inherit from and from features attached to you — a feature is a surface you carry rather than inherit, and it counts the same — so two actors standing in the same room can hold different tools. Your set changes when your class or your features change, and the server then sends notifications/tools/list_changed.",
+          "Everything else you can reach is named the same way: <object>__<verb> is a verb on that object. See also: tools, building. (For the self <text> speech verb, see: speech.)"
+        ],
+        "suit": [
+          "*forward*",
+          "self"
+        ],
+        "me": [
+          "*forward*",
+          "self"
+        ],
+        "tools": [
+          "Three tools are always present. woo_call(object, verb, args) calls any verb you may reach, and still works when your cached tool list is stale. woo_wait(timeout_ms, limit) listens for what other actors do. woo_list_reachable_tools(scope, object, query, limit, cursor) pages and filters the dynamic tools; scope is one of active, here, object, or space.",
+          "Every other tool is dynamic and named <object>__<verb>. You can reach yourself, the space you are in, the objects visible in that space, and the objects you carry — nothing else. Moving, taking, and dropping change that set.",
+          "When the set changes the server sends notifications/tools/list_changed. List tools again before your next decision. See also: self, focus, wait."
+        ],
+        "focus": [
+          "There is no focus protocol on the tool surface: no woo_focus, no woo_unfocus, no focus_list, and no focus tool on yourself either. Those verbs exist in the world, but only as native verbs, and native verbs are never published as tools.",
+          "Nothing would change if they were. Your reachable set is your own object, the space you are in, what is visible there, and what you carry — a working set does not widen it. To use another object's verbs, move to it or take it, then list tools again. See also: tools."
+        ],
+        "wait": [
+          "woo_wait(timeout_ms, limit) drains observations queued for your session. It returns at once if events are already waiting, otherwise it holds until timeout_ms elapses or limit events arrive.",
+          "This is how you hear what other actors do — speech, arrivals and departures, taken and dropped, and anything else that happens between your own calls. woo_wait is the only way to do it: the in-world wait verb is native, and native verbs are not published as tools. See also: tools."
+        ],
+        "building": [
+          "Authoring has two independent gates. A surface supplies the tools: $builder adds create, chparent, recycle, set_property, inspect, and search; $programmer adds install_verb, list_verb, set_verb_info, edit_verb, and eval. You hold a surface either by inheriting it through your class chain or by carrying it as an attached feature — both count. The programmer flag supplies the authority — without it those tools are still listed but every one of them raises E_PERM.",
+          "You cannot grant yourself either gate, and you cannot reach for a tool to ask: the verbs that provision an agent and set the flag — create_agent, promote_agent_to_programmer, demote_agent_from_programmer — belong to the human who owns your account, and they are native, so they are not published as tools to anyone. Ask the account owner.",
+          "install_verb(id, descriptor, source) writes a verb in one call and returns diagnostics; pass opts.dry_run to check without writing. edit_verb(id, descriptor) moves you into a verb editor space whose commands are view, insert, delete, replace, dry_run, save, pause, and abort — look around once you are there. See also: self."
+        ]
+      },
+      "supersedes": {
+        "focus": [
+          [
             "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
             "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
-          ],
-          "wait": [
+          ]
+        ],
+        "wait": [
+          [
             "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
             "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
-          ],
-          "building": [
+          ]
+        ],
+        "building": [
+          [
             "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
             "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
           ]
-        }
+        ]
       }
     },
-    { "kind": "set_property", "object": "$system", "property": "help_dbs", "value": ["$help"], "mode": "append_unique" }
+    {
+      "kind": "set_property",
+      "object": "$system",
+      "property": "help_dbs",
+      "value": [
+        "$help"
+      ],
+      "mode": "append_unique"
+    }
   ]
 }

@@ -569,6 +569,31 @@ export class ScopeSequencer {
     cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>,
     removals: Array<Pick<Cell, "kind" | "object" | "name">> = []
   ): OperatorDefinitionRepair {
+    return this.orderedOperatorRepair("operator_definition_repair", cells, removals);
+  }
+
+  /** Signed operator migration for seeded property VALUES (the data twin of
+   * `operatorRepairDefinitions`). The Worker shell computes each replacement
+   * by merging the bundled manifest's `merge_map` seed hook into the stored
+   * cell (src/core/seed-property-merge.ts) before calling this method, so an
+   * operator-edited entry never reaches this commit — only cells whose merge
+   * actually changed something arrive here. Same ordered-event contract:
+   * head advance, authoritative stamp, one tail entry for fanout/catch-up. */
+  operatorRepairSeedProperties(
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>
+  ): OperatorDefinitionRepair {
+    return this.orderedOperatorRepair("operator_seed_property_repair", cells, []);
+  }
+
+  /** Shared ordered-commit body for the signed operator repair family:
+   * idempotency marker from the change set, one head advance, authoritative
+   * stamps, one tail entry, one durable transaction. Unchanged replay returns
+   * `{status: "empty"}` without touching the head. */
+  private orderedOperatorRepair(
+    markerLabel: string,
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>,
+    removals: Array<Pick<Cell, "kind" | "object" | "name">>
+  ): OperatorDefinitionRepair {
     const changed = cells.filter((cell) => {
       const existing = this.store.get(cellKey(cell.kind, cell.object, cell.name));
       return existing?.version !== cellVersion(cell.value);
@@ -580,7 +605,7 @@ export class ScopeSequencer {
       return { status: "empty", head: this.headState, cells: [], removed: [] };
     }
 
-    const marker = `operator_definition_repair:${cellVersion({
+    const marker = `${markerLabel}:${cellVersion({
       replacements: changed.map((cell) => [cell.kind, cell.object, cell.name ?? null, cell.value]),
       removals: removed
     })}`;

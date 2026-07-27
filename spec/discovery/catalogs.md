@@ -444,12 +444,30 @@ Seed hooks are intentionally small. `create_instance` creates a named instance
 from a catalog or dependency class, `attach_feature` appends a feature object to
 a consumer, `set_property` writes a generic registry/configuration property, and
 `change_parent` runs the normal authored `chparent` path for an existing object.
-`set_property.mode` is one of `set`, `set_if_missing`, or `append_unique`;
-`append_unique` is for registry lists such as `$system.help_dbs`, where catalogs
-must add their object without knowing what other catalogs contributed. Catalogs
-use `change_parent` only for explicit opt-in surface changes such as making
-`$wiz` inherit a newly installed programmer class; it is not a hidden privilege
-grant.
+`set_property.mode` is one of `set`, `set_if_missing`, `append_unique`, or
+`merge_map`; `append_unique` is for registry lists such as `$system.help_dbs`,
+where catalogs must add their object without knowing what other catalogs
+contributed. Catalogs use `change_parent` only for explicit opt-in surface
+changes such as making `$wiz` inherit a newly installed programmer class; it is
+not a hidden privilege grant.
+
+`merge_map` (implemented) is for seeded map databases the catalog owns the
+wording of but the operator may edit — a help-topic table is the canonical
+case. The hook `value` is the current shipped map, and the optional
+`supersedes` block lists, per key, the historical shipped values the hook may
+replace. Applying the hook merges key-wise: a key absent from the stored map
+is added; a key whose stored value matches one of its declared superseded
+values byte-for-byte is still the shipped default and is upgraded to the
+current value; every other key — operator edits included — survives untouched.
+A malformed (non-map) stored value is left alone. The merge is idempotent by
+construction, so it is safe on every install, repair, and boot drift pass. The
+verifier reports the hook as drift only when applying the merge would change
+something, which is what lets an already-installed world heal through the
+ordinary §CT5.4.1 drift pass with no hand-authored one-shot migration. On the
+deployed Net stack the same declaration is delivered by the signed
+`repair-seed-properties` operator operation
+([net-cutover.md §NC5](../operations/net-cutover.md)), which applies the
+identical merge to the owning scope's durable cell.
 
 Schema entries may set `live: true` to declare that the observation type is safe
 on the v2 live plane. Omitted `live` means `false`: the observation type is

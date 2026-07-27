@@ -376,6 +376,285 @@ describe("local catalogs", () => {
     expect(feats.filter((f) => f === "$programmer").length).toBe(1);
   });
 
+  // help v0.1.1 seeded three topics that misdirected every MCP agent that read
+  // them: `focus` named woo_focus/woo_unfocus/focus_list (no such tools), `wait`
+  // named the tool `wait` rather than woo_wait, and `building` named no path to
+  // authoring authority. Plain seed properties are initial values only, so a
+  // manifest fix alone reaches fresh worlds and leaves deployed ones
+  // misinformed. help v0.2.0 therefore seeds the topics through a `merge_map`
+  // set_property hook whose `supersedes` block declares the v0.1.1 values as
+  // replaceable — the boot drift pass detects the unsatisfied merge as
+  // seed_property_drift on every cold init and repairs it, with no
+  // hand-written migration in core (spec §CT5.4).
+  const STALE_FOCUS_TOPIC = [
+    "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
+    "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
+  ];
+  const STALE_WAIT_TOPIC = [
+    "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
+    "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
+  ];
+  const STALE_BUILDING_TOPIC = [
+    "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
+    "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
+  ];
+
+  // Rewind a freshly-installed world to the help v0.1.1 topic shape: the three
+  // stale values restored and the topics this change adds removed. No ledger
+  // surgery is needed — the drift pass re-verifies the merge hook against the
+  // stored value on every cold init, so the rewound drift alone re-triggers it.
+  function rewindHelpToV011(world: ReturnType<typeof createWorld>): void {
+    const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
+    topics.focus = [...STALE_FOCUS_TOPIC];
+    topics.wait = [...STALE_WAIT_TOPIC];
+    topics.building = [...STALE_BUILDING_TOPIC];
+    for (const added of ["self", "suit", "me", "tools"]) delete topics[added];
+    world.setProp("$help", "topics", topics as never);
+  }
+
+  it("rewrites help v0.1.1 topics that named nonexistent MCP tools, and adds the orientation topics", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const topics = world.getProp("$help", "topics") as Record<string, string[]>;
+    // The stale tool names are gone...
+    expect(topics.focus.join(" ")).not.toContain("Use woo_focus(");
+    expect(topics.wait.join(" ")).not.toContain("wait(<timeout_ms>, <limit>)");
+    expect(topics.building.join(" ")).not.toContain("Use the programmer MCP tools");
+    // ...replaced by text that names the real surface.
+    expect(topics.focus.join(" ")).toContain("no woo_focus");
+    expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+    expect(topics.building.join(" ")).toContain("promote_agent_to_programmer");
+    // The orientation topics land, aliases included.
+    expect(topics.self.join(" ")).toContain("<object>__<verb>");
+    expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+    expect(topics.suit).toEqual(["*forward*", "self"]);
+    expect(topics.me).toEqual(["*forward*", "self"]);
+    // Unrelated topics are untouched — the merge is surgical, not a
+    // wholesale replacement of the topics map.
+    expect(topics.look.join(" ")).toContain("look (no argument)");
+  });
+
+  it("leaves help topics an operator has edited alone", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+
+    // An operator who rewrote a topic must not be silently overwritten. The
+    // merge replaces a key only when its stored value still matches a
+    // declared superseded default byte-for-byte, and skips otherwise.
+    const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
+    topics.focus = ["Our house rules for focus."];
+    topics.self = ["Our own orientation text."];
+    world.setProp("$help", "topics", topics as never);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const after = world.getProp("$help", "topics") as Record<string, string[]>;
+    expect(after.focus).toEqual(["Our house rules for focus."]);
+    expect(after.self).toEqual(["Our own orientation text."]);
+    // The topics the operator did not touch are still repaired.
+    expect(after.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+    expect(after.tools.join(" ")).toContain("woo_list_reachable_tools");
+  });
+
+  it("is idempotent: re-running the help topic merge changes nothing", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+    installLocalCatalogs(world, ["help"]);
+    const afterFirst = JSON.stringify(world.getProp("$help", "topics"));
+
+    // After one repair every seeded key either equals the shipped value or
+    // was operator-edited, so a second and third cold init verify the merge
+    // as satisfied and write nothing — there is no one-shot ledger entry to
+    // clear because the gate is the value itself.
+    installLocalCatalogs(world, ["help"]);
+    expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
+    installLocalCatalogs(world, ["help"]);
+    expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
+  });
+
+  it("repairs a world whose registry still records help v0.1.1, and advances the recorded version", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    rewindHelpToV011(world);
+    // A deployed v0.1.1 world differs from a current one in three ways, and all
+    // three have to be rewound or the scenario is not the one being claimed.
+    // Rewinding only the topics and the registry version leaves the CURRENT
+    // schema-plan completion record in place; the sync then short-circuits on
+    // that record and the version appears to stay at 0.1.1 — an artifact of the
+    // fixture, not behavior. Dropping the records models the real thing.
+    const installed = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .map((record) => (record.alias === "help" ? { ...record, version: "0.1.1" } : record));
+    world.setProp("$catalog_registry", "installed_catalogs", installed as never);
+    world.setProp("$system", "catalog_migration_records", [] as never);
+
+    installLocalCatalogs(world, ["help"]);
+
+    const topics = world.getProp("$help", "topics") as Record<string, string[]>;
+    expect(topics.focus.join(" ")).toContain("no woo_focus");
+    expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+    // Minor drift needs no §CT14 migration file: runLocalCatalogVersionMigrations
+    // routes only MAJOR edges through updateCatalogManifest, and the auto schema
+    // sync covers the rest — including writing manifest.version back onto the
+    // registry record. So the recorded version DOES advance on a minor bump.
+    // The merge repair must still not depend on that; its gate is the stored
+    // value itself, which is what makes it correct either way.
+    const after = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .find((record) => record.alias === "help");
+    expect(after?.version).toBe("0.2.0");
+  });
+
+  // The help topics name builder/programmer verbs in prose ("$programmer adds
+  // install_verb, ... and eval"). Prose claims escape the transport test's
+  // <you>__verb pattern, and a verb that exists but is not tool_exposed is
+  // invisible to an agent — `trace` shipped in this topic exactly that way.
+  // Any word in a help topic that names a prog-catalog verb must therefore name
+  // an exposed one. Words that are not prog verbs are ignored, so ordinary
+  // prose ("class", "surface", "authority") cannot trip this.
+  it("help topics never name a verb an agent cannot call (unexposed, or native)", () => {
+    const helpManifest = JSON.parse(
+      readFileSync(join(root, "help", "manifest.json"), "utf8")
+    ) as { seed_hooks: Array<{ kind: string; property?: string; value?: Record<string, unknown> }> };
+    const progManifest = JSON.parse(
+      readFileSync(join(root, "prog", "manifest.json"), "utf8")
+    ) as { classes: Array<{ verbs?: Array<{ name: string; tool_exposed?: boolean }> }> };
+
+    const exposedByName = new Map<string, boolean>();
+    for (const klass of progManifest.classes ?? []) {
+      for (const verb of klass.verbs ?? []) {
+        // An exposed definition anywhere wins: the same name may be defined on
+        // several classes and the agent only needs one reachable page.
+        exposedByName.set(verb.name, (exposedByName.get(verb.name) ?? false) || verb.tool_exposed === true);
+      }
+    }
+    expect(exposedByName.size).toBeGreaterThan(0);
+    // Self-check on the fixture: `trace` must still be a known, unexposed verb,
+    // otherwise this test would silently stop being able to catch anything.
+    expect(exposedByName.get("trace")).toBe(false);
+
+    // The other half of the trap: NATIVE verbs. Eleven of them carry
+    // `tool_exposed: true` and are still never published, because the resolver
+    // advertises bytecode pages only — $actor:focus/unfocus/focus_list/wait and
+    // the $human provisioning verbs among them. Derive the set from a seeded
+    // world rather than hardcoding it, so new natives are covered automatically.
+    const seeded = createWorld({ catalogs: false });
+    const nativeNames = new Set<string>();
+    for (const id of seeded.objects.keys()) {
+      for (const verb of seeded.object(id).verbs) {
+        if (verb.kind === "native") nativeNames.add(verb.name);
+      }
+    }
+    expect(nativeNames.has("focus")).toBe(true);
+    expect(nativeNames.has("create_agent")).toBe(true);
+
+    const unreachable = (word: string): string | null => {
+      if (exposedByName.has(word) && exposedByName.get(word) !== true) return "is not tool_exposed";
+      if (nativeNames.has(word)) return "is a native verb, which is never published as a tool";
+      return null;
+    };
+
+    // The topics ship as a merge_map set_property hook (the delivery vehicle
+    // for aged worlds), so the scanner reads the hook's value.
+    const topics = helpManifest.seed_hooks.find(
+      (hook) => hook.kind === "set_property" && hook.property === "topics"
+    )?.value ?? {};
+    expect(Object.keys(topics).length).toBeGreaterThan(0);
+    for (const [name, value] of Object.entries(topics)) {
+      const text = Array.isArray(value) ? value.join(" ") : String(value);
+      // A topic may name an unreachable verb in order to say it is unreachable.
+      // Those sentences are the documentation, not a claim, and are identified
+      // by the same phrasing the transport test uses.
+      const claims = text
+        // "See also: tools, focus, wait." cross-references name TOPICS, not
+        // verbs, and topics are deliberately named after the thing they
+        // explain. Drop them before scanning or every such pointer reads as a
+        // call claim.
+        .replace(/See also:[^.]*\.?/gi, " ")
+        .replace(/\bsee:[^.)]*/gi, " ")
+        .split(/(?<=\.)\s+/)
+        .filter((sentence) => !/There is no|not published|never published/.test(sentence))
+        .join(" ");
+      for (const word of claims.match(/[a-z][a-z0-9_]*/g) ?? []) {
+        const reason = unreachable(word);
+        expect(
+          reason,
+          `help topic "${name}" names "${word}", which ${reason} — an agent cannot call it`
+        ).toBeNull();
+      }
+    }
+  });
+
+  // AGENTS.md migration discipline: a migration must be test-run on a local
+  // SQLite woo. Seed an aged world, close it, reopen, migrate, close, reopen —
+  // so the repair is proven to survive the storage round trip rather than only
+  // existing in the in-memory object graph.
+  it("repairs the help topics through a real SQLite round trip", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { LocalSQLiteRepository } = await import("../src/server/sqlite-repository");
+    const dir = mkdtempSync(join(tmpdir(), "woo-help-topics-mig-"));
+    const path = join(dir, "world.sqlite");
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      installLocalCatalogs(seedWorld, ["help"]);
+      rewindHelpToV011(seedWorld);
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
+      // The aged state really did persist — otherwise the migration below
+      // would be repairing a world that was never broken.
+      expect((upgradeWorld.getProp("$help", "topics") as Record<string, string[]>).focus.join(" "))
+        .toContain("Use woo_focus(");
+      installLocalCatalogs(upgradeWorld, ["help"]);
+      upgradeRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      const topics = verifyWorld.getProp("$help", "topics") as Record<string, string[]>;
+      expect(topics.focus.join(" ")).toContain("no woo_focus");
+      expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
+      expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+
+      // Rerunning against the already-repaired persisted world is a no-op.
+      const before = JSON.stringify(topics);
+      installLocalCatalogs(verifyWorld, ["help"]);
+      expect(JSON.stringify(verifyWorld.getProp("$help", "topics"))).toBe(before);
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The generic merge behind the merge_map mode, at its edges. Both delivery
+  // lanes (local boot drift and the signed net operator repair) call this one
+  // function, so its contract is worth pinning independent of the help data.
+  it("merge_map semantics: adds, fingerprint-gated replaces, and malformed-value refusal", async () => {
+    const { mergeSeedMapProperty } = await import("../src/core/seed-property-merge");
+    const seeded = { a: ["new a"], b: ["new b"], c: ["c"] };
+    const supersedes = { a: [["old a"]], b: [["old b"]] };
+
+    // Absent stored value seeds the full map (the fresh-install case).
+    expect(mergeSeedMapProperty(undefined, seeded, supersedes)).toEqual({ merged: seeded, changed: true });
+    // Superseded values upgrade; an edited key survives; missing keys land.
+    const aged = { a: ["old a"], b: ["operator edit"] };
+    expect(mergeSeedMapProperty(aged, seeded, supersedes)).toEqual({
+      merged: { a: ["new a"], b: ["operator edit"], c: ["c"] },
+      changed: true
+    });
+    // Already-converged input reports no change.
+    expect(mergeSeedMapProperty(seeded, seeded, supersedes)?.changed).toBe(false);
+    // A malformed (non-map) stored value is left alone, not clobbered.
+    expect(mergeSeedMapProperty("broken", seeded, supersedes)).toBeNull();
+    expect(mergeSeedMapProperty(["broken"], seeded, supersedes)).toBeNull();
+  });
+
   it("repairs older demoworld installs where the garden missed $conversational", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);

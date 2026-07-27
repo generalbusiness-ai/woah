@@ -118,6 +118,7 @@ import {
 } from "../../net/relations";
 import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
+import { mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
@@ -1741,6 +1742,114 @@ export class NetScopeDO {
           head: repaired.head,
           changed: [...repaired.cells.map((cell) => cell.key), ...repaired.removed].sort(),
           removed: repaired.removed
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/net/repair-seed-properties") {
+        // Aged-world repair for seeded property VALUES — the data twin of
+        // /net/repair-definitions. A deployed runtime never rewrites durable
+        // cells, so a bundled catalog's corrected seed data (a `merge_map`
+        // set_property hook, spec §CT5.4) reaches an active net world only
+        // through this signed operator op. The merge itself is the same
+        // generic key-wise function the local boot drift pass applies
+        // (src/core/seed-property-merge.ts): add keys the stored map lacks,
+        // replace keys still holding a manifest-declared superseded value,
+        // leave operator-edited keys untouched. The CLI mines entries from
+        // the bundled manifests only (scripts/net-repair-seed-properties.ts),
+        // so an operator cannot inject arbitrary property writes here.
+        const body = (await request.json()) as {
+          entries?: Array<{
+            object: string;
+            property: string;
+            value: Record<string, unknown>;
+            supersedes?: SeedMapSupersedes;
+          }>;
+          dry_run?: boolean;
+        };
+        const entries = Array.isArray(body.entries) ? body.entries : [];
+        const dryRun = body.dry_run === true;
+        const seq = this.ensureSequencer();
+        if (entries.length === 0 || entries.length > 32) {
+          throw netError("E_INVARG", "seed property repair requires 1..32 entries", { scope: seq.scope, count: entries.length });
+        }
+        const keys = new Set<string>();
+        const cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">> = [];
+        const skipped: string[] = [];
+        for (const entry of entries) {
+          const validShape = entry && typeof entry === "object" &&
+            typeof entry.object === "string" && entry.object.startsWith("$") &&
+            typeof entry.property === "string" && entry.property.length > 0 &&
+            Boolean(entry.value) && typeof entry.value === "object" && !Array.isArray(entry.value) &&
+            (entry.supersedes === undefined ||
+              (Boolean(entry.supersedes) && typeof entry.supersedes === "object" && !Array.isArray(entry.supersedes) &&
+                Object.values(entry.supersedes).every((priors) => Array.isArray(priors))));
+          const key = validShape ? cellKey("property_cell", entry.object, entry.property) : "";
+          // The owned-lineage check keeps this op on objects this scope is
+          // authoritative for — a rider-cache copy must never be repaired
+          // here (the owning scope repairs it and fanout converges readers).
+          if (!validShape || keys.has(key) ||
+              !this.ownsCellLocally(seq, cellKey("object_lineage", entry.object))) {
+            throw netError("E_INVARG", "seed property repair accepts unique owned seeded map properties only", { key: key || null });
+          }
+          keys.add(key);
+          const stored = seq.store.get(key);
+          const payload = stored?.value as { value?: unknown; def?: unknown } | undefined;
+          const result = mergeSeedMapProperty(payload?.value, entry.value, entry.supersedes);
+          if (!result || !result.changed) {
+            // Malformed stored value (left alone) or already converged.
+            skipped.push(key);
+            continue;
+          }
+          cells.push({
+            kind: "property_cell",
+            object: entry.object,
+            name: entry.property,
+            value: { ...(payload ?? {}), value: result.merged }
+          });
+        }
+        if (dryRun || cells.length === 0) {
+          return json({
+            ok: true,
+            scope: seq.scope,
+            status: cells.length === 0 ? "empty" : "would_apply",
+            dry_run: dryRun,
+            head: seq.head(),
+            changed: cells.map((cell) => cellKey(cell.kind, cell.object, cell.name)).sort(),
+            skipped: skipped.sort()
+          });
+        }
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.operatorRepairSeedProperties(cells);
+          if (result.status === "applied") {
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            // Shared payload: stringify once, splice delivery_seq per
+            // subscriber (see withDeliverySeq).
+            const seedBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
+              cells: result.cells,
+              removed_cells: [],
+              observations: []
+            };
+            const seedText = JSON.stringify(seedBody);
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, seedBody, seedText);
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({
+          ok: true,
+          scope: seq.scope,
+          status: repaired.status,
+          dry_run: false,
+          head: repaired.head,
+          changed: repaired.cells.map((cell) => cell.key).sort(),
+          skipped: skipped.sort()
         });
       }
       if (request.method === "POST" && url.pathname === "/net/activate") {
