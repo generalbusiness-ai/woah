@@ -341,6 +341,38 @@ describe("AP11 operator wizard provisioning (fake-DO lane)", () => {
       await h.settleAll();
       expect(await scopeProp(h, h.clusterScope, agent, "api_key_id")).toBe(pointerId);
       expect(await scopeProp(h, h.clusterScope, h.account, "agent_count")).toBe(3);
+
+      // --- Retirement (AP11.7). `revoke_agent` is the lever, driven by the
+      // OWNING HUMAN over the same client doorway: it strips programmer state,
+      // revokes the key, deactivates the actor, and returns both counters. The
+      // wizard flag is deliberately left set — a deactivated actor cannot
+      // authenticate, so it grants nothing. ---
+      const humanToken = await ensureRoutedCredential(h, h.human, "9");
+      const humanSession = await clientFetch(h, "POST", "/net-api/session", { token: humanToken, body: { ttl_ms: 600_000 } });
+      expect(humanSession.status, JSON.stringify(humanSession.body)).toBe(200);
+      const revoked = await clientFetch(h, "POST", "/net-api/turn", {
+        token: humanToken,
+        body: { target: h.human, verb: "revoke_agent", args: [agent], session: humanSession.body.session, route: "direct" }
+      });
+      expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
+      expect(revoked.body?.reply?.status, JSON.stringify(revoked.body).slice(0, 800)).toBe("accepted");
+      expect(revoked.body?.error, JSON.stringify(revoked.body?.error)).toBeUndefined();
+      await h.settleAll();
+      expect(await scopeProp(h, h.clusterScope, agent, "deactivated_at")).toBeTruthy();
+      expect(await scopeProp(h, h.clusterScope, h.account, "agent_count")).toBe(2);
+      expect(await scopeProp(h, h.clusterScope, h.account, "programmer_agent_count")).toBe(1);
+      expect((await scopeLineage(h, h.clusterScope, agent))?.flags?.programmer ?? false).toBe(false);
+
+      // The retired wizard can no longer authenticate at all.
+      const deadSession = await clientFetch(h, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+      expect(deadSession.status, JSON.stringify(deadSession.body)).toBe(403);
+      expect(deadSession.body?.error?.detail?.reason).toBe("identity_deactivated");
+
+      // And its provision_id is not reusable: AP11.7 says take a new one.
+      const reuse = await provision(h, { human: h.human, provision_id: "ops-wizard-1" });
+      expect(reuse.status, JSON.stringify(reuse.body)).not.toBe(200);
+      await h.settleAll();
+      expect(await scopeProp(h, h.clusterScope, h.account, "agent_count")).toBe(2);
     } finally {
       h.close();
     }

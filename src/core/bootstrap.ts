@@ -1361,7 +1361,11 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$system", "set_quota", "set_quota", "verb :set_quota(account, kind, value) rxd { /* native: audited per-account quota mutation. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["account", "kind", "value"], authority: { prefetch: [{ arg: 0 }] } } });
   native(world, "$human", "create_agent", "human_create_agent", "verb :create_agent(name, purpose?, programmer?) rxd { /* native: self-service agent provisioning. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["name", "purpose?", "programmer?"] } });
   native(world, "$human", "list_agents", "human_list_agents", "verb :list_agents() rxd { /* native: list agents owned by this human. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: [] } });
-  native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"] } });
+  // Same prefetch shape as promote/demote below, and for the same reason: the
+  // turn reads the account (programmer counter, agent count) and the owned
+  // agent (flags, features, api_key_id, its own api_keys record) beyond the
+  // target, and an unwarmed instance read silently returns the class default.
+  native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   // The prefetch warms the two authority objects this turn reads beyond the
   // target (the human): the account behind `target.account` (its
   // programmer_grant_quota / programmer_agent_count) and the owned agent named

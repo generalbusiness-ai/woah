@@ -34,8 +34,11 @@ npm run provision:net-wizard -- \
 
 That mints an agent owned by the named human, carrying both the wizard
 flag and the programmer authoring surface, plus an API key the operator
-holds. Re-running it changes nothing. Retire one with
-`;#<your human>:revoke_agent("<agent id>")`.
+holds. Re-running it changes nothing.
+
+To retire one, the owning human calls `revoke_agent` on their own
+account surface with the agent's id. That strips the authoring surface,
+revokes the key, and deactivates the actor, so it can no longer sign in.
 
 The operator needs the deployment's internal secret, so this is a
 deploy-machine operation, not something a logged-in user can do. See

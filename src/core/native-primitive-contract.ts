@@ -399,6 +399,46 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     },
     note: "AP11 operator provisioning. Reached only through the internal-signed /net-operator/wizard/provision route and gated on wizard authority. Mints no credential material — the api-key id is a pointer whose verifier arrives through the separate signed credential-ensure route — so the primitive is fully deterministic apart from the counter-allocated object id and creation timestamps, exactly like every other recorded create. Every mutation is a recorded lineage/property write co-resident in the human's authority cluster; the audit is the accepted commit record, with the $system.wizard_actions catalog write suppressed by the profile sink on Net (audit.md AU1)."
   },
+  human_revoke_agent: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "human_revoke_agent",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "human/agent lineage and ownership",
+      "human.account and account binding",
+      "account.programmer_agent_count",
+      "$system.programmer_surface",
+      "agent.features and features_version",
+      "agent.api_key_id and the actor-owned api_keys record",
+      "account.agent_count"
+    ],
+    writes: [
+      "agent lineage (programmer flag cleared, via the object_lineage seam)",
+      "agent.features",
+      "agent.features_version",
+      "account.programmer_agent_count",
+      "agent.api_keys[<id>].revoked_at",
+      "agent.deactivated_at",
+      "account.agent_count"
+    ],
+    emits: ["cell_write"],
+    open_seed: {
+      object_property_names: [
+        "account",
+        "programmer_agent_count",
+        "agent_count",
+        "features",
+        "features_version",
+        "api_key_id",
+        "api_keys",
+        "deactivated_at"
+      ],
+      catalog_property_names: ["programmer_surface"]
+    },
+    note: "Human self-service revoke: strips programmer state through the shared transition, marks the actor-owned api-key record revoked, sets deactivated_at, and decrements the account agent count — every effect a recorded lineage/property write co-resident in the human authority cluster. Session teardown is a live-runtime action, not a durable effect, so it runs only after an accepted commit (same posture as revoke_api_key). The audit is the commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1). Legacy catalog-owned api-key ids remain outside this contract: revoking one still writes $system and is refused on Net."
+  },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "catalog_registry_install",

@@ -106,7 +106,19 @@ argument or the plan writes the new quota over a class-default prior).
 refused `incomplete_transcript` (probe-confirmed). Removing the catalog write is
 a precondition for tracking it, not the whole job.
 
-**F3 (not fixed, deliberate) — `setObjectFlags` still calls
+**F3 (fixed) — `$human:revoke_agent` was unusable on Net,** same catalog audit
+write. Found by probing the AP11.7 retirement story rather than assuming it:
+the first probe returned `E_CATALOG_MUTATION` on
+`property_cell:$system:wizard_actions`, so *no account owner on the deployed
+world could retire an agent at all*. Fix is the same three pieces as set_quota
+(AU1 sink, tracked contract, authority prefetch matching promote/demote).
+Re-probed: accepted, touching `object_lineage:<agent>`, `agent_count`,
+`programmer_agent_count`, `deactivated_at`, `features`, `features_version`.
+The same probe confirmed `$system:revoke_api_key` already worked over Net
+(it converges after one E_READ_VERSION repair round — it has no prefetch,
+because its argument is a key id, not an object the grammar can resolve).
+
+**F4 (not fixed, deliberate) — `setObjectFlags` still calls
 `recordWizardAction`.** Its only caller, `$system:set_actor_flag`, is untracked
 and is refused over Net before that line runs. Moving its audit to the sink
 would be inert while implying Net support that does not exist. Wizard authority
@@ -115,7 +127,7 @@ on Net is granted by AP11.
 ## Named residuals (not verified, not claimed)
 
 - **Other `recordWizardAction` call sites on cluster-local primitives** —
-  `agent_revoked`, `actor_deactivated`, `actor_reactivated`, `actor_recycled`,
+  `actor_deactivated`, `actor_reactivated`, `actor_recycled`,
   `mint_session_for`, `force_recycle`, `force_direct`. Each writes
   `$system.wizard_actions` and would fail `E_CATALOG_MUTATION` if its verb were
   ever tracked and driven over Net. Most are untracked natives today, so they
@@ -128,7 +140,13 @@ on Net is granted by AP11.
   in AP11.7 rather than changed: clearing programmer-without-wizard is the
   correct meaning of demote for ordinary agents, and `revoke_agent`
   (deactivation) is the lever for retiring an operator wizard. A deactivated
-  actor cannot authenticate, so the residual flag grants nothing.
+  actor cannot authenticate, so the residual flag grants nothing. Both halves
+  are now proved end to end over the client doorway.
+- **`revoke_api_key` has no authority prefetch.** Its argument is a key id, not
+  an object the prefetch grammar can resolve, so the actor's `api_keys` cell is
+  read cold and the turn pays one E_READ_VERSION repair round. It converges
+  (probe-confirmed) and is correct, but it is a round slower than it needs to
+  be. Not changed here.
 - **Fresh installs still seed no usable wizard.** Considered and deliberately
   not done: seeding an operator wizard at install time means seeding a
   credential at install time, and there is no human account to anchor it to

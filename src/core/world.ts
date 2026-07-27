@@ -11394,7 +11394,13 @@ export class WooWorld {
         if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
         this.setProp(agent, "deactivated_at", Date.now());
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        this.recordWizardAction(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
+        // AU1 seam, not recordWizardAction: every durable effect above is
+        // cluster-resident (agent lineage, agent props, account counter, the
+        // actor-owned api-key record), but `$system` is catalog-scoped on Net,
+        // so appending wizard_actions made the whole revocation fail
+        // E_CATALOG_MUTATION — leaving account owners with no way to retire an
+        // agent at all. Local profiles still materialize the entry.
+        this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
         return true;
       });
       this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {

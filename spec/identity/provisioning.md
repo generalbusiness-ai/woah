@@ -846,15 +846,32 @@ the wire. `npm run provision:net-wizard` drives all three.
 ### AP11.7 Revocation
 
 `demote_agent_from_programmer` clears the `programmer` flag and the surface but
-**not** the `wizard` flag — it would leave authority without tools. The
-supported lever for retiring an operator-provisioned wizard is therefore
-`$human:revoke_agent(actor_id)`: it strips programmer state through the shared
-transition, revokes the api key, closes its sessions, sets `deactivated_at`,
-and decrements `agent_count`. A deactivated actor cannot authenticate, so the
-residual `wizard` flag grants nothing.
+**not** the `wizard` flag — demote's meaning is "stop being a programmer", and
+clearing an unrelated authority bit would be a surprise. It therefore leaves an
+operator-provisioned wizard with authority and no tools, which is not the
+retirement anyone wants.
+
+The lever is `$human:revoke_agent(actor_id)`, called by the owning human: it
+strips programmer state through the shared transition, marks the actor-owned
+api-key record revoked, sets `deactivated_at`, and decrements `agent_count`.
+The `wizard` flag is deliberately left set — a deactivated actor cannot
+authenticate at all (`E_PERM identity_deactivated` at session mint), so the
+residual bit grants nothing, and the flag's history stays legible in the
+lineage cell.
+
+`revoke_agent` is a tracked native with the same authority prefetch as
+promote/demote, so it commits over `/net-api/turn` in the human's authority
+cluster. Its audit goes through the AU1 sink for the same reason as AP11.8:
+before that, `$system.wizard_actions` made every revocation fail
+`E_CATALOG_MUTATION`, which left account owners with no way to retire an agent
+on a Net world at all.
 
 Re-running provisioning against a deactivated agent's `provision_id` refuses;
 a replacement uses a new `provision_id`.
+
+Revoking only the credential (`$system:revoke_api_key(id)`, also tracked and
+verified over Net) is the narrower action: it kills the operator's access
+without retiring the actor.
 
 ### AP11.8 Related fix: `$system:set_quota` on Net
 
