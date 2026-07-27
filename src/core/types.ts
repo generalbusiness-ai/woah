@@ -673,6 +673,12 @@ export type CompileDiagnostic = {
   severity: "error" | "warning" | "info";
   code: string;
   message: string;
+  /** Remediation sentence for a human or an agent. The compiler supplies the
+   * generic form; a caller with world knowledge (e.g. `eval`) may sharpen it. */
+  hint?: string;
+  /** The offending source symbol, when the diagnostic is about one. Lets a
+   * caller check it against the world without re-parsing `message`. */
+  symbol?: string;
   span?: {
     line: number;
     column: number;

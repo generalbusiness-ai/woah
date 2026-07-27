@@ -106,6 +106,8 @@ this.location.name           // chained property access; each `.` may yield
 target.(name)                // dynamic property access; name expression yields str
 this:verb(arg1, arg2)        // verb call; may yield for host RPC
 $wiz:announce("hello")       // corename; resolves through $system
+#the_mug.description         // objref literal: an object addressed by id
+$system.spec_version         // corename literal, then property access
 pass(arg1, arg2)             // call this verb's parent-chain version
 [1, 2, 3]                    // list literal
 { "type": "say", "body": s } // map literal
@@ -127,6 +129,19 @@ Operators (precedence high to low):
 ```
 
 `.` and `:` are syntactically distinct: `.` is property access (data), `:` is verb call (dispatch). Both may yield.
+
+**Object literals.** A bare identifier resolves only to a local, a verb
+argument, or a frame global (`this`, `actor`, `caller`, …) — never to an object
+id. An object is written as a literal in one of two forms: `#<id>` (objref; the
+`#` is stripped, so `#the_mug` evaluates to the ref `the_mug`) or `$<name>`
+(corename, resolved through `$system`). A ref literal ends at the first
+character that is not `[A-Za-z0-9_-]`, so `.` and `:` after one are ordinary
+property access and verb dispatch: `#the_mug.description` reads a property and
+`$wiz:announce("hi")` dispatches a verb. Object ids therefore may not contain
+`.`. A bare id in expression position is a compile error whose diagnostic
+carries a `hint` naming the `#<id>` form (and a `symbol` field with the
+offending name); `$programmer:eval` sharpens that hint to a "did you mean"
+when the world can confirm the id exists.
 
 `obj.(expr)` is dynamic property access. `expr` must evaluate to a string. It
 uses the same `GET_PROP` / `SET_PROP` semantics as `obj.name`, but the property

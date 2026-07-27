@@ -10,6 +10,7 @@ import {
   observationReachesActor,
   valuesEqual,
   type AppliedFrame,
+  type CompileDiagnostic,
   type DirectLiveAudience,
   type DirectResultFrame,
   type ErrorFrame,
@@ -6340,6 +6341,21 @@ export class WooWorld {
     };
   }
 
+  /** Upgrade the compiler's generic objref hint into a "did you mean" once the
+   * world can confirm the symbol really is an object id. The compiler has no
+   * world access, so it can only offer the general rule; eval is the surface
+   * where an agent types a freshly-created id (`obj_human_2_1:ping()`) and
+   * needs to be told the literal form is `#obj_human_2_1`. A sparse view that
+   * has not warmed the object simply keeps the generic hint — never a claim
+   * that the id does not exist. */
+  private sharpenEvalDiagnostics(diagnostics: CompileDiagnostic[]): CompileDiagnostic[] {
+    return diagnostics.map((diagnostic) => {
+      const symbol = diagnostic.symbol;
+      if (!symbol || !this.objects.has(symbol)) return diagnostic;
+      return { ...diagnostic, hint: `${symbol} is an object; address it with the objref literal — did you mean #${symbol}?` };
+    });
+  }
+
   async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(ctx.actor, surfaceClass);
     const options = progOptions(opts);
@@ -6354,7 +6370,7 @@ export class WooWorld {
     const wrapped = `verb :_eval() rxd {\n  ${body}\n}`;
     const compiled = compileVerb(wrapped);
     if (!compiled.ok || !compiled.bytecode) {
-      return { ok: false, dry_run: dryRun, diagnostics: compiled.diagnostics as unknown as WooValue };
+      return { ok: false, dry_run: dryRun, diagnostics: this.sharpenEvalDiagnostics(compiled.diagnostics) as unknown as WooValue };
     }
     if (dryRun) return { ok: true, dry_run: true, diagnostics: [] };
     // The wrapper verb is not persisted. Run it directly with the actor as

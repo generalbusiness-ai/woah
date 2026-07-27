@@ -85,6 +85,54 @@ describe("$programmer:eval", () => {
     expect((result.diagnostics as unknown[]).length).toBeGreaterThan(0);
   });
 
+  it("points an unknown identifier at the #objref literal, and names the object when the world knows it", async () => {
+    // The walkthrough's finding: `create()` hands back a bare id
+    // (`obj_human_2_1`), typing it into eval fails "unknown identifier", and
+    // nothing anywhere documents that the callable form is `#obj_human_2_1`.
+    const world = createWorld();
+    const { actor } = programmerActor(world, "guest:eval-objref");
+    world.createObject({ id: "eval_probe_widget", parent: "$thing", owner: actor, name: "Probe Widget" });
+
+    // The world KNOWS this id, so the hint is the sharp "did you mean" form.
+    const known = await callEval(world, actor, "eval_probe_widget.name");
+    expect(known.ok).toBe(false);
+    const knownDiag = (known.diagnostics as Array<Record<string, unknown>>)[0];
+    expect(knownDiag.code).toBe("E_COMPILE");
+    expect(knownDiag.message).toContain("unknown identifier: eval_probe_widget");
+    expect(knownDiag.symbol).toBe("eval_probe_widget");
+    expect(knownDiag.hint).toContain("#eval_probe_widget");
+    expect(knownDiag.hint).toContain("did you mean");
+
+    // And the objref literal the hint recommends actually works — including
+    // for a property read. `.` terminates a ref token (language.md §7.3);
+    // while it did not, `#obj.prop` and `$core.prop` compiled to a single
+    // string literal and returned "eval_probe_widget.name" with no error.
+    const viaObjref = await callEval(world, actor, "#eval_probe_widget.name");
+    expect(viaObjref).toMatchObject({ ok: true, value: "Probe Widget" });
+    const viaCoreref = await callEval(world, actor, "$programmer.name");
+    expect(viaCoreref.ok, JSON.stringify(viaCoreref)).toBe(true);
+    expect(typeof viaCoreref.value).toBe("string");
+    expect(viaCoreref.value).not.toBe("$programmer.name");
+    // Verb dispatch on a ref is unaffected.
+    const viaVerb = await callEval(world, actor, "#eval_probe_widget:title()");
+    expect(viaVerb.ok, JSON.stringify(viaVerb)).toBe(true);
+
+    // An id the world does not know keeps the compiler's generic rule — the
+    // hint must never claim knowledge a sparse view does not have.
+    const unknown = await callEval(world, actor, "no_such_object_here.name");
+    const unknownDiag = (unknown.diagnostics as Array<Record<string, unknown>>)[0];
+    expect(unknownDiag.hint).toContain("#no_such_object_here");
+    expect(unknownDiag.hint).not.toContain("did you mean");
+
+    // The chat line carries the remediation too; a diagnostic nobody reads
+    // is not a fix.
+    const frame = await world.directCall(undefined, actor, actor, "eval", ["eval_probe_widget.name", {}]);
+    expect(frame.op).toBe("result");
+    if (frame.op !== "result") return;
+    const told = frame.observations.find((o) => o.type === "text" && (o as { target?: string }).target === actor);
+    expect((told as unknown as { text: string }).text).toContain("#eval_probe_widget");
+  });
+
   it("propagates runtime errors as a thrown error frame", async () => {
     const world = createWorld();
     const { actor } = programmerActor(world, "guest:eval-runtime-err");

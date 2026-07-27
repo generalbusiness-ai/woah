@@ -16,14 +16,14 @@ not the catalog installer's.
 **MCP / direct call:**
 
 ```
-woo_call("$me", "eval", ["the_chatroom:say(\"hi\")", {}])
+woo_call("$me", "eval", ["#the_chatroom:say(\"hi\")", {}])
 woo_call("$me", "eval", ["create($thing, {name: \"a thing\"})", {mode: "expr"}])
 ```
 
 **Chat alias for expression mode (`;`):**
 
 ```
-;the_chatroom:say("hi")
+;#the_chatroom:say("hi")
 ```
 
 The chat planner intercepts a leading `;` (alone, not followed by
@@ -38,6 +38,32 @@ dispatches to the speaker's eval verb.
 
 A leading `;;` runs the body verbatim as a verb body, equivalent to
 `eval(<text>, {mode: "stmts"})`.
+
+## Naming objects: `#id` and `$name`
+
+This is the first thing that trips people (and agents) up. **A bare word in
+eval source is never an object.** Bare names resolve only to locals, verb
+arguments, and frame globals (`this`, `actor`, `caller`, `progr`). An object is
+written as a literal:
+
+| Form | Meaning | Example |
+|---|---|---|
+| `#<id>` | objref literal — an object addressed by its id | `;#obj_human_2_1:ping()` |
+| `$<name>` | corename literal — resolved through `$system` | `;$wiz.name` |
+
+`create(...)` hands back a **bare** id (`obj_human_2_1`). Typing that straight
+back into eval fails:
+
+```
+;obj_human_2_1:ping()
+compile error: E_COMPILE unknown identifier: obj_human_2_1
+  (obj_human_2_1 is an object; address it with the objref literal —
+   did you mean #obj_human_2_1?)
+```
+
+Add the `#` and it works. The literal ends at the first character that is not
+a letter, digit, `_` or `-`, so `.` and `:` after it behave normally:
+`#the_mug.description` reads a property, `#the_mug:read()` calls a verb.
 
 ## Modes
 
@@ -94,7 +120,7 @@ verb on an object and let that verb decide what to do.
 **Quick property read:**
 
 ```
-;the_lamp.color
+;#the_lamp.color
 ```
 
 (One-line read; `expr` mode returns the value.)
@@ -102,7 +128,7 @@ verb on an object and let that verb decide what to do.
 **Quick verb call:**
 
 ```
-;the_lamp:turn_on()
+;#the_lamp:turn_on()
 ```
 
 **Bulk operation:**
@@ -134,7 +160,7 @@ woo_call("the_lamp", "set_color", ["blue"])
 …you can:
 
 ```
-woo_call("$me", "eval", ["the_lamp:turn_on(); the_lamp:set_color(\"blue\")", {mode: "stmts"}])
+woo_call("$me", "eval", ["#the_lamp:turn_on(); #the_lamp:set_color(\"blue\")", {mode: "stmts"}])
 ```
 
 Each `woo_call` round-trip costs an MCP turn; one `eval` doesn't.
@@ -167,7 +193,7 @@ won't compile as a verb body won't compile in eval either. Use
 Combined with `install_verb`, eval is the fast feedback loop:
 
 ```
-;;let r = "$programmer":install_verb(the_lamp, "turn_on", "verb turn_on() this.lit = true; observe({type: \"say\", text: \"clicked.\"}); endverb", {dry_run: true});
+;;let r = $programmer:install_verb(#the_lamp, "turn_on", "verb :turn_on() rxd { this.lit = true; observe({type: \"say\", text: \"clicked.\"}); }", {dry_run: true});
 observe({type: "say", text: "diagnostics: " + tostr(r["diagnostics"])});
 ```
 

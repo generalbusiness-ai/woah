@@ -92,7 +92,10 @@ class CompileError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly span?: Span
+    readonly span?: Span,
+    /** Optional remediation sentence + the offending symbol; both surface on
+     * the CompileDiagnostic so callers (eval, install_verb) can relay them. */
+    readonly extra?: { hint?: string; symbol?: string }
   ) {
     super(message);
   }
@@ -198,6 +201,8 @@ function compileDiagnostic(err: unknown): CompileDiagnostic {
       severity: "error",
       code: err.code,
       message: err.message,
+      ...(err.extra?.hint ? { hint: err.extra.hint } : {}),
+      ...(err.extra?.symbol ? { symbol: err.extra.symbol } : {}),
       span: err.span ? toDiagnosticSpan(err.span) : undefined
     };
   }
@@ -310,7 +315,14 @@ class Lexer {
   private ref(kind: "objref" | "coreref"): void {
     const start = this.mark();
     let value = this.advance();
-    while (!this.atEnd() && /[A-Za-z0-9_.-]/.test(this.peek())) value += this.advance();
+    // `.` deliberately TERMINATES a ref token. language.md §7.3 makes `.`
+    // property access on whatever precedes it, and a ref is an expression like
+    // any other — `$system.spec_version` and `#the_mug.description` must read
+    // properties. Including `.` in the ref charset silently produced a single
+    // string literal ("$system.spec_version") instead, so the read compiled
+    // fine and returned the wrong kind of value with no diagnostic. No object
+    // id contains a dot (checked across bootstrap and every bundled catalog).
+    while (!this.atEnd() && /[A-Za-z0-9_-]/.test(this.peek())) value += this.advance();
     if (value.length === 1) throw this.error(`invalid ${kind}`, start);
     // Coreref ids are stored with the leading `$` ($wiz, $root, ...).
     // Objref ids are stored without the leading `#`, so strip it here so
@@ -1085,7 +1097,17 @@ class Codegen {
       this.emit(globalOp);
       return;
     }
-    throw new CompileError("E_COMPILE", `unknown identifier: ${expr.name}`, expr.span);
+    // A bare name resolves only to a local/argument or a frame global. Object
+    // ids are NOT in that namespace — they are written as the `#<id>` objref
+    // literal (`$name` for corerefs). An agent that just called `create()` and
+    // got back `obj_human_2_1` has no way to guess that from "unknown
+    // identifier", so the remediation ships with the diagnostic. A caller that
+    // knows the world (see World.programmerEval) sharpens this into a
+    // "did you mean" once it confirms the id exists.
+    throw new CompileError("E_COMPILE", `unknown identifier: ${expr.name}`, expr.span, {
+      symbol: expr.name,
+      hint: `bare names resolve only to locals, verb arguments, and frame globals; write an object id as the objref literal #${expr.name} (or $${expr.name} for a core reference)`
+    });
   }
 
   private compileBinary(expr: BinaryExpr): void {
