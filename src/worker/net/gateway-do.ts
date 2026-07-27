@@ -328,7 +328,7 @@ type TurnRequest = {
   counters?: PlanTurnInput["counters"];
 };
 
-/** /net/provision-wizard body (AP7; see operatorProvisionWizard). The
+/** /net/provision-wizard body (AP11; see operatorProvisionWizard). The
  * internal-signed operator op that mints a usable wizard on a deployed world.
  * Carries no credential material: the api-key id is a pointer whose verifier
  * is installed by the separate /net-operator/credentials/ensure route. */
@@ -2390,7 +2390,7 @@ export class NetGatewayDO {
   }
 
   /**
-   * /net/provision-wizard — AP7 signed-operator wizard provisioning.
+   * /net/provision-wizard — AP11 signed-operator wizard provisioning.
    *
    * Why this is a TURN and not a cell write like the repair family: every other
    * signed operator op repairs state whose correct value is derivable outside

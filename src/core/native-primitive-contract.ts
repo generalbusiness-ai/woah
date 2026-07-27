@@ -397,7 +397,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       ],
       catalog_property_names: ["programmer_surface"]
     },
-    note: "AP7 operator provisioning. Reached only through the internal-signed /net-operator/wizard/provision route and gated on wizard authority. Mints no credential material — the api-key id is a pointer whose verifier arrives through the separate signed credential-ensure route — so the primitive is fully deterministic apart from the counter-allocated object id and creation timestamps, exactly like every other recorded create. Every mutation is a recorded lineage/property write co-resident in the human's authority cluster; the audit is the accepted commit record, with the $system.wizard_actions catalog write suppressed by the profile sink on Net (audit.md AU1)."
+    note: "AP11 operator provisioning. Reached only through the internal-signed /net-operator/wizard/provision route and gated on wizard authority. Mints no credential material — the api-key id is a pointer whose verifier arrives through the separate signed credential-ensure route — so the primitive is fully deterministic apart from the counter-allocated object id and creation timestamps, exactly like every other recorded create. Every mutation is a recorded lineage/property write co-resident in the human's authority cluster; the audit is the accepted commit record, with the $system.wizard_actions catalog write suppressed by the profile sink on Net (audit.md AU1)."
   },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",

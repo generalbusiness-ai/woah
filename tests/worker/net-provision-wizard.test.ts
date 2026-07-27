@@ -1,4 +1,4 @@
-// AP7 — signed-operator wizard provisioning (spec/operations/wizard-provision.md).
+// AP11 — signed-operator wizard provisioning (spec/identity/provisioning.md §AP11).
 //
 // The deployed lock this op exists to break: `$wiz` is a catalog seed, so a
 // client turn planning at its anchor classifies as `catalog` and is refused
@@ -188,7 +188,7 @@ async function scopeLineage(h: Harness, scope: string, object: string): Promise<
   return closure.cells?.find((cell) => cell.key === `object_lineage:${object}`)?.value as Record<string, any> | undefined;
 }
 
-describe("AP7 operator wizard provisioning (fake-DO lane)", () => {
+describe("AP11 operator wizard provisioning (fake-DO lane)", () => {
   it("provisions a usable wizard agent, is idempotent, and keeps every counter honest", async () => {
     const h = await buildWorld({ controlAgent: true });
     try {

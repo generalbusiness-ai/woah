@@ -4155,10 +4155,10 @@ export class WooWorld {
     }
 
     /**
-     * AP7 — signed-operator provisioning of a wizard-flagged agent anchored
+     * AP11 — signed-operator provisioning of a wizard-flagged agent anchored
      * under an existing human account.
      *
-     * Motivation (auth.md A11 "backup wizard", operations/wizard-provision.md):
+     * Motivation (auth.md A11 "backup wizard", identity/provisioning.md §AP11):
      * a deployed world whose only wizard is the unplaced catalog seed `$wiz`
      * has no usable wizard on the client/MCP surface, and programmer minting is
      * quota-gated to zero with only a wizard able to raise the quota. A non-`$`
@@ -10390,8 +10390,8 @@ export class WooWorld {
     // caller, is an UNTRACKED native and is therefore refused over Net before
     // this line can run (incomplete_transcript) — routing the audit through the
     // AU1 sink would be inert while implying Net support that does not exist.
-    // On Net, wizard authority is granted by the AP7 provisioning op
-    // (spec/operations/wizard-provision.md), which writes the flag through the
+    // On Net, wizard authority is granted by the AP11 provisioning op
+    // (spec/identity/provisioning.md §AP11), which writes the flag through the
     // lineage seam and audits through the sink.
     this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
     this.markObjectDirty(target);
@@ -11409,7 +11409,7 @@ export class WooWorld {
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         return true;
       });
-      // AP7 operator provisioning. Defined on the human kind — and therefore invoked
+      // AP11 operator provisioning. Defined on the human kind — and therefore invoked
       // with the HUMAN as the turn target — so the whole transition commits in
       // the human's authority cluster, where the account, the new agent, and
       // its api-key record all live. A $system-targeted verb would commit at

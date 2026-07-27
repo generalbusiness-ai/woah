@@ -1213,7 +1213,7 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$account", "created_at", 0, "int", "r");
   define(world, "$account", "deactivated_at", null, "int|null", "r");
   define(world, "$account", "recycle_on_delete", false, "bool", "r");
-  // AP7 idempotency ledger for signed-operator wizard provisioning:
+  // AP11 idempotency ledger for signed-operator wizard provisioning:
   // provision_id -> the agent minted for it. Bounded by the account's own agent
   // quota; read only by the provisioning primitive that writes it.
   define(world, "$account", "operator_provisioned_agents", {}, "map", "r");
@@ -1225,7 +1225,7 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$agent", "purpose", "", "str", "r");
   define(world, "$agent", "scope", "write", "str", "r");
   define(world, "$agent", "deactivated_at", null, "int|null", "r");
-  // AP7: the operator token this agent was provisioned for. The reverse pointer
+  // AP11: the operator token this agent was provisioned for. The reverse pointer
   // of the account's operator_provisioned_agents ledger, checked before any idempotent
   // re-run reuses the recorded agent.
   define(world, "$agent", "provision_id", null, "str|null", "r");
@@ -1371,7 +1371,7 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "promote_agent_to_programmer", "human_promote_agent_to_programmer", "verb :promote_agent_to_programmer(actor_id) rxd { /* native: consume programmer-agent quota and set programmer flag. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   native(world, "$human", "demote_agent_from_programmer", "human_demote_agent_from_programmer", "verb :demote_agent_from_programmer(actor_id) rxd { /* native: clear programmer flag on an owned agent. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
-  // AP7 signed-operator wizard provisioning (spec/operations/wizard-provision.md).
+  // AP11 signed-operator wizard provisioning (spec/identity/provisioning.md §AP11).
   // NOT tool_exposed: the only caller is the internal-signed
   // /net-operator/wizard/provision route, and the handler additionally requires
   // wizard authority. The prefetch warms the account (quotas, counters, and the

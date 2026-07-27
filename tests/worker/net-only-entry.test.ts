@@ -129,6 +129,76 @@ describe("net-only Worker entry", () => {
     close();
   });
 
+  it("forwards the AP11 wizard provisioning op to a gateway shard, freshly signed", async () => {
+    const scopeState = netState("scope-catalog-provision");
+    const forwarded: Array<{ url: string; body: unknown; signedForGateway: boolean }> = [];
+    let env: NetOnlyEnv;
+    env = {
+      WOO_INTERNAL_SECRET: "net-only-test-secret",
+      NET_API_GATEWAY_SHARDS: "1",
+      NET_RESOLVE: (destination: string) => {
+        if (destination === "scope:catalog") return new NetScopeDO(scopeState.state, env);
+        if (destination.startsWith("gateway:")) {
+          return {
+            fetch: async (request: Request) => {
+              // The trusted hop must be signed by the EDGE, never by inheriting
+              // an inbound header.
+              await signInternalRequest(env, request.clone());
+              forwarded.push({
+                url: request.url,
+                body: await request.clone().json(),
+                signedForGateway: request.headers.has("x-woo-internal-signature")
+                  || [...request.headers.keys()].some((name) => name.toLowerCase().startsWith("x-woo-internal-"))
+              });
+              return new Response(JSON.stringify({ ok: true, scope: "cluster:human_2", result: { actor_id: "agent_7" } }), {
+                headers: { "content-type": "application/json" }
+              });
+            }
+          } as unknown as ReturnType<NonNullable<NetOnlyEnv["NET_RESOLVE"]>>;
+        }
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+
+    const body = { human: "human_2", provision_id: "ops-wizard-1", name: "OpsWizard" };
+    const unsigned = await worker.fetch(new Request("https://woo.test/net-operator/wizard/provision", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }), env);
+    expect(unsigned.status).toBe(401);
+    expect(forwarded).toHaveLength(0);
+
+    const signed = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/wizard/provision", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    })), env);
+    expect(signed.status, await signed.clone().text()).toBe(200);
+    expect(await signed.json()).toMatchObject({ ok: true, result: { actor_id: "agent_7" } });
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]!.url).toBe("https://do/net/provision-wizard");
+    expect(forwarded[0]!.body).toEqual(body);
+    expect(forwarded[0]!.signedForGateway).toBe(true);
+
+    // A body without a human never reaches a DO.
+    const malformed = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/wizard/provision", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provision_id: "x" })
+    })), env);
+    expect(malformed.status).toBe(400);
+    // The allow-list is exact: no sibling operator path exists.
+    const unknown = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/wizard/demote", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    })), env);
+    expect(unknown.status).toBe(404);
+    expect(forwarded).toHaveLength(1);
+    scopeState.close();
+  });
+
   it("retains the signed, world-state-free install readiness probe", async () => {
     const { env, close } = harness();
     const request = await signInternalRequest(env, new Request("https://woo.test/net-install/probe"));

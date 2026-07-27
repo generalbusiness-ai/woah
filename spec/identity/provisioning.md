@@ -14,7 +14,8 @@ quotas of agent identities, with onboarding optimized for Hermes-style
 multi-profile setups — is normative below.
 
 Operator-grade pieces (directory sync, federation, bulk reconcile) stay
-deferred, called out in AP8.
+deferred, called out in AP8. AP11 covers the one operator surface that is
+implemented: signed provisioning of a usable wizard on a deployed world.
 
 ---
 
@@ -686,7 +687,8 @@ Every state transition routes through one of these `$system` verbs:
 | `$system:issue_signup_invite(quantity, expires_at)` | Mint redeemable signup codes. | Yes — `signup_invite_issued` |
 | `$system:gc_pending_credentials()` | Sweep expired bearers, verification tokens, provision-state nonces, expired unused invites, and old used invite records. | Yes — `gc_pending_credentials` |
 | `$system:set_actor_flag(actor, flag, value)` | Flip a runtime-blessed flag (`programmer`, `wizard`). Quota-checked for `programmer` on `$agent` per AP6; unrestricted for wizard-on-`$human`. | Yes — `actor_flag_changed` with `flag`, `old`, `new` |
-| `$system:set_quota(account, kind, value)` | Adjust `agent_quota` or `programmer_grant_quota` per account. | Yes — `account_quota_changed` |
+| `$system:set_quota(account, kind, value)` | Adjust `agent_quota` or `programmer_grant_quota` per account. Tracked native; on Net the audit is the commit record (AP11.8). | Yes — `account_quota_changed` |
+| `$human:provision_wizard_agent(provision_id, options?)` | Signed-operator provisioning of a wizard-flagged, programmer-surfaced agent under this human's account (AP11). Wizard-gated; not `tool_exposed`. | Yes — `account_quota_changed`, `actor_provisioned`, `agent_promoted_to_programmer`, `actor_wizard_flag_set`, `operator_wizard_agent_provisioned` |
 
 Self-service surfaces (`$human:create_agent`, `/signup`, `/connect`)
 call these primitives under wizard authority via the perms-bypass
@@ -707,3 +709,162 @@ with `$human` or `$agent`, set quota/account fields as needed, and use
 the same API-key rotation and deactivation verbs. The self-service
 signup path adds browser-facing credential exchange and guest
 promotion, but it does not create a separate actor model.
+
+---
+
+## AP11. Operator wizard provisioning (implemented)
+
+### AP11.1 The lock this breaks
+
+A deployed Net world can reach a state in which **no wizard can act and no
+programmer agent can ever be minted**. Two independent facts compose:
+
+1. The seeded `$wiz` is a catalog identity with no placement. A client turn's
+   planning anchor falls back to the actor itself when it is located nowhere
+   (CO14), a `$`-prefixed anchor classifies to the `catalog` scope, and the
+   catalog scope is not client-plannable — so every `$wiz` turn is refused
+   `E_INVARG unplannable_scope`, including the ones whose purpose is to fix
+   placement.
+2. Programmer minting consumes `account.programmer_grant_quota` (AP6), which
+   defaults to 0, and only a wizard may raise it.
+
+The world is not broken — it is *unreachable*. Nothing inside it can grant the
+first capability, so the repair must arrive from outside, signed.
+
+### AP11.2 The remedy: an anchored, non-catalog wizard
+
+`$human:provision_wizard_agent(provision_id, options?)` mints a **non-`$`
+agent anchored under an existing human account** and gives it both authority
+and tools. A non-catalog actor anchored to a human authority root plans at
+that cluster **even while located nowhere**, so the provisioned actor is usable
+over MCP/`/net-api` immediately, with no placement step.
+
+The verb is defined on `$human` and is invoked with the human as the turn
+target, so the entire transition plans and commits in the human's authority
+cluster — where the account, the new agent, and its api-key record all live. A
+`$system`-targeted verb would commit at the catalog scope and could write none
+of them.
+
+It is **wizard-gated** and **not `tool_exposed`**: the only intended caller is
+the internal-signed operator route (AP11.5).
+
+### AP11.3 Ledger-honest sequence (normative)
+
+One turn performs, in order, the exact effects of the corresponding
+self-service primitives — so every counter and audit record afterwards is
+indistinguishable from an ordinary provisioning:
+
+1. **Quota headroom** with `$system:set_quota` semantics, granted only in the
+   amount the following steps consume: `agent_quota` is raised to
+   `agent_count + 1` only if a mint would exceed it, and
+   `programmer_grant_quota` to `programmer_agent_count + 1` only if a promote
+   would. A converged re-run grants nothing. Each grant records
+   `account_quota_changed`.
+2. **Create** through the shared `provisionActorInternal` path used by
+   `$system:provision_actor` and `create_agent`: `$agent` parent, owned by the
+   human, anchored at the family authority root, customer attribution derived,
+   `actor_provisioned` recorded, `account.actors` appended, `agent_count`
+   incremented.
+3. **Promote** through the same shared transition as
+   `promote_agent_to_programmer`: consumes the grant quota, increments
+   `programmer_agent_count`, sets the `programmer` flag through the
+   `object_lineage` lineage seam, and attaches the published programmer surface
+   (`$system.programmer_surface`).
+4. **Wizard flag** through the lineage seam, with the surface reconciled.
+
+Step 3 is **required** before step 4. The two-gate model (AP4) separates
+authority from tools: a wizard-flagged actor without the authoring surface has
+permission to author and no verbs with which to do it.
+
+**Atomicity.** All four steps are one turn, so a failure at any step commits
+nothing. There is no partially-provisioned outcome to clean up.
+
+**Audit.** As in AP6, the audit is profile-materialized. On Net the accepted
+commit record IS the audit; the `$system.wizard_actions` catalog write is
+suppressed by the profile sink (audit.md AU1). Local and SQLite profiles
+materialize `account_quota_changed`, `actor_provisioned`,
+`agent_promoted_to_programmer`, `actor_wizard_flag_set`, and
+`operator_wizard_agent_provisioned` as usual.
+
+### AP11.4 Idempotency
+
+The operator supplies an opaque `provision_id`. The account carries
+`operator_provisioned_agents`, a `provision_id -> agent` map, and the agent
+carries `provision_id` as the reverse pointer.
+
+- A re-run whose `provision_id` is already in the ledger reuses that agent:
+  nothing is created, no counter moves, no quota is granted, and the receipt
+  reports `created: false`.
+- The reuse path is **fail-closed**. If the recorded id names an object that is
+  absent, is not a live agent owned by this human, or does not carry the same
+  `provision_id`, the call refuses. A stale or unwarmed read must never become
+  a duplicate identity.
+- The verb declares an authority prefetch for the account and for every agent
+  the ledger names, because a property read of an unwarmed instance silently
+  returns the class default rather than an error the repair loop could act on.
+
+Distinct `provision_id`s under one account mint distinct agents, each with its
+own unit of quota.
+
+### AP11.5 The signed operator route
+
+`POST /net-operator/wizard/provision`, alongside
+`POST /net-operator/credentials/ensure`
+([cloudflare.md §R14](../reference/cloudflare.md)). Same trust model as the
+rest of the operator surface: the inbound internal HMAC is the gate, the edge
+strips the inbound signature and freshly signs the DO hop, and the allow-list
+is exact.
+
+Body: `{human, provision_id, name?, purpose?, api_key_id?}`. The route refuses
+a missing or `$`-prefixed `human`, a `provision_id` outside
+`[A-Za-z0-9._:-]{1,128}`, and a `human` that does not classify to an authority
+cluster. It is addressed to a gateway shard (not a scope) because it runs a
+turn, keyed by the human so repeated runs reuse one warm view.
+
+The acting principal is the **owner of the resolved `provision_wizard_agent`
+verb page**, the same data-driven derivation the guest door uses for
+`maintenance_principal`; the runtime never names `$wiz`. A world that does not
+install the primitive refuses `E_VERBNF` at the route rather than failing deep
+inside planning.
+
+### AP11.6 Credential handling
+
+The primitive **mints no credential**. A routed api-key id embeds the actor it
+is bound to, so it cannot exist before the agent does; the operator therefore:
+
+1. provisions (learning the agent id),
+2. generates the id/secret/salt locally, writes them to an owner-only file, and
+   installs only the salted verifier through
+   `POST /net-operator/credentials/ensure`,
+3. re-runs provisioning with `api_key_id` so the agent's key pointer names the
+   credential the operator holds.
+
+Every step is independently idempotent and the replayable secret never crosses
+the wire. `npm run provision:net-wizard` drives all three.
+
+### AP11.7 Revocation
+
+`demote_agent_from_programmer` clears the `programmer` flag and the surface but
+**not** the `wizard` flag — it would leave authority without tools. The
+supported lever for retiring an operator-provisioned wizard is therefore
+`$human:revoke_agent(actor_id)`: it strips programmer state through the shared
+transition, revokes the api key, closes its sessions, sets `deactivated_at`,
+and decrements `agent_count`. A deactivated actor cannot authenticate, so the
+residual `wizard` flag grants nothing.
+
+Re-running provisioning against a deactivated agent's `provision_id` refuses;
+a replacement uses a new `provision_id`.
+
+### AP11.8 Related fix: `$system:set_quota` on Net
+
+`set_quota` previously appended `$system.wizard_actions`, a catalog cell, so
+every call over Net failed `E_CATALOG_MUTATION` — a deployed world could not
+grant programmer quota even holding a working wizard, which is half of the lock
+in AP11.1. Its audit now goes through the AU1 profile sink and the primitive is
+a tracked native with an argument-0 authority prefetch (the turn target
+`$system` is catalog-resident, so the account must be prefetched from the
+argument).
+
+`$system:set_actor_flag` remains an **untracked** native and is therefore still
+refused over Net (`incomplete_transcript`, fail-closed). Granting wizard
+authority on a Net world goes through AP11, not through `set_actor_flag`.

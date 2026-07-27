@@ -310,7 +310,7 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
   if (request.method !== "POST") {
     return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure or /net-operator/wizard/provision" } }, 404);
   }
-  // AP7 wizard provisioning runs a TURN, so it is addressed to a gateway shard
+  // AP11 wizard provisioning runs a TURN, so it is addressed to a gateway shard
   // rather than a scope authority. The edge still only forwards, freshly
   // signed, exactly the routes on this allow-list.
   if (url.pathname === "/net-operator/wizard/provision") {

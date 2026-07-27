@@ -33,6 +33,7 @@
     "repair:net-definitions": "tsx scripts/net-repair-definitions.ts",
     "repair:net-seed-properties": "tsx scripts/net-repair-seed-properties.ts",
     "credential:net-ensure": "tsx scripts/net-ensure-credential.ts",
+    "provision:net-wizard": "tsx scripts/net-provision-wizard.ts",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
     "task:time": "node scripts/task-time.mjs",
     "test:guards": "npm run catalog:index && npm run catalog:check && npm run guard:object-names && npm run guard:layering && npm run guard:programmer-surface && npm run guard:programmer-collision && npm run guard:catalog-layering && npm run guard:catalog-runtime-boundary && npm run guard:tool-workspace-ui && npm run guard:catalog-migrations && npm run guard:client-imports && npm run guard:command-planning && npm run guard:vocabulary && npm run guard:turn-effects && npm run guard:serialized-access && npm run guard:smoke-wrangler && npm run guard:smoke-mcp-args && npm run guard:module-mocking-tests",
