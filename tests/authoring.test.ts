@@ -301,6 +301,26 @@ describe("authoring", () => {
     }));
   });
 
+  it("reserves the DSL's property-access character in new object ids, but never on the restore path", async () => {
+    const world = createWorld();
+    // Mint: refused, and the refusal says which character and why. Every
+    // runtime mint funnels through createObject; the ids the VM generates
+    // (`obj_<scope>_<n>`) can never trip this, so the rule exists for the one
+    // path that takes an id from outside — a catalog manifest's local_name.
+    expect(() => world.createObject({ id: "mint.me", parent: "$thing", owner: "$wiz" }))
+      .toThrow(/may not contain "\."/);
+    expect(world.objects.has("mint.me")).toBe(false);
+
+    // Restore: accepted. Ids are opaque in storage and on the wire, so an
+    // identity export or an adopted world may carry an id minted before this
+    // rule existed. Refusing it here would strand a restorable world; the
+    // quoted objref form (`#"legacy.dotted"`) is what keeps it addressable
+    // from source. See tests/programmer-eval.test.ts for that half.
+    const restored = world.createObject({ id: "legacy.dotted", parent: "$thing", owner: "$wiz", restoring: true });
+    expect(restored.id).toBe("legacy.dotted");
+    expect(world.objects.has("legacy.dotted")).toBe(true);
+  });
+
   it("names the editor and the operator remediation when the editor space is absent", async () => {
     // The walkthrough hit this on the workerd lane and prod alike: with the
     // seeded editor unreadable, edit_verb answered with the substrate's

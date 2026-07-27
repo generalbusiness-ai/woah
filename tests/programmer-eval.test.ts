@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import type { WooValue } from "../src/core/types";
 
@@ -131,6 +132,34 @@ describe("$programmer:eval", () => {
     if (frame.op !== "result") return;
     const told = frame.observations.find((o) => o.type === "text" && (o as { target?: string }).target === actor);
     expect((told as unknown as { text: string }).text).toContain("#eval_probe_widget");
+  });
+
+  it("reaches an object whose id holds a reserved character through the quoted objref form", async () => {
+    // `.` terminating a bare ref token re-means `#foo.bar` from "object
+    // foo.bar" to "property bar on object foo". Ids are opaque in storage and
+    // on the wire, so a world minted before that rule (or by a third-party
+    // catalog's local_name) can already hold a dotted id, and it must stay
+    // addressable from source. The quoted form is that escape; without it the
+    // object would be unreferenceable with no error and no migration.
+    const world = createWorld();
+    const { actor } = programmerActor(world, "guest:eval-quoted-ref");
+    // `restoring` is the reconstruction path (identity import / world
+    // adoption); it is exactly how a legacy dotted id enters a fresh world.
+    world.createObject({ id: "legacy.dotted", parent: "$thing", owner: actor, name: "Legacy Dotted", restoring: true });
+    world.setProp("legacy.dotted", "name", "Legacy Dotted");
+    const installed = installVerb(world, "legacy.dotted", "ping", "verb :ping() rxd { return 7; }", null);
+    expect(installed.ok).toBe(true);
+
+    const read = await callEval(world, actor, `#"legacy.dotted".name`);
+    expect(read).toMatchObject({ ok: true, value: "Legacy Dotted" });
+    const called = await callEval(world, actor, `#"legacy.dotted":ping()`);
+    expect(called).toMatchObject({ ok: true, value: 7 });
+    // The bare form still means property access — the two spellings are
+    // genuinely different references, which is the whole point. It compiles,
+    // then fails at runtime looking for an object named `legacy`.
+    const bare = await world.directCall(undefined, actor, actor, "eval", ["#legacy.dotted", {}]);
+    expect(bare.op).toBe("error");
+    if (bare.op === "error") expect(bare.error.code).toBe("E_OBJNF");
   });
 
   it("propagates runtime errors as a thrown error frame", async () => {

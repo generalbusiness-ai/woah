@@ -108,6 +108,7 @@ this:verb(arg1, arg2)        // verb call; may yield for host RPC
 $wiz:announce("hello")       // corename; resolves through $system
 #the_mug.description         // objref literal: an object addressed by id
 $system.spec_version         // corename literal, then property access
+#"legacy.id".description     // quoted objref: an id the bare form would end on
 pass(arg1, arg2)             // call this verb's parent-chain version
 [1, 2, 3]                    // list literal
 { "type": "say", "body": s } // map literal
@@ -137,11 +138,22 @@ id. An object is written as a literal in one of two forms: `#<id>` (objref; the
 (corename, resolved through `$system`). A ref literal ends at the first
 character that is not `[A-Za-z0-9_-]`, so `.` and `:` after one are ordinary
 property access and verb dispatch: `#the_mug.description` reads a property and
-`$wiz:announce("hi")` dispatches a verb. Object ids therefore may not contain
-`.`. A bare id in expression position is a compile error whose diagnostic
-carries a `hint` naming the `#<id>` form (and a `symbol` field with the
-offending name); `$programmer:eval` sharpens that hint to a "did you mean"
-when the world can confirm the id exists.
+`$wiz:announce("hi")` dispatches a verb.
+
+Both forms have a **quoted variant** — `#"<id>"` and `$"<name>"` — whose body
+is taken verbatim, with the same escapes as a string literal. This is the only
+way to write an id containing a character the bare form would end on, and it is
+what makes `#"foo.bar"` a reference to the object `foo.bar` rather than a read
+of property `bar` on object `foo`. Object ids are opaque in storage and on the
+wire, so a world may hold such an id — minted before the reservation in
+[objects.md §5.5.1](objects.md#551-mint-time-id-grammar), or by a
+catalog manifest — and the quoted form is how it stays reachable from source.
+Prefer the bare form; reach for quotes only for an id that needs them.
+
+A bare id in expression position is a compile error whose diagnostic carries a
+`hint` naming the `#<id>` form (and a `symbol` field with the offending name);
+`$programmer:eval` sharpens that hint to a "did you mean" when the world can
+confirm the id exists.
 
 `obj.(expr)` is dynamic property access. `expr` must evaluate to a string. It
 uses the same `GET_PROP` / `SET_PROP` semantics as `obj.name`, but the property

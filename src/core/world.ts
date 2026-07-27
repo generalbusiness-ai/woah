@@ -1,5 +1,6 @@
 import {
   assertMap,
+  assertMintableObjectId,
   assertObj,
   assertString,
   cloneValue,
@@ -1814,9 +1815,22 @@ export class WooWorld {
     location?: ObjRef | null;
     anchor?: ObjRef | null;
     flags?: WooObject["flags"];
+    /** Reconstructing an object that already exists somewhere else (identity
+     * import, world adoption) rather than minting a new one. The id was chosen
+     * by whatever world produced it — possibly before the reservation below —
+     * and refusing it here would strand a restorable world. Ordinary hydration
+     * (importWorld, Net cell application) writes `objects` directly and never
+     * reaches this method at all. */
+    restoring?: boolean;
   }): WooObject {
     const existing = this.objects.get(input.id);
     if (existing) return existing;
+    // The single mint seam. Every path that introduces a NEW object — the
+    // `create` builtin, actor/account provisioning, guest seeding, catalog
+    // install (`local_name` / `seed_hooks.as` become ids verbatim, so a
+    // third-party manifest is the one genuinely unconstrained source) —
+    // funnels through here.
+    if (!input.restoring) assertMintableObjectId(input.id);
     const now = Date.now();
     const obj: WooObject = {
       id: input.id,

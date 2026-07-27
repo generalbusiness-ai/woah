@@ -50,6 +50,7 @@ written as a literal:
 |---|---|---|
 | `#<id>` | objref literal — an object addressed by its id | `;#obj_human_2_1:ping()` |
 | `$<name>` | corename literal — resolved through `$system` | `;$wiz.name` |
+| `#"<id>"` | quoted objref — for an id the bare form would end on | `;#"legacy.id".name` |
 
 `create(...)` hands back a **bare** id (`obj_human_2_1`). Typing that straight
 back into eval fails:
@@ -64,6 +65,11 @@ compile error: E_COMPILE unknown identifier: obj_human_2_1
 Add the `#` and it works. The literal ends at the first character that is not
 a letter, digit, `_` or `-`, so `.` and `:` after it behave normally:
 `#the_mug.description` reads a property, `#the_mug:read()` calls a verb.
+
+New object ids may not contain `.` for exactly that reason. If you meet an
+older object whose id does (a legacy world, or a catalog that minted one before
+the rule), quote it: `#"legacy.id".name` addresses the object `legacy.id`,
+while `#legacy.id` reads property `id` of object `legacy`.
 
 ## Modes
 

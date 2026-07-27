@@ -289,8 +289,16 @@ class Lexer {
   }
 
   private string(): void {
-    const quote = this.peek();
     const start = this.mark();
+    const decoded = this.quoted(start);
+    this.push("string", decoded, start, decoded);
+  }
+
+  /** Scan a quoted run at the cursor and return its decoded text. Shared by
+   * string literals and the quoted ref forms (`#"..."` / `$"..."`), so escape
+   * handling cannot drift between them. */
+  private quoted(start: Mark): string {
+    const quote = this.peek();
     this.advance();
     let raw = "";
     while (!this.atEnd() && this.peek() !== quote) {
@@ -304,9 +312,9 @@ class Lexer {
     }
     if (this.atEnd()) throw this.error("unterminated string literal", start);
     this.advance();
-    const quoted = `"${raw.replace(/"/g, '\\"')}"`;
+    const json = `"${raw.replace(/"/g, '\\"')}"`;
     try {
-      this.push("string", JSON.parse(quoted), start, JSON.parse(quoted));
+      return JSON.parse(json) as string;
     } catch {
       throw this.error("invalid string escape", start);
     }
@@ -314,14 +322,28 @@ class Lexer {
 
   private ref(kind: "objref" | "coreref"): void {
     const start = this.mark();
-    let value = this.advance();
-    // `.` deliberately TERMINATES a ref token. language.md §7.3 makes `.`
+    const sigil = this.advance();
+    let value = sigil;
+    if (this.peek() === '"' || this.peek() === "'") {
+      // QUOTED form: `#"foo.bar"` / `$"foo.bar"`. The bare form below stops at
+      // the first character outside [A-Za-z0-9_-], so an id holding any other
+      // character would otherwise be inexpressible in DSL source. Ids are
+      // opaque in storage and on the wire, and a world minted before the
+      // creation-time reservation (see assertMintableObjectId) may already
+      // hold one; this is how such an object stays reachable. The quoted body
+      // is taken verbatim — no sigil is implied inside it.
+      const body = this.quoted(start);
+      if (!body) throw this.error(`invalid ${kind}`, start);
+      const literal = kind === "objref" ? body : `${sigil}${body}`;
+      this.push(kind, `${sigil}"${body}"`, start, literal);
+      return;
+    }
+    // `.` deliberately TERMINATES a bare ref token. language.md §7.3 makes `.`
     // property access on whatever precedes it, and a ref is an expression like
     // any other — `$system.spec_version` and `#the_mug.description` must read
     // properties. Including `.` in the ref charset silently produced a single
     // string literal ("$system.spec_version") instead, so the read compiled
-    // fine and returned the wrong kind of value with no diagnostic. No object
-    // id contains a dot (checked across bootstrap and every bundled catalog).
+    // fine and returned the wrong kind of value with no diagnostic.
     while (!this.atEnd() && /[A-Za-z0-9_-]/.test(this.peek())) value += this.advance();
     if (value.length === 1) throw this.error(`invalid ${kind}`, start);
     // Coreref ids are stored with the leading `$` ($wiz, $root, ...).

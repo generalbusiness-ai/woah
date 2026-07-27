@@ -718,6 +718,43 @@ export function wooError(code: string, message?: string, value?: WooValue): Erro
   return { code, message, value };
 }
 
+/**
+ * Characters a NEWLY MINTED object id may not contain, with the reason each is
+ * reserved. One table, consulted by the one enforcement point below — id rules
+ * that live in several places drift.
+ *
+ * `.` is the DSL's property-access operator. A bare ref literal ends at the
+ * first character outside `[A-Za-z0-9_-]`, so `#foo.bar` reads property `bar`
+ * on object `foo`; an id carrying a dot is expressible only through the quoted
+ * escape `#"foo.bar"`. Minting more of those makes every future reference to
+ * them a trap, so the reservation stops the divergence growing.
+ */
+const RESERVED_OBJECT_ID_CHARS: ReadonlyArray<{ char: string; reason: string }> = [
+  { char: ".", reason: "the DSL reads `#obj.name` as property access, so a dotted id is only expressible as the quoted objref `#\"obj.name\"`" }
+];
+
+/**
+ * Mint-time object-id rule. Ids stay **opaque** everywhere else — in storage,
+ * on the Net wire, in cell keys, and on every read/call/restore path — because
+ * a world may already hold an id that predates this rule (or that a
+ * third-party catalog minted through `local_name`). Those objects keep working
+ * and remain addressable from DSL source through the quoted ref form; only new
+ * mints are constrained. The Net transport has its own, separate reservation
+ * of `:` as the compound cell-key delimiter (`isConcreteRuntimeObjectId`),
+ * which is a wire-format rule rather than a mint rule and is deliberately not
+ * duplicated here.
+ */
+export function assertMintableObjectId(id: string): void {
+  for (const { char, reason } of RESERVED_OBJECT_ID_CHARS) {
+    if (!id.includes(char)) continue;
+    throw wooError(
+      "E_INVARG",
+      `object id ${JSON.stringify(id)} may not contain ${JSON.stringify(char)}: ${reason}`,
+      { id, reserved: char }
+    );
+  }
+}
+
 // Guarded recursive clone for plain JSON-shaped data. This is the hot clone
 // path: `cloneValue` runs on every property write, verb install, VM literal
 // push, and frame snapshot, and bootstrap/import fan out through it. It replaces
