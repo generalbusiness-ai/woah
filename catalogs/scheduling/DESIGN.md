@@ -74,6 +74,21 @@ ingress never sees. Hence the `caller != $system` guard in each. Both
 defences are needed and both are tested; removing the guard alone leaves
 the ingress test green.
 
+## Why deadlines are internal and reminders are not
+
+A reminder belongs to one actor, so its id embeds that actor and the verbs
+rebuild it — nobody can name anyone else's.
+
+A deadline cannot work that way: casework arms one when a task is opened and
+cancels it when a *different* actor claims the task. Object-global ids are
+therefore necessary, which means a public `cancel_deadline` would let any
+user delete anyone's escalation from a guessable key. So deadlines are a
+catalog-internal primitive reached through `this:deadline(...)`, and the
+consumer catalog decides who may arm and cancel.
+
+Ticking sits between the two: its key is object-global like a deadline's, but
+it is ambient behaviour of the object, so it is gated on the owner.
+
 ## Why reminder ids embed the caller
 
 `cancel_reminder` takes a tag, not a schedule id, and rebuilds the id from the

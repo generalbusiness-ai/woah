@@ -2271,6 +2271,26 @@ export class NetScopeDO {
       // discarded its sequencer (transaction abort discard path).
       since_construct_ms: hydrateStarted - this.constructedAt
     });
+    // CO2.8 belt-and-braces: re-derive the wake from durable state on cold
+    // hydration.
+    //
+    // NOT proven necessary by any lane, and this comment says so rather than
+    // implying otherwise. The workerd restart case (run 1b of the smoke lane)
+    // passes with this removed — a stored DO alarm does survive a process
+    // restart there, so every other arming site is sufficient for the case we
+    // can actually reproduce.
+    //
+    // It is kept because the case we CANNOT reproduce is the one it covers: a
+    // targeted mid-flight eviction, where the platform's alarm behaviour is
+    // not something local tooling can demonstrate either way. Re-arming from
+    // rows we already read costs one indexed lookup on a path that just did
+    // several, and the failure it guards against is silent — a scope holding
+    // pending work that nothing ever wakes. `dueNow` covers rows already past
+    // due, which the next-FUTURE selection would skip entirely.
+    const hydratedNow = this.host.now();
+    if (this.store.nextScheduledAfter(0) !== null) {
+      this.rearmAlarm(hydratedNow, { dueNow: this.store.hasScheduledDue(hydratedNow) });
+    }
     return this.seq;
   }
 

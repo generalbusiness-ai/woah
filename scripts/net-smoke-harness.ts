@@ -140,6 +140,56 @@ export async function withWorkerd(
   }
 }
 
+/**
+ * Two workerd LIFETIMES over one persistence directory.
+ *
+ * `withWorkerd` proves an alarm fires in a warm process, which is not the
+ * question a scheduled turn actually poses: does the work survive the host
+ * going away? Here the first lifetime arms, the process is stopped outright
+ * before the alarm is due, and a second lifetime starts on a fresh port
+ * against the SAME persisted state. Everything in memory is gone; only what
+ * was written durably can bring the timer back.
+ *
+ * This is the strongest eviction analogue workerd allows. It is not a
+ * targeted mid-flight DO eviction (workerd cannot force one — see the honest
+ * limits in net-smoke-workerd.ts), and it says nothing about the deploy-only
+ * multi-day alarm question. It does cover cold rehydration of the scheduled
+ * row family, the alarm re-arm on reactivation, and planner re-subscription.
+ */
+export async function withWorkerdRestart(
+  vars: Record<string, string>,
+  first: (base: string) => Promise<void>,
+  second: (base: string) => Promise<void>,
+  options: WorkerdOptions = {}
+): Promise<void> {
+  const persistDir = mkdtempSync(join(tmpdir(), "woo-net-smoke-restart-"));
+  try {
+    const portA = await findFreePort();
+    const baseA = `http://127.0.0.1:${portA}`;
+    const childA = startWorkerd(portA, persistDir, vars, options);
+    try {
+      await waitReady(baseA);
+      await first(baseA);
+    } finally {
+      await stopWorkerd(childA);
+    }
+
+    // A DIFFERENT port, deliberately: it makes accidental reuse of the first
+    // lifetime's base URL fail loudly instead of silently passing.
+    const portB = await findFreePort();
+    const baseB = `http://127.0.0.1:${portB}`;
+    const childB = startWorkerd(portB, persistDir, vars, options);
+    try {
+      await waitReady(baseB);
+      await second(baseB);
+    } finally {
+      await stopWorkerd(childB);
+    }
+  } finally {
+    rmSync(persistDir, { recursive: true, force: true });
+  }
+}
+
 export function startWorkerd(
   port: number,
   persistDir: string,

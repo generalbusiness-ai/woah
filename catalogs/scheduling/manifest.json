@@ -65,7 +65,7 @@
         },
         {
           "name": "deadline",
-          "perms": "rxd",
+          "perms": "rx",
           "arg_spec": {
             "args": [
               "delay_ms",
@@ -74,21 +74,17 @@
               "key"
             ]
           },
-          "source": "verb :deadline(delay_ms, verb_name, verb_args, key) rxd {\n  /* Named `verb_args`, not `args`: `args` is a verb-body global (the\n     current call's own argument list), so a parameter of that name does\n     not compile.\n\n     \"If nothing happens by T, do X.\" Armed `always` because a deadline\n     with nobody watching is still a deadline \u2014 that is the shape the\n     escalation and auto-close patterns need.\n\n     `verb_args` carries the SUBJECT. A deadline that could not say what it was\n     about could only fire object-wide verbs, which is useless for the case\n     it exists to serve (\"escalate THIS task\"). The first real user of this\n     verb found that out immediately.\n\n     `key` is caller-supplied and stable so the deadline can be CANCELLED\n     when the thing it was waiting for happens. Re-arming the same key\n     replaces rather than duplicates (CO16.2 upsert), so extending a\n     deadline is just calling this again. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"deadline needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(verb_name) != \"string\" || !verb_name) { raise { code: \"E_INVARG\", message: \"deadline needs a verb name\", value: verb_name }; }\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"deadline needs a stable key so it can be cancelled\", value: key }; }\n  let payload = verb_args;\n  if (typeof(payload) != \"list\") { payload = []; }\n  /* Internal names are not reachable this way: a deadline that could\n     fire _deliver_reminder or _tick would let a caller forge the\n     scheduler's own internals. */\n  if (str_starts(verb_name, \"_\")) { raise { code: \"E_PERM\", message: \"deadline cannot target an internal verb\", value: verb_name }; }\n  return schedule(this, \"_fire_deadline\", [verb_name, payload], delay_ms, { \"key\": \"deadline:\" + key, \"idle_policy\": \"always\" });\n}",
-          "direct_callable": true,
-          "tool_exposed": true
+          "source": "verb :deadline(delay_ms, verb_name, verb_args, key) rxd {\n  /* NOT direct_callable, and that is the security boundary. A deadline is\n     shared by construction: casework arms one when a task is opened and\n     cancels it when a DIFFERENT actor claims the task, so the id cannot\n     be scoped to the arming actor the way a reminder's is. That left any\n     user able to cancel or replace anyone's deadline just by naming a\n     predictable key \u2014 a denial of service against escalation itself.\n\n     So deadlines are a catalog-internal coordination primitive: reachable\n     from a consumer's own verbs via `this:deadline(...)`, never from the\n     outside. The consumer decides who may arm and cancel, because only it\n     knows what the deadline means. */\n\n  /* Named `verb_args`, not `args`: `args` is a verb-body global (the\n     current call's own argument list), so a parameter of that name does\n     not compile.\n\n     \"If nothing happens by T, do X.\" Armed `always` because a deadline\n     with nobody watching is still a deadline \u2014 that is the shape the\n     escalation and auto-close patterns need.\n\n     `verb_args` carries the SUBJECT. A deadline that could not say what it was\n     about could only fire object-wide verbs, which is useless for the case\n     it exists to serve (\"escalate THIS task\"). The first real user of this\n     verb found that out immediately.\n\n     `key` is caller-supplied and stable so the deadline can be CANCELLED\n     when the thing it was waiting for happens. Re-arming the same key\n     replaces rather than duplicates (CO16.2 upsert), so extending a\n     deadline is just calling this again. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"deadline needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(verb_name) != \"string\" || !verb_name) { raise { code: \"E_INVARG\", message: \"deadline needs a verb name\", value: verb_name }; }\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"deadline needs a stable key so it can be cancelled\", value: key }; }\n  let payload = verb_args;\n  if (typeof(payload) != \"list\") { payload = []; }\n  /* Internal names are not reachable this way: a deadline that could\n     fire _deliver_reminder or _tick would let a caller forge the\n     scheduler's own internals. */\n  if (str_starts(verb_name, \"_\")) { raise { code: \"E_PERM\", message: \"deadline cannot target an internal verb\", value: verb_name }; }\n  return schedule(this, \"_fire_deadline\", [verb_name, payload], delay_ms, { \"key\": \"deadline:\" + key, \"idle_policy\": \"always\" });\n}"
         },
         {
           "name": "cancel_deadline",
-          "perms": "rxd",
+          "perms": "rx",
           "arg_spec": {
             "args": [
               "key"
             ]
           },
-          "source": "verb :cancel_deadline(key) rxd {\n  /* The ack path calls this. Idempotent: cancelling a deadline that\n     already fired, or was never armed, is a no-op. */\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"cancel_deadline needs the key the deadline was armed with\", value: key }; }\n  cancel_schedule(tostr(this) + \":deadline:\" + key);\n  return null;\n}",
-          "direct_callable": true,
-          "tool_exposed": true
+          "source": "verb :cancel_deadline(key) rxd {\n  /* NOT direct_callable, and that is the security boundary. A deadline is\n     shared by construction: casework arms one when a task is opened and\n     cancels it when a DIFFERENT actor claims the task, so the id cannot\n     be scoped to the arming actor the way a reminder's is. That left any\n     user able to cancel or replace anyone's deadline just by naming a\n     predictable key \u2014 a denial of service against escalation itself.\n\n     So deadlines are a catalog-internal coordination primitive: reachable\n     from a consumer's own verbs via `this:deadline(...)`, never from the\n     outside. The consumer decides who may arm and cancel, because only it\n     knows what the deadline means. */\n\n  /* The ack path calls this. Idempotent: cancelling a deadline that\n     already fired, or was never armed, is a no-op. */\n  if (typeof(key) != \"string\" || !key) { raise { code: \"E_INVARG\", message: \"cancel_deadline needs the key the deadline was armed with\", value: key }; }\n  cancel_schedule(tostr(this) + \":deadline:\" + key);\n  return null;\n}"
         },
         {
           "name": "_fire_deadline",
@@ -109,7 +105,7 @@
               "rate_ms"
             ]
           },
-          "source": "verb :start_ticking(rate_ms) rxd {\n  /* Periodic `this:tick()`. `while_active` (the default) is deliberate:\n     ambient behaviour exists to be seen, so it should not bill a world\n     forever in a room nobody visits. The scope defers it while nobody is\n     attached and the next accepted turn wakes it (CO16.6).\n\n     Idempotent by construction: the stable key means calling this while\n     already ticking re-arms rather than starting a second chain. The\n     rate rides in the args, so the chain needs no stored state \u2014 the\n     pending entry IS the state, and stopping is cancelling it. */\n  if (typeof(rate_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"start_ticking needs a rate in milliseconds\", value: rate_ms }; }\n  return schedule(this, \"_tick\", [rate_ms], rate_ms, { \"key\": \"tick\" });\n}",
+          "source": "verb :start_ticking(rate_ms) rxd {\n  /* Owner or wizard. A tick chain is ambient behaviour of the object it\n     runs on, and its key is object-global \u2014 so without this any visitor\n     could silently stop a room's chain, or restart it at a rate the owner\n     did not choose. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) {\n    raise { code: \"E_PERM\", message: \"ticking is the object owner's call\", value: { actor: actor, owner: this.owner } };\n  }\n\n  /* Periodic `this:tick()`. `while_active` (the default) is deliberate:\n     ambient behaviour exists to be seen, so it should not bill a world\n     forever in a room nobody visits. The scope defers it while nobody is\n     attached and the next accepted turn wakes it (CO16.6).\n\n     Idempotent by construction: the stable key means calling this while\n     already ticking re-arms rather than starting a second chain. The\n     rate rides in the args, so the chain needs no stored state \u2014 the\n     pending entry IS the state, and stopping is cancelling it. */\n  if (typeof(rate_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"start_ticking needs a rate in milliseconds\", value: rate_ms }; }\n  return schedule(this, \"_tick\", [rate_ms], rate_ms, { \"key\": \"tick\" });\n}",
           "direct_callable": true,
           "tool_exposed": true
         },
@@ -119,7 +115,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :stop_ticking() rxd {\n  /* Cancels the pending entry, which is the entire state of the chain.\n     A chain already stopped cancels to a no-op. */\n  cancel_schedule(tostr(this) + \":tick\");\n  return null;\n}",
+          "source": "verb :stop_ticking() rxd {\n  /* Owner or wizard. A tick chain is ambient behaviour of the object it\n     runs on, and its key is object-global \u2014 so without this any visitor\n     could silently stop a room's chain, or restart it at a rate the owner\n     did not choose. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) {\n    raise { code: \"E_PERM\", message: \"ticking is the object owner's call\", value: { actor: actor, owner: this.owner } };\n  }\n\n  /* Cancels the pending entry, which is the entire state of the chain.\n     A chain already stopped cancels to a no-op. */\n  cancel_schedule(tostr(this) + \":tick\");\n  return null;\n}",
           "direct_callable": true,
           "tool_exposed": true
         },

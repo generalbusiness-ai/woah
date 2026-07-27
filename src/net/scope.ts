@@ -2082,8 +2082,16 @@ export class ScopeSequencer {
       // Refusing is better than ordering the cleanup after the insert: arming
       // work for an object you are destroying in the same breath is a bug in
       // the caller, and silently dropping it would hide that.
-      if ((submit.transcript.recycles ?? []).some((entry) => entry.object === request.call.target)) {
+      // BOTH directions, matching the queue cleanup: an entry aimed at a
+      // recycled object, and one ARMED BY a recycled object. The second is
+      // easy to miss and just as broken — the entry outlives the only object
+      // whose namespace could cancel it, so nothing can ever reach it again.
+      const recycledHere = new Set((submit.transcript.recycles ?? []).map((entry) => entry.object));
+      if (recycledHere.has(request.call.target)) {
         return `schedule ${request.id} targets ${request.call.target}, which this same turn recycles`;
+      }
+      if (recycledHere.has(armedBy.thisObj)) {
+        return `schedule ${request.id} is armed by ${armedBy.thisObj}, which this same turn recycles`;
       }
 
       // A target created by THIS turn is schedulable — but only if the create

@@ -5031,7 +5031,15 @@ export class WooWorld {
       const audience = await this.directAudience(actor, target, verbName, args, hostMemo);
       const sessionId = options.sessionId === undefined ? this.primarySessionForActor(actor)?.id ?? null : options.sessionId;
       if (audience) await this.chatPresentAsync(audience, actor);
-      if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience, sessionId);
+      // A scheduled turn has NO session and its actor is very likely gone —
+      // that is the ordinary case, not the edge one: a reminder fires because
+      // you are not there to remember. Presence is a question about a live
+      // connection, so it cannot apply here (scheduling.md SC5). Leaving it in
+      // meant every scheduled verb failed with E_PERM the moment its actor
+      // left the room, which is precisely when timers matter.
+      if (audience && verb.skip_presence_check !== true && !forceDirect && options.scheduled === undefined) {
+        this.authorizePresence(actor, audience, sessionId);
+      }
       return await this.dispatchDirectCallFrame(frameId, actor, target, verbName, args, {
         startedAt,
         sessionId,
@@ -5058,7 +5066,18 @@ export class WooWorld {
     options: DirectDispatchFrameOptions
   ): Promise<DirectResultFrame> {
     const observations: Observation[] = [...(options.initialObservations ?? [])];
-    const message: Message = { actor, target, verb: verbName, args };
+    const message: Message = {
+      actor,
+      target,
+      verb: verbName,
+      args,
+      // CO16.8 fire-time context, reachable from woocode as `message`. The
+      // verb can tell it was woken rather than called, and how late: `at` and
+      // `fired_at` diverge after eviction, after a floor deferral, and after a
+      // busy scope defers a due batch. A no-catch-up chain needs to see that
+      // gap, and the spec promised it before anything carried it.
+      ...(options.scheduled ? { scheduled: options.scheduled as unknown as WooValue } : {})
+    };
     const deferredHostEffects: DeferredHostEffect[] = [];
     let result: WooValue = null;
     let mutated = false;

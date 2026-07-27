@@ -1126,6 +1126,29 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(seq.peekDue(NOW + LEAD)).toEqual([]);
   });
 
+  it("refuses arming FROM an object the same turn recycles", () => {
+    // The other direction, and the easier one to miss: the target is alive,
+    // so the turn looked fine — but the entry outlives the only object whose
+    // namespace could cancel it, so nothing can ever reach it again.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    seedTarget(seq);
+    seq.submit(submitFor(seq, transcript({
+      creates: [{ object: "#doomed", name: "Doomed", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {}, writer: WRITER }]
+    }), "make-doomed"));
+
+    const reply = seq.submit(armingTurn(seq, {
+      recycles: [{ object: "#doomed" }],
+      schedules: [armed({
+        id: "#doomed:after",
+        armed_by: { ...WRITER, thisObj: "#doomed" },
+        call: { actor: "#actor", target: "#thing", verb: "tick", args: [] }
+      })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/armed by .*recycles/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
   it("refuses more schedules in one turn than the per-turn cap", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));

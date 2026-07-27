@@ -157,7 +157,10 @@ The scheduled turn is an ordinary committed turn with:
   scheduled verb may reach targets an external direct call could not —
   bounded by the recorded actor's ordinary permissions, but a real
   difference worth knowing when you decide what to arm.
-- no presence check: there is no session and nothing to be present on.
+- **no presence check**: there is no session and nothing to be present on.
+  This is load-bearing, not a detail — a reminder fires precisely because
+  its actor is elsewhere. While presence was still enforced, every
+  scheduled verb failed with `E_PERM` the moment its actor left the room.
 - programmer authority from the **fired verb's own owner**, exactly as on a
   live call. Arming a schedule stores no authority.
 - a `scheduled` context block: `{id, at, fired_at}`. `at` is when it was
@@ -292,13 +295,37 @@ touch is the `$scheduling` feature (`catalogs/scheduling`), mounted on a
 space or actor:
 
 ```
-:remind_in(delay_ms, text)                    -> schedule_id
-:cancel_reminder(schedule_id)
-:deadline(delay_ms, verb_name, verb_args, key) -> schedule_id
-:cancel_deadline(key)
-:start_ticking(rate_ms)                       -> schedule_id
-:stop_ticking()
+:remind_in(delay_ms, text, tag)                -> schedule_id   -- any actor
+:cancel_reminder(tag)                                           -- any actor
+:start_ticking(rate_ms)                        -> schedule_id   -- owner/wizard
+:stop_ticking()                                                 -- owner/wizard
+:deadline(delay_ms, verb_name, verb_args, key) -> schedule_id   -- INTERNAL
+:cancel_deadline(key)                                           -- INTERNAL
 ```
+
+**Reminders are addressed by `tag`, not by schedule id.** The id embeds the
+calling actor, and the verbs rebuild it, so a caller can only ever name
+their own reminder. Taking a raw id let one user cancel another's, because
+these verbs are `$wiz`-owned — which is how ordinary users reach the
+scheduler at all — so the kernel's cross-namespace check saw wizard
+authority and allowed it for anybody.
+
+`tag` defaults to `"default"`, which means **two untagged reminders replace
+each other**: the second upserts the first (CO16.2). Pass distinct tags for
+concurrent reminders.
+
+**Deadlines are internal.** A deadline is shared by construction — one
+actor arms it and a *different* one cancels it, which is the whole
+escalation pattern — so its id cannot be scoped to the arming actor the way
+a reminder's is. Left publicly callable, that let any user cancel or
+replace anyone's deadline from a guessable key. So `:deadline` and
+`:cancel_deadline` are reachable only from the consumer's own verbs
+(`this:deadline(...)`), and the consumer decides who may arm and cancel,
+because only it knows what the deadline means.
+
+**Ticking is the object owner's call.** A chain's key is object-global, so
+without that gate any visitor could stop a room's chain or restart it at a
+rate the owner did not choose.
 
 It is where the wizard gate of SC7 is discharged — these verbs are
 catalog-owned (`$wiz`), so an ordinary actor arms an `always` reminder or

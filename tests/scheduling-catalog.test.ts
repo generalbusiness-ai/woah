@@ -228,10 +228,43 @@ describe("cancellation authority is the actor's, not the code's", () => {
 });
 
 describe("$scheduling — deadlines", () => {
+  /** Deadlines are catalog-internal: a consumer exposes its own policy verb
+   * and calls `this:deadline(...)`. Reaching the primitive from outside is
+   * refused, so the tests reach it the way casework does. */
+  async function withConsumerVerbs(world: ReturnType<typeof createWorld>) {
+    expect(installVerb(
+      world, "the_widget", "arm_it",
+      'verb :arm_it(delay, verb_name, subject, key) rxd { return this:deadline(delay, verb_name, subject, key); }',
+      null
+    ).ok).toBe(true);
+    expect(installVerb(
+      world, "the_widget", "disarm_it",
+      'verb :disarm_it(key) rxd { return this:cancel_deadline(key); }',
+      null
+    ).ok).toBe(true);
+  }
+
+  it("refuses reaching the deadline primitive from outside", async () => {
+    // The DoS this closes: deadline ids are object-global by necessity (the
+    // opener arms, a different claimer cancels), so a publicly callable
+    // cancel let any user delete anyone's escalation from a guessable key.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    for (const verb of ["deadline", "cancel_deadline"] as const) {
+      const outcome = await world.directCall(
+        `outside-${verb}`, actor, "the_widget", verb, [86_400_000, "escalate", [], "k"] as never,
+        { sessionId: session.id } as never
+      );
+      expect(outcome.op).toBe("error");
+      expect(JSON.stringify(outcome)).toMatch(/E_DIRECT_DENIED|E_PERM|E_VERBNF/);
+    }
+  });
+
   it("arms a cancellable always deadline under a stable key", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { transcript } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], session.id);
+    await withConsumerVerbs(world);
+    const { transcript } = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "escalate", ["t1"], "case-42"], session.id);
     const armed = transcript.schedules![0];
     expect(armed.id).toBe("the_widget:deadline:case-42");
     expect(armed.idlePolicy).toBe("always");
@@ -245,11 +278,12 @@ describe("$scheduling — deadlines", () => {
     // trip through both verbs or the ack silently fails to stop the timer.
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const armedTurn = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], "arm", session.id);
+    await withConsumerVerbs(world);
+    const armedTurn = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "escalate", ["t1"], "case-42"], "arm", session.id);
     const { seq } = commit(world, armedTurn.transcript, "arm");
     expect(seq.peekDue(Date.now() + 2 * 86_400_000)).toHaveLength(1);
 
-    const cancelTurn = await callAndRecord(world, actor, "the_widget", "cancel_deadline", ["case-42"], "ack", session.id);
+    const cancelTurn = await callAndRecord(world, actor, "the_widget", "disarm_it", ["case-42"], "ack", session.id);
     expect(cancelTurn.transcript.cancellations).toHaveLength(1);
     expect(cancelTurn.transcript.cancellations![0].id).toBe("the_widget:deadline:case-42");
 
@@ -271,9 +305,10 @@ describe("$scheduling — deadlines", () => {
   it("re-arming the same key extends rather than duplicates", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const first = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", ["t1"], "case-42"], "arm-1", session.id);
+    await withConsumerVerbs(world);
+    const first = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "escalate", ["t1"], "case-42"], "arm-1", session.id);
     const { seq } = commit(world, first.transcript, "arm-1");
-    const second = await callAndRecord(world, actor, "the_widget", "deadline", [172_800_000, "escalate", ["t1"], "case-42"], "arm-2", session.id);
+    const second = await callAndRecord(world, actor, "the_widget", "arm_it", [172_800_000, "escalate", ["t1"], "case-42"], "arm-2", session.id);
     const submitted = { ...second.transcript, reads: [] } as EffectTranscript;
     const derived = applyTranscript(seq.store as CellStore, submitted, { scope_head: "x", catalog_epoch: EPOCH });
     seq.submit({
@@ -294,14 +329,16 @@ describe("$scheduling — deadlines", () => {
     // _tick with forged arguments, wearing the scheduler's own identity.
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "_tick", [], "sneaky"], session.id);
+    await withConsumerVerbs(world);
+    const { outcome } = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "_tick", [], "sneaky"], session.id);
     expect(JSON.stringify(outcome)).toMatch(/E_PERM/);
   });
 
   it("requires a stable key, because a deadline you cannot cancel is a bug", async () => {
     const { world, actor, session } = schedulingWorld();
     await enter(world, session);
-    const { outcome } = await callAndRecord(world, actor, "the_widget", "deadline", [86_400_000, "escalate", [], ""], session.id);
+    await withConsumerVerbs(world);
+    const { outcome } = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "escalate", [], ""], session.id);
     expect(JSON.stringify(outcome)).toMatch(/E_INVARG/);
   });
 });
@@ -591,6 +628,58 @@ describe("$scheduling — the verbs actually fire", () => {
       scheduled: { id: `${target}:${verb}`, at: Date.now(), fired_at: Date.now() }
     } as never);
   }
+
+  it("fires for an actor who has LEFT the room — the ordinary case", async () => {
+    // A reminder fires because you are not there to remember. Every other
+    // firing test enters the actor immediately beforehand, so all of them
+    // missed this: presence was still being checked, and a scheduled verb
+    // failed with E_PERM the moment its actor walked out.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    // Arm while present, then leave — exactly the shape of a real reminder.
+    const left = await world.directCall("leave", actor, actor, "moveto", ["$nowhere"] as never, {
+      sessionId: session.id
+    } as never);
+    expect(left.op).toBe("result");
+    expect(world.object(actor).location).not.toBe("the_widget");
+
+    const before = world.objects.size;
+    const fired = await fire(world, actor, "the_widget", "_deliver_reminder", [actor, "you left"], "gone-1");
+    expect(fired.op).toBe("result");
+    expect(world.objects.size).toBe(before + 1);
+  });
+
+  it("fires with no live session at all", async () => {
+    // Stronger still: not merely absent from the room, but with no session.
+    // A scheduled turn carries none by construction (CO14 sessions-absent).
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    world.endSession(session.id);
+
+    const fired = await fire(world, actor, "the_widget", "_deliver_reminder", [actor, "no session"], "gone-2");
+    expect(fired.op).toBe("result");
+  });
+
+  it("exposes the fire-time context to the verb body", async () => {
+    // SC5 promised `scheduled: {id, at, fired_at}` in `message`, and nothing
+    // carried it. A no-catch-up chain needs `fired_at - at` to see how late
+    // it is after an eviction; without it the promise was decorative.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    expect(installVerb(
+      world, "the_widget", "report_context",
+      'verb :report_context() rxd { return message; }',
+      null
+    ).ok).toBe(true);
+
+    const fired = await world.directCall(
+      "ctx", actor, "the_widget", "report_context", [] as never,
+      { scheduled: { id: "the_widget:probe", at: 1000, fired_at: 4000 } } as never
+    );
+    expect(fired.op).toBe("result");
+    const seen = (fired as { op: "result"; result: Record<string, unknown> }).result;
+    expect(seen.scheduled).toMatchObject({ id: "the_widget:probe", at: 1000, fired_at: 4000 });
+  });
 
   it("delivers a reminder, minting a durable note before telling", async () => {
     const { world, actor, session } = schedulingWorld();
