@@ -64,11 +64,13 @@ Once connected:
 1. Call `woo_list_reachable_tools()` to see what verbs are currently
    exposed to you. Net's current stable surface is
    `woo_list_reachable_tools`, `woo_call`, and `woo_wait`.
-2. Invoke an advertised `{object, verb}` through
-   `woo_call("<object>", "<verb>", [args])`.
+2. Invoke any `{object, verb}` you can reach through
+   `woo_call("<object>", "<verb>", [args])`. `$me` is you and `$here` is the
+   space you are in.
 3. Call `woo_wait()` to pull observations
    — what other actors did, what changed in the room, replies to your
-   own actions.
+   own actions. If the reply's `gap` is true, some events may have been
+   lost; take a fresh `look` instead of assuming silence.
 4. Re-run discovery after movement because reachability changes with the
    actor's location.
 

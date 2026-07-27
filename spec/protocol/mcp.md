@@ -1,6 +1,6 @@
 ---
 date: 2026-05-02
-updated: 2026-07-17
+updated: 2026-07-27
 status: implemented
 ---
 
@@ -36,6 +36,13 @@ an idempotent success.
 One MCP session binds to one actor. MCP never changes `actor`, `progr`, verb
 permissions, or the normal Net turn authority rules.
 
+The `initialize` result's `instructions` string is an agent's entire
+orientation — many MCP clients read nothing else unprompted — so it must name
+the actor, state that the dynamic tool list tracks structural context and must
+be re-listed on `notifications/tools/list_changed`, and point at the three
+entry moves: the actor's own `help` tool, `woo_wait` for hearing other actors,
+and `woo_list_reachable_tools` for paging the dynamic surface.
+
 The stdio entry is a transport bridge. It forwards JSON-RPC messages to this
 HTTP surface, retains the returned session id, and closes the session when
 stdin closes. A pipelined pre-session prefix is ordered behind `initialize` so
@@ -59,12 +66,56 @@ page.
 | Tool | Contract |
 |---|---|
 | `woo_list_reachable_tools(scope?, object?, query?, limit?, cursor?, include_schema?)` | Pages and filters descriptors from the same resolver used by `tools/list` and invocation. |
-| `woo_call(object, verb, args?)` | Calls a currently reachable descriptor by canonical object and verb. `args` is a positional JSON list. |
-| `woo_wait(timeout_ms?, limit?)` | Long-polls the session observation queue. |
+| `woo_call(object, verb, args?)` | Calls any verb on a reachable object by canonical object and verb. `args` is a positional JSON list. |
+| `woo_wait(timeout_ms?, limit?)` | Long-polls the session observation queue. Returns `{observations, gap}`. |
 
-These are protocol controls, not world verbs. `woo_call` is an escape hatch for
-clients with stale dynamic metadata; it does not bypass structural context,
-tool exposure, or verb permissions.
+These are protocol controls, not world verbs.
+
+`woo_call` is the escape hatch for clients with stale dynamic metadata, and it
+is deliberately **wider than the listing**. Its gates are exactly two:
+
+1. the target object is in the session's structural context (§M3); and
+2. the verb (or one of its aliases) resolves on the target's dispatch chain to
+   a bytecode page the actor passes the generic execute prefilter for.
+
+`tool_exposed` is a **listing** flag (§M2.2) and has no bearing on `woo_call`.
+Gating the escape hatch on an advertising flag made an author unable to invoke
+a verb they had just installed on an object in their own inventory. The
+routing and authority rules are unchanged: routing still comes from the
+descriptor's command contract (§M4), a `direct`-route call still requires
+`direct_callable`, and every world authority check still runs inside the
+authoritative turn. Exposure remains a discoverability decision, never an
+authority grant — and now never an authority *denial* either.
+
+`$me` and `$here` are session aliases accepted in `woo_call`'s `object`
+position, resolving to the session actor and the session's active space. They
+are transport-level conveniences; no world object bears either id, and they are
+not accepted anywhere else in the protocol.
+
+#### M2.1.1 Refusal vocabulary
+
+A refused `woo_call` names one condition, because each has a different
+remediation. `detail.reason` carries the machine-readable form:
+
+| Condition | Code | `detail.reason` |
+|---|---|---|
+| Target is not in structural context | `E_PERM` | `target_not_reachable` |
+| `$here` used with no active space | `E_PERM` | `no_active_scope` |
+| Verb resolves nowhere on the chain | `E_VERBNF` | `verb_not_defined` |
+| Verb resolves to a native page | `E_PERM` | `native_verb` |
+| Verb fails the execute prefilter | `E_PERM` | `verb_not_executable` |
+| `direct` route, verb lacks `direct_callable` | `E_DIRECT_DENIED` | `not_direct_callable` |
+
+`E_VERBNF` uses the engine's `{obj, name}` detail shape. Each refusal also
+carries a `remediation` string naming the action that would change the answer.
+A world-level refusal from the turn itself carries no gateway `reason` — that
+is how a client distinguishes "the gateway would not send it" from "the world
+said no".
+
+Refusals shaped by the gateway for a client's benefit never weaken a rule. In
+particular an `E_SCOPE_SPLIT` (CO2.3) raised for a mounted tool-space the
+actor has not entered stays terminal; the gateway only adds `active_scope`,
+`target`, and a `remediation` naming the space to enter.
 
 `woo_list_reachable_tools` returns:
 
@@ -89,6 +140,19 @@ without guessing focus from contextual objects that may include mounted spaces.
 `query` is a case-insensitive match over name, object, verb, aliases, and
 description. `include_schema:true` adds `input_schema` to descriptor summaries.
 Limits default to 64 and cap at 256.
+
+`total` counts **dynamic descriptors only** and is not capped. Standard
+`tools/list` returns at most 128 entries per page **including** the stable
+`woo_*` controls. The two numbers are therefore not comparable — a client
+comparing `tools/list` page 1 against `total` is comparing a page to a total,
+not observing a filter disagreement. The identity that does hold, for the same
+session and `scope:"active"`, is:
+
+    (every tools/list page, concatenated).length
+      == total + (number of stable controls)
+
+The tool's own description states this, so an agent does not need the spec to
+reconcile the two.
 
 The supported scopes change presentation, never authority:
 
@@ -120,7 +184,17 @@ A page is advertised only when all of these hold:
 - the actor passes the gateway's generic execute-permission prefilter.
 
 The authoritative Net turn performs the permission check again. Exposure is a
-discoverability decision, never an authority grant.
+discoverability decision, never an authority grant. The second bullet is a
+**listing** condition only: `woo_call` (§M2.1) reaches an unadvertised page on
+a reachable object.
+
+The description is the verb doc-comment's first **paragraph** followed by the
+canonical call form. A paragraph is the first block-comment paragraph, or the
+contiguous run of `//` lines beginning at the first one, ending at a bare `//`
+or at the first non-comment line. It is collapsed to a single line and clamped
+to 500 characters on a word boundary with a trailing ellipsis. Taking the first
+*line* instead truncates wrapped doc-comments mid-sentence, which is what an
+agent then reads as the verb's whole contract.
 
 Names are deterministic within a listing. The base form is
 `<sanitized-object>__<sanitized-verb>`; a numeric suffix resolves collisions.
@@ -138,8 +212,7 @@ actor's own tail rather than an arbitrary subset displaced by unrelated objects.
 A client that pages only once therefore sees the actor's tools first and, while
 the suit fits, all of them. This ordering is the only privileged position in the
 listing; it changes rank, not membership or authority.
-The description contains the first source comment paragraph and canonical call
-form. `inputSchema` is derived from `arg_spec.args`/`params` and optional type
+`inputSchema` is derived from `arg_spec.args`/`params` and optional type
 hints. When explicit hints are absent, the gateway preserves the stable JSON
 shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
 string, resolved object slots are object-id strings, and `cmd` is an object.
@@ -205,9 +278,12 @@ derived rows before declaring MCP parity; runtime global lookup is forbidden.
 ## M4. Invocation and results
 
 Dynamic-name calls and `woo_call` resolve through the same current descriptor
-set. A globally known but non-contextual object is refused. A canonical target
-must also pass the concrete runtime-object-id validator before it can consume
-turn planning or repair budget.
+producer, over the same structural context, and differ only in the listing
+gate (§M2.1): a dynamic name can only exist for an advertised page, while
+`woo_call` also reaches unadvertised ones. A globally known but non-contextual
+object is refused for both. A canonical target must also pass the concrete
+runtime-object-id validator before it can consume turn planning or repair
+budget.
 
 Every accepted invocation enters the normal Net client-turn path with a fresh
 idempotency key; MCP never runs a private VM. Routing comes from the descriptor's
@@ -242,7 +318,7 @@ not duplicate the same action.
 `woo_wait` drains a gateway-local, per-session FIFO fed by the same
 presence-routed fanout as WebSocket clients. It accepts `timeout_ms` from 0 to
 25,000 and `limit` from 1 to 256 (default 64). It returns
-`{observations:[...]}`.
+`{observations:[...], gap:<bool>}`.
 
 The queue holds at most 256 observations and drops the oldest on overflow.
 It is intentionally live and at-most-once: Durable Object eviction or session
@@ -251,6 +327,36 @@ separate protocol feature and must not be implied by this queue.
 
 Multiple parked waits may wake together, but draining uses prefix removal so
 an observation is returned to at most one waiter.
+
+### M5.1 Continuity marker
+
+Every `woo_wait` reply carries `gap`. It is a **continuity claim about the
+queue, not a count of lost observations**: `gap:false` means this gateway can
+prove the session's queue has been continuous since the client's previous
+drain; `gap:true` means it cannot, so observations may have been lost and the
+client should re-orient (look/who) rather than assume it heard everything.
+
+Delivery semantics are unchanged — still in-memory, still at-most-once, still
+no durable storage. `gap` only reports what the transport already knew and
+previously discarded silently. A browser WebSocket client can live with silent
+at-most-once loss; a turn-based polling agent, for which the observation queue
+is its only ear, cannot.
+
+`gap` is set when:
+
+- the gateway reconstructs live session state for a session whose durable cell
+  already exists — a Durable Object restart or a capacity eviction; or
+- a bounded-buffer overflow discards undelivered rows.
+
+It is **conservative**: a restart sets it whether or not anything was actually
+queued at the time. A session whose state was installed by its own
+`initialize` and never lost starts gap-free, so an ordinary first wait does not
+report a false gap.
+
+The marker is one-shot. It describes a discontinuity, not a state, and is
+cleared by the reply that carries it. A pending gap also short-circuits the
+long-poll park, so the signal reaches the client on its next call rather than
+after a full `timeout_ms`.
 
 ## M6. Dynamic-list lifecycle
 
