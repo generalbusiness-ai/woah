@@ -126,6 +126,35 @@ export function directedRecipients(observation: Observation): DirectedRecipients
   };
 }
 
+/**
+ * Recipient test for one carrier when a *space-wide* observation list is being
+ * delivered to a single session — the `applied`-frame (sequenced) fanout path.
+ *
+ * That path carries no per-observation audience vector: each gateway shard
+ * replays the space's committed observations and re-resolves delivery from its
+ * own presence mirror, so the planner's enumeration cannot travel with the
+ * frame. The two audience rules that are *intrinsic to the observation* do
+ * survive the round trip, and both must be applied at every delivery point:
+ *
+ *   - directed observations (§12.7.1 `told`/`text`) reach only `to`/`from`
+ *     (for `text`, the `target` recipient);
+ *   - self-addressed `looked`/`who` payloads reach only their `to`.
+ *
+ * Without the directed half, a `tell()` emitted inside a *sequenced* verb —
+ * `$exit:move` sends the mover its second-person `leave_msg` before the room's
+ * third-person `left` — broadcasts to every session in the room. A browser
+ * client happens to re-filter `text` by `target`, but a raw MCP wait queue does
+ * not, so an agent reads another actor's private line. Audience is server-side
+ * state; no transport may be trusted to redo it.
+ */
+export function observationReachesActor(observation: Observation, actor: ObjRef | null): boolean {
+  const directed = directedRecipients(observation);
+  if (directed.to !== null) {
+    return actor !== null && (actor === directed.to || actor === directed.from);
+  }
+  return typeof observation.to !== "string" || observation.to === actor;
+}
+
 export type AppliedFrame = {
   op: "applied";
   id?: string;

@@ -7,6 +7,7 @@ import {
   isDeeplyFrozen,
   directedRecipients,
   isErrorValue,
+  observationReachesActor,
   valuesEqual,
   type AppliedFrame,
   type DirectLiveAudience,
@@ -10446,12 +10447,33 @@ export class WooWorld {
     // delivery projections, matching the direct-observation path. Local stale
     // projection rows are excluded so accepted-frame fanout cannot deliver a
     // destination-room event to a session that already moved away.
-    const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
-    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) sessionSet.add(sessionId);
-    const sessions = Array.from(sessionSet);
+    const sessionActors = new Map<string, ObjRef | null>();
+    const projected = this.presenceSessionsIn(space);
+    for (const sessionId of this.sessionTableAudienceIn(space).sessions) {
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? null);
+    }
+    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) {
+      if (sessionActors.has(sessionId)) continue;
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? projected?.get(sessionId) ?? null);
+    }
+    const sessions = Array.from(sessionActors.keys());
+    if (observations.length === 0) {
+      return { audienceSessions: sessions.length > 0 ? sessions : undefined };
+    }
+    // The observation-intrinsic audience rules (directed `told`/`text`,
+    // self-addressed `looked`/`who`) apply to committed frames too: a
+    // sequenced verb that emits `tell()` must not broadcast the recipient's
+    // second-person line to the whole room. Delivery lanes that re-resolve
+    // presence themselves apply the same predicate (see gateway-do
+    // pushScopedObservations); keeping it here means the frame's own audience
+    // hint never contradicts what the transports do.
+    const perObservation = observations.map((observation) =>
+      sessions.filter((sessionId) => observationReachesActor(observation, sessionActors.get(sessionId) ?? null))
+    );
+    const union = Array.from(new Set(perObservation.flat()));
     return {
-      audienceSessions: sessions.length > 0 ? sessions : undefined,
-      observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
+      audienceSessions: union.length > 0 ? union : undefined,
+      observationSessionAudiences: perObservation
     };
   }
 
