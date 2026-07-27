@@ -399,6 +399,86 @@ describe("authoring", () => {
     expect(world.object(programmer.actor).location).toBe("$nowhere");
   });
 
+  it("refuses editor and install access to an existing verb the programmer does not own", async () => {
+    // Verb owner is the verb's execution authority (`progr`) — the
+    // set_verb_code / set_verb_info rule. Object authorship alone must not
+    // permit replacing a verb someone else owns on your object: a wizard-
+    // installed verb on a programmer-owned object stays the wizard's to
+    // edit. The editor's save path (programmerInstallVerb) historically
+    // skipped this check, letting edit_verb → replace → save modify and
+    // chown a $wiz-owned verb.
+    const world = createWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const programmer = world.auth("guest:verb-owner-gate");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+
+    const created = await world.directCall("owner-gate-create", programmer.actor, programmer.actor, "create", ["$thing", { name: "Gate Base" }]);
+    expect(created.op).toBe("result");
+    const base = created.op === "result" ? (created.result as Record<string, string>).id : "";
+    // A wizard plants a verb on the programmer's object; its owner is the
+    // wizard, not the object's owner.
+    const planted = installVerbAs(world, "$wiz", base, "wizonly", `verb :wizonly() rx {
+  return "wizard body";
+}`, null);
+    expect(planted.ok).toBe(true);
+    expect(world.ownVerb(base, "wizonly")?.owner).toBe("$wiz");
+
+    // The editor refuses at the door: a buffer the actor can never save
+    // must not open a session.
+    const opened = await world.directCall("owner-gate-open", programmer.actor, programmer.actor, "edit_verb", [base, "wizonly", {}]);
+    expect(opened.op).toBe("error");
+    if (opened.op === "error") expect(opened.error.code).toBe("E_PERM");
+    expect(world.propOrNull("the_verb_editor", "sessions") ?? {}).toEqual({});
+
+    // The install path refuses independently (defense in depth beneath the
+    // door check), for both save and dry-run shapes.
+    await expect(
+      world.programmerInstallVerb(programmer.actor, base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, {}, "$programmer")
+    ).rejects.toMatchObject({ code: "E_PERM" });
+    await expect(
+      world.programmerInstallVerb(programmer.actor, base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, { dry_run: true }, "$programmer")
+    ).rejects.toMatchObject({ code: "E_PERM" });
+    expect(world.ownVerb(base, "wizonly")?.source).toContain("wizard body");
+    expect(world.ownVerb(base, "wizonly")?.owner).toBe("$wiz");
+
+    // The ordinary install_verb surface agrees (set_verb_code's rule).
+    const surface = await world.directCall("owner-gate-surface", programmer.actor, programmer.actor, "install_verb", [base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, {}]);
+    expect(surface.op).toBe("error");
+    if (surface.op === "error") expect(surface.error.code).toBe("E_PERM");
+
+    // A wizard updating a programmer-owned verb through the same path
+    // PRESERVES the original owner (set_verb_code semantics — ownership
+    // changes go through set_verb_info's explicit rule only).
+    const own = await world.directCall("owner-gate-own", programmer.actor, programmer.actor, "install_verb", [base, "mine", `verb :mine() rx {
+  return 1;
+}`, {}]);
+    expect(own.op).toBe("result");
+    expect(world.ownVerb(base, "mine")?.owner).toBe(programmer.actor);
+    const wizardEdit = await world.programmerInstallVerb("$wiz", base, "mine", `verb :mine() rx {
+  return 2;
+}`, {}, "$programmer") as Record<string, unknown>;
+    expect(wizardEdit.ok).toBe(true);
+    expect(world.ownVerb(base, "mine")?.source).toContain("return 2");
+    expect(world.ownVerb(base, "mine")?.owner).toBe(programmer.actor);
+
+    // Defining a NEW own verb still needs only object authorship, and an
+    // INHERITED verb opens normally (saving defines an own override).
+    const fresh = await world.directCall("owner-gate-fresh", programmer.actor, programmer.actor, "install_verb", [base, "fresh", `verb :fresh() rx {
+  return 3;
+}`, {}]);
+    expect(fresh.op).toBe("result");
+    expect(world.ownVerb(base, "fresh")?.owner).toBe(programmer.actor);
+  });
+
   it("rejects non-wizard programmer attempting to set or chparent verb owner to another principal", async () => {
     const world = createWorld();
     const programmer = world.auth("guest:owner-attack");

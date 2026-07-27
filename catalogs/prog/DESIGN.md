@@ -114,8 +114,9 @@ See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md)
 ### Status over Net (2026-07-26)
 
 The editor had no Net or worker coverage until
-`tests/worker/net-verb-editor.test.ts`, and the distributed path broke it in
-three places. Entering and editing now work; **leaving does not**.
+`tests/worker/net-verb-editor.test.ts`. Proving it surfaced six defects — five
+on the distributed path and one authorization gap — all now fixed; the full
+loop works end-to-end over Net.
 
 1. *Fixed.* The seeded instance lives in its own scope, which an ordinary turn
    never warms, so it was absent from the turn's world and `isa(editor, $space)`
@@ -165,6 +166,16 @@ three places. Entering and editing now work; **leaving does not**.
    (spec/semantics/moveto.md M2.1 step 7). Editor movement now keys exit
    presence by the moving session's active scope and physically relocates only
    from the actor's primary session (or the sessionless object-graph fallback).
+6. *Fixed (authorization, not Net-specific).* `programmerInstallVerb` checked
+   only object authorship, so a non-wizard programmer could edit_verb →
+   replace → save a $wiz-owned verb on an object they own — modifying it and
+   taking ownership — where `set_verb_code` and ordinary `install_verb`
+   refuse. The install path now enforces the verb-owner rule (wizard, or the
+   actor owns the existing verb) at save and dry-run, an update preserves the
+   verb's existing owner instead of chowning to the installer, and
+   `editorInvoke` refuses at the door so a session that can never save does
+   not open (spec/authoring/editor-rooms.md E4 step 2;
+   `tests/authoring.test.ts` "refuses editor and install access…").
 
 The full loop — enter, edit, pause, resume, save, and the edited verb running
 with its new behavior — is exercised over the authoritative Net turn path by

@@ -117,7 +117,14 @@ The verb-editor flow:
 1. `invoke(target, descriptor)` or an equivalent command resolves the target
    using actor-scoped authoring lookup, not room matching.
 2. The editor checks that the actor may see the target and may attempt the
-   requested authoring operation.
+   requested authoring operation. Concretely: replacing an EXISTING own verb
+   requires the verb's execution authority — wizard, or the actor owns the
+   verb (the `set_verb_code`/`set_verb_info` rule; verb owner is dispatch's
+   `progr`) — and object authorship alone is not sufficient. The install path
+   (`programmerInstallVerb`) enforces the same rule independently at save and
+   dry-run, and an update preserves the verb's existing owner; only defining
+   a new own verb (including an override of an inherited verb) binds the
+   installing actor as owner under plain object authorship.
 3. If the actor already has a dirty session, the editor refuses or asks the
    actor to `pause`, `save`, or `abort` first.
 4. The actor is moved into the editor room and `previous_location` is recorded.

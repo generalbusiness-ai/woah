@@ -6178,6 +6178,19 @@ export class WooWorld {
     const expectedVersion = optionNullableInt(options, "expected_version");
     const compiled = compileVerb(source);
     const selected = this.selectOwnVerbForInstall(objRef, descriptor, { mode, append });
+    // Replacing an EXISTING verb requires the verb's execution authority:
+    // wizard, or the actor owns the verb — the set_verb_code / set_verb_info
+    // rule. Object authorship (checked above) is NOT sufficient: verb owner
+    // is dispatch's `progr`, so overwriting a verb you do not own on an
+    // object you do would let you replace, and take ownership of, another
+    // principal's code (e.g. a $wiz-installed verb on a programmer-owned
+    // object). Defining a NEW own verb (current absent) needs only the
+    // object authorship already asserted.
+    if (selected.current && !this.isWizard(actor) && selected.current.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${selected.name} owned by ${selected.current.owner}`, {
+        actor, obj: objRef, verb: selected.name, owner: selected.current.owner
+      });
+    }
     // Net planning: pin the page this install is predicated on (the same
     // optimistic-conflict read addVerbForActor/setVerbCode record). Without
     // it the editor-save path produced a transcript with no verb read OR
@@ -6221,7 +6234,12 @@ export class WooWorld {
       kind: "bytecode",
       name: selected.name,
       aliases: selected.current?.aliases ?? [],
-      owner: actor,
+      // An update preserves the verb's owner (set_verb_code semantics —
+      // ownership changes go through set_verb_info's explicit rule); only
+      // a fresh define binds the installing actor. Non-wizards can only
+      // reach an update as the owner, so this matters for wizard edits:
+      // fixing someone's verb must not silently chown it to the wizard.
+      owner: selected.current?.owner ?? actor,
       perms: parsedPerms.perms,
       arg_spec: compiled.metadata?.arg_spec ?? selected.current?.arg_spec ?? {},
       direct_callable: parsedPerms.directCallable,
@@ -6340,6 +6358,23 @@ export class WooWorld {
         return { ...this.editorSessionSummary(existing), resumed: true, editor: editorRef };
       }
       replacedPrevious = this.editorSessionSummary(existing);
+    }
+
+    // Refuse at the door what save/dry_run will refuse anyway (the
+    // verb-owner rule in programmerInstallVerb): opening a buffer the actor
+    // can never install is a trap. An INHERITED verb resolves no own slot
+    // here — saving it defines a new own override, which the object
+    // authorship checked at install time permits.
+    let ownCurrent: VerbDef | null = null;
+    try {
+      ownCurrent = this.ownVerbResolve(targetRef, descriptor);
+    } catch {
+      ownCurrent = null;
+    }
+    if (ownCurrent && !this.isWizard(ctx.actor) && ownCurrent.owner !== ctx.actor) {
+      throw wooError("E_PERM", `${ctx.actor} cannot edit verb ${targetRef}:${ownCurrent.name} owned by ${ownCurrent.owner}`, {
+        actor: ctx.actor, obj: targetRef, verb: ownCurrent.name, owner: ownCurrent.owner
+      });
     }
 
     const listed = assertMap(this.programmerListVerb(ctx.actor, targetRef, descriptor, { include_source: true }, surfaceClass));
