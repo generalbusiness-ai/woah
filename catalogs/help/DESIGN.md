@@ -31,6 +31,38 @@ A miss returns `{ok: false, status: "not_found", topic, topics, lines}`, where
 `topics` is the union of every reachable database's topic names and `lines`
 renders as `No help available for "x".` followed by `Topics: ...`.
 
+### Applying v1.0.0 to an existing world
+
+Same declaration, three lanes, as with the topic corrections above:
+
+- **Fresh worlds** install v1.0.0 directly.
+- **Aged local/classic worlds** heal on the next cold init: boot sees the
+  recorded version behind the bundle, and the major edge runs
+  `migration-v0-to-v1.json` through the ordinary update path. Covered in
+  `tests/catalogs.test.ts`, including a SQLite round trip.
+- **Aged Net worlds do NOT self-heal**, and here the reason is stronger than for
+  the topics: a Net runtime never runs a local catalog lifecycle at all, so
+  there is no deployed counterpart to the boot upgrade (spec §CT14.7). Delivery
+  is one signed operator call carrying both halves of the edge — the corrected
+  caller and the retired definitions — run once after the deploy:
+
+  ```
+  npm run repair:net-definitions -- <worker> '$player:help' \
+    --drop '$generic_help_db:record_miss' 'prop:$generic_help_db:missed_topics'
+  ```
+
+  The drops are authorized *by* `migration-v0-to-v1.json`: the CLI admits a
+  removal only when a bundled migration declares it and the current bundle no
+  longer defines the page. Proven end-to-end by
+  `tests/worker/net-help-migration-aged.test.ts`.
+
+Until that repair runs, an aged Net world's miss path stays broken — before the
+deploy with `E_CATALOG_MUTATION`, and after it with `incomplete_transcript`
+(`native:$help:record_miss`), because this version also deletes the native the
+retired verb page points at. Neither state is unrecoverable and the same repair
+resolves both, so the deploy and the repair may be run in either order; both
+shapes are covered by that test.
+
 The seeded `$help` instance is the global baseline database. Catalogs can add additional database objects and register them by appending to `$system.help_dbs`; objects and spaces can also expose contextual databases through their inherited `.help` property.
 
 The first-light database verbs are native-backed. Their DSL source bodies are intentionally explicit `/* native */` stubs so verb inspection does not present an incomplete shadow implementation as the behavior that actually runs. The native path is the authority for topic matching and directive expansion until the DSL has the remaining help primitives.

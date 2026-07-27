@@ -618,6 +618,101 @@ describe("json folder persistence", () => {
     }
   });
 
+  // Regression for the seam the two migration fixtures above CANNOT see.
+  // Both wrap their update in `repo.transaction(...)`, which leaves
+  // transactionDepth at 1 so the persist flush flattens. The real boot path
+  // (installLocalCatalogs -> runLocalCatalogVersionMigrations ->
+  // updateCatalogManifest) has no such wrapper, so its per-step
+  // world.withMutationSavepoint() IS the outermost scope — and a SAVEPOINT
+  // opened outside an explicit BEGIN starts a transaction implicitly. The
+  // inner BEGIN IMMEDIATE then failed with "cannot start a transaction within
+  // a transaction", every migration step threw, and applyCatalogMigration
+  // swallowed it into migration_state while the schema sync still advanced the
+  // recorded catalog version. Worlds reported themselves migrated with none of
+  // their drops applied. Note the shape below: NO enclosing transaction.
+  it("persists a write made inside an OUTERMOST savepoint, with no enclosing transaction", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      seedWorld.addVerb("$thing", {
+        kind: "native",
+        name: "doomed_verb",
+        aliases: [],
+        owner: seedWorld.object("$thing").owner,
+        perms: "rxd",
+        arg_spec: { args: [] },
+        source: "verb :doomed_verb() rxd { return null; }",
+        source_hash: "doomed",
+        version: 1,
+        line_map: {},
+        native: "noop",
+        direct_callable: true
+      });
+      expect(seedWorld.ownVerbExact("$thing", "doomed_verb")).toBeTruthy();
+      seedRepo.close();
+
+      const dropRepo = new LocalSQLiteRepository(path);
+      const dropWorld = createWorld({ repository: dropRepo, catalogs: false });
+      expect(dropWorld.ownVerbExact("$thing", "doomed_verb")).toBeTruthy();
+      // removeVerb persists, exactly as the drop_verb migration step does.
+      dropWorld.withMutationSavepoint(() => {
+        dropWorld.removeVerb("$thing", "doomed_verb");
+      });
+      expect(dropWorld.ownVerbExact("$thing", "doomed_verb")).toBeNull();
+      dropRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      expect(verifyWorld.ownVerbExact("$thing", "doomed_verb")).toBeNull();
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The other half of the same seam: flattening the nested transaction must
+  // not cost the savepoint its rollback isolation. A step that throws must
+  // leave nothing behind, which is what makes a partially-failed migration
+  // safe to re-run.
+  it("rolls back a failed outermost savepoint, leaving the persisted world untouched", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      seedWorld.addVerb("$thing", {
+        kind: "native",
+        name: "kept_verb",
+        aliases: [],
+        owner: seedWorld.object("$thing").owner,
+        perms: "rxd",
+        arg_spec: { args: [] },
+        source: "verb :kept_verb() rxd { return null; }",
+        source_hash: "kept",
+        version: 1,
+        line_map: {},
+        native: "noop",
+        direct_callable: true
+      });
+      seedRepo.close();
+
+      const failRepo = new LocalSQLiteRepository(path);
+      const failWorld = createWorld({ repository: failRepo, catalogs: false });
+      expect(() => failWorld.withMutationSavepoint(() => {
+        failWorld.removeVerb("$thing", "kept_verb");
+        throw new Error("step failed after its write");
+      })).toThrow("step failed after its write");
+      failRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      expect(verifyWorld.ownVerbExact("$thing", "kept_verb")).toBeTruthy();
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("dumps selected objects as a partial JSON folder", async () => {
     const { dir, path } = tempDb();
     try {

@@ -766,6 +766,8 @@ Inputs that don't match the op's accepted types raise `E_INVARG`. Anything more 
 
 A major-version `update` runs migration steps inside `$catalog_registry`'s sequenced call, in declared order. Each step is wrapped in a savepoint. If a step fails, the migration body catches the error, rolls back only the failing step's savepoint, records `migration_state`, emits `migration_failed`, and returns normally. That means the registry call itself commits with `applied_ok=true`; completed earlier steps remain committed and the registry log records exactly where the migration stopped.
 
+A step's savepoint is frequently the **outermost** persistence scope — the boot-time bundled-version upgrade path (§CT5.4.1) calls the update directly, with no enclosing transaction. Steps mutate definitions through ordinary world writers (`drop_verb` → `removeVerb`, `drop_property` → `deleteProp`, `add_property` → `defineProperty`), and those writers persist. A persistent repository MUST therefore let a write nested inside a savepoint flush without opening a second transaction. Where it does not, every step throws, `migration_state` swallows the throw by design, and the schema sync still advances the recorded version: the world reports itself migrated with none of its steps applied. That combination — a silent, self-certifying half-migration — is the failure this rule exists to prevent, and it is invisible to any fixture that wraps the update in its own transaction.
+
 This is deliberately **not** the same as an unhandled behavior failure. If the migration body lets the error escape, the standard `$space:call` failure rule applies and the whole behavior savepoint rolls back. Catalog migration code must catch step failures when it wants the partial-progress semantics described here.
 
 Recovery from a failed migration is operator work in v1. The registry exposes `:migration_state(catalog)` returning `{from_version, to_version, completed_steps, failed_step?}` so operators can either complete the migration manually or roll back to a backup.
@@ -795,6 +797,56 @@ This practice composes with the deployment lifecycle: catalog updates are *not* 
 - **Auto-generated migrations from manifest diffs.** Tooling for "compute the migration steps between v1.0 and v2.0 manifests" is useful but secondary; publishers write migrations by hand for now.
 
 The principle: **migrations are the publisher's responsibility, recovery is the operator's, and the runtime provides the sequencing and audit substrate.** This matches the rest of woo's discipline — the runtime guarantees minimal primitives; user/publisher code does the domain-specific work.
+
+### CT14.7 Reaching a deployed Net world
+
+Everything above describes a world that runs a local catalog lifecycle. A Net
+world does not. `installLocalCatalogs` runs only inside the install planner, at
+namespace genesis; no gateway or scope cold start re-runs it. The boot-time
+bundled-version upgrade of §CT5.4.1 therefore has **no deployed counterpart**,
+and shipping a runtime that carries a new major manifest leaves an active Net
+world on the old definitions indefinitely. Runtime deployment alone never
+implies a durable-world update
+([net-cutover.md §NC5](../operations/net-cutover.md#nc5-the-installation-doorway)).
+
+The delivery vehicle is the signed operator repair family, addressed at the
+catalog authority. A major edge decomposes into exactly the pieces those ops
+carry:
+
+| Migration content | Net delivery |
+|---|---|
+| `drop_verb`, `drop_property` | `repair-definitions`, `remove` array |
+| new/changed verb bodies and property definitions | `repair-definitions`, `cells` array |
+| corrected seeded map values (`merge_map` hooks) | `repair-seed-properties` |
+| instance data rewrites (`transform_property`, `rename_property`) | **no operator op — see below** |
+
+The authorization is the migration file itself: the CLI admits a drop only when
+a bundled migration declares that `drop_verb` / `drop_property` **and** the
+current bundle no longer defines the page, so publishing the migration is what
+grants the operator the ability to apply it. Replacements are mined from a fresh
+install plan. An operator cannot name an arbitrary definition in either array.
+Both halves of an edge travel in one signed request, so they land at a single
+advanced catalog head rather than leaving a window in which callers and callees
+disagree. Re-running is a no-op.
+
+Two constraints follow for a publisher:
+
+- **A class-scoped drop only reaches class-scoped cells.** The local step walks
+  `classAndDescendants`; the Net `remove` array names cells literally. When the
+  retired property was only ever a class default — no instance materialized its
+  own cell — the class-scoped drop is complete. A publisher retiring a property
+  that instances actually wrote must name those instance cells too, and verify
+  it against the install plan rather than assuming.
+- **Instance data rewrites have no Net operator path in v1.** `transform_property`
+  and `rename_property` over live instances are not expressible in the repair
+  family, which addresses definition pages and seeded map values. A catalog whose
+  major edge rewrites instance data cannot be completed on a deployed Net world
+  today; that gap is tracked here rather than in each catalog.
+
+The recorded version in `$catalog_registry.installed_catalogs` is **not**
+advanced by a repair. On a Net world it reports the genesis version and is
+operator metadata only — the runtime reads it on the local lifecycle path, which
+a Net world never runs, and the value is served read-only over `/net-api/catalogs`.
 
 ---
 

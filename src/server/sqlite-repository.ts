@@ -591,14 +591,38 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   savepoint<T>(fn: () => T): T {
     const name = `woo_sp_${++this.savepointCounter}`;
     this.db.exec(`SAVEPOINT ${name}`);
+    // A SAVEPOINT opened outside an explicit BEGIN starts a transaction
+    // IMPLICITLY, so a nested transaction() must flatten into it exactly as it
+    // does inside transaction(). Without this the inner call issues
+    // BEGIN IMMEDIATE while the savepoint's implicit transaction is open and
+    // SQLite fails the statement with "cannot start a transaction within a
+    // transaction".
+    //
+    // That defect made every catalog migration STEP fail on the SQLite
+    // profile: applyCatalogMigration runs each step inside
+    // world.withMutationSavepoint(), and any step that mutates definitions
+    // (drop_verb -> removeVerb, drop_property -> deleteProp, add_property ->
+    // defineProperty, change_parent, ...) calls world.persist(), which flushes
+    // through transaction(). The thrown step error was then swallowed into
+    // `migration_state` while the schema sync still advanced the recorded
+    // catalog version — so a persisted world reported itself migrated with
+    // none of its drops applied. In-memory worlds have no repository and so
+    // never showed it. See tests/persistence.test.ts.
+    const outerDepth = this.transactionDepth;
+    this.transactionDepth = outerDepth + 1;
     try {
       const result = fn();
+      // Releasing the OUTERMOST savepoint commits the implicit transaction, so
+      // it owes the same pending-outcome check a real COMMIT makes.
+      if (outerDepth === 0) this.assertNoPendingLogOutcomes();
       this.db.exec(`RELEASE SAVEPOINT ${name}`);
       return result;
     } catch (err) {
       this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
       this.db.exec(`RELEASE SAVEPOINT ${name}`);
       throw err;
+    } finally {
+      this.transactionDepth = outerDepth;
     }
   }
 }
