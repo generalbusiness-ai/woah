@@ -376,7 +376,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["help database topics", "forwarded help database topics", "object or verb docs when directives request them"],
     writes: [],
     emits: [],
-    note: "Help topic rendering is read-only except when caller separately invokes record_miss."
+    note: "Help topic rendering is read-only; a miss returns a not_found reply carrying the topic list, and writes nothing."
   },
   help_db_dump_topic: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -388,17 +388,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     writes: [],
     emits: [],
     note: "Help dump_topic is a read-only exact/abbreviation lookup over the tracked topics property."
-  },
-  help_db_record_miss: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "help_db_record_miss",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["help database missed_topics"],
-    writes: ["help database missed_topics"],
-    emits: ["logical_input"],
-    note: "Help miss recording writes only the bounded missed_topics list and records its timestamp as a logical input."
   },
   player_join: {
     kind: "woo.native_primitive_contract.shadow.v1",

@@ -1,6 +1,6 @@
 {
   "name": "help",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "LambdaMOO-shaped in-world help database classes and a seeded global help database.",
   "license": "MIT",
@@ -9,18 +9,12 @@
     {
       "local_name": "$generic_help_db",
       "parent": "$thing",
-      "description": "Generic help database. It stores static topic values in a topics map, resolves exact and abbreviated topic names, renders compact topic output, and records missed lookups for later documentation work.",
+      "description": "Generic help database. It stores static topic values in a topics map, resolves exact and abbreviated topic names, and renders compact topic output. A lookup that matches nothing returns a not_found reply carrying the topic list; the database itself is never written by a help lookup.",
       "properties": [
         {
           "name": "topics",
           "type": "map<str,any>",
           "default": {},
-          "perms": "r"
-        },
-        {
-          "name": "missed_topics",
-          "type": "list<map>",
-          "default": [],
           "perms": "r"
         }
       ],
@@ -69,21 +63,6 @@
           "implementation": {
             "kind": "native",
             "handler": "help_db_dump_topic"
-          }
-        },
-        {
-          "name": "record_miss",
-          "perms": "rxd",
-          "direct_callable": true,
-          "arg_spec": {
-            "args": [
-              "topic"
-            ]
-          },
-          "source": "verb :record_miss(topic) rxd { return null; /* native: see help_db_record_miss */ }",
-          "implementation": {
-            "kind": "native",
-            "handler": "help_db_record_miss"
           }
         },
         {

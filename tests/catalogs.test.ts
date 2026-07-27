@@ -482,6 +482,30 @@ describe("local catalogs", () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["help"]);
     rewindHelpToV011(world);
+    // v0.x also carried the miss-telemetry surface that help v1.0.0 drops.
+    // Restore it so the version jump exercises the §CT14 migration file rather
+    // than trivially finding nothing to drop.
+    world.defineProperty("$generic_help_db", {
+      name: "missed_topics",
+      defaultValue: [],
+      typeHint: "list<map>",
+      owner: world.object("$generic_help_db").owner,
+      perms: "r"
+    });
+    world.addVerb("$generic_help_db", {
+      kind: "native",
+      name: "record_miss",
+      aliases: [],
+      owner: world.object("$generic_help_db").owner,
+      perms: "rxd",
+      arg_spec: { args: ["topic"] },
+      source: "verb :record_miss(topic) rxd { return null; /* native: see help_db_record_miss */ }",
+      source_hash: "aged-record-miss",
+      version: 1,
+      line_map: {},
+      native: "help_db_record_miss",
+      direct_callable: true
+    });
     // A deployed v0.1.1 world differs from a current one in three ways, and all
     // three have to be rewound or the scenario is not the one being claimed.
     // Rewinding only the topics and the registry version leaves the CURRENT
@@ -498,15 +522,27 @@ describe("local catalogs", () => {
     const topics = world.getProp("$help", "topics") as Record<string, string[]>;
     expect(topics.focus.join(" ")).toContain("no woo_focus");
     expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
-    // Minor drift needs no §CT14 migration file: runLocalCatalogVersionMigrations
-    // routes only MAJOR edges through updateCatalogManifest, and the auto schema
-    // sync covers the rest — including writing manifest.version back onto the
-    // registry record. So the recorded version DOES advance on a minor bump.
-    // The merge repair must still not depend on that; its gate is the stored
-    // value itself, which is what makes it correct either way.
+    // 0.1.1 → 1.0.0 is a MAJOR edge, so runLocalCatalogVersionMigrations routes
+    // it through updateCatalogManifest with the bundled §CT14 file. That file
+    // carries the destructive half of the fix: an aged world keeps the
+    // record_miss verb and the missed_topics property until the drop steps run
+    // (the schema sync alone never removes definitions the manifest stopped
+    // declaring). Both must be gone afterwards.
+    expect(world.object("$generic_help_db").verbs.map((verb) => verb.name)).not.toContain("record_miss");
+    expect(world.object("$generic_help_db").propertyDefs.has("missed_topics")).toBe(false);
     const after = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
       .find((record) => record.alias === "help");
-    expect(after?.version).toBe("0.2.0");
+    expect(after?.version).toBe("1.0.0");
+
+    // Migration rule: reruns must be safe. A second cold init finds nothing to
+    // drop and leaves the repaired state alone.
+    installLocalCatalogs(world, ["help"]);
+    expect(world.object("$generic_help_db").verbs.map((verb) => verb.name)).not.toContain("record_miss");
+    expect(world.object("$generic_help_db").propertyDefs.has("missed_topics")).toBe(false);
+    expect(
+      ((world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+        .find((record) => record.alias === "help"))?.version
+    ).toBe("1.0.0");
   });
 
   // The help topics name builder/programmer verbs in prose ("$programmer adds
@@ -805,9 +841,50 @@ describe("local catalogs", () => {
       expect(plan.result).toMatchObject({ route: "direct", target: "$wiz", verb: "help", args: ["movement"] });
     }
 
+    // An unknown topic is a *reply*, never a failure, and it hands back the
+    // topic list so the asker can recover in one step.
+    //
+    // This path used to also record the miss as a `missed_topics` property
+    // write on the first help db. On a Net world $help is installed catalog
+    // state, so that write is refused at commit with E_CATALOG_MUTATION — a
+    // turn verdict, decided after the verb has run, which the `try`/`except`
+    // around the dispatch could not catch. `guest:help("programmer")` returned
+    // a raw invariant dump on the deployed world instead of an answer, and the
+    // telemetry recorded nothing there anyway (nothing ever read the list
+    // back). help v1.0.0 drops the verb and the property.
+    //
+    // Local worlds do not enforce the catalog-write rule, so the local proof
+    // is the second half: the whole help turn must leave $help byte-identical.
+    // If it writes anything, Net refuses the turn. The Net lane itself is
+    // proven in tests/worker/net-mcp-agent-surface.test.ts.
+    const helpBefore = JSON.stringify(world.exportObjects(["$help"]));
     const miss = await world.directCall("help-miss", "$wiz", "$wiz", "help", ["definitely-missing"]);
     expect(miss.op).toBe("result");
-    expect(world.getProp("$help", "missed_topics")).toContainEqual(expect.objectContaining({ topic: "definitely-missing", actor: "$wiz" }));
+    if (miss.op === "result") {
+      expect(miss.result).toMatchObject({ ok: false, status: "not_found", topic: "definitely-missing" });
+      const reply = miss.result as { topics?: unknown; lines?: unknown };
+      expect(Array.isArray(reply.topics)).toBe(true);
+      // The same list `help()` with no topic renders in its index.
+      const indexTopics = Object.keys(world.getProp("$help", "topics") as Record<string, WooValue>);
+      expect(reply.topics as string[]).toEqual(expect.arrayContaining(indexTopics));
+      expect(reply.lines as string[]).toEqual([
+        'No help available for "definitely-missing".',
+        `Topics: ${(reply.topics as string[]).join(", ")}`
+      ]);
+      // The asker is told, not just the return value: both lines reach them.
+      expect(miss.observations).toContainEqual(
+        expect.objectContaining({ type: "text", target: "$wiz", text: expect.stringContaining("No help available") })
+      );
+      expect(miss.observations).toContainEqual(
+        expect.objectContaining({ type: "text", target: "$wiz", text: expect.stringContaining("Topics: ") })
+      );
+    }
+    expect(JSON.stringify(world.exportObjects(["$help"])), "a help miss must not write to the help db").toBe(helpBefore);
+
+    // The dead telemetry surface is gone from the class, not merely unused.
+    const helpDbVerbs = world.object("$generic_help_db").verbs.map((verb) => verb.name);
+    expect(helpDbVerbs).not.toContain("record_miss");
+    expect(world.object("$generic_help_db").propertyDefs.has("missed_topics")).toBe(false);
 
     // Regression for notes/2026-05-16-online-walkthrough.md Inconsistency 1.
     // The minimum first-light topic set must include look, say, focus, wait,

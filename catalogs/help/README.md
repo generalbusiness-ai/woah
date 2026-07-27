@@ -1,6 +1,6 @@
 ---
 name: help
-version: 0.2.0
+version: 1.0.0
 spec_version: v1
 license: MIT
 description: In-world help database classes.
