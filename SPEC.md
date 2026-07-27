@@ -125,7 +125,7 @@ Operationally visible procedures for lifecycle management: deploys, migrations, 
 - [deployments.md](spec/operations/deployments.md) — dev / staging / prod, version coordination, cross-environment sync (DP1–DP9)
 - [observability.md](spec/operations/observability.md) — logs, metrics, traces, audit (O1–O9)
 - [audit.md](spec/operations/audit.md) — **the audit trail**: unified audit/observability correlation — OTel-semantics trace context, the principal envelope threading the customer (account) through unrelated objects, audit records as projections of committed transcripts, per-customer routed delivery, query/export, integrity (AU1–AU10, **draft**)
-- [workflows.md](spec/operations/workflows.md) — state machines on `$space`s; role gating; transition rules (WF1–WF10)
+- [workflows.md](spec/operations/workflows.md) — state machines on `$space`s; role gating; transition rules; Act-recorded transitions (WF1–WF11)
 - [net-cutover.md](spec/operations/net-cutover.md) — net namespace installation, activation barrier, write-freeze/export watermark, rollback contract, v2 stack decommission (NC1–NC8; NC9 **draft**)
 
 ### Identity

@@ -3,7 +3,8 @@
 // emitted by one actor lands in the other's MCP wait queue (or that a verb
 // reply carries the expected shape). This is the cross-actor coverage the
 // narrow single-call smoke does not provide: cross-scope moves, take/drop
-// fanout, pinboard/outliner/tasks tool-space collaboration.
+// fanout, pinboard/outliner/tasks tool-space collaboration, and the dispenser
+// order/cancel round on the_horoscope.
 //
 // The scenario is driver-agnostic: it operates on a mutable `SmokeSessionPair`
 // and an injected `step` runner. The runner owns lane-specific policy — the
@@ -55,6 +56,16 @@ export type SmokeScenarioOptions = {
   // enumeration path that cross-scope lineage gaps break in cf-dev/deployed.
   // PASS in fake lane; FAIL in cf-dev/deployed until A2 lands. TRACKED → A2.
   includeToolSurfaceAfterMove?: boolean;
+  // Dispenser step tuning. The deployed lane has a live competing consumer —
+  // the production horoscope plug drains the same queue on a cron AND receives
+  // a synchronous wakeup hint from `:order` — and runs each step under a
+  // watchdog. Fresh-world lanes (workerd, fake) have neither, so they keep the
+  // strict deterministic assertions.
+  dispenserCompetingConsumer?: boolean;
+  // Ceiling for the one bounded E_RATE_LIMIT admission wait. The lane runner
+  // owns this policy because it knows its own step watchdog; the scenario
+  // default covers the demo block's 60s requester window.
+  dispenserAdmissionWaitMs?: number;
   // Per-assertion wait budget (the cross-actor fanout settle window).
   waitTimeoutMs?: number;
   drainBudgetMs?: number;
@@ -355,6 +366,193 @@ export async function runSmokeWalkthrough(
       typeof obs.note.text === "string" &&
       obs.note.text.includes(text),
     waitMs, ctx.signal, cfg);
+  });
+
+  // Dispenser: the Acts-kernel anchored-actor adopter (the_horoscope, standing
+  // on the_deck). One order/cancel round proves the typed surface end-to-end in
+  // every lane: sequenced admission (`order`), the recorded fact fanning out to
+  // a co-present peer, the plug-only authority boundary refusing an ordinary
+  // actor, and a terminal disposition with its own peer-visible fact. The
+  // deliver half is deliberately absent: `next_pending`/`prepare_artifact`/
+  // `deliver` accept only the block actor (the apikey plug) or a wizard
+  // (catalogs/dispenser/DESIGN.md), so the right walkthrough assertion for an
+  // ordinary credential is that they REFUSE; delivery mechanics are covered by
+  // tests/dispenser-acts.test.ts and the plug's own suite.
+  //
+  // COMPETING CONSUMER (deployed lane): the production horoscope plug drains
+  // this same queue — on a 15-minute cron AND promptly, because `:order` sends
+  // the block a synchronous wakeup hint. A delivered-under-us order is
+  // therefore a legitimate outcome there, not a failure: the plug racing us IS
+  // the production loop working. In that mode the step cancels IMMEDIATELY
+  // after ordering (narrowest possible window before real AI quota is spent),
+  // accepts either terminal disposition, and asserts the matching terminal
+  // fact. Fresh-world lanes have no plug, so they keep the strict
+  // deterministic sequence (queued status read between order and cancel, and
+  // exactly a canceled outcome).
+  //
+  // LEAK GUARD (best-effort by construction, with the residual case named):
+  // an abandoned pending order would be drained by the plug within its poll
+  // interval, spending quota and delivering an unwanted note. The finally
+  // block therefore (a) runs its cleanup calls WITHOUT the step signal — a
+  // fired watchdog must abort the assertions, not the cleanup, and each call
+  // stays bounded by the session's own RPC deadline; (b) recovers a lost
+  // order id when the order committed server-side but its reply timed out, by
+  // scanning both sessions' observation queues for the ordered fact carrying
+  // this run's unique request string; and (c) cancels whenever no terminal
+  // reply was observed (`cancel` is idempotent: delivered → {duplicate,
+  // reason:"delivered"}, already-canceled → {duplicate:true}). A lost
+  // delivery race is cleaned up too: the terminal fact carries the note ref,
+  // and dropping it by literal `#id` disperses it (a `$dispensed_note`
+  // recycles on drop). The irreducible residual — the smoke process dying
+  // mid-window — leaves at most one order, which the live plug itself settles
+  // (delivery or plug-cancel) within its poll interval; that residual is
+  // documented, not denied.
+  //
+  // Rolling v0→v1 contract: a runtime deploy does not rewrite an installed
+  // world's catalog pages, so an aged world may still run the pre-Acts
+  // dispenser page, which emits flat `order_placed`/`canceled`/`delivered`
+  // observations instead of the `dispenser.*` Act envelopes. Accept both,
+  // exactly like the Outliner steps below.
+  await step("dispenser: order reaches peer, plug surface refuses, terminal fact lands", async (ctx) => {
+    const { alice, bob } = pair;
+    // Both actors to the_deck. The pinboard step normally leaves them inside
+    // the_pinboard; the chatroom guard covers a recorded earlier failure.
+    await alice.leaveIfIn("the_pinboard", ctx.signal);
+    await bob.leaveIfIn("the_pinboard", ctx.signal);
+    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
+    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", [], ctx.signal);
+    if (alice.currentRoom !== "the_deck" || bob.currentRoom !== "the_deck") {
+      throw new Error(`dispenser: both actors expected on the_deck; alice=${alice.currentRoom} bob=${bob.currentRoom}`);
+    }
+    await drain(alice, cfg, ctx.signal);
+    await drain(bob, cfg, ctx.signal);
+
+    const competing = options.dispenserCompetingConsumer === true;
+    const admissionWaitMs = options.dispenserAdmissionWaitMs ?? DEFAULT_ADMISSION_WAIT_MS;
+    const request = `walkthrough-order-${runId}`;
+    let orderAttempted = false;
+    let orderId: string | null = null;
+    let terminalReached = false;
+    try {
+      orderAttempted = true;
+      const reply = await orderWithAdmissionRetry(alice, request, admissionWaitMs, ctx.signal, cfg);
+      if (!isRecord(reply) || reply.queued !== true || typeof reply.order_id !== "string" || !reply.order_id) {
+        throw new Error(`dispenser order should return {order_id, queued:true}; got ${JSON.stringify(reply).slice(0, 300)}`);
+      }
+      orderId = reply.order_id;
+
+      // Which terminal facts we accept, and which we then observed.
+      let expected: DispenserFactKind[];
+      if (competing) {
+        // Cancel first, before any assertion widens the race window. The
+        // reply classifies the race but cannot always name the winner: a
+        // pre-Acts page deletes the pending row both when the plug DELIVERS
+        // and when the plug CANCELS (its prepare_artifact call E_VERBNFs on
+        // that page and it cancels the order as permanent), and both read
+        // back as `not_pending`. An ambiguous reply therefore accepts either
+        // terminal fact and learns the outcome from whichever arrives.
+        const canceled = await alice.call("the_horoscope", "cancel", [orderId], ctx.signal);
+        const disposition = dispenserCancelDisposition(canceled);
+        if (disposition === null) {
+          throw new Error(`dispenser cancel for ${orderId} returned neither a cancellation nor a settled race; got ${JSON.stringify(canceled).slice(0, 300)}`);
+        }
+        terminalReached = true;
+        expected = disposition === "canceled" ? ["canceled"]
+          : disposition === "delivered" ? ["delivered"]
+          : ["canceled", "delivered"];
+      } else {
+        // Strict fresh-world sequence: the queued status read is meaningful
+        // only when nothing else can drain the queue underneath it.
+        await waitFor(bob, (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", orderId!) !== null, waitMs, ctx.signal, cfg);
+        const status = await alice.call("the_horoscope", "status", [orderId], ctx.signal);
+        if (!isRecord(status) || status.state !== "queued") {
+          throw new Error(`dispenser status for ${orderId} should be queued; got ${JSON.stringify(status).slice(0, 300)}`);
+        }
+        const canceled = await alice.call("the_horoscope", "cancel", [orderId], ctx.signal);
+        if (!isRecord(canceled) || canceled.canceled !== true) {
+          throw new Error(`dispenser cancel for ${orderId} should return canceled:true; got ${JSON.stringify(canceled).slice(0, 300)}`);
+        }
+        terminalReached = true;
+        expected = ["canceled"];
+      }
+
+      // The recorded ordered fact reaches the co-present peer through the
+      // room's ordinary observation fanout (retained in bob's queue whether or
+      // not the cancel already committed).
+      if (competing) {
+        await waitFor(bob, (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", orderId!) !== null, waitMs, ctx.signal, cfg);
+      }
+      // ... and so does a terminal fact from the accepted set. The matched
+      // observation names the actual outcome (and, for a delivery, the note).
+      const terminalObs = await waitFor(
+        bob,
+        (obs) => findDispenserFact(obs, expected, "the_horoscope", orderId!) !== null,
+        waitMs,
+        ctx.signal,
+        cfg
+      );
+      const terminal = findDispenserFact(terminalObs, expected, "the_horoscope", orderId)!;
+
+      if (terminal.kind === "delivered") {
+        // Race lost: a real note landed in alice's inventory. Disperse it —
+        // the terminal fact carries the note ref, the room matcher resolves
+        // literal `#id`, and a $dispensed_note recycles on drop. Best-effort:
+        // a failed dispersal logs the residue instead of failing the step.
+        const note = terminal.note;
+        if (note) {
+          try {
+            await alice.call("the_deck", "drop", [`#${note}`], ctx.signal);
+            cfg.log?.(`    [${alice.label}] dispenser race lost: ${orderId} was delivered before the cancel; dispersed the delivered note ${note}`);
+          } catch {
+            cfg.log?.(`    [${alice.label}] dispenser race lost AND dispersal failed: delivered note ${note} remains in ${alice.label}'s inventory (drop it to disperse)`);
+          }
+        } else {
+          cfg.log?.(`    [${alice.label}] dispenser race lost: ${orderId} delivered; terminal fact carried no note ref, note remains in inventory`);
+        }
+      }
+
+      // The terminal disposition is durably readable: whatever the outcome,
+      // the order is no longer queued. (v1 keeps a terminal receipt; v0
+      // removed the row, which reads as "unknown".)
+      const settled = await alice.call("the_horoscope", "status", [orderId], ctx.signal);
+      if (isRecord(settled) && settled.state === "queued") {
+        throw new Error(`dispenser order ${orderId} still queued after its terminal disposition; got ${JSON.stringify(settled).slice(0, 300)}`);
+      }
+
+      // Authority boundary: the pending queue is plug-only. `next_pending` is
+      // command-shaped and therefore reachable in the room's tool context, so
+      // a refusal here is the verb's own E_PERM guard, not tool enumeration.
+      let refusal: string | null = null;
+      try {
+        await bob.call("the_horoscope", "next_pending", [], ctx.signal);
+      } catch (err) {
+        refusal = err instanceof Error ? err.message : String(err);
+      }
+      if (!refusal || !refusal.includes("E_PERM")) {
+        throw new Error(`the_horoscope:next_pending must refuse an ordinary actor with E_PERM; got ${refusal ?? "success"}`);
+      }
+    } finally {
+      // The leak guard. Deliberately signal-free: a fired watchdog aborts the
+      // assertions above, not this cleanup — each call is still bounded by
+      // the session's own RPC deadline. Swallowed individually so cleanup can
+      // never mask the step's real error.
+      if (orderId === null && orderAttempted) {
+        // The order may have committed server-side while its reply was lost.
+        // The ordered fact carries this run's unique request string; scan
+        // both sessions' observation queues for it to recover the id.
+        orderId = await recoverDispenserOrderId([alice, bob], request, cfg);
+      }
+      if (orderId !== null && !terminalReached) {
+        try {
+          await alice.call("the_horoscope", "cancel", [orderId]);
+          cfg.log?.(`    [${alice.label}] dispenser leak-guard canceled ${orderId}`);
+        } catch {
+          cfg.log?.(`    [${alice.label}] dispenser leak-guard cancel for ${orderId} failed; the live plug will settle it within its poll interval`);
+        }
+      }
+      try { await drain(alice, cfg); } catch { /* best-effort */ }
+      try { await drain(bob, cfg); } catch { /* best-effort */ }
+    }
   });
 
   // Outliner is mounted in the_chatroom, so both actors come back west. Movement
@@ -728,6 +926,180 @@ function matchesOutlinerFact(
   if (observation.type !== type) return false;
   const normalized = normalizeOutlinerObservation(observation);
   return normalized !== null && matches(normalized.fact);
+}
+
+export type DispenserFactKind = "ordered" | "canceled" | "delivered";
+
+const DISPENSER_LEGACY_TYPES: Record<DispenserFactKind, string> = {
+  ordered: "order_placed",
+  canceled: "canceled",
+  delivered: "delivered"
+};
+
+/** Normalize the two shapes allowed by the dispenser v0→v1 rolling contract:
+ * the v1 Act envelope (`dispenser.ordered`/`.canceled`/`.delivered`,
+ * `version: 1`, `payload.order_id`, composer in `source`) and the pre-Acts
+ * flat observation (`order_placed`/`canceled`/`delivered` with a top-level
+ * `order_id` and `block`). Both shapes must name the emitting block: the
+ * legacy words are generic and must not match another catalog's observation.
+ * A partial/malformed Act never falls back to legacy — once the `dispenser.`
+ * type is present, the exact envelope is required, mirroring the Outliner
+ * normalizer above. A delivered fact also surfaces its note ref (both shapes
+ * carry it) so the walkthrough can disperse a race-delivered note. */
+export function normalizeDispenserObservation(
+  observation: unknown,
+  kind: DispenserFactKind,
+  block: string
+): { mode: "act" | "legacy"; orderId: string; note: string | null } | null {
+  if (!isRecord(observation) || typeof observation.type !== "string") return null;
+  if (observation.type === `dispenser.${kind}`) {
+    if (observation.version !== 1 || observation.source !== block) return null;
+    if (!isRecord(observation.payload) || typeof observation.payload.order_id !== "string") return null;
+    const actNote = observation.payload.note;
+    return { mode: "act", orderId: observation.payload.order_id, note: typeof actNote === "string" && actNote ? actNote : null };
+  }
+  if (observation.type !== DISPENSER_LEGACY_TYPES[kind]) return null;
+  if (observation.block !== block || typeof observation.order_id !== "string") return null;
+  const legacyNote = observation.note;
+  return { mode: "legacy", orderId: observation.order_id, note: typeof legacyNote === "string" && legacyNote ? legacyNote : null };
+}
+
+/** Match one observation against a set of acceptable dispenser fact kinds for
+ * a specific order, returning which kind matched (and the note ref, when the
+ * shape carries one). The set form exists because a settled race cannot
+ * always be classified from the cancel reply alone (see
+ * dispenserCancelDisposition): the caller accepts either terminal fact and
+ * learns the outcome from whichever arrives. */
+export function findDispenserFact(
+  observation: unknown,
+  kinds: readonly DispenserFactKind[],
+  block: string,
+  orderId: string
+): { kind: DispenserFactKind; note: string | null } | null {
+  for (const kind of kinds) {
+    const normalized = normalizeDispenserObservation(observation, kind, block);
+    if (normalized !== null && normalized.orderId === orderId) {
+      return { kind, note: normalized.note };
+    }
+  }
+  return null;
+}
+
+/** Classify a cancel reply for an order this run just placed. `canceled:true`
+ * is the normal outcome. The v1 duplicate/delivered receipt names a lost
+ * delivery race explicitly. `reason: "not_pending"` (pre-Acts page) only
+ * proves the order settled WITHOUT us: that page deletes the pending row both
+ * when the plug delivers and when the plug cancels (its `prepare_artifact`
+ * call E_VERBNFs there and the plug cancels the order as permanent) — so it
+ * classifies as "raced", and the caller must accept either terminal fact.
+ * Anything else (including `reason: "unknown"`) is a real failure. */
+export function dispenserCancelDisposition(reply: unknown): "canceled" | "delivered" | "raced" | null {
+  if (!isRecord(reply)) return null;
+  if (reply.canceled === true) return "canceled";
+  if (reply.duplicate === true && reply.reason === "delivered") return "delivered";
+  if (reply.reason === "not_pending") return "raced";
+  return null;
+}
+
+/** Recover a committed order's id when the order reply was lost (server-side
+ * commit, client-side timeout): the ordered fact carries the run's unique
+ * request string and fans out to every co-present session. Scans a few
+ * bounded `woo_wait` polls per session, signal-free — this runs from cleanup
+ * paths where the step signal may already be aborted. */
+export async function recoverDispenserOrderId(
+  sessions: readonly SmokeSession[],
+  request: string,
+  cfg: DrainConfig
+): Promise<string | null> {
+  for (const session of sessions) {
+    for (let poll = 0; poll < 3; poll += 1) {
+      let observations: unknown[];
+      try {
+        const result = await session.callTool("woo_wait", { timeout_ms: cfg.drainPollMs, limit: 100 });
+        observations = waitObservationsOf(result);
+      } catch {
+        break; // this session is unusable (reset/closed); try the next one
+      }
+      for (const obs of observations) {
+        if (!isRecord(obs)) continue;
+        const normalized = normalizeDispenserObservation(obs, "ordered", "the_horoscope");
+        if (normalized === null) continue;
+        const observedRequest = normalized.mode === "act"
+          ? (isRecord(obs.payload) ? obs.payload.request : undefined)
+          : obs.request;
+        if (observedRequest === request) {
+          cfg.log?.(`    [${session.label}] recovered lost dispenser order id ${normalized.orderId} from the ordered fact`);
+          return normalized.orderId;
+        }
+      }
+      if (observations.length === 0) break;
+    }
+  }
+  return null;
+}
+
+/** Extract the admission-window wait from a thrown E_RATE_LIMIT refusal. The
+ * dispenser's refusal detail carries `retry_in_seconds`; a rate refusal whose
+ * detail cannot be parsed still gets the demo block's 60s default window.
+ * Returns null when the message is not a rate refusal at all. */
+export function rateLimitRetrySeconds(message: string): number | null {
+  if (!message.includes("E_RATE_LIMIT")) return null;
+  const match = message.match(/"retry_in_seconds"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
+  const parsed = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return 60;
+  return Math.ceil(parsed);
+}
+
+// Default ceiling for the one bounded admission wait: the demo block's 60s
+// requester window plus scheduling slack. A lane with a step watchdog should
+// pass its own `dispenserAdmissionWaitMs` computed to reserve time for the
+// calls that follow the wait — the scenario cannot see the watchdog.
+const DEFAULT_ADMISSION_WAIT_MS = 66_000;
+
+// Persistent deployed actors keep dispenser admission state between runs, so a
+// rerun inside the requester rate window is refused E_RATE_LIMIT with a stated
+// retry_in_seconds. Honor that one bounded wait rather than failing — the retry
+// proves the admission contract's own recovery path. A stated window above the
+// lane's ceiling means either an operator widened the block's config or the
+// lane has no room to wait; the walkthrough says so rather than stalling into
+// its watchdog.
+async function orderWithAdmissionRetry(
+  session: SmokeSession,
+  request: string,
+  ceilingMs: number,
+  signal: AbortSignal | undefined,
+  cfg: DrainConfig
+): Promise<unknown> {
+  try {
+    return await session.call("the_horoscope", "order", [request], signal);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const retrySeconds = rateLimitRetrySeconds(message);
+    if (retrySeconds === null) throw err;
+    const waitMs = (retrySeconds + 1) * 1000;
+    if (waitMs > ceilingMs) {
+      throw new Error(`dispenser admission window (${retrySeconds}s) exceeds this lane's ${Math.floor(ceilingMs / 1000)}s wait ceiling: ${message.slice(0, 200)}`);
+    }
+    cfg.log?.(`    [${session.label}] dispenser admission window active; waiting ${retrySeconds + 1}s for the one retry`);
+    await sleepUnlessAborted(waitMs, signal);
+    return await session.call("the_horoscope", "order", [request], signal);
+  }
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    throwIfAborted(signal);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      const reason = signal?.reason;
+      reject(reason instanceof Error ? reason : new Error("operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 // Drain pending observations from a session's wait queue so the next assertion

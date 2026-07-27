@@ -6,7 +6,15 @@ import {
   SmokeCascadeHalt,
   raceWithAbort
 } from "../scripts/smoke-walkthrough";
-import { ensureInChatroom, normalizeOutlinerObservation } from "../scripts/smoke/scenario";
+import {
+  dispenserCancelDisposition,
+  ensureInChatroom,
+  findDispenserFact,
+  normalizeDispenserObservation,
+  normalizeOutlinerObservation,
+  rateLimitRetrySeconds,
+  recoverDispenserOrderId
+} from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
@@ -148,6 +156,145 @@ describe("smoke walkthrough harness", () => {
       item: "item_1"
     })).toBeNull();
     expect(normalizeOutlinerObservation({ type: "said", item: "item_1" })).toBeNull();
+  });
+
+  it("normalizes both allowed dispenser rolling-upgrade observation shapes", () => {
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      payload: { order_id: "ord_9", request: "walkthrough", artifact: "o_note" },
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9", note: null });
+    expect(normalizeDispenserObservation({
+      type: "dispenser.canceled",
+      version: 1,
+      payload: { order_id: "ord_9" },
+      source: "the_horoscope"
+    }, "canceled", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9", note: null });
+    // Pre-Acts flat shapes from an aged installed catalog page.
+    expect(normalizeDispenserObservation({
+      type: "order_placed",
+      block: "the_horoscope",
+      order_id: "ord_9",
+      requester: "guest_a"
+    }, "ordered", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9", note: null });
+    expect(normalizeDispenserObservation({
+      type: "canceled",
+      block: "the_horoscope",
+      order_id: "ord_9"
+    }, "canceled", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9", note: null });
+  });
+
+  it("does not match malformed dispenser Acts or another block's observations", () => {
+    // A partial Act envelope never falls back to legacy.
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 2,
+      payload: { order_id: "ord_9" },
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toBeNull();
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      order_id: "ord_9",
+      source: "the_horoscope"
+    }, "ordered", "the_horoscope")).toBeNull();
+    // Both shapes must name the emitting block: the legacy `canceled` type is a
+    // generic word and must not match another catalog's observation.
+    expect(normalizeDispenserObservation({
+      type: "dispenser.ordered",
+      version: 1,
+      payload: { order_id: "ord_9" },
+      source: "other_block"
+    }, "ordered", "the_horoscope")).toBeNull();
+    expect(normalizeDispenserObservation({
+      type: "canceled",
+      order_id: "ord_9"
+    }, "canceled", "the_horoscope")).toBeNull();
+  });
+
+  it("recognizes a delivered fact, with its note ref, in both rolling-contract shapes", () => {
+    expect(normalizeDispenserObservation({
+      type: "dispenser.delivered",
+      version: 1,
+      payload: { order_id: "ord_9", note: "o_note" },
+      source: "the_horoscope"
+    }, "delivered", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9", note: "o_note" });
+    expect(normalizeDispenserObservation({
+      type: "delivered",
+      block: "the_horoscope",
+      order_id: "ord_9",
+      note: "o_note"
+    }, "delivered", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9", note: "o_note" });
+    expect(normalizeDispenserObservation({
+      type: "delivered",
+      order_id: "ord_9"
+    }, "delivered", "the_horoscope")).toBeNull();
+  });
+
+  it("finds a terminal fact from an accepted set and names the actual outcome", () => {
+    const canceledFact = { type: "dispenser.canceled", version: 1, payload: { order_id: "ord_9" }, source: "the_horoscope" };
+    const deliveredFact = { type: "delivered", block: "the_horoscope", order_id: "ord_9", note: "o_note" };
+    // A settled race accepts either kind and learns which one arrived.
+    expect(findDispenserFact(canceledFact, ["canceled", "delivered"], "the_horoscope", "ord_9"))
+      .toEqual({ kind: "canceled", note: null });
+    expect(findDispenserFact(deliveredFact, ["canceled", "delivered"], "the_horoscope", "ord_9"))
+      .toEqual({ kind: "delivered", note: "o_note" });
+    // A different order's fact never matches.
+    expect(findDispenserFact(canceledFact, ["canceled", "delivered"], "the_horoscope", "ord_8")).toBeNull();
+  });
+
+  it("classifies cancel replies for an order this run just placed", () => {
+    // Normal cancellation.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: true, duplicate: false })).toBe("canceled");
+    // v1 lost race: the plug delivered before the cancel committed.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, duplicate: true, reason: "delivered" })).toBe("delivered");
+    // Pre-Acts settled race: the row is gone, but that page deletes it both
+    // for plug delivery AND plug cancel (prepare_artifact E_VERBNFs there and
+    // the plug cancels as permanent) — so it is only "raced", never assumed
+    // delivered; the caller accepts either terminal fact.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, reason: "not_pending" })).toBe("raced");
+    // A genuinely unknown order is a real failure, not a race.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, duplicate: false, reason: "unknown" })).toBeNull();
+    expect(dispenserCancelDisposition("nope")).toBeNull();
+  });
+
+  it("recovers a lost order id from the ordered fact by unique request", async () => {
+    const makeSession = (batches: unknown[][]): { label: string; calls: number; callTool(): Promise<unknown> } => ({
+      label: "alice",
+      calls: 0,
+      async callTool(): Promise<unknown> {
+        const batch = batches[this.calls] ?? [];
+        this.calls += 1;
+        return { result: { structuredContent: { result: { observations: batch } } } };
+      }
+    });
+    const cfg = { drainBudgetMs: 100, drainPollMs: 10 };
+
+    const hit = makeSession([[
+      { type: "said", text: "noise" },
+      { type: "dispenser.ordered", version: 1, payload: { order_id: "ord_7", request: "walkthrough-order-run1", artifact: "o_a" }, source: "the_horoscope" }
+    ]]);
+    await expect(recoverDispenserOrderId([hit as any], "walkthrough-order-run1", cfg)).resolves.toBe("ord_7");
+
+    // A different run's order never matches; an erroring session is skipped.
+    const miss = makeSession([[
+      { type: "order_placed", block: "the_horoscope", order_id: "ord_6", request: "walkthrough-order-run0" }
+    ]]);
+    const broken = { label: "bob", async callTool(): Promise<unknown> { throw new Error("session reset"); } };
+    await expect(recoverDispenserOrderId([broken as any, miss as any], "walkthrough-order-run1", cfg)).resolves.toBeNull();
+  });
+
+  it("parses the admission-window wait only out of E_RATE_LIMIT refusals", () => {
+    expect(rateLimitRetrySeconds(
+      'MCP tool error: {"code":"E_RATE_LIMIT","message":"too many orders from this requester; try again later",' +
+      '"value":{"retry_in_seconds":12.3,"scope":"requester","rate_limit_seconds":60}}'
+    )).toBe(13);
+    // A rate refusal with an unparseable detail still gets the demo default.
+    expect(rateLimitRetrySeconds('MCP tool error: {"code":"E_RATE_LIMIT","message":"cooldown"}')).toBe(60);
+    // Non-rate errors are not retried.
+    expect(rateLimitRetrySeconds('MCP tool error: {"code":"E_QUEUE_FULL","message":"too many pending orders"}')).toBeNull();
+    expect(rateLimitRetrySeconds("I don't see \"mug\" here.")).toBeNull();
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {
