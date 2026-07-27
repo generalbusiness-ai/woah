@@ -7568,24 +7568,24 @@ export class NetGatewayDO {
     return out;
   }
 
-  /** CO13 relation-owner directions for the committing scope: the
+  /** CO13 affected-owner directions for the committing scope: the
    * transcript's relation OWNER objects — move sources/destinations,
    * create locations, contents-write containers, session-transition
-   * rooms — classified by the same walk route.ts selects scopes with,
-   * keeping only owners anchored to a scope OTHER than the committing
-   * one. The scope shell feeds these to the sequencer's delta partition
-   * (`scopeOf`) and addresses the /net/relate outbox rows from them —
-   * anchor topology stays gateway knowledge (the rider_destinations
-   * rule). An owner the classifier cannot place falls back to the
-   * planning scope inside `classifierFor`, so a same-turn-created
-   * container classifies with the turn, never as a spurious foreign
-   * owner. */
+   * rooms — plus recorded observation audiences. Relation owners are
+   * classified by the same walk route.ts selects scopes with; observation
+   * indexes use events.md §12.7's semantic call-space/source-space rule.
+   * The scope shell feeds relation objects to the sequencer's delta
+   * partition (`scopeOf`) and addresses one combined /net/relate outbox row
+   * per foreign owner. Anchor topology stays gateway knowledge (the
+   * rider_destinations rule). An owner the classifier cannot place falls
+   * back to the planning scope inside `classifierFor`, so a same-turn-created
+   * container classifies with the turn, never as a spurious foreign owner. */
   private relateDestinationsFor(
     request: TurnRequest,
     classifier: ScopeClassifier,
     planned: PlanTurnResult,
     targetScope: string
-  ): Record<string, { destination: string; objects: string[] }> {
+  ): Record<string, { destination: string; objects: string[]; observation_indexes?: number[] }> {
     const owners = new Set<string>();
     for (const move of planned.transcript.moves ?? []) {
       if (move.from) owners.add(move.from);
@@ -7609,9 +7609,58 @@ export class NetGatewayDO {
       set.add(owner);
       objectsByScope.set(scope, set);
     }
-    const out: Record<string, { destination: string; objects: string[] }> = {};
-    for (const [scope, objects] of objectsByScope) {
-      out[scope] = { destination: this.destinationFor(request, scope), objects: [...objects].sort() };
+
+    // A sequenced call may commit away from its semantic space when every
+    // domain write belongs to another authority. The durable observation
+    // still has the call-space audience (events.md §12.7), so tell the
+    // committing scope which foreign owner must receive each observation.
+    // This is especially important for rolling/aged catalog pages that write
+    // an anchored actor directly instead of folding a room-owned projection.
+    //
+    // A source that is ACTUALLY a self-sequenced semantic space wins. Merely
+    // belonging to a shared scope is insufficient: ordinary room-anchored
+    // items also classify there, but events.md §12.7 says their observations
+    // retain the call-space audience. CO15 names a self-sequenced space's
+    // scope `room:<its own id>`, which proves the role without teaching the
+    // gateway a catalog class literal. Relation-owner observations may appear
+    // in both maps; enqueueDeliveries merges them by index before creating one
+    // idempotent /relate row.
+    const observationIndexesByScope = new Map<string, number[]>();
+    if (planned.transcript.route === "sequenced") {
+      planned.transcript.observations.forEach((observation, index) => {
+        const record =
+          observation !== null && typeof observation === "object" && !Array.isArray(observation)
+            ? observation as { source?: unknown }
+            : null;
+        let scope = request.planningScope;
+        const source = record?.source;
+        if (typeof source === "string") {
+          try {
+            const classified = classifier.scopeOf(source);
+            if (classifier.isShared(classified) && classified === `room:${source}`) scope = classified;
+          } catch {
+            // Sparse planning may not hold an optional source's complete
+            // anchor chain. The sequenced call space remains the normative
+            // fallback audience.
+          }
+        }
+        if (scope === targetScope) return;
+        const indexes = observationIndexesByScope.get(scope) ?? [];
+        indexes.push(index);
+        observationIndexesByScope.set(scope, indexes);
+      });
+    }
+
+    const out: Record<string, { destination: string; objects: string[]; observation_indexes?: number[] }> = {};
+    const scopes = new Set([...objectsByScope.keys(), ...observationIndexesByScope.keys()]);
+    for (const scope of [...scopes].sort()) {
+      const objects = objectsByScope.get(scope) ?? new Set<string>();
+      const observationIndexes = observationIndexesByScope.get(scope) ?? [];
+      out[scope] = {
+        destination: this.destinationFor(request, scope),
+        objects: [...objects].sort(),
+        ...(observationIndexes.length > 0 ? { observation_indexes: observationIndexes } : {})
+      };
     }
     return out;
   }

@@ -1185,6 +1185,98 @@ describe("outliner add over the net path converges", () => {
 });
 
 describe("Dispenser anchored-actor Acts over the Net path", () => {
+  it("routes an aged pre-Acts observation to the semantic room when the actor cluster commits", async () => {
+    const plan = await planNetInstall();
+    const world = plan.world;
+    const block = world.exportWorld().objects.find((object) => object.parent === "$horoscope_block");
+    if (!block) throw new Error("no $horoscope_block instance seeded");
+    const logSpace = world.object(block.id).location;
+    if (!logSpace) throw new Error("seeded horoscope block is not anchored");
+
+    // Production can retain the v0 Dispenser page across a runtime deploy.
+    // Model its important topology without copying a historical catalog:
+    // the anchored block writes only its own cluster-owned state and emits a
+    // room-audience observation. Unlike the v1 Act page, there is no
+    // room-owned projection write to pull the commit onto the room scope.
+    const installed = installVerb(
+      world,
+      block.id,
+      "legacy_peer_probe",
+      `verb :legacy_peer_probe(request_text, shared_item) rx {
+        this.last_error = request_text;
+        observe({ type: "legacy_peer_probe", source: this, request_text: request_text });
+        // A non-space object can itself be anchored to another shared
+        // authority. It still does not override the call-space audience.
+        observe({ type: "shared_item_peer_probe", source: shared_item, request_text: request_text });
+        return true;
+      }`,
+      null
+    );
+    expect(installed.ok, installed.diagnostics?.map((diagnostic) => diagnostic.message).join("\n")).toBe(true);
+
+    const requester = world.auth("guest:net-aged-dispenser-requester");
+    const placed = await world.directCall("net-aged-dispenser-place", requester.actor, requester.actor, "moveto", [logSpace], {
+      sessionId: requester.id
+    });
+    expect(placed.op).toBe("result");
+
+    const planningScope = `room:${logSpace}`;
+    const clusterScope = `cluster:${block.id}`;
+    // Use a holder because TypeScript does not model mutation performed by
+    // the asynchronous intercept callback when narrowing a local variable.
+    const submitted = { body: null as Record<string, any> | null };
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, plan.epoch, {
+      intercept: async (scope, path, request) => {
+        if (scope === clusterScope && path === "/net/submit") {
+          submitted.body = await request.clone().json() as Record<string, any>;
+        }
+        return null;
+      }
+    });
+    if (!scopeDOs.has(planningScope) || !scopeDOs.has(clusterScope)) {
+      throw new Error("aged Dispenser proof did not partition block and room separately");
+    }
+
+    const turn = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "net-aged-dispenser-observe",
+        route: "sequenced",
+        scope: logSpace,
+        session: requester.id,
+        actor: requester.actor,
+        target: block.id,
+        verb: "legacy_peer_probe",
+        args: ["scorpio", "the_couch"]
+      },
+      planningScope,
+      catalog_epoch: plan.epoch,
+      idempotency_key: "net-aged-dispenser-observe"
+    });
+    expect(turn.reply.status, JSON.stringify(turn.trace)).toBe("accepted");
+    expect(turn.reply.scope).toBe(clusterScope);
+    expect(turn.observations).toEqual([
+      expect.objectContaining({ type: "legacy_peer_probe", source: block.id, request_text: "scorpio" }),
+      expect.objectContaining({ type: "shared_item_peer_probe", source: "the_couch", request_text: "scorpio" })
+    ]);
+
+    // The gateway must tell the committing scope which foreign semantic
+    // owner receives each observation. This metadata is part of the durable
+    // accept/outbox transaction; deriving it after the reply would reopen the
+    // exact production loss window this test covers.
+    const roomDirections = submitted.body?.relate_destinations?.[planningScope];
+    expect(roomDirections).toMatchObject({
+      destination: `scope:${planningScope}`,
+      observation_indexes: [0, 1]
+    });
+    expect(submitted.body?.relate_destinations?.["room:the_chatroom"]?.observation_indexes).toBeUndefined();
+
+    // The companion shell regression in net-relations.test.ts drives this
+    // exact metadata through cluster outbox → semantic owner → peer fanout,
+    // including redelivery. Keeping the gateway proof focused here avoids
+    // relying on this file's intentionally fire-and-forget waitUntil harness.
+  });
+
   it("orders and delivers through authenticated room sequencing, with dropped-reply replay", async () => {
     const plan = await planNetInstall();
     const world = plan.world;

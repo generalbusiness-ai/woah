@@ -76,6 +76,12 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
      ([`scripts/smoke-walkthrough.ts`](../../scripts/smoke-walkthrough.ts)) over
      MCP HTTP against the deployed worker — the most expensive lane.
 
+  Unless an operator invokes an explicit emergency test override, the guarded
+  deployment script runs lanes 1 and 2 sequentially before it builds or
+  uploads. A failing lane keeps its temporary log and names that path so the
+  failure can be investigated before any rerun. Lane 3 remains post-deploy
+  because it needs the published worker and persistent operator credentials.
+
   Fidelity is a ladder, not a guarantee: workerd-local still runs every DO in one
   process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
   authority gaps remain a deploy-only signal until fault injection lands

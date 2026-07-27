@@ -1848,9 +1848,11 @@ export class ScopeSequencer {
    *   refan at an unadvanced head would no-op at any subscriber that
    *   already saw that seq and the roster delta would be silently lost.
    * - An all-no-op batch (adds of identical rows, removes of absent
-   *   rows) is `empty`: no head advance, nothing to refan — but the
-   *   caller's (from_scope, seq) high-water still advances at the shell,
-   *   exactly like an all-conflict adoption (the fact WAS processed).
+   *   rows) is `empty`: no head advance, nothing to refan — unless the
+   *   same owner delivery carries observations. Those recorded facts still
+   *   require one owner-sequenced refan, so `recordEvent` advances the head
+   *   even with zero changed relation rows. The caller's (from_scope, seq)
+   *   high-water advances at the shell in either case.
    * - Durable write-through covers rows + meta + tail in one transaction
    *   (CO5 copy #1 discipline, same as submit/adopt).
    *
@@ -1862,17 +1864,18 @@ export class ScopeSequencer {
    */
   applyForeignRelationDeltas(
     deltas: RelationDelta[],
-    from?: { from_scope: string; seq: number }
+    from?: { from_scope: string; seq: number },
+    options: { recordEvent?: boolean } = {}
   ): { status: "applied" | "empty"; head: ScopeHead; changed: string[] } {
     const changed = applyRelationDeltas(this.relationRows, deltas);
     this.syncOrderedRelationIndex(changed);
-    if (changed.length === 0) {
+    if (changed.length === 0 && options.recordEvent !== true) {
       return { status: "empty", head: this.headState, changed: [] };
     }
     // One head advance for the batch — the same rolling-digest shape as
     // adopt(), keeping the recovery tail legible (relates have no
     // transcript of their own).
-    const marker = `relate:${from?.from_scope ?? this.scope}:${from?.seq ?? 0}`;
+    const marker = `${changed.length > 0 ? "relate" : "observe"}:${from?.from_scope ?? this.scope}:${from?.seq ?? 0}`;
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,

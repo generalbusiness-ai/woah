@@ -87,6 +87,7 @@ function clusterCells() {
   return [
     { kind: "object_lineage" as const, object: "#actor", value: { parent: null, owner: "#actor", name: "actor", anchor: null, flags: {} } },
     { kind: "object_live" as const, object: "#actor", value: { location: null } },
+    { kind: "property_cell" as const, object: "#actor", name: "last_error", value: { value: null } },
     // CO14: the cluster is the session's authority — the sequenced move
     // below names s1, and authorize validates it from this owned cell.
     { kind: "session" as const, object: "s1", value: { id: "s1", actor: "#actor", started: 0 } }
@@ -132,6 +133,56 @@ function crossScopeMoveSubmit(base: ScopeHead): CommitSubmit {
     scope: CLUSTER_SCOPE,
     base,
     idempotency_key: "relations-move-1",
+    transcript: transcript as never,
+    post_state_version: derived.postStateVersion,
+    stamp: { scope_head: "x", catalog_epoch: EPOCH }
+  };
+}
+
+/** A rolling/aged catalog shape: a sequenced call through #room writes only
+ * the anchored actor's cluster state and emits a default-audience fact. With
+ * no room-owned projection write and no relation delta, the observation-owner
+ * direction is the only path from the accepted cluster commit to room peers. */
+function offSpaceObservationSubmit(base: ScopeHead): CommitSubmit {
+  const transcript = {
+    kind: "woo.effect_transcript.shadow.v1",
+    route: "sequenced",
+    scope: CLUSTER_SCOPE,
+    space: "#room",
+    seq: 1,
+    session: "s1",
+    call: { actor: "#actor", target: "#actor", verb: "legacy_notice", args: ["scorpio"], body: undefined },
+    reads: [],
+    writes: [{
+      cell: { kind: "prop", object: "#actor", name: "last_error" },
+      value: "scorpio",
+      op: "set",
+      writer: {
+        progr: "#actor",
+        thisObj: "#actor",
+        verb: "legacy_notice",
+        definer: "#actor",
+        caller: "#actor",
+        callerPerms: "#actor"
+      }
+    }],
+    creates: [],
+    moves: [],
+    observations: [{ type: "legacy_notice", source: "#actor", request: "scorpio" }],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: "net-relations-observe-1"
+  };
+  const twin = new ScopeSequencer(CLUSTER_SCOPE, EPOCH);
+  twin.seed(clusterCells());
+  const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+  return {
+    kind: "woo.net.commit_submit.v1",
+    scope: CLUSTER_SCOPE,
+    base,
+    idempotency_key: "relations-observe-1",
     transcript: transcript as never,
     post_state_version: derived.postStateVersion,
     stamp: { scope_head: "x", catalog_epoch: EPOCH }
@@ -333,6 +384,122 @@ describe("CO13 relations over the DO shells", () => {
       "/relation?relation=session_presence&owner=exact_room"
     )).members).toEqual([]);
 
+    gatewayState.close();
+  });
+
+  it("an observations-only affected-scope delivery advances the semantic owner and refans to its subscribers", async () => {
+    const gatewayState = netState("gateway-observation-owner");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const gatewayRecorder = recordingStub(gateway);
+
+    const room = netState(`scope-${ROOM_SCOPE}-observation-owner`);
+    const roomEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "gateway:g1") return gatewayRecorder.stub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    const roomRecorder = recordingStub(roomDO);
+    await call(roomDO, roomEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+    await call(roomDO, roomEnv, "/subscribe", { destination: "gateway:g1" });
+
+    const cluster = netState(`scope-${CLUSTER_SCOPE}-observation-owner`);
+    const clusterEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${ROOM_SCOPE}`) return roomRecorder.stub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const clusterDO = new NetScopeDO(cluster.state, clusterEnv);
+    await call(clusterDO, clusterEnv, "/seed", { scope: CLUSTER_SCOPE, catalog_epoch: EPOCH, cells: clusterCells() });
+
+    const head0 = (await call<{ head: ScopeHead }>(clusterDO, clusterEnv, "/head")).head;
+    const submit = offSpaceObservationSubmit(head0);
+    await expect(call(clusterDO, clusterEnv, "/submit", {
+      submit,
+      relate_destinations: {
+        [ROOM_SCOPE]: {
+          destination: `scope:${ROOM_SCOPE}`,
+          objects: [],
+          observation_indexes: [1]
+        }
+      }
+    })).rejects.toThrow(/E_INVARG.*observation index/);
+    // Invalid internal routing metadata must roll back both authority and
+    // outbox state; accepting the same turn below proves no phantom cached
+    // reply survived discardSeqOnThrow.
+    expect((await call<{ head: ScopeHead }>(clusterDO, clusterEnv, "/head")).head.seq).toBe(0);
+
+    const relate = {
+      [ROOM_SCOPE]: {
+        destination: `scope:${ROOM_SCOPE}`,
+        objects: [],
+        observation_indexes: [0]
+      }
+    };
+    const reply = await call<CommitReply>(clusterDO, clusterEnv, "/submit", {
+      submit,
+      relate_destinations: relate
+    });
+    expect(reply.status).toBe("accepted");
+    if (reply.status !== "accepted") return;
+    expect(reply.relations_foreign).toBeUndefined();
+    expect(roomRecorder.calls.filter((call) => call.path === "/net/relate")).toHaveLength(0);
+
+    await clusterDO.alarm();
+    await cluster.settle();
+    await room.settle();
+
+    const relateCalls = roomRecorder.calls.filter((call) => call.path === "/net/relate");
+    expect(relateCalls).toHaveLength(1);
+    const relateBody = relateCalls[0].body as {
+      from_scope: string;
+      seq: number;
+      deltas: RelationDelta[];
+      observations: unknown[];
+      submitter_turn_id: string;
+      echo_id: string;
+    };
+    expect(relateBody).toMatchObject({
+      from_scope: CLUSTER_SCOPE,
+      seq: 1,
+      deltas: [],
+      observations: [{ type: "legacy_notice", source: "#actor", request: "scorpio" }],
+      submitter_turn_id: "relations-observe-1",
+      echo_id: turnEchoId("relations-observe-1")
+    });
+    expect((await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head.seq).toBe(1);
+
+    // The incoming owner delivery enqueued refan but did not recurse through
+    // room → gateway in the same request lineage.
+    expect(gatewayRecorder.calls.filter((call) => call.path === "/net/fanout")).toHaveLength(0);
+    await roomDO.alarm();
+    await room.settle();
+    const fanoutCalls = gatewayRecorder.calls.filter((call) => call.path === "/net/fanout");
+    expect(fanoutCalls).toHaveLength(1);
+    expect(fanoutCalls[0].body).toMatchObject({
+      scope: ROOM_SCOPE,
+      seq: 1,
+      cells: [],
+      observations: [{ type: "legacy_notice", source: "#actor", request: "scorpio" }],
+      relations: [],
+      submitter_turn_id: "relations-observe-1",
+      echo_id: turnEchoId("relations-observe-1")
+    });
+
+    // Source redelivery is idempotent at the semantic owner: no second head
+    // advance and no second refan.
+    expect((await call<{ applied: boolean }>(roomDO, roomEnv, "/relate", relateBody)).applied).toBe(false);
+    await room.settle();
+    expect((await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head.seq).toBe(1);
+    expect(gatewayRecorder.calls.filter((call) => call.path === "/net/fanout")).toHaveLength(1);
+
+    room.close();
+    cluster.close();
     gatewayState.close();
   });
 

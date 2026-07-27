@@ -883,6 +883,19 @@ One write path per fact (CO9), concretized:
   so a refan at an unadvanced head would silently no-op. An all-no-op
   batch (idempotent re-adds, removes of absent rows) advances nothing
   and refans nothing; the sender high-water still moves.
+- **Recorded observations follow their semantic owner even when the commit
+  does not.** A sequenced call can write only cells anchored away from its
+  call space — notably an aged catalog page that predates a room-owned Act
+  projection. The gateway therefore includes transcript observation indexes
+  in the existing `relate_destinations` direction for each foreign semantic
+  audience. The committing scope persists one combined `/net/relate` row per
+  affected owner in the same transaction as acceptance, merging any
+  relation-owner observations so a receiver high-water cannot suppress half
+  the event. An observations-only delivery advances the semantic owner's head
+  once with an `observe:<from_scope>:<seq>` recovery-tail entry and refans the
+  observations under that owner seq. Redelivery is still idempotent by
+  `(from_scope, seq)`. This owner event is a distribution record, not a second
+  domain commit or a replay-log append.
 - **Planning never promotes a relation projection into an authority-cell
   dependency.** In particular, recorded session movement emits one
   `sessionScopeTransition`; it does not read or write the compatibility
@@ -941,11 +954,12 @@ One write path per fact (CO9), concretized:
   outbox converges the owner asynchronously. A dependent roster read may be
   briefly stale in this degraded case, but the caller is never told that its
   already-durable write failed.
-- **Relation-owner topology is gateway knowledge** (the
+- **Affected-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents
-  containers, transition rooms) and ships a `relate_destinations` submit
-  sibling; the sequencer partitions deltas through it and never learns
+  containers, transition rooms) plus foreign semantic observation audiences
+  and ships a `relate_destinations` submit sibling; the sequencer partitions
+  deltas and the shell selects observations through it, while neither learns
   anchor topology itself.
 - `contents(parent) = { object | live:location:<object> == parent }`
   (CA4) remains the definitional truth; relation rows are its

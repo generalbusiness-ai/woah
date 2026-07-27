@@ -178,6 +178,15 @@ half is deliberately absent from the walkthrough — those verbs accept only the
 block actor or a wizard, and the walkthrough's job is to prove they refuse
 ordinary credentials.
 
+`tests/worker/net-outliner-converge.test.ts` also models the pre-Acts authority
+topology directly: the anchored block writes only cluster-owned state while its
+recorded fact retains the room call-space audience. The gateway regression and
+the affected-owner shell regression in `tests/worker/net-relations.test.ts`
+prove that this observations-only event is durably handed to the room owner,
+refanned to room subscribers, and deduplicated on source redelivery. Both run
+in the guarded Acts release gate; the guarded deploy additionally runs the
+shared MCP walkthrough against real workerd before building.
+
 ## Deliberate exclusions
 
 - Note content and physical location retain artifact authority; the queue

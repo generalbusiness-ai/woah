@@ -54,20 +54,19 @@
  *                           acknowledges
  *                           but never installs marked definition riders
  *                           (CO15's authority enforcement).
- *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
- *                           delivery: deltas derived at another scope
- *                           whose owner objects anchor here apply to
- *                           this scope's relation family (owner-
- *                           sequenced — the head advances once per
- *                           applied batch) and refan to this scope's
- *                           own subscribers; idempotent by (from_scope,
- *                           seq) — a separate high-water from /adopt
+ *       POST /net/relate    {from_scope, seq, deltas, observations?} →
+ *                           CO13 affected-owner delivery: relation deltas
+ *                           derived at another scope and/or recorded facts
+ *                           addressed here apply as one owner-sequenced
+ *                           event, then refan to this scope's subscribers;
+ *                           idempotent by (from_scope, seq) — a separate
+ *                           high-water from /adopt
  *       POST /net/schedule  park a scheduled turn + arm the alarm
  *                           (test-facing until the gateway machinery
  *                           schedules from transcripts)
  *   - the durable fanout outbox (CO2.7): accepted commits enqueue
  *     /net/fanout rows (every subscriber), /net/adopt rows (every
- *     rider scope), and /net/relate rows (every foreign relation-owner
+ *     rider scope), and /net/relate rows (every foreign affected-owner
  *     scope) in the SAME transaction as the commit write-through,
  *     then drain via host.defer — never on the reply path; leftover rows
  *     drain on the next request (drain-on-reactivation);
@@ -149,15 +148,23 @@ export type NetScopeEnv = NetBindingsEnv;
  * rider scope, its rpc destination and the objects anchored to it. */
 type RiderDestinations = Record<string, { destination: string; objects: string[] }>;
 
-/** The gateway's CO13 relation-owner directions (submit HTTP-body
+/** The gateway's CO13 affected-owner directions (submit HTTP-body
  * sibling, same principle as RiderDestinations: anchor topology is
  * gateway knowledge the sequencer never learns). Per FOREIGN owner
  * scope, its rpc destination and the relation-owner OBJECTS (move
  * sources/destinations, create locations, transition rooms) anchored to
- * it. The shell turns this into the sequencer's `scopeOf` hints, so the
+ * it, plus indexes of observations whose semantic audience is that owner.
+ * The shell turns the objects into the sequencer's `scopeOf` hints, so the
  * accept-path delta partition and the /relate row destinations agree by
- * construction. Absent (direct submits, tests) → every delta is local. */
-type RelateDestinations = Record<string, { destination: string; objects: string[] }>;
+ * construction. Observation indexes let an off-owner sequenced commit hand
+ * its recorded facts to the semantic space even when no relation changed.
+ * Absent (direct submits, tests) → every delta is local and no foreign
+ * observation handoff is attempted. */
+type RelateDestinations = Record<string, {
+  destination: string;
+  objects: string[];
+  observation_indexes?: number[];
+}>;
 
 /** The outbox delivery surfaces. They drain as separate lanes so a
  * destination carrying several cannot collide row ids, and adoption/
@@ -1146,6 +1153,16 @@ export class NetScopeDO {
           echo_id?: string;
         };
         const related = this.relate(body);
+        this.metric({
+          kind: "net_scope_relate",
+          scope: this.ensureSequencer().scope,
+          from_scope: body.from_scope,
+          seq: body.seq,
+          status: related.applied ? "applied" : "duplicate",
+          changed: related.changed,
+          observations: body.observations?.length ?? 0,
+          head_seq: related.head.seq
+        });
         // Refan from a fresh alarm event; never extend the incoming
         // /relate delivery's request lineage.
         this.armOutboxRetryAlarm();
@@ -2904,11 +2921,11 @@ export class NetScopeDO {
    * the commit's LOCAL relation deltas, so subscriber gateways learn
    * rosters push-fashion — CO13), a /net/adopt row per rider scope
    * carrying only the replacement/removal keys anchored to it, and a
-   * /net/relate row per
-   * foreign relation-owner scope carrying its deltas — the gateway's
-   * rider_destinations/relate_destinations name those objects/scopes,
-   * because anchor topology is gateway knowledge the sequencer never
-   * learns. Adopt rows also carry the per-cell prior versions captured
+   * /net/relate row per foreign affected-owner scope carrying relation
+   * deltas and/or observations — the gateway's rider_destinations /
+   * relate_destinations name those objects/scopes because anchor topology
+   * is gateway knowledge the sequencer never learns. Adopt rows also carry
+   * the per-cell prior versions captured
    * pre-commit (captureRiderPriors) for the owner's CAS, and the shipped
    * rider keys are recorded in the residue ledger (see the constructor
    * comment).
@@ -2969,33 +2986,58 @@ export class NetScopeDO {
         this.persistFanoutRow(destination, delivery_seq, base, baseText);
       }
     }
-    // CO13: foreign relation deltas go to their owner scopes as durable
-    // /relate rows (same transaction as the commit, same at-least-once
-    // drain, (from_scope, seq) idempotency at the receiver — the /adopt
-    // idioms exactly). The destination comes from the gateway's
-    // relate_destinations when named, else the CO15 `scope:<scopeName>`
-    // convention (the DO namespace key IS the scope name).
-    for (const entry of reply.relations_foreign ?? []) {
-      // Client-shell phase i: room-addressed observations RIDE WITH the
-      // presence delta to the room's owner. A movement commits at the
-      // actor's own authority (B6 — off the room sequencer), so its
-      // `left`/`entered` announcements would otherwise fan out only to
-      // the committing scope's audience, where nobody is present. The
-      // owner applies the delta and refans BOTH to its subscribers under
-      // its own head seq — the transition and its announcement arrive as
-      // one sequenced event, exactly the v2 affected-scopes delivery.
-      const roomObservations = observationsForRelationOwners(observations, entry.deltas);
-      this.persistOutboxRow("/relate", relateDestinations[entry.scope]?.destination ?? `scope:${entry.scope}`, {
-        scope: seq.scope,
-        seq: reply.head.seq,
-        cells: [],
-        observations: roomObservations,
-        relations: entry.deltas,
-        // Preserve both halves through the relation-owner hop: the trusted
-        // submitter key remains internal; only the digest may reach peers.
-        submitter_turn_id: submit.idempotency_key,
-        echo_id: turnEchoId(submit.idempotency_key)
-      });
+    // CO13: foreign relation deltas AND off-owner sequenced observations go
+    // to their semantic owners as durable /relate rows (same transaction as
+    // the commit, same at-least-once drain, (from_scope, seq) idempotency at
+    // the receiver — the /adopt idioms exactly). One destination gets one
+    // combined row: movement announcements already selected by their
+    // relation owner and gateway-selected observation indexes are deduped
+    // before persistence, so the receiver's high-water cannot suppress one
+    // half of the accepted event.
+    const relationsByScope = new Map(
+      (reply.relations_foreign ?? []).map((entry) => [entry.scope, entry.deltas] as const)
+    );
+    const affectedScopes = new Set([
+      ...relationsByScope.keys(),
+      ...Object.entries(relateDestinations)
+        .filter(([, destination]) => (destination.observation_indexes?.length ?? 0) > 0)
+        .map(([scope]) => scope)
+    ]);
+    for (const affectedScope of [...affectedScopes].sort()) {
+      const deltas = relationsByScope.get(affectedScope) ?? [];
+      const selected = new Set(observationsForRelationOwners(observations, deltas));
+      for (const index of relateDestinations[affectedScope]?.observation_indexes ?? []) {
+        if (!Number.isSafeInteger(index) || index < 0 || index >= observations.length) {
+          // `relate_destinations` is internal gateway metadata, but silently
+          // dropping a malformed index would acknowledge the authority commit
+          // without its recorded fact. Abort the shared commit/outbox
+          // transaction instead; discardSeqOnThrow then reloads memory from
+          // the rolled-back durable state.
+          throw netError("E_INVARG", "affected-owner observation index is outside the transcript", {
+            scope: affectedScope,
+            index,
+            observations: observations.length
+          });
+        }
+        selected.add(observations[index]);
+      }
+      const affectedObservations = observations.filter((observation) => selected.has(observation));
+      if (deltas.length === 0 && affectedObservations.length === 0) continue;
+      this.persistOutboxRow(
+        "/relate",
+        relateDestinations[affectedScope]?.destination ?? `scope:${affectedScope}`,
+        {
+          scope: seq.scope,
+          seq: reply.head.seq,
+          cells: [],
+          observations: affectedObservations,
+          relations: deltas,
+          // Preserve both halves through the owner hop: the trusted submitter
+          // key remains internal; only the digest may reach peers.
+          submitter_turn_id: submit.idempotency_key,
+          echo_id: turnEchoId(submit.idempotency_key)
+        }
+      );
     }
     for (const rider of Object.values(riderDestinations)) {
       const objects = new Set(rider.objects);
@@ -4016,12 +4058,12 @@ export class NetScopeDO {
   }
 
   /**
-   * CO13 relation delivery: deltas derived at ANOTHER scope whose owner
-   * objects anchor here, applied to this scope's relation family as an
-   * owner-sequenced event (ScopeSequencer.applyForeignRelationDeltas
-   * advances the head once per non-empty batch — see its doc for why the
-   * refan needs a real seq), then REFANNED to this scope's own fanout
-   * subscribers so their gateways learn the roster change push-fashion.
+   * CO13 affected-owner delivery: relation deltas derived at ANOTHER scope
+   * and/or recorded observations addressed to this semantic space. The
+   * receiver applies the deltas and records one owner-sequenced event
+   * (ScopeSequencer.applyForeignRelationDeltas advances the head for changed
+   * rows or a non-empty observation carrier — see its doc for why the refan
+   * needs a real seq), then REFANS to this scope's own subscribers.
    *
    * Mirrors adopt() exactly: the application, the refan enqueue, and the
    * (from_scope, seq) high-water advance share ONE transaction, so a
@@ -4045,7 +4087,14 @@ export class NetScopeDO {
       );
       const last = rows.length > 0 ? Number(rows[0].seq) : 0;
       if (body.seq <= last) return { applied: false, changed: 0, head: seq.head() };
-      const result = seq.applyForeignRelationDeltas(body.deltas, { from_scope: body.from_scope, seq: body.seq });
+      const result = seq.applyForeignRelationDeltas(
+        body.deltas,
+        { from_scope: body.from_scope, seq: body.seq },
+        // An accepted off-owner sequenced observation is still an event for
+        // this semantic owner even when no relation row changed. Advance once
+        // so its refan carries a head seq that subscriber high-waters accept.
+        { recordEvent: (body.observations?.length ?? 0) > 0 }
+      );
       if (result.status === "applied") {
         // Refan exactly the deltas that changed this family (an add of an
         // identical row / remove of an absent row carries no news) at the

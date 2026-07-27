@@ -251,17 +251,18 @@ else
   fi
 fi
 
-# Local workerd smoke (item 1). Cross-actor net scenario against `wrangler
-# dev` (real workerd, real per-DO storage, real cross-DO RPC) — a far
-# higher-fidelity pre-deploy gate than the in-process fake run by `npm test`
-# above. (The classic `smoke:cf-dev` lane retired with the v2 stack; the net
-# workerd lane is the same fidelity rung on the net path.) It is NOT a full
-# prod replica: workerd-local runs every DO in one process with fast reliable
-# RPC, so cross-colo-latency / cold-owner-timeout authority gaps remain a
-# deploy-only signal. Gate it independently so a flaky local workerd never
-# blocks an emergency redeploy.
+# Local workerd smokes (deployment spec DP1 items 1 and 2). The protocol lane
+# proves storage/RPC/alarm mechanics through /net-smoke; the MCP lane then
+# drives the ONE shared cross-actor walkthrough through the public /net-api/mcp
+# adapter. `npm test` cannot replace either real-workerd boundary, and running
+# only item 1 previously let a broken MCP walkthrough reach main and deploy.
+#
+# These are not full production replicas: workerd-local runs every DO in one
+# process with fast reliable RPC, so cross-colo latency and cold-owner timeout
+# authority gaps remain deploy-only signals. WOO_DEPLOY_CF_DEV=0 remains the
+# emergency override for both local workerd lanes.
 if [[ "${WOO_DEPLOY_CF_DEV:-1}" == "0" || $SKIP_TESTS -eq 1 ]]; then
-  warn "skipping local workerd smoke (smoke:net-dev)"
+  warn "skipping local workerd smokes (smoke:net-dev, smoke:net-mcp)"
 else
   net_dev_log=$(mktemp -t woo-deploy-net-dev.XXXXXX.log)
   if npm run smoke:net-dev >"$net_dev_log" 2>&1; then
@@ -270,8 +271,17 @@ else
     ok "workerd smoke: ${net_dev_summary:-npm run smoke:net-dev}"
   else
     grep -aE '^(  ok|  FAIL|summary\[)' "$net_dev_log" | tail -20 || tail -20 "$net_dev_log"
-    rm -f "$net_dev_log"
-    fail "local workerd smoke failed — run: npm run smoke:net-dev"
+    fail "local workerd smoke failed — inspect $net_dev_log before rerunning: npm run smoke:net-dev"
+  fi
+
+  net_mcp_log=$(mktemp -t woo-deploy-net-mcp.XXXXXX.log)
+  if npm run smoke:net-mcp >"$net_mcp_log" 2>&1; then
+    net_mcp_summary=$(grep -a -oE 'summary\[net-mcp-walkthrough\]: [0-9]+ passed, 0 failed' "$net_mcp_log" | head -1 || true)
+    rm -f "$net_mcp_log"
+    ok "workerd MCP smoke: ${net_mcp_summary:-npm run smoke:net-mcp}"
+  else
+    grep -aE '^(  ok|  FAIL|summary\[)' "$net_mcp_log" | tail -20 || tail -20 "$net_mcp_log"
+    fail "local workerd MCP smoke failed — inspect $net_mcp_log before rerunning: npm run smoke:net-mcp"
   fi
 fi
 
