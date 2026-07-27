@@ -13,7 +13,8 @@ import {
   normalizeDispenserObservation,
   normalizeOutlinerObservation,
   rateLimitRetrySeconds,
-  recoverDispenserOrderId
+  recoverDispenserOrderId,
+  waitFor
 } from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
@@ -242,6 +243,42 @@ describe("smoke walkthrough harness", () => {
       .toEqual({ kind: "delivered", note: "o_note" });
     // A different order's fact never matches.
     expect(findDispenserFact(canceledFact, ["canceled", "delivered"], "the_horoscope", "ord_8")).toBeNull();
+  });
+
+  it("preserves later observations from a matched woo_wait batch for the next assertion", async () => {
+    const batches = [[
+      { type: "order_placed", block: "the_horoscope", order_id: "ord_9" },
+      { type: "canceled", block: "the_horoscope", order_id: "ord_9" }
+    ]];
+    let calls = 0;
+    const session = {
+      label: "bob",
+      async callTool(): Promise<unknown> {
+        const observations = batches[calls] ?? [];
+        calls += 1;
+        return { result: { structuredContent: { result: { observations } } } };
+      }
+    } as unknown as SmokeSession;
+    const cfg = { drainBudgetMs: 100, drainPollMs: 10 };
+
+    await expect(waitFor(
+      session,
+      (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", "ord_9") !== null,
+      100,
+      undefined,
+      cfg
+    )).resolves.toMatchObject({ type: "order_placed" });
+    await expect(waitFor(
+      session,
+      (obs) => findDispenserFact(obs, ["canceled"], "the_horoscope", "ord_9") !== null,
+      100,
+      undefined,
+      cfg
+    )).resolves.toMatchObject({ type: "canceled" });
+
+    // The second assertion consumed the retained suffix; it did not issue a
+    // new long-poll after the server had already drained both facts.
+    expect(calls).toBe(1);
   });
 
   it("classifies cancel replies for an order this run just placed", () => {

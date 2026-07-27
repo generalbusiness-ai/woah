@@ -78,6 +78,14 @@ const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 const DEFAULT_DRAIN_BUDGET_MS = 3000;
 const DEFAULT_DRAIN_POLL_MS = 500;
 
+// `woo_wait` drains a whole server batch. A matcher commonly wants only one
+// fact from that batch, but later facts are still future input for the next
+// assertion (the deployed Dispenser can enqueue ordered + terminal before the
+// peer's first poll). Retain only the suffix after a match: observations before
+// the match were deliberately examined and rejected, while observations after
+// it have not yet been consumed by scenario order.
+const pendingObservationSuffixes = new WeakMap<SmokeSession, unknown[]>();
+
 export async function runSmokeWalkthrough(
   pair: SmokeSessionPair,
   step: StepRunner,
@@ -1107,6 +1115,9 @@ function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 // at tail percentiles, so poll until the queue reports empty or the budget
 // elapses. Best-effort cleanup — errors are swallowed and must not fail a step.
 async function drain(session: SmokeSession, cfg: DrainConfig, signal?: AbortSignal): Promise<void> {
+  // A step boundary declares every already-received observation stale,
+  // including a suffix retained from an earlier batched match.
+  pendingObservationSuffixes.delete(session);
   const started = Date.now();
   while (Date.now() - started < cfg.drainBudgetMs) {
     try {
@@ -1125,7 +1136,7 @@ async function drain(session: SmokeSession, cfg: DrainConfig, signal?: AbortSign
 // Poll `woo_wait` until `match` returns true for one of the observations, or the
 // cumulative timeout elapses. Polls in short increments so it stays responsive
 // when the run is healthy rather than blocking on one long wait.
-async function waitFor(
+export async function waitFor(
   session: SmokeSession,
   match: (obs: Record<string, any>) => boolean,
   totalTimeoutMs: number,
@@ -1136,15 +1147,30 @@ async function waitFor(
   const seen: string[] = [];
   while (Date.now() - startedAt < totalTimeoutMs) {
     throwIfAborted(signal);
-    const remaining = totalTimeoutMs - (Date.now() - startedAt);
-    const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 }, { signal });
-    const observations = waitObservationsOf(result);
+    const pending = pendingObservationSuffixes.get(session);
+    let observations: unknown[];
+    if (pending && pending.length > 0) {
+      observations = pending.splice(0, 100);
+      if (pending.length === 0) pendingObservationSuffixes.delete(session);
+    } else {
+      const remaining = totalTimeoutMs - (Date.now() - startedAt);
+      const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 }, { signal });
+      observations = waitObservationsOf(result);
+    }
     if (observations.length) {
       cfg.log?.(`    [${session.label}] received ${observations.length} obs: ${observations.map((o: any) => o.type).join(",")}`);
     }
-    for (const obs of observations) {
+    for (let index = 0; index < observations.length; index += 1) {
+      const obs = observations[index];
       if (isRecord(obs)) seen.push(observationSummary(obs));
-      if (isRecord(obs) && match(obs)) return obs;
+      if (isRecord(obs) && match(obs)) {
+        const suffix = observations.slice(index + 1);
+        if (suffix.length > 0) {
+          const later = pendingObservationSuffixes.get(session) ?? [];
+          pendingObservationSuffixes.set(session, [...suffix, ...later]);
+        }
+        return obs;
+      }
     }
   }
   const suffix = seen.length ? `; saw ${seen.slice(-12).join("; ")}` : "; saw no observations";
