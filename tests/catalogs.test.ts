@@ -1019,6 +1019,37 @@ describe("local catalogs", () => {
     expect(() => installCatalogManifest(world, manifest, { tap: "@local", alias: "needs-chat" })).toThrow(/@local:chat.*\(none\)/);
   });
 
+  it("refuses to mint an object id the DSL cannot address, naming the reserved character", async () => {
+    // A manifest's `local_name` / `seed_hooks.as` become object ids verbatim,
+    // which makes a third-party catalog the one genuinely unconstrained
+    // id-minting path. `.` is the DSL's property-access operator, so an id
+    // carrying one is only addressable through the quoted objref escape —
+    // minting more of those grows a divergence nobody can see. The refusal has
+    // to name the character and why, or a catalog author has no way to guess.
+    const world = createWorld({ catalogs: false });
+    const dottedClass = {
+      name: "dotted-class",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [{ local_name: "$dotted.probe", parent: "$thing" }]
+    } as unknown as RuntimeCatalogManifest;
+    expect(() => installCatalogManifest(world, dottedClass, { tap: "@local", alias: "dotted-class" }))
+      .toThrow(/\$dotted\.probe.*may not contain.*property access/s);
+    expect(world.objects.has("$dotted.probe")).toBe(false);
+
+    // Seed hooks mint ids through the same seam.
+    const dottedSeed = {
+      name: "dotted-seed",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [{ local_name: "$dotted_seed_class", parent: "$thing" }],
+      seed_hooks: [{ kind: "create_instance", class: "$dotted_seed_class", as: "the.dotted.instance" }]
+    } as unknown as RuntimeCatalogManifest;
+    expect(() => installCatalogManifest(world, dottedSeed, { tap: "@local", alias: "dotted-seed" }))
+      .toThrow(/the\.dotted\.instance.*may not contain/s);
+    expect(world.objects.has("the.dotted.instance")).toBe(false);
+  });
+
   it("ignores unknown manifest object flags and keeps known ones", async () => {
     const world = createWorld({ catalogs: false });
     // `recyclable` was a catalog flag before its runtime gate was removed

@@ -1,5 +1,6 @@
 import {
   assertMap,
+  assertMintableObjectId,
   assertObj,
   assertString,
   cloneValue,
@@ -7,8 +8,10 @@ import {
   isDeeplyFrozen,
   directedRecipients,
   isErrorValue,
+  observationReachesActor,
   valuesEqual,
   type AppliedFrame,
+  type CompileDiagnostic,
   type DirectLiveAudience,
   type DirectResultFrame,
   type ErrorFrame,
@@ -1813,9 +1816,22 @@ export class WooWorld {
     location?: ObjRef | null;
     anchor?: ObjRef | null;
     flags?: WooObject["flags"];
+    /** Reconstructing an object that already exists somewhere else (identity
+     * import, world adoption) rather than minting a new one. The id was chosen
+     * by whatever world produced it — possibly before the reservation below —
+     * and refusing it here would strand a restorable world. Ordinary hydration
+     * (importWorld, Net cell application) writes `objects` directly and never
+     * reaches this method at all. */
+    restoring?: boolean;
   }): WooObject {
     const existing = this.objects.get(input.id);
     if (existing) return existing;
+    // The single mint seam. Every path that introduces a NEW object — the
+    // `create` builtin, actor/account provisioning, guest seeding, catalog
+    // install (`local_name` / `seed_hooks.as` become ids verbatim, so a
+    // third-party manifest is the one genuinely unconstrained source) —
+    // funnels through here.
+    if (!input.restoring) assertMintableObjectId(input.id);
     const now = Date.now();
     const obj: WooObject = {
       id: input.id,
@@ -6619,6 +6635,21 @@ export class WooWorld {
     };
   }
 
+  /** Upgrade the compiler's generic objref hint into a "did you mean" once the
+   * world can confirm the symbol really is an object id. The compiler has no
+   * world access, so it can only offer the general rule; eval is the surface
+   * where an agent types a freshly-created id (`obj_human_2_1:ping()`) and
+   * needs to be told the literal form is `#obj_human_2_1`. A sparse view that
+   * has not warmed the object simply keeps the generic hint — never a claim
+   * that the id does not exist. */
+  private sharpenEvalDiagnostics(diagnostics: CompileDiagnostic[]): CompileDiagnostic[] {
+    return diagnostics.map((diagnostic) => {
+      const symbol = diagnostic.symbol;
+      if (!symbol || !this.objects.has(symbol)) return diagnostic;
+      return { ...diagnostic, hint: `${symbol} is an object; address it with the objref literal — did you mean #${symbol}?` };
+    });
+  }
+
   async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(ctx.actor, surfaceClass);
     const options = progOptions(opts);
@@ -6633,7 +6664,7 @@ export class WooWorld {
     const wrapped = `verb :_eval() rxd {\n  ${body}\n}`;
     const compiled = compileVerb(wrapped);
     if (!compiled.ok || !compiled.bytecode) {
-      return { ok: false, dry_run: dryRun, diagnostics: compiled.diagnostics as unknown as WooValue };
+      return { ok: false, dry_run: dryRun, diagnostics: this.sharpenEvalDiagnostics(compiled.diagnostics) as unknown as WooValue };
     }
     if (dryRun) return { ok: true, dry_run: true, diagnostics: [] };
     // The wrapper verb is not persisted. Run it directly with the actor as
@@ -10735,12 +10766,33 @@ export class WooWorld {
     // delivery projections, matching the direct-observation path. Local stale
     // projection rows are excluded so accepted-frame fanout cannot deliver a
     // destination-room event to a session that already moved away.
-    const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
-    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) sessionSet.add(sessionId);
-    const sessions = Array.from(sessionSet);
+    const sessionActors = new Map<string, ObjRef | null>();
+    const projected = this.presenceSessionsIn(space);
+    for (const sessionId of this.sessionTableAudienceIn(space).sessions) {
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? null);
+    }
+    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) {
+      if (sessionActors.has(sessionId)) continue;
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? projected?.get(sessionId) ?? null);
+    }
+    const sessions = Array.from(sessionActors.keys());
+    if (observations.length === 0) {
+      return { audienceSessions: sessions.length > 0 ? sessions : undefined };
+    }
+    // The observation-intrinsic audience rules (directed `told`/`text`,
+    // self-addressed `looked`/`who`) apply to committed frames too: a
+    // sequenced verb that emits `tell()` must not broadcast the recipient's
+    // second-person line to the whole room. Delivery lanes that re-resolve
+    // presence themselves apply the same predicate (see gateway-do
+    // pushScopedObservations); keeping it here means the frame's own audience
+    // hint never contradicts what the transports do.
+    const perObservation = observations.map((observation) =>
+      sessions.filter((sessionId) => observationReachesActor(observation, sessionActors.get(sessionId) ?? null))
+    );
+    const union = Array.from(new Set(perObservation.flat()));
     return {
-      audienceSessions: sessions.length > 0 ? sessions : undefined,
-      observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
+      audienceSessions: union.length > 0 ? union : undefined,
+      observationSessionAudiences: perObservation
     };
   }
 

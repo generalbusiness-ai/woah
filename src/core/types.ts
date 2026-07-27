@@ -126,6 +126,35 @@ export function directedRecipients(observation: Observation): DirectedRecipients
   };
 }
 
+/**
+ * Recipient test for one carrier when a *space-wide* observation list is being
+ * delivered to a single session — the `applied`-frame (sequenced) fanout path.
+ *
+ * That path carries no per-observation audience vector: each gateway shard
+ * replays the space's committed observations and re-resolves delivery from its
+ * own presence mirror, so the planner's enumeration cannot travel with the
+ * frame. The two audience rules that are *intrinsic to the observation* do
+ * survive the round trip, and both must be applied at every delivery point:
+ *
+ *   - directed observations (§12.7.1 `told`/`text`) reach only `to`/`from`
+ *     (for `text`, the `target` recipient);
+ *   - self-addressed `looked`/`who` payloads reach only their `to`.
+ *
+ * Without the directed half, a `tell()` emitted inside a *sequenced* verb —
+ * a catalog exit verb sends the mover its second-person departure line before
+ * broadcasting the room's third-person `left` — reaches every session in the
+ * room. A browser client happens to re-filter `text` by `target`, but a raw
+ * MCP wait queue does not, so an agent reads another actor's private line.
+ * Audience is server-side state; no transport may be trusted to redo it.
+ */
+export function observationReachesActor(observation: Observation, actor: ObjRef | null): boolean {
+  const directed = directedRecipients(observation);
+  if (directed.to !== null) {
+    return actor !== null && (actor === directed.to || actor === directed.from);
+  }
+  return typeof observation.to !== "string" || observation.to === actor;
+}
+
 export type AppliedFrame = {
   op: "applied";
   id?: string;
@@ -644,6 +673,12 @@ export type CompileDiagnostic = {
   severity: "error" | "warning" | "info";
   code: string;
   message: string;
+  /** Remediation sentence for a human or an agent. The compiler supplies the
+   * generic form; a caller with world knowledge (e.g. `eval`) may sharpen it. */
+  hint?: string;
+  /** The offending source symbol, when the diagnostic is about one. Lets a
+   * caller check it against the world without re-parsing `message`. */
+  symbol?: string;
   span?: {
     line: number;
     column: number;
@@ -681,6 +716,43 @@ export type InstallResult = {
 
 export function wooError(code: string, message?: string, value?: WooValue): ErrorValue {
   return { code, message, value };
+}
+
+/**
+ * Characters a NEWLY MINTED object id may not contain, with the reason each is
+ * reserved. One table, consulted by the one enforcement point below — id rules
+ * that live in several places drift.
+ *
+ * `.` is the DSL's property-access operator. A bare ref literal ends at the
+ * first character outside `[A-Za-z0-9_-]`, so `#foo.bar` reads property `bar`
+ * on object `foo`; an id carrying a dot is expressible only through the quoted
+ * escape `#"foo.bar"`. Minting more of those makes every future reference to
+ * them a trap, so the reservation stops the divergence growing.
+ */
+const RESERVED_OBJECT_ID_CHARS: ReadonlyArray<{ char: string; reason: string }> = [
+  { char: ".", reason: "the DSL reads `#obj.name` as property access, so a dotted id is only expressible as the quoted objref `#\"obj.name\"`" }
+];
+
+/**
+ * Mint-time object-id rule. Ids stay **opaque** everywhere else — in storage,
+ * on the Net wire, in cell keys, and on every read/call/restore path — because
+ * a world may already hold an id that predates this rule (or that a
+ * third-party catalog minted through `local_name`). Those objects keep working
+ * and remain addressable from DSL source through the quoted ref form; only new
+ * mints are constrained. The Net transport has its own, separate reservation
+ * of `:` as the compound cell-key delimiter (`isConcreteRuntimeObjectId`),
+ * which is a wire-format rule rather than a mint rule and is deliberately not
+ * duplicated here.
+ */
+export function assertMintableObjectId(id: string): void {
+  for (const { char, reason } of RESERVED_OBJECT_ID_CHARS) {
+    if (!id.includes(char)) continue;
+    throw wooError(
+      "E_INVARG",
+      `object id ${JSON.stringify(id)} may not contain ${JSON.stringify(char)}: ${reason}`,
+      { id, reserved: char }
+    );
+  }
 }
 
 // Guarded recursive clone for plain JSON-shaped data. This is the hot clone

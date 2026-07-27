@@ -385,6 +385,10 @@ export async function importIdentity(
         parent: actor.parent,
         owner: actor.owner,
         flags: actor.flags as never,
+        // Reconstruction, not a mint: this id was chosen by the exporting
+        // world, possibly before the mint-time id reservation existed. An
+        // export must stay importable, so the reservation is not applied here.
+        restoring: true,
         // Anchor is set at creation and never patched (world.ts) — it must ride
         // the create call, not a later setProp, to reconstruct the authority
         // family's single-cluster placement. Verified below to resolve.

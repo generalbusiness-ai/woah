@@ -190,6 +190,13 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
       expect(progNames, `${verb} missing from ${JSON.stringify(progNames.filter((n) => n.startsWith(p)))}`).toContain(`${p}__${verb}`);
     }
 
+    // ...and `trace` is deliberately NOT among them. It is a v1.1 stub whose
+    // only behavior is to raise, so listing it would advertise a tool that can
+    // never succeed. Assert from the LIVE list, not the manifest flag: this is
+    // the project's repeat defect (tool_exposed in a manifest is not evidence
+    // of callability, and a flag flip here is silent).
+    expect(progNames, "trace is a raise-only stub; it must not be advertised").not.toContain(`${p}__trace`);
+
     // The removed "all" scope is rejected by the MCP validator, not silently
     // degraded to the local closure (§7 / no global enumeration).
     const scopeAll = await call(progSession, "woo_list_reachable_tools", { scope: "all" });
@@ -296,6 +303,25 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const invokedGeneric = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
     await settleAll();
     expect(invokedGeneric.result?.structuredContent?.result, JSON.stringify(invokedGeneric).slice(0, 600)).toBe(42);
+
+    // (12) Reaching the unadvertised `trace` stub anyway (eval dispatches under
+    // the actor's own authority and is not tool-gated) must produce an answer
+    // an agent can act on: what it would have done, that it is absent from this
+    // world, and what to use instead. The programmer flag is NOT the blocker —
+    // this agent holds it — so a "you lack authority" style refusal would send
+    // the reader hunting for a permission that would not help.
+    const tracedRaw = await call(progSession, "woo_call", {
+      object: progAgent,
+      verb: "eval",
+      args: [`this:trace(#${widget}, "hi")`, {}]
+    });
+    await settleAll();
+    const tracedText = JSON.stringify(tracedRaw);
+    expect(tracedRaw.result?.isError, tracedText.slice(0, 400)).toBe(true);
+    expect(tracedText).toContain("E_NOT_IMPLEMENTED");
+    expect(tracedText).toContain("not implemented in this world");
+    expect(tracedText).toContain("list_verb");
+    expect(tracedText).not.toContain("E_PERM");
 
     for (const st of states) st.close();
   });

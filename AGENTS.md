@@ -102,12 +102,20 @@ observation shapes the catalog emits.
     `moveto(this, target)` from inside `:moveto` falls through via a
     per-call marker set, so a verb can decorate the move and still let
     the default chain finish it.
-  - `observationAudienceActors` (~5821): who receives an `observe()`.
+  - `observationAudienceActors` (~10458): who receives an `observe()`.
     Order: `_audience_override` → typed routing for `looked`/`who`
-    (`to`-only) → directed recipients (`to`/`from`) → `observation.source`
-    if it's a $space → fallback to the call's audience. `entered`/`left`/
-    `taken`/`dropped` exclude the actor from the room broadcast (the
-    actor's own `tell(...)` line covers their view).
+    (`to`-only) → an actor-valued `target` → directed recipients
+    (`to`/`from`) → `observation.source` if it's a $space → fallback to
+    the call's audience. `entered`/`left`/`taken`/`dropped` exclude the
+    actor from the room broadcast (the actor's own `tell(...)` line
+    covers their view).
+  - Committed (`applied`-frame) fanout carries NO audience vector — each
+    gateway shard re-resolves it from its own presence mirror. The
+    observation-intrinsic rules therefore have to be re-applied at every
+    delivery point: `observationReachesActor` (`src/core/types.ts`) is
+    the single predicate, used by `appliedFrameAudience` here and by
+    `pushScopedObservations` in `src/worker/net/gateway-do.ts`. Skipping
+    it leaks a sequenced `tell()` to the whole room.
 - `tiny-vm.ts` — verb bytecode interpreter. `OBSERVE`/`EMIT` ops invoke
   `ctx.observe(...)`; `recycle`/`moveto`/`create`/`isa` etc. are builtins
   in the big switch around line 1000.

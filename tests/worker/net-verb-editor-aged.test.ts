@@ -155,7 +155,17 @@ describe("Verb editor aged-world repair (fake-DO lane)", () => {
     const aged = await callVerb(agent, "edit_verb", [widget, "hi", {}]);
     const agedText = JSON.stringify(aged);
     expect(aged?.result?.isError, `aged edit_verb unexpectedly succeeded — the aging step no longer reproduces: ${agedText.slice(0, 300)}`).toBe(true);
-    expect(agedText).toContain("E_TYPE");
+    // The refusal must be legible to the agent that hit it, not an internals
+    // dump. The substrate's contract check ("editor must be space-like and
+    // define a private sessions property") is correct but names neither the
+    // object nor a remedy; the prog catalog owns the editor contract and
+    // translates it. An operator reading a bug report needs the object name
+    // and the repair op; the agent needs to know what still works.
+    expect(agedText).toContain("E_EDITOR_UNAVAILABLE");
+    expect(agedText).toContain(EDITOR);
+    expect(agedText).toContain("repair:net-definitions");
+    expect(agedText).toContain("install_verb and list_verb still work");
+    expect(agedText, "the raw substrate contract string must not reach the agent").not.toContain("space-like");
 
     // --- 2. the signed operator definition repair carries the current page --
     // Inputs mined exactly the way `npm run repair:net-definitions --

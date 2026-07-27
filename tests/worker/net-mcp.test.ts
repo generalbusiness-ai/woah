@@ -443,6 +443,15 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const moveObs = waitedMove.result?.structuredContent?.result?.observations ?? [];
     const left = moveObs.find((obs: any) => obs?.type === "left" && obs.actor === alice);
     expect(left, JSON.stringify(moveObs).slice(0, 400)).toBeTruthy();
+    // ...and ONLY the third-person line. `$exit:move` tells the mover its
+    // second-person `leave_msg` from inside the SEQUENCED move, so that `text`
+    // observation rides the committed applied frame through the same fanout.
+    // The browser client re-filters `text` by `target`; a raw MCP queue does
+    // not, so the audience rule has to hold server-side (events.md §12.7.1).
+    const leakedEcho = moveObs.find((obs: any) => obs?.type === "text" && obs.target !== bob);
+    expect(leakedEcho, `directed echo leaked to a bystander: ${JSON.stringify(moveObs).slice(0, 400)}`).toBeUndefined();
+    // (The mover's own copy rides the turn reply / its other sessions' fanout;
+    // tests/worker/net-ws.test.ts pins both halves of that audience rule.)
     expect(await nextSseMessage(aliceToolEvents)).toEqual({
       jsonrpc: "2.0",
       method: "notifications/tools/list_changed"

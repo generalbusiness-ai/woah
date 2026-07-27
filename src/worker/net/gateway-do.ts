@@ -112,6 +112,9 @@ import {
   isRecognizedGuestResetVerbPageFor
 } from "../../core/bootstrap";
 import { turnEchoId } from "../../net/turn-echo";
+// Audience rules that live inside the observation (directed / self-addressed)
+// are shared with the core direct-call path so both delivery lanes agree.
+import { observationReachesActor, type Observation } from "../../core/types";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
@@ -6334,17 +6337,21 @@ export class NetGatewayDO {
           if (mode === "explicit") {
             if (Array.isArray(sessionAudience) && sessionAudience.includes(row.member)) return true;
             if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
-            return Array.isArray(sessionAudience) ? false : typeof obs?.to !== "string" || obs.to === actor;
+            return Array.isArray(sessionAudience) ? false : observationReachesActor(obs as unknown as Observation, actor);
           }
           // Compatibility for older live carriers that predate the mode
           // vector: preserve their session-first filtering contract.
           if (Array.isArray(sessionAudience)) return sessionAudience.includes(row.member);
           if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
         }
-        // Rolling/committed fallback for older carriers: looked/who-style
-        // `to` observations stay private; ordinary observations broadcast to
-        // every session present in this scope.
-        return typeof obs?.to !== "string" || obs.to === actor;
+        // Committed fanout (and the rolling fallback for older live carriers)
+        // ships no audience vector — every shard re-resolves delivery from its
+        // own presence mirror. Apply the audience rules that live inside the
+        // observation itself: directed `told`/`text` reach only their named
+        // recipient, self-addressed `looked`/`who` only their `to`, everything
+        // else broadcasts to the sessions present in this scope. See
+        // observationReachesActor (core/types.ts) and events.md §12.7.
+        return observationReachesActor(obs as unknown as Observation, actor);
       });
       if (visible.length === 0) continue;
       deliveredMembers += 1;

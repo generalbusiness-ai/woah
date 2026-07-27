@@ -271,7 +271,12 @@ the MCP-tool gates above.
 ## Deferred
 
 - `trace` is declared but returns `E_NOT_IMPLEMENTED` until source-span tracing
-  is wired for live calls.
+  is wired for live calls. It is `tool_exposed: false` on purpose: a tool whose
+  only behavior is to raise is worse than an absent one, because an agent
+  spends a turn discovering that. Its refusal names the substitutes
+  (`list_verb`, `eval`, the trace frames on raised errors); a live-tools/list
+  assertion in tests/worker/net-mcp-programmer.test.ts keeps the flag honest,
+  since the manifest flag alone has never been evidence of callability.
 - Full search indexes are deferred; the first version may use bounded local
   scans.
 - Shared live buffers are deferred; first editor-room sessions are per actor.

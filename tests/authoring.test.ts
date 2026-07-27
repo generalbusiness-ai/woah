@@ -301,6 +301,67 @@ describe("authoring", () => {
     }));
   });
 
+  it("reserves the DSL's property-access character in new object ids, but never on the restore path", async () => {
+    const world = createWorld();
+    // Mint: refused, and the refusal says which character and why. Every
+    // runtime mint funnels through createObject; the ids the VM generates
+    // (`obj_<scope>_<n>`) can never trip this, so the rule exists for the one
+    // path that takes an id from outside — a catalog manifest's local_name.
+    expect(() => world.createObject({ id: "mint.me", parent: "$thing", owner: "$wiz" }))
+      .toThrow(/may not contain "\."/);
+    expect(world.objects.has("mint.me")).toBe(false);
+
+    // Restore: accepted. Ids are opaque in storage and on the wire, so an
+    // identity export or an adopted world may carry an id minted before this
+    // rule existed. Refusing it here would strand a restorable world; the
+    // quoted objref form (`#"legacy.dotted"`) is what keeps it addressable
+    // from source. See tests/programmer-eval.test.ts for that half.
+    const restored = world.createObject({ id: "legacy.dotted", parent: "$thing", owner: "$wiz", restoring: true });
+    expect(restored.id).toBe("legacy.dotted");
+    expect(world.objects.has("legacy.dotted")).toBe(true);
+  });
+
+  it("names the editor and the operator remediation when the editor space is absent", async () => {
+    // The walkthrough hit this on the workerd lane and prod alike: with the
+    // seeded editor unreadable, edit_verb answered with the substrate's
+    // contract string ("editor must be space-like and define a private
+    // sessions property"). True, and useless — it names no object, no cause,
+    // and no fix, so neither the agent nor the operator reading its bug report
+    // can act. Core stays generic (it may not name catalog objects); the prog
+    // catalog, which owns the editor contract, translates.
+    const world = createWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const programmer = world.auth("guest:verb-editor-absent");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+    const baseCreated = await world.directCall("absent-editor-base", programmer.actor, programmer.actor, "create", ["$thing", { name: "Editor Base" }]);
+    expect(baseCreated.op).toBe("result");
+    const base = baseCreated.op === "result" ? (baseCreated.result as Record<string, string>).id : "";
+
+    // A world installed before the prog catalog's create_instance seed hook
+    // (or one whose sparse view has not warmed the editor) has no readable
+    // editor object at all.
+    expect(world.objects.delete("the_verb_editor")).toBe(true);
+
+    const refused = await world.directCall("absent-editor-open", programmer.actor, programmer.actor, "edit_verb", [base, "title", {}]);
+    expect(refused.op).toBe("error");
+    if (refused.op !== "error") return;
+    expect(refused.error.code).toBe("E_EDITOR_UNAVAILABLE");
+    expect(refused.error.message).toContain("the_verb_editor");
+    expect(refused.error.message).toContain("reinstalling the prog catalog");
+    expect(refused.error.message).toContain("repair:net-definitions");
+    expect(refused.error.message).toContain("install_verb and list_verb still work");
+    expect(refused.error.message, "the substrate's internal contract string must not reach the caller").not.toContain("space-like");
+    expect(refused.error.value).toMatchObject({
+      editor: "the_verb_editor",
+      target: base,
+      descriptor: "title",
+      remediation: "repair:net-definitions"
+    });
+  });
+
   it("supports verb editor room sessions through the programmer surface", async () => {
     const world = createWorld();
     // The verb editor exit-to-$nowhere assertions below assume the actor had
