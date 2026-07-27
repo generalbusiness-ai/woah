@@ -655,6 +655,33 @@ describe("local catalogs", () => {
     expect(mergeSeedMapProperty(["broken"], seeded, supersedes)).toBeNull();
   });
 
+  // A seed map is DATA (values.md V6). Topic names and other manifest keys can
+  // collide with Object.prototype members, and inherited-member access breaks
+  // the merge in both directions: `"constructor" in {}` is true, so the key
+  // would read as already-present and never seed, and `merged["__proto__"] = v`
+  // reaches the prototype accessor instead of defining a property.
+  it("merge_map treats Object.prototype member names as ordinary keys", async () => {
+    const { mergeSeedMapProperty } = await import("../src/core/seed-property-merge");
+    // NOTE the computed key: a bare `__proto__:` in an object literal is the
+    // prototype-setter syntax and would never become an own key at all.
+    const seeded = { constructor: ["ctor"], toString: ["str"], ["__proto__"]: ["proto"] } as Record<string, unknown>;
+
+    const fresh = mergeSeedMapProperty(undefined, seeded, undefined);
+    expect(fresh?.changed).toBe(true);
+    expect(Object.keys(fresh?.merged ?? {}).sort()).toEqual(["__proto__", "constructor", "toString"]);
+    expect(Object.getPrototypeOf(fresh?.merged)).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+    // A stored map already holding those keys is respected, not re-seeded.
+    const converged = mergeSeedMapProperty(fresh?.merged, seeded, undefined);
+    expect(converged?.changed).toBe(false);
+
+    // And the supersedes lookup is own-key too: an absent fingerprint must not
+    // resolve an inherited member and license a replacement.
+    const edited = { constructor: ["operator edit"] };
+    expect(mergeSeedMapProperty(edited, { constructor: ["ctor"] }, {})?.changed).toBe(false);
+  });
+
   it("repairs older demoworld installs where the garden missed $conversational", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);

@@ -87,7 +87,17 @@ function sortKeys(value: unknown): unknown {
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const k of Object.keys(value as Record<string, unknown>).sort()) {
-      out[k] = sortKeys((value as Record<string, unknown>)[k]);
+      const encoded = sortKeys((value as Record<string, unknown>)[k]);
+      // `out[k] = v` reaches Object.prototype's `__proto__` accessor for that
+      // one key name (values.md V6), which would DROP the entry from the
+      // canonical form. This function decides cell identity, so a dropped key
+      // means two materially different cell values hash identically — a
+      // version collision, not merely lost text.
+      if (k === "__proto__") {
+        Object.defineProperty(out, k, { value: encoded, writable: true, enumerable: true, configurable: true });
+      } else {
+        out[k] = encoded;
+      }
     }
     return out;
   }

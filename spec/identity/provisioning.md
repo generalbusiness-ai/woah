@@ -920,8 +920,10 @@ apikey holder pairs a long-lived key with an already-minted session id. Note
 credential on that actor survives retirement — a retired wizard was verified to
 commit a wizard-only `set_quota` turn this way. Both classes therefore refuse
 `E_PERM identity_deactivated` when the resolved actor's `deactivated_at` cell is
-present in the serving gateway's view with a non-null value. This check is deliberately **view-only and conservative**: it never warms
-or fetches (it is on every session-bearer request), and an absent cell is not a
+present in the serving gateway's view with a non-null value.
+
+This check is deliberately **view-only and conservative**: it never warms or
+fetches (it is on the hot path of every authenticated request), and an absent cell is not a
 refusal, because a gateway that has not pulled the actor's cluster cannot
 distinguish "not deactivated" from "not pulled". Propagation is therefore
 **eventual** — the tombstone commits in the same authority cluster that hosts

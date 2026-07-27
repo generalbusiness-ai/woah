@@ -192,6 +192,26 @@ path whose reason for existing is that it is cheap). Regression tests added to
 `tests/clone-plain-data.test.ts`. This affects every map property in the
 system, not just AP11's ledger.
 
+Auditing the sibling sites (`out[k] = v` over untrusted keys, plus inherited
+`in`/index reads) found three more real ones, all fixed with tests:
+
+- **`sortKeys` in `src/net/cells.ts`** — the CANONICAL cell encoder behind
+  `cellVersion`. A dropped key means two materially different cell values hash
+  identically: a version collision, not merely lost text. Safe to change
+  because no stored world can hold such a value — the clone path destroyed it
+  before it could be persisted.
+- **`scrubTombstoneRefs` in `world.ts`** — a `__proto__` entry vanished from any
+  map that survived a tombstone scrub, turning a GC pass into silent data loss.
+- **`mergeSeedMapProperty`** — wrong in BOTH directions: `key in merged` is an
+  inherited test (`"constructor" in {}` is true), so a manifest key named after
+  a prototype member read as already-present and never seeded, and the write
+  dropped `__proto__`. The `supersedes?.[key]` lookup was inherited too, which
+  could license a replacement from a fingerprint that was never declared.
+
+Checked and already correct: the VM's `INDEX_SET` uses the safe
+object-literal computed-key form, so woocode `m["__proto__"] = v` cannot
+pollute.
+
 Honest scoping note: the gateway half of R4 (own-key prefetch read) is
 **defence in depth**, not a reproducible failure — an inherited lookup there
 yields a function, `typeof === "string"` rejects it, and the prefetch is merely
@@ -235,6 +255,12 @@ in the ordering where it matters.
   with a seeded credential, which is a bigger identity decision than this
   change should make. The runbook step below is the sanctioned path for every
   world, fresh or aged.
+- **Remaining V6 sites are unaudited.** `catalog-installer.ts` (exits map),
+  `bootstrap.ts` verb-metadata copy, and two `out[...]` builders in
+  `gateway-do.ts` use the same `obj[key] = value` shape. Their keys are object
+  ids, scope names, or a fixed metadata vocabulary rather than user text, so
+  the exposure is much lower — but they were reasoned about, not probed, and
+  are not claimed correct.
 - **Dead exports discovered**: `nativePrimitiveOpenSeedVerbLookups`,
   `…ObjectPropertyNames`, `…CatalogPropertyNames`, `…DispatchVerbNames` in
   `src/core/native-primitive-contract.ts` have no callers anywhere (leftovers

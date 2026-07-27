@@ -2014,7 +2014,14 @@ export class WooWorld {
         }
         const next = this.scrubTombstoneRefs(entry);
         if (!valuesEqual(entry, next)) changed = true;
-        out[key] = next;
+        // Own-property definition, not [[Set]] (values.md V6): a `__proto__`
+        // entry would otherwise vanish from any map that survives a tombstone
+        // scrub, turning a GC pass into silent data loss.
+        if (key === "__proto__") {
+          Object.defineProperty(out, key, { value: next, writable: true, enumerable: true, configurable: true });
+        } else {
+          out[key] = next;
+        }
       }
       return changed ? out as WooValue : value;
     }

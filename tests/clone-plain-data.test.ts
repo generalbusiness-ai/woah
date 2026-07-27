@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { clonePlainData, cloneValue, deepFreezePlainValue } from "../src/core/types";
+import { cellVersion } from "../src/net/cells";
 
 describe("clonePlainData", () => {
   it("deep-clones nested plain data with full isolation", () => {
@@ -109,6 +110,17 @@ describe("clonePlainData", () => {
     );
     // Nothing leaked onto a bystander object.
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("the canonical cell encoder keeps a __proto__ entry (cell identity)", () => {
+    // cellVersion decides cell IDENTITY. Dropping a key from the canonical form
+    // makes two materially different values hash the SAME — a version
+    // collision, not merely lost text.
+    const withKey = { ...{}, ["__proto__"]: "a", z: 1 };
+    const withoutKey = { z: 1 };
+    expect(cellVersion(withKey)).not.toBe(cellVersion(withoutKey));
+    expect(cellVersion(withKey)).toBe(cellVersion({ ...{}, ["__proto__"]: "a", z: 1 }));
+    expect(cellVersion(withKey)).not.toBe(cellVersion({ ...{}, ["__proto__"]: "b", z: 1 }));
   });
 
   it("cloneValue delegates to clonePlainData for WooValue", () => {
