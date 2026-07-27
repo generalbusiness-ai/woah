@@ -314,14 +314,20 @@ authority and allowed it for anybody.
 each other**: the second upserts the first (CO16.2). Pass distinct tags for
 concurrent reminders.
 
-**Deadlines are internal.** A deadline is shared by construction — one
-actor arms it and a *different* one cancels it, which is the whole
-escalation pattern — so its id cannot be scoped to the arming actor the way
-a reminder's is. Left publicly callable, that let any user cancel or
-replace anyone's deadline from a guessable key. So `:deadline` and
-`:cancel_deadline` are reachable only from the consumer's own verbs
-(`this:deadline(...)`), and the consumer decides who may arm and cancel,
-because only it knows what the deadline means.
+**Deadlines are internal, enforced by `caller == this`.** A deadline is
+shared by construction — one actor arms it and a *different* one cancels
+it, which is the whole escalation pattern — so its id cannot be scoped to
+the arming actor the way a reminder's is. Left reachable, that lets any
+user cancel or replace anyone's deadline from a guessable key.
+
+The guard is an in-verb check that the caller is the object itself, the
+same one `$acts:act` uses. Withholding `direct_callable` is **not** enough
+and must not be mistaken for a boundary: that flag gates the *direct* route
+only, and client room calls default to **sequenced**, where it is never
+consulted. A co-present guest calling `room:cancel_deadline(...)` on the
+sequenced route reached the primitive and it applied — under the catalog's
+own wizard authority. An attacker's verb dispatching at another object gets
+there too. `caller == this` refuses both, whatever route the request took.
 
 **Ticking is the object owner's call.** A chain's key is object-global, so
 without that gate any visitor could stop a room's chain or restart it at a

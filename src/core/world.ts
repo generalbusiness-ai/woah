@@ -5091,7 +5091,7 @@ export class WooWorld {
       // `fired_at` diverge after eviction, after a floor deferral, and after a
       // busy scope defers a due batch. A no-catch-up chain needs to see that
       // gap, and the spec promised it before anything carried it.
-      ...(options.scheduled ? { scheduled: options.scheduled as unknown as WooValue } : {})
+      ...(options.scheduled ? { scheduled: options.scheduled } : {})
     };
     const deferredHostEffects: DeferredHostEffect[] = [];
     let result: WooValue = null;

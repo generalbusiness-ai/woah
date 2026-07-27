@@ -244,6 +244,66 @@ describe("$scheduling — deadlines", () => {
     ).ok).toBe(true);
   }
 
+  it("refuses a SEQUENCED call to the deadline primitive", async () => {
+    // The path the direct-call test missed entirely. Room client calls
+    // default to `sequenced`, and the `direct_callable` metadata gate applies
+    // only to the direct route — so removing that flag blocked nothing here.
+    // A co-present guest could call room:cancel_deadline(...) and have it
+    // apply, under this catalog's $wiz programmer authority.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    for (const [verb, args] of [
+      ["deadline", [86_400_000, "escalate", [], "k"]],
+      ["cancel_deadline", ["k"]]
+    ] as const) {
+      const applied = await world.call(`seq-${verb}`, session.id, "the_widget", {
+        actor,
+        target: "the_widget",
+        verb,
+        args: [...args] as never[]
+      });
+      // The turn may be applied (it consumed a seq), but the VERB must refuse:
+      // no schedule effect may survive it.
+      const observations = (applied as { observations?: Array<{ type: string; code?: string }> }).observations ?? [];
+      expect(observations.some((o) => o.type === "$error" && o.code === "E_PERM")).toBe(true);
+    }
+  });
+
+  it("refuses an attacker-owned verb dispatching into another object's deadline", async () => {
+    // The second path: the caller need not be a client at all. A verb on the
+    // attacker's OWN object can dispatch at the victim room. `caller` is then
+    // the attacker's object, not the victim — which is exactly what the
+    // caller != this guard tests, and what a direct-ingress flag never could.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    world.createObject({ id: "attacker_thing", name: "Attacker", parent: "$room", owner: actor });
+    expect(installVerb(
+      world, "attacker_thing", "steal",
+      'verb :steal(victim) rxd { return dispatch(victim, "cancel_deadline", ["k"]); }',
+      null
+    ).ok).toBe(true);
+
+    const moved = await world.directCall("to-attacker", actor, actor, "moveto", ["attacker_thing"] as never, {
+      sessionId: session.id
+    } as never);
+    expect(moved.op).toBe("result");
+    const outcome = await world.directCall("steal-1", actor, "attacker_thing", "steal", ["the_widget"] as never, {
+      sessionId: session.id
+    } as never);
+    expect(outcome.op).toBe("error");
+    expect(JSON.stringify(outcome)).toMatch(/E_PERM/);
+  });
+
+  it("still lets the object's OWN verbs reach it", async () => {
+    // The guard must not break the only legitimate caller — the pattern
+    // casework depends on.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    await withConsumerVerbs(world);
+    const { outcome } = await callAndRecord(world, actor, "the_widget", "arm_it", [86_400_000, "escalate", [], "ok-key"], "own-1", session.id);
+    expect(outcome.op).toBe("result");
+  });
+
   it("refuses reaching the deadline primitive from outside", async () => {
     // The DoS this closes: deadline ids are object-global by necessity (the
     // opener arms, a different claimer cancels), so a publicly callable

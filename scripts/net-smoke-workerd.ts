@@ -50,8 +50,13 @@
 // available here — a full process restart over the same persistence
 // directory, so a scheduled turn must come back from durable state alone —
 // which is genuinely more than "the alarm fires while the process is warm".
-// It still says NOTHING about the deploy-only multi-day alarm question
-// (tasks.md 16.2): a six-second gap is not a six-day one. Cross-colo
+// Run 1b waits past the due time WITHOUT addressing the scope, so the first
+// post-due read either already shows the effect (the stored alarm survived
+// and woke the host on its own) or it does not. An earlier version polled
+// immediately, which cold-hydrated the scope — and hydration re-arms every
+// pending row, so the poll repaired the wake and then observed its own
+// repair. It still says NOTHING about the deploy-only multi-day alarm
+// question (tasks.md 16.2): a six-second gap is not a six-day one. Cross-colo
 // latency is modeled by injected latency, not real distance.
 //
 // Exit: 0 all steps pass, 1 any step fails, 2 harness crash.
@@ -677,23 +682,32 @@ async function main(): Promise<number> {
         }
       });
       restartCounterBefore = (await readCounter(base)) ?? -1;
+      // Assert the timer is genuinely still PENDING when the process dies —
+      // "counter >= 0" would have been satisfied by an entry that already
+      // fired, quietly degrading this into the warm case above.
+      const pending = await get<{ pending: Array<{ id: string; at: number }> }>(base, "scope", ROOM, "schedules");
+      const row = pending.pending.find((entry) => entry.id === "lane-tick-restart");
+      const remainingMs = row === undefined ? -1 : row.at - Date.now();
       step(
-        "armed a future scheduled turn, then stopped workerd before it was due",
-        restartCounterBefore >= 0,
-        `counter=${restartCounterBefore}`
+        "armed a future scheduled turn, still pending with time to spare when workerd is stopped",
+        restartCounterBefore >= 0 && remainingMs > 1000,
+        `counter=${restartCounterBefore} remaining=${remainingMs}ms`
       );
     },
     async (base) => {
       // A cold process: no in-memory sequencer, no armed alarm, no planner
       // subscription in memory. All of it has to come back from storage.
-      const bumped = await poll(async () => {
-        const value = await readCounter(base);
-        return value !== undefined && value > restartCounterBefore ? value : null;
-      }, 25_000);
+      // Do NOT touch the scope yet. Any request cold-hydrates it, and
+      // hydration re-arms every pending row — so polling would repair the
+      // wake and then congratulate itself for observing it. Waiting past the
+      // due time without addressing the DO is what separates "the stored
+      // alarm survived and woke the host" from "our own read fixed it".
+      await sleep(9000);
+      const firstRead = await readCounter(base);
       step(
-        "the scheduled turn fired in a NEW workerd lifetime, from durable state alone",
-        bumped !== null,
-        `counter ${restartCounterBefore} -> ${String(bumped)}`
+        "the stored alarm woke a NEW workerd lifetime with no request to prompt it",
+        firstRead !== undefined && firstRead > restartCounterBefore,
+        `first post-due read: ${restartCounterBefore} -> ${String(firstRead)}`
       );
     },
     laneWorkerdOptions

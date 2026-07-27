@@ -86,6 +86,14 @@ user delete anyone's escalation from a guessable key. So deadlines are a
 catalog-internal primitive reached through `this:deadline(...)`, and the
 consumer catalog decides who may arm and cancel.
 
+The enforcement is `caller != this` inside the verb, not the absence of
+`direct_callable`. That flag gates the direct route only; client room calls
+default to sequenced, where nothing consults it. Withholding it looked like
+a boundary and was not one — a co-present guest could still call
+`room:cancel_deadline(...)` and have it apply. This is worth remembering
+generally: in this codebase `direct_callable` is an ingress convention, and
+anything that needs to be unreachable needs a check in the verb body.
+
 Ticking sits between the two: its key is object-global like a deadline's, but
 it is ambient behaviour of the object, so it is gated on the owner.
 
