@@ -145,10 +145,16 @@ on Net is granted by AP11.
 
 ## Verification lanes actually run
 
-- `npm run typecheck` — both tsconfigs.
-- `npm test` (fast guarded gate) and `npm run test:worker`.
+- `npm run typecheck` — both tsconfigs, clean.
+- `npm test` — 81 files, 987 tests, all passing (was 978 on the branch point).
+- `npm run test:worker` — 40 files, 302 tests, all passing.
 - `tests/worker/net-provision-wizard.test.ts` — real fake DOs, real signed
-  route, real `/net-api/session` + `/net-api/turn`.
+  route, real `/net-api/session` + `/net-api/turn`. The wizard-authority claim
+  is proved against a CONTROL agent in the same cluster that gets `E_PERM` on
+  the identical call, so it cannot pass by accident.
+- `tests/operator-wizard-provision.test.ts` — core semantics: quota accounting,
+  the local audit sequence, convergence, and the four fail-closed ledger
+  branches. Added to the `npm test` curated list.
 - `tests/worker/net-only-entry.test.ts` — the edge allow-list and fresh
   signing.
 - `tests/net/net-provision-wizard-script.test.ts` — the CLI's three-call

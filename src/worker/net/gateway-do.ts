@@ -2427,7 +2427,19 @@ export class NetGatewayDO {
       return json({ error: { code: "E_INVARG", message: "provision_id must be 1..128 chars of [A-Za-z0-9._:-]" } }, 400);
     }
     const apiKeyId = typeof body.api_key_id === "string" ? body.api_key_id.trim() : "";
-    const epoch = (await this.catalogIdentity()).epoch;
+    // Named world-state verdicts (not installed / not active) rather than the
+    // generic 500 the outer handler would give a ClientAuthError: an operator
+    // running this against a half-installed namespace must be able to tell
+    // "the world is not ready" from "the op is broken".
+    let epoch: string;
+    try {
+      epoch = (await this.catalogIdentity()).epoch;
+    } catch (err) {
+      if (err instanceof ClientAuthError) {
+        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
+      }
+      throw err;
+    }
     const planningScope = await this.clientPlanningScope(human, human);
     if (!planningScope.startsWith("cluster:")) {
       return json({
@@ -2445,20 +2457,32 @@ export class NetGatewayDO {
     // repair loop could act on, and here that would mean either a spurious
     // refusal or a duplicate identity. The declared argSpec prefetch covers the
     // same ground for any other caller; this is the explicit belt.
+    //
+    // These pulls are HARD, unlike the best-effort prefetch elsewhere: a
+    // degraded read here does not fail loudly, it produces a plan that reads
+    // class defaults (quota 0, provision_id null) and would then either refuse
+    // confusingly or grant the wrong headroom. Failing the operator's request
+    // is the correct outcome.
     const account = this.netObjectProperty(human, "account");
     if (typeof account === "string" && account) {
-      await this.pullTargeted(planningScope, `scope:${planningScope}`, [account]).catch((err) => {
-        this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
-      });
+      const prefetch = async (object: string, role: string): Promise<void> => {
+        try {
+          await this.pullTargeted(planningScope, `scope:${planningScope}`, [object]);
+        } catch (err) {
+          this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
+          throw netError("E_MISSING_STATE", `wizard provisioning could not read the ${role} authority state`, {
+            scope: planningScope,
+            object,
+            role
+          });
+        }
+      };
+      await prefetch(account, "account");
       const ledger = this.netObjectProperty(account, "operator_provisioned_agents");
       const recorded = ledger && typeof ledger === "object" && !Array.isArray(ledger)
         ? (ledger as Record<string, unknown>)[provisionId]
         : undefined;
-      if (typeof recorded === "string" && recorded) {
-        await this.pullTargeted(planningScope, `scope:${planningScope}`, [recorded]).catch((err) => {
-          this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
-        });
-      }
+      if (typeof recorded === "string" && recorded) await prefetch(recorded, "recorded agent");
     }
     // Each invocation is its OWN turn. The durable idempotency handle is the
     // operator's `provision_id`, enforced inside the primitive: a re-run

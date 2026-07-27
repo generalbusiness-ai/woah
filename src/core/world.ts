@@ -4218,11 +4218,13 @@ export class WooWorld {
       if (recorded !== null) {
         // Every branch here is fail-closed: the only accepted outcome is an
         // agent that unambiguously belongs to this provision_id.
-        if (!this.objects.has(recorded)) {
-          throw wooError("E_OBJNF", "recorded operator-provisioned agent no longer exists", { account, provision_id: input.provisionId, agent: recorded });
-        }
-        // assertOwnedAgent is the shared kind + ownership check; the reverse
-        // provision_id pointer is what makes the match unambiguous.
+        //
+        // assertOwnedAgent is the shared kind + ownership check, and it opens
+        // with `this.object(recorded)` on purpose: under a sparse guarded plan
+        // that emits a materialization probe and drives the repair loop, so an
+        // unmaterialized recorded agent converges on retry instead of failing
+        // as a semantic absence. The reverse provision_id pointer below is what
+        // makes the match unambiguous.
         this.assertOwnedAgent(human, recorded);
         if (this.propOrNull(recorded, "provision_id") !== input.provisionId) {
           throw wooError("E_INVARG", "recorded operator-provisioned agent does not match this provision_id", { account, provision_id: input.provisionId, agent: recorded });

@@ -755,11 +755,12 @@ self-service primitives — so every counter and audit record afterwards is
 indistinguishable from an ordinary provisioning:
 
 1. **Quota headroom** with `$system:set_quota` semantics, granted only in the
-   amount the following steps consume: `agent_quota` is raised to
-   `agent_count + 1` only if a mint would exceed it, and
-   `programmer_grant_quota` to `programmer_agent_count + 1` only if a promote
-   would. A converged re-run grants nothing. Each grant records
-   `account_quota_changed`.
+   amount the next step consumes and only immediately before it: `agent_quota`
+   is raised to `agent_count + 1` only if the mint would exceed it, and
+   `programmer_grant_quota` to `programmer_agent_count + 1` only if the promote
+   would be a real transition. A converged re-run grants nothing. Each grant
+   records `account_quota_changed`. (Because the grants are just-in-time, the
+   materialized audit order is `actor_provisioned` before the programmer grant.)
 2. **Create** through the shared `provisionActorInternal` path used by
    `$system:provision_actor` and `create_agent`: `$agent` parent, owned by the
    human, anchored at the family authority root, customer attribution derived,
