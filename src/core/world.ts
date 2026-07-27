@@ -482,6 +482,14 @@ type VerbEditorSession = {
   kind: "verb";
   descriptor: WooValue;
   slot: number | null;
+  /** How save/dry_run install the buffer. "upsert" replaces the OWN slot
+   * that existed at open, CAS-guarded by expected_version. "define" is the
+   * inherited-override / new-verb shape: no own slot existed at open, so
+   * the install must still find it absent — mode "define"'s existence check
+   * IS the optimistic guard (expected_version stays null; a version CAS
+   * against an absent slot would always conflict, which is exactly the bug
+   * that made every inherited-verb save fail E_VERSION). */
+  install_mode: "upsert" | "define";
   expected_version: number | null;
   buffer: string;
   dirty: boolean;
@@ -6345,6 +6353,29 @@ export class WooWorld {
     }
     this.assertEditorObject(editorRef);
     const options = progOptions(opts);
+
+    // Refuse at the door what save/dry_run will refuse anyway (the
+    // verb-owner rule in programmerInstallVerb): opening a buffer the actor
+    // can never install is a trap. An INHERITED verb resolves no own slot
+    // here — saving it defines a new own override, which the object
+    // authorship checked at install time permits. This runs BEFORE the
+    // resume path below: authorization is revalidated against the verb's
+    // CURRENT owner every entry, so a verb chowned away while the session
+    // was paused refuses resume instead of admitting the actor to a buffer
+    // whose save can only fail. The paused session (and its buffer) is left
+    // untouched by the refusal.
+    let ownCurrent: VerbDef | null = null;
+    try {
+      ownCurrent = this.ownVerbResolve(targetRef, descriptor);
+    } catch {
+      ownCurrent = null;
+    }
+    if (ownCurrent && !this.isWizard(ctx.actor) && ownCurrent.owner !== ctx.actor) {
+      throw wooError("E_PERM", `${ctx.actor} cannot edit verb ${targetRef}:${ownCurrent.name} owned by ${ownCurrent.owner}`, {
+        actor: ctx.actor, obj: targetRef, verb: ownCurrent.name, owner: ownCurrent.owner
+      });
+    }
+
     const existing = this.editorSessionOrNull(editorRef, ctx.actor);
     let replacedPrevious: Record<string, WooValue> | null = null;
     if (existing) {
@@ -6360,23 +6391,6 @@ export class WooWorld {
       replacedPrevious = this.editorSessionSummary(existing);
     }
 
-    // Refuse at the door what save/dry_run will refuse anyway (the
-    // verb-owner rule in programmerInstallVerb): opening a buffer the actor
-    // can never install is a trap. An INHERITED verb resolves no own slot
-    // here — saving it defines a new own override, which the object
-    // authorship checked at install time permits.
-    let ownCurrent: VerbDef | null = null;
-    try {
-      ownCurrent = this.ownVerbResolve(targetRef, descriptor);
-    } catch {
-      ownCurrent = null;
-    }
-    if (ownCurrent && !this.isWizard(ctx.actor) && ownCurrent.owner !== ctx.actor) {
-      throw wooError("E_PERM", `${ctx.actor} cannot edit verb ${targetRef}:${ownCurrent.name} owned by ${ownCurrent.owner}`, {
-        actor: ctx.actor, obj: targetRef, verb: ownCurrent.name, owner: ownCurrent.owner
-      });
-    }
-
     const listed = assertMap(this.programmerListVerb(ctx.actor, targetRef, descriptor, { include_source: true }, surfaceClass));
     const source = listed.source;
     if (typeof source !== "string") throw wooError("E_PERM", `${ctx.actor} cannot read source for ${targetRef}:${String(descriptor)}`, { actor: ctx.actor, target: targetRef, descriptor });
@@ -6390,7 +6404,17 @@ export class WooWorld {
       kind: "verb",
       descriptor: cloneValue(descriptor),
       slot: typeof listed.slot === "number" ? listed.slot : null,
-      expected_version: optionNullableInt(options, "expected_version") ?? (typeof listed.version === "number" ? listed.version : null),
+      // Own slot at open → upsert with a version CAS against THAT slot.
+      // No own slot (inherited verb, or a brand-new name) → define: the
+      // buffer becomes a new own verb, and mode "define"'s absence check
+      // is the optimistic guard. `listed.version` must NOT seed the CAS in
+      // that case — it is the INHERITED verb's version, and comparing it
+      // against the absent own slot made every override save fail
+      // E_VERSION.
+      install_mode: ownCurrent ? "upsert" : "define",
+      expected_version: ownCurrent
+        ? optionNullableInt(options, "expected_version") ?? (typeof listed.version === "number" ? listed.version : null)
+        : null,
       buffer: source,
       dirty: false,
       diagnostics: [],
@@ -6466,6 +6490,7 @@ export class WooWorld {
     const session = this.requireEditorSession(editorRef, ctx.actor);
     const result = assertMap(await this.programmerInstallVerb(ctx.actor, session.target, session.descriptor, session.buffer, {
       dry_run: true,
+      mode: session.install_mode,
       expected_version: session.expected_version
     }, session.surface_class));
     session.diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
@@ -6477,6 +6502,7 @@ export class WooWorld {
   async editorSave(ctx: CallContext, editorRef: ObjRef): Promise<WooValue> {
     const session = this.requireEditorSession(editorRef, ctx.actor);
     const result = assertMap(await this.programmerInstallVerb(ctx.actor, session.target, session.descriptor, session.buffer, {
+      mode: session.install_mode,
       expected_version: session.expected_version
     }, session.surface_class));
     session.diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
@@ -6760,6 +6786,7 @@ export class WooWorld {
       kind: session.kind,
       descriptor: cloneValue(session.descriptor),
       slot: session.slot,
+      install_mode: session.install_mode,
       expected_version: session.expected_version,
       dirty: session.dirty,
       diagnostics: cloneValue(session.diagnostics as WooValue) as WooValue[],
@@ -12751,6 +12778,10 @@ function parseVerbEditorSession(value: WooValue): VerbEditorSession {
     kind: "verb",
     descriptor: cloneValue(raw.descriptor),
     slot: typeof raw.slot === "number" && Number.isInteger(raw.slot) ? raw.slot : null,
+    // Sessions persisted before install_mode existed could only save an
+    // OWN slot successfully (the inherited path always E_VERSIONed), so
+    // "upsert" is the faithful default.
+    install_mode: raw.install_mode === "define" ? "define" : "upsert",
     expected_version: typeof raw.expected_version === "number" && Number.isInteger(raw.expected_version) ? raw.expected_version : null,
     buffer: assertString(raw.buffer),
     dirty: raw.dirty === true,
@@ -12769,6 +12800,7 @@ function serializeVerbEditorSession(session: VerbEditorSession): Record<string, 
     kind: session.kind,
     descriptor: cloneValue(session.descriptor),
     slot: session.slot,
+    install_mode: session.install_mode,
     expected_version: session.expected_version,
     buffer: session.buffer,
     dirty: session.dirty,

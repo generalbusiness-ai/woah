@@ -114,9 +114,9 @@ See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md)
 ### Status over Net (2026-07-26)
 
 The editor had no Net or worker coverage until
-`tests/worker/net-verb-editor.test.ts`. Proving it surfaced six defects — five
-on the distributed path and one authorization gap — all now fixed; the full
-loop works end-to-end over Net.
+`tests/worker/net-verb-editor.test.ts`. Proving it surfaced eight defects —
+five on the distributed path, an authorization gap, and two follow-on gaps in
+that gap's first fix — all now fixed; the full loop works end-to-end over Net.
 
 1. *Fixed.* The seeded instance lives in its own scope, which an ordinary turn
    never warms, so it was absent from the turn's world and `isa(editor, $space)`
@@ -176,6 +176,21 @@ loop works end-to-end over Net.
    `editorInvoke` refuses at the door so a session that can never save does
    not open (spec/authoring/editor-rooms.md E4 step 2;
    `tests/authoring.test.ts` "refuses editor and install access…").
+7. *Fixed.* Inherited-verb overrides always failed to save: the session
+   recorded the INHERITED verb's version as `expected_version`, and save
+   compared it against the target's absent own slot — every override save
+   rejected E_VERSION. Sessions now carry `install_mode`, fixed at open: an
+   own slot opens `"upsert"` (version CAS as before); no own slot opens
+   `"define"` with a null `expected_version`, and mode `define`'s
+   own-slot-absence check is the optimistic guard (an own verb appearing
+   between open and save refuses "verb already exists" and keeps the
+   buffer). Spec: editor-rooms.md E3/E4.
+8. *Fixed.* Resuming a paused same-target session returned before the new
+   authorization door, so a verb chowned away while the session was paused
+   still admitted the actor (save then failed E_PERM inside the editor).
+   The door check now runs before the resume path — authorization is
+   revalidated on every entry, and a refusal leaves the paused session and
+   buffer untouched.
 
 The full loop — enter, edit, pause, resume, save, and the edited verb running
 with its new behavior — is exercised over the authoritative Net turn path by
