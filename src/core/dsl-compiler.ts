@@ -1099,11 +1099,11 @@ class Codegen {
     }
     // A bare name resolves only to a local/argument or a frame global. Object
     // ids are NOT in that namespace — they are written as the `#<id>` objref
-    // literal (`$name` for corerefs). An agent that just called `create()` and
-    // got back `obj_human_2_1` has no way to guess that from "unknown
-    // identifier", so the remediation ships with the diagnostic. A caller that
-    // knows the world (see World.programmerEval) sharpens this into a
-    // "did you mean" once it confirms the id exists.
+    // literal (a leading-dollar name for corerefs). An agent that just called
+    // `create()` and got back `obj_human_2_1` has no way to guess that from
+    // "unknown identifier", so the remediation ships with the diagnostic. A
+    // caller that knows the world (see World.programmerEval) sharpens this
+    // into a "did you mean" once it confirms the id exists.
     throw new CompileError("E_COMPILE", `unknown identifier: ${expr.name}`, expr.span, {
       symbol: expr.name,
       hint: `bare names resolve only to locals, verb arguments, and frame globals; write an object id as the objref literal #${expr.name} (or $${expr.name} for a core reference)`

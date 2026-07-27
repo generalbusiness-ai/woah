@@ -141,11 +141,11 @@ export function directedRecipients(observation: Observation): DirectedRecipients
  *   - self-addressed `looked`/`who` payloads reach only their `to`.
  *
  * Without the directed half, a `tell()` emitted inside a *sequenced* verb —
- * `$exit:move` sends the mover its second-person `leave_msg` before the room's
- * third-person `left` — broadcasts to every session in the room. A browser
- * client happens to re-filter `text` by `target`, but a raw MCP wait queue does
- * not, so an agent reads another actor's private line. Audience is server-side
- * state; no transport may be trusted to redo it.
+ * a catalog exit verb sends the mover its second-person departure line before
+ * broadcasting the room's third-person `left` — reaches every session in the
+ * room. A browser client happens to re-filter `text` by `target`, but a raw
+ * MCP wait queue does not, so an agent reads another actor's private line.
+ * Audience is server-side state; no transport may be trusted to redo it.
  */
 export function observationReachesActor(observation: Observation, actor: ObjRef | null): boolean {
   const directed = directedRecipients(observation);
