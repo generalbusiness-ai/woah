@@ -7,6 +7,8 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- MCP v2
+
 - DSL syntax: json-wrapped is terrible for editors
 
 - "blob" type? backed by DO storage ofc
