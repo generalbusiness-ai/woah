@@ -22,6 +22,16 @@ export type Message = {
   verb: string;
   args: WooValue[];
   body?: Record<string, WooValue>;
+  /**
+   * CO16.8 fire-time context, present only on a turn the scheduler woke:
+   * `{id, at, fired_at}`. Declared here rather than cast in at the dispatch
+   * site — the cast hid the mismatch from TypeScript, so the field the spec
+   * promised and the type that describes `message` could drift apart
+   * silently, which for a while they did.
+   *
+   * `fired_at - at` is how a no-catch-up chain sees how late it is.
+   */
+  scheduled?: { id: string; at: number; fired_at: number };
 };
 
 export type Observation = Record<string, WooValue> & {

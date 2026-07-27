@@ -1198,6 +1198,20 @@ export class ScopeSequencer {
       else this.store.delete(key);
     }
     this.headState = nextHead;
+    // CO16.8 lifecycle: a recycled object's pending entries go with it, in
+    // this same transaction. The SCOPE does this rather than the recycling
+    // verb because only the scope holds the queue — woocode cannot enumerate
+    // it and so cannot cancel what it cannot see. Both directions are covered:
+    // entries that would FIRE at the object, and entries the object ARMED on
+    // something else. Leaving either behind means a timer that wakes a
+    // tombstone, or one that outlives the only thing that could cancel it.
+    for (const recycle of submit.transcript.recycles ?? []) {
+      for (const row of this.pendingScheduleRows()) {
+        const separator = row.id.indexOf(":");
+        const owner = separator < 0 ? "" : row.id.slice(0, separator);
+        if (row.call.target === recycle.object || owner === recycle.object) this.cancel(row.id);
+      }
+    }
     // CO16.2: apply the queue effects ATOMICALLY with the turn's writes.
     // Cancellations run before schedules so a turn that cancels one id and
     // arms another in the same breath cannot have the cancel clobber a fresh
@@ -2087,6 +2101,24 @@ export class ScopeSequencer {
           return `schedule ${request.id} targets ${request.call.target} in scope ${targetScope}, not ${this.scope}`;
         }
       }
+      // ...and MUST NOT be one this same turn destroys. Lifecycle cleanup
+      // scans the queue before these entries are inserted, so a recycle and a
+      // schedule in one transcript left a pending entry aimed at a tombstone.
+      // Refusing is better than ordering the cleanup after the insert: arming
+      // work for an object you are destroying in the same breath is a bug in
+      // the caller, and silently dropping it would hide that.
+      // BOTH directions, matching the queue cleanup: an entry aimed at a
+      // recycled object, and one ARMED BY a recycled object. The second is
+      // easy to miss and just as broken — the entry outlives the only object
+      // whose namespace could cancel it, so nothing can ever reach it again.
+      const recycledHere = new Set((submit.transcript.recycles ?? []).map((entry) => entry.object));
+      if (recycledHere.has(request.call.target)) {
+        return `schedule ${request.id} targets ${request.call.target}, which this same turn recycles`;
+      }
+      if (recycledHere.has(armedBy.thisObj)) {
+        return `schedule ${request.id} is armed by ${armedBy.thisObj}, which this same turn recycles`;
+      }
+
       // A target created by THIS turn is schedulable — but only if the create
       // actually lands here. Created cells route by the create's ANCHOR, so an
       // object anchored under something in another scope belongs to that
@@ -2233,6 +2265,20 @@ export class ScopeSequencer {
     };
   }
 
+  /** Every pending row, in id order. The CO16.9 live introspection read
+   * (`GET /net/schedules`) surfaces this; it is a live answer and may be
+   * stale the instant it is returned. */
+  pendingRows(): ScheduledTurn[] {
+    return this.pendingScheduleRows().slice().sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));
+  }
+
+  /** Every pending row. Bounded by the per-scope cap (CO16.7), so this is a
+   * bounded read rather than an unbounded scan — which is what lets recycle
+   * cancellation be a scan and need no secondary index. */
+  private pendingScheduleRows(): ScheduledTurn[] {
+    return this.options.durable ? this.options.durable.readScheduled() : [...this.scheduled.values()];
+  }
+
   /** Current queue shape for the CO16.7 caps. Bounded by the per-scope cap,
    * so this is a bounded read, not an unbounded scan. */
   private pendingScheduleSummary(): {
@@ -2241,7 +2287,7 @@ export class ScopeSequencer {
     perObject: Map<string, number>;
     byId: Map<string, { bytes: number; owner: string }>;
   } {
-    const rows = this.options.durable ? this.options.durable.readScheduled() : [...this.scheduled.values()];
+    const rows = this.pendingScheduleRows();
     const perObject = new Map<string, number>();
     const byId = new Map<string, { bytes: number; owner: string }>();
     let bytes = 0;

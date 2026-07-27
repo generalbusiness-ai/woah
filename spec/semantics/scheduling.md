@@ -1,6 +1,6 @@
 ---
 date: 2026-07-25
-status: partial — SC1–SC10 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records); SC11's `$scheduling` catalog surface and SC2's live introspection read are specified and not yet built
+status: partial — SC1–SC11 implemented (builtins, clamping, namespaced ids, fork sugar, errors, fire-time context, idle policy, failure records, and the `$scheduling` catalog feature); introspection is the live `GET /net-api/schedules` read (CO16.9), not a verb
 ---
 
 # Scheduling
@@ -147,7 +147,9 @@ object's timer.
 
 The scheduled turn is an ordinary committed turn with:
 
-- `caller` = `$system` — it was woken, not called.
+- `caller` = `$system` — it was woken, not called. This is what lets a
+  verb refuse ordinary callers, and it is carried by an internal marker on
+  the scheduler's dispatch that no request can set.
 - the actor recorded when it was armed, with permissions checked **now**,
   against live state, by the ordinary permission kernel: `x` / verb-owner
   / wizard. `direct_callable` is **not** consulted: that flag gates what an
@@ -155,7 +157,10 @@ The scheduled turn is an ordinary committed turn with:
   scheduled verb may reach targets an external direct call could not —
   bounded by the recorded actor's ordinary permissions, but a real
   difference worth knowing when you decide what to arm.
-- no presence check: there is no session and nothing to be present on.
+- **no presence check**: there is no session and nothing to be present on.
+  This is load-bearing, not a detail — a reminder fires precisely because
+  its actor is elsewhere. While presence was still enforced, every
+  scheduled verb failed with `E_PERM` the moment its actor left the room.
 - programmer authority from the **fired verb's own owner**, exactly as on a
   live call. Arming a schedule stores no authority.
 - a `scheduled` context block: `{id, at, fired_at}`. `at` is when it was
@@ -286,13 +291,75 @@ author passing a large `args` payload should pass a reference instead.
 ## SC11. Catalog surface
 
 The builtins are the substrate. What authors and users should normally
-touch is the `$scheduling` feature: `:remind_in`, `:deadline`,
-`:start_ticking`, `:stop_ticking`, `:pending`. It is where the wizard gate
-of SC7 is discharged and where the durable-landing discipline of SC6 is
-already applied.
+touch is the `$scheduling` feature (`catalogs/scheduling`), mounted on a
+space or actor:
 
-`:pending` is the introspection surface, and it is a **live** read, not a
-committed one: it asks the scope what is queued and reports the answer.
-That answer may be stale the moment it arrives — an entry may fire while
-the reply is in flight — which is fine for "what does this room have
-armed?" and is why no committed builtin offers the same thing (SC2).
+```
+:remind_in(delay_ms, text, tag)                -> schedule_id   -- any actor
+:cancel_reminder(tag)                                           -- any actor
+:start_ticking(rate_ms)                        -> schedule_id   -- owner/wizard
+:stop_ticking()                                                 -- owner/wizard
+:deadline(delay_ms, verb_name, verb_args, key) -> schedule_id   -- INTERNAL
+:cancel_deadline(key)                                           -- INTERNAL
+```
+
+**Reminders are addressed by `tag`, not by schedule id.** The id embeds the
+calling actor, and the verbs rebuild it, so a caller can only ever name
+their own reminder. Taking a raw id let one user cancel another's, because
+these verbs are `$wiz`-owned — which is how ordinary users reach the
+scheduler at all — so the kernel's cross-namespace check saw wizard
+authority and allowed it for anybody.
+
+`tag` defaults to `"default"`, which means **two untagged reminders replace
+each other**: the second upserts the first (CO16.2). Pass distinct tags for
+concurrent reminders.
+
+**Deadlines are internal, enforced by `caller == this`.** A deadline is
+shared by construction — one actor arms it and a *different* one cancels
+it, which is the whole escalation pattern — so its id cannot be scoped to
+the arming actor the way a reminder's is. Left reachable, that lets any
+user cancel or replace anyone's deadline from a guessable key.
+
+The guard is an in-verb check that the caller is the object itself, the
+same one `$acts:act` uses. Withholding `direct_callable` is **not** enough
+and must not be mistaken for a boundary: that flag gates the *direct* route
+only, and client room calls default to **sequenced**, where it is never
+consulted. A co-present guest calling `room:cancel_deadline(...)` on the
+sequenced route reached the primitive and it applied — under the catalog's
+own wizard authority. An attacker's verb dispatching at another object gets
+there too. `caller == this` refuses both, whatever route the request took.
+
+**Ticking is the object owner's call.** A chain's key is object-global, so
+without that gate any visitor could stop a room's chain or restart it at a
+rate the owner did not choose.
+
+It is where the wizard gate of SC7 is discharged — these verbs are
+catalog-owned (`$wiz`), so an ordinary actor arms an `always` reminder or
+deadline through them without holding wizard authority — and where the
+durable-landing discipline of SC6 is applied: `:remind_in` mints a note
+before it tells.
+
+`verb_args` on `:deadline` carries the SUBJECT. A deadline that cannot say
+what it is about can only fire object-wide verbs, which is useless for the
+case it exists to serve; the first real consumer found that out
+immediately. (The parameter is `verb_args` rather than `args` because
+`args` is a verb-body global.)
+
+Tick chains hold **no consumer-side state**. The rate rides in the
+schedule's own arguments and the stable key IS the chain, so starting
+twice re-arms one entry rather than racing two, and stopping is
+cancelling. Nothing needs a `ticking` property.
+
+**Introspection is a read, not a verb.** "What has this room got armed?"
+is answered by `GET /net-api/schedules?scope=` (CO16.9), authorized by the
+same co-presence rule as the other client reads, and it returns recent
+*failures* alongside pending entries — a timer that failed is missing from
+the pending list precisely because it is gone.
+
+There is deliberately no `:pending` verb. A verb runs inside a turn, and a
+committed read of the queue would need a versioned read proof the queue
+cannot give (SC2); any answer it computed could be falsified before the
+turn committed, with nothing to catch it. So the introspection surface is
+live and sits outside turn semantics, where a possibly-stale answer is
+honest. Woocode cannot ask this question, and should not be given a way
+that lies.

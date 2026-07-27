@@ -28,6 +28,21 @@ export type ShadowTurnCall = {
   verb: string;
   args: WooValue[];
   body?: Record<string, WooValue>;
+  /**
+   * CO16.4/CO16.8 — set ONLY by the scheduler's dispatch path, never by any
+   * client route. A client turn's fields are built one by one from parsed
+   * parameters, so there is no path by which a request body reaches this;
+   * that matters, because this marker relaxes the ingress check and presents
+   * `caller = $system`.
+   *
+   * `direct_callable` is an INGRESS flag — "an outside client may invoke this
+   * while bypassing sequencing" — and a scheduled turn is not outside. Left
+   * unhandled, it made every scheduler-fired verb unreachable: the internals
+   * are deliberately not direct_callable, so they answered E_DIRECT_DENIED,
+   * and even past that they would have seen `caller = #-1` and refused their
+   * own `$system` guard.
+   */
+  scheduled?: { id: string; at: number; fired_at: number };
 };
 
 export type ShadowTurnCallRun = {
@@ -206,7 +221,10 @@ export async function runShadowTurnCallOnWorldTranscript(
   let frame: AppliedFrame | DirectResultFrame | ErrorFrame;
   try {
     if (call.route === "direct") {
-      frame = await world.directCall(call.id, call.actor, call.target, call.verb, call.args, { sessionId: call.session ?? null });
+      frame = await world.directCall(call.id, call.actor, call.target, call.verb, call.args, {
+        sessionId: call.session ?? null,
+        ...(call.scheduled ? { scheduled: call.scheduled } : {})
+      });
     } else {
       const message: Message = {
         actor: call.actor,

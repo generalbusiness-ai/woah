@@ -1078,6 +1078,77 @@ describe("scheduled-turn effects (CO16.2)", () => {
     if (cyclic.status === "rejected") expect(String(cyclic.detail?.schedule)).toMatch(/anchored outside/);
   });
 
+  it("cancels a recycled object's pending entries, in both directions (CO16.8)", () => {
+    // The scope does this because only the scope holds the queue: woocode
+    // cannot enumerate pending entries, so a recycling verb cannot cancel
+    // what it cannot see. Both directions matter — an entry that would FIRE
+    // at the tombstone, and an entry the dead object ARMED on something else
+    // and can no longer cancel.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    seedTarget(seq);
+    seq.submit(submitFor(seq, transcript({
+      creates: [{ object: "#doomed", name: "Doomed", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {}, writer: WRITER }]
+    }), "make-doomed"));
+
+    // (a) armed BY #thing, firing AT #doomed.
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ id: "#thing:at-doomed", call: { actor: "#actor", target: "#doomed", verb: "tick", args: [] } })]
+    }, "s1"));
+    // (b) armed BY #doomed, firing AT #thing.
+    seq.submit(armingTurn(seq, {
+      schedules: [armed({ id: "#doomed:from-doomed", armed_by: { ...WRITER, thisObj: "#doomed" }, call: { actor: "#actor", target: "#thing", verb: "tick", args: [] } })]
+    }, "s2"));
+    // (c) unrelated to #doomed — must survive.
+    seq.submit(armingTurn(seq, { schedules: [armed({ id: "#thing:survivor" })] }, "s3"));
+    expect(seq.peekDue(NOW + LEAD)).toHaveLength(3);
+
+    const reply = seq.submit(submitFor(seq, transcript({
+      recycles: [{ object: "#doomed" }]
+    }), "recycle"));
+    expect(reply.status).toBe("accepted");
+
+    expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:survivor"]);
+  });
+
+  it("refuses arming work for an object the same turn recycles", () => {
+    // Lifecycle cleanup scans the queue BEFORE this turn's schedules are
+    // inserted, so recycle-plus-schedule in one transcript used to leave a
+    // pending entry aimed at a tombstone. The earlier test only covered
+    // entries armed in previous turns.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    seedTarget(seq);
+    const reply = seq.submit(armingTurn(seq, {
+      recycles: [{ object: "#thing" }],
+      schedules: [armed({ id: "#thing:doomed" })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/same turn recycles/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
+  it("refuses arming FROM an object the same turn recycles", () => {
+    // The other direction, and the easier one to miss: the target is alive,
+    // so the turn looked fine — but the entry outlives the only object whose
+    // namespace could cancel it, so nothing can ever reach it again.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    seedTarget(seq);
+    seq.submit(submitFor(seq, transcript({
+      creates: [{ object: "#doomed", name: "Doomed", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {}, writer: WRITER }]
+    }), "make-doomed"));
+
+    const reply = seq.submit(armingTurn(seq, {
+      recycles: [{ object: "#doomed" }],
+      schedules: [armed({
+        id: "#doomed:after",
+        armed_by: { ...WRITER, thisObj: "#doomed" },
+        call: { actor: "#actor", target: "#thing", verb: "tick", args: [] }
+      })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/armed by .*recycles/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
   it("refuses more schedules in one turn than the per-turn cap", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));

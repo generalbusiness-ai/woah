@@ -274,6 +274,42 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_dispatched"))).toBe(true);
   });
 
+  it("answers the live introspection read with pending entries and recent failures (CO16.9)", async () => {
+    // The gap this closes: authors and operators had NO way to ask what a
+    // room has armed. It is a live read on purpose — the queue is not a cell,
+    // so a committed read could not carry a versioned proof (SC2) — and it
+    // returns failures alongside pending, because a timer that failed is
+    // invisible in the pending list precisely because it is gone.
+    const planner = rejectingPlannerStub();
+    const scope = netState(`scope-${SCOPE}-introspect`);
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => planner.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    await call(scopeDO, env, "/subscribe", { destination: "gateway:planner-a", role: "planner" });
+    await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-later", Date.now() + 3_600_000) });
+    await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick("sched-doomed", Date.now() + 30) });
+
+    const armed = await call<{ scope: string; pending: Array<{ id: string; verb: string }>; failures: unknown[] }>(
+      scopeDO, env, "/schedules"
+    );
+    expect(armed.scope).toBe(SCOPE);
+    expect(armed.pending.map((row) => row.id).sort()).toEqual(["sched-doomed", "sched-later"]);
+    expect(armed.pending[0]).toMatchObject({ verb: "tick" });
+    expect(armed.failures).toEqual([]);
+
+    // Let the near one fire and be terminally rejected.
+    await sleep(60);
+    await scopeDO.alarm();
+    await scope.settle();
+
+    const after = await call<{ pending: Array<{ id: string }>; failures: Array<{ id: string; outcome: string }> }>(
+      scopeDO, env, "/schedules"
+    );
+    // Gone from pending — which is exactly why the failures list has to exist.
+    expect(after.pending.map((row) => row.id)).toEqual(["sched-later"]);
+    expect(after.failures.map((row) => row.id)).toEqual(["sched-doomed"]);
+    expect(after.failures[0]).toMatchObject({ outcome: "rejected" });
+  });
+
   it("records a terminal failure durably instead of discarding it (CO16.8)", async () => {
     // The regression this guards: a 200 carrying a terminal rejection deletes
     // the outbox row, and NOBODY is waiting on a scheduled turn — no session,

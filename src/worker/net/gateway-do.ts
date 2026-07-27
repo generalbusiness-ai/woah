@@ -2350,17 +2350,16 @@ export class NetGatewayDO {
         target: turn.call.target,
         verb: turn.call.verb,
         args: turn.call.args as PlanTurnInput["call"]["args"],
-        // CO16.8 fire-time context: the verb can tell it was woken rather than
-        // called, and how late. `at` and `fired_at` differ after eviction and
-        // after a busy scope defers a due batch — a month-old gap is exactly
-        // what a no-catch-up chain needs to be able to see.
-        body: {
-          scheduled: {
-            id: turn.id,
-            at: turn.at_logical_time,
-            fired_at: Date.now()
-          }
-        } as PlanTurnInput["call"]["body"]
+        // CO16.8 fire-time context, on a TOP-LEVEL field rather than in
+        // `body`: body is client-supplied on /net-api/turn, and this marker
+        // relaxes the ingress gate and presents `caller = $system`, so it must
+        // sit somewhere no request can reach. The client route builds its call
+        // field by field, so nothing a caller sends lands here.
+        scheduled: {
+          id: turn.id,
+          at: turn.at_logical_time,
+          fired_at: Date.now()
+        }
       },
       ...(scheduledPrincipal ? { principal: scheduledPrincipal } : {}),
       ...(scheduledTrace ? { trace: scheduledTrace } : {}),
@@ -2923,6 +2922,41 @@ export class NetGatewayDO {
         // and session cell values from presence (clientRelationMembers) —
         // a co-present peer's session id IS their credential.
         return json({ relation, owner, members: this.clientRelationMembers(relation, owner) });
+      }
+      if (request.method === "GET" && url.pathname === "/net-api/schedules") {
+        /* CO16.9. "What has this room got armed, and what failed?" — the
+           question authors and operators had no way to ask, which is why
+           invisible timers were the largest gap in the scheduling surface.
+           A LIVE read: the queue is not a cell and cannot be read inside a
+           turn honestly (SC2), so this deliberately sits outside turn
+           semantics and may be stale the moment it returns. */
+        // The query names the ROOM the caller is in — `capi_room` — because
+        // that is what presence reports and what a user can be expected to
+        // know. The DO that holds the queue is addressed by its CO15 scope
+        // name, `room:capi_room`. Authorizing on one and routing to the other
+        // is the whole of this route's subtlety: an earlier cut authorized
+        // the semantic id and then RPC'd it verbatim, reaching a DO that
+        // holds nothing.
+        const room = url.searchParams.get("scope") ?? "";
+        if (!room) return json({ error: { code: "E_INVARG", message: "scope query param is required" } }, 400);
+        const session = this.readSession(url, actor, bearerSession);
+        // Same co-presence rule the other reads use: you can see what a room
+        // has armed if you are in it. No global reads.
+        if (!this.callerPresenceScopes(session, actor).has(room)) {
+          throw new ClientAuthError("schedules not readable outside the caller's presence", { scope: room }, "E_PERM", 403);
+        }
+        const view = this.ensureView();
+        const classifier = classifierFromLineage(
+          (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+        );
+        let routed: string;
+        try {
+          routed = classifier.scopeOf(room);
+        } catch {
+          throw new ClientAuthError("scope is not routable from this view", { scope: room }, "E_MISSING_STATE", 404);
+        }
+        const reply = await this.host.rpc(`scope:${routed}`, "/schedules");
+        return json({ ...(reply as Record<string, unknown>), room });
       }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";

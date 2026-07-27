@@ -1339,9 +1339,9 @@ One write path per fact (CO9), concretized:
 
 > Status: **implemented** — CO16.1–CO16.7 and the failure record of
 > CO16.8/CO16.9, end to end from the `schedule` builtins through the
-> transcript to delivery. **Not yet implemented:** the CO16.8 *lifecycle*
-> cancellations (recycle, scope retirement) and the CO16.9 live
-> introspection route. Design rationale in
+> transcript to delivery, plus recycle cancellation and the CO16.9 live
+> introspection read. **Not yet implemented:** cancellation on scope
+> retirement (CO17 is itself draft). Design rationale in
 > `notes/2026-07-24-scheduled-events-design.md`. This section supersedes
 > [v2-turn-network.md §VTN18](v2-turn-network.md#vtn18-scheduled-turns-draftproposed);
 > where the two differ, this governs.
@@ -1541,6 +1541,13 @@ harmless.
   checks do not apply — there is no session and no connection to be
   present on.
 
+  The dispatch carries an internal `scheduled` marker — set only on the
+  scheduler's own path, never reachable from a request body — which is what
+  relaxes the ingress check and presents `caller = $system`. Without it the
+  scheduler could fire only verbs a browser could also call directly, which
+  excludes exactly the internal verbs a scheduled chain is made of; and a
+  fired verb would see `caller = #-1` and be unable to tell it was woken.
+
   **`direct_callable` is not consulted, and that is a real difference from
   the client surface.** The flag is an *ingress* gate: the gateway's
   client path refuses an externally-requested `direct` route to a verb
@@ -1721,8 +1728,15 @@ fully reconstructible from durable storage alone. See
 
 ### CO16.8 Lifecycle
 
-- **Target recycled** → its pending entries are cancelled. Bounded by the
-  per-scope cap, so a scan, not an index.
+- **Target recycled** → the scope cancels its pending entries in the same
+  transaction as the recycle, in **both directions**: entries that would
+  fire *at* the object, and entries the object *armed* on something else.
+  Leaving either behind means a timer that wakes a tombstone, or one that
+  outlives the only thing that could have cancelled it. The scope does
+  this rather than the recycling verb because only the scope holds the
+  queue — woocode cannot enumerate pending entries and so cannot cancel
+  what it cannot see. Bounded by the per-scope cap, so a scan, not an
+  index.
 - **Target moved out of scope** → the entry fires, the turn cannot resolve
   the target, the failure is recorded per the rule below, entry dropped.
   Silently following an object across scopes would be the cross-scope
@@ -1796,8 +1810,17 @@ making the durable path the default one.
 - `net_scope_scheduled_turn_failed` — a recorded terminal failure or
   abandonment, per CO16.8. A world with a rising count here has timers
   that are not doing their job, and it is the alert that matters most.
-- Pending entries are introspectable through a **live** read — a
-  non-committed query answered by the scope, outside turn semantics.
+- Pending entries are introspectable through a **live** read: the scope
+  answers `GET /net/schedules` with its pending rows *and its recent
+  failure records*, and the gateway exposes it as
+  `GET /net-api/schedules?scope=` under the same co-presence rule the
+  other client reads use — you can see what a room has armed if you are in
+  it. Failures ride along because "what is armed" and "what did not fire"
+  are one operational question, and a failed timer is absent from the
+  pending list precisely because it is gone.
+
+  It is a **live** read — a non-committed query answered by the scope,
+  outside turn semantics.
   Invisible timers are unmaintainable for authors and worse for operators,
   but introspection deliberately does not enter the commit path: a queue
   read inside a turn would need a versioned read proof to be honest, and

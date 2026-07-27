@@ -44,10 +44,19 @@
 //                    taxonomy attempt trace (CO6), never an unnamed error.
 //
 // HONEST LIMITS (smoke-discipline rule: never claim a lane catches what it
-// cannot): workerd-local cannot force DO eviction mid-flight, so
-// eviction-survival of parked tasks and replies stays gated by the fake
-// lane's cold-restart tests (tests/worker/net-do.test.ts); this lane proves
-// the alarm fires and the machinery runs under real workerd. Cross-colo
+// cannot): workerd-local cannot force a TARGETED mid-flight DO eviction, so
+// that case stays gated by the fake lane's cold-restart tests
+// (tests/worker/net-do.test.ts). Run 1b does cover the strongest analogue
+// available here — a full process restart over the same persistence
+// directory, so a scheduled turn must come back from durable state alone —
+// which is genuinely more than "the alarm fires while the process is warm".
+// Run 1b waits past the due time WITHOUT addressing the scope, so the first
+// post-due read either already shows the effect (the stored alarm survived
+// and woke the host on its own) or it does not. An earlier version polled
+// immediately, which cold-hydrated the scope — and hydration re-arms every
+// pending row, so the poll repaired the wake and then observed its own
+// repair. It still says NOTHING about the deploy-only multi-day alarm
+// question (tasks.md 16.2): a six-second gap is not a six-day one. Cross-colo
 // latency is modeled by injected latency, not real distance.
 //
 // Exit: 0 all steps pass, 1 any step fails, 2 harness crash.
@@ -62,7 +71,8 @@ import {
   postRaw,
   seedPartitions,
   sleep,
-  withWorkerd
+  withWorkerd,
+  withWorkerdRestart
 } from "./net-smoke-harness";
 import { buildLaneFixture } from "./net-smoke-fixture";
 import type { CommitReply, ScopeHead } from "../src/net/scope";
@@ -634,6 +644,74 @@ async function main(): Promise<number> {
     }, 15_000);
     step("scheduled turn executed by the planner gateway via real workerd alarm (counter 2→3)", bumped !== null);
   }, laneWorkerdOptions);
+
+  // ---- run 1b: the timer survives the host going away ---------------------
+  //
+  // The case above proves an alarm fires in a WARM process, which is not the
+  // question a scheduled turn poses. Here the arming lifetime is killed
+  // outright before the alarm is due and a second lifetime starts on a fresh
+  // port against the same persisted state: everything in memory is gone, so
+  // only what was written durably can bring the timer back.
+  console.log("run 1b: scheduled turn survives a full workerd restart");
+  // This run has its OWN persistence directory, so the counter starts wherever
+  // the fixture seeds it — NOT at run 1's value. Assert the increment, not an
+  // absolute: baking in a sibling run's history made this fail for a reason
+  // that had nothing to do with what it tests.
+  let restartCounterBefore = -1;
+  const readCounter = async (base: string): Promise<number | undefined> => {
+    const closure = await post<{ cells: Array<{ value?: { value?: number } }> }>(base, "scope", ROOM, "closure", {
+      keys: ["property_cell:lane_box:counter"],
+      known: ["object_lineage:lane_box"]
+    });
+    return closure.cells[0]?.value?.value;
+  };
+  await withWorkerdRestart(
+    {},
+    async (base) => {
+      await seedAndPull(base);
+      await post(base, "scope", ROOM, "subscribe", { destination: `gateway:${GATEWAY}`, role: "planner" });
+      // Far enough out that it cannot fire before the process is stopped —
+      // otherwise this silently degrades into the warm case above.
+      await post(base, "scope", ROOM, "schedule", {
+        scope: ROOM,
+        catalog_epoch: EPOCH,
+        turn: {
+          id: "lane-tick-restart",
+          at_logical_time: Date.now() + 6000,
+          call: { actor: fixture.actor, target: "lane_box", verb: "bump", args: [] }
+        }
+      });
+      restartCounterBefore = (await readCounter(base)) ?? -1;
+      // Assert the timer is genuinely still PENDING when the process dies —
+      // "counter >= 0" would have been satisfied by an entry that already
+      // fired, quietly degrading this into the warm case above.
+      const pending = await get<{ pending: Array<{ id: string; at: number }> }>(base, "scope", ROOM, "schedules");
+      const row = pending.pending.find((entry) => entry.id === "lane-tick-restart");
+      const remainingMs = row === undefined ? -1 : row.at - Date.now();
+      step(
+        "armed a future scheduled turn, still pending with time to spare when workerd is stopped",
+        restartCounterBefore >= 0 && remainingMs > 1000,
+        `counter=${restartCounterBefore} remaining=${remainingMs}ms`
+      );
+    },
+    async (base) => {
+      // A cold process: no in-memory sequencer, no armed alarm, no planner
+      // subscription in memory. All of it has to come back from storage.
+      // Do NOT touch the scope yet. Any request cold-hydrates it, and
+      // hydration re-arms every pending row — so polling would repair the
+      // wake and then congratulate itself for observing it. Waiting past the
+      // due time without addressing the DO is what separates "the stored
+      // alarm survived and woke the host" from "our own read fixed it".
+      await sleep(9000);
+      const firstRead = await readCounter(base);
+      step(
+        "the stored alarm woke a NEW workerd lifetime with no request to prompt it",
+        firstRead !== undefined && firstRead > restartCounterBefore,
+        `first post-due read: ${restartCounterBefore} -> ${String(firstRead)}`
+      );
+    },
+    laneWorkerdOptions
+  );
 
   // ---- run 2: injected submit latency ------------------------------------
   console.log("run 2: 100ms /submit latency (latency is not divergence)");
