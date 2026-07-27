@@ -147,7 +147,9 @@ object's timer.
 
 The scheduled turn is an ordinary committed turn with:
 
-- `caller` = `$system` — it was woken, not called.
+- `caller` = `$system` — it was woken, not called. This is what lets a
+  verb refuse ordinary callers, and it is carried by an internal marker on
+  the scheduler's dispatch that no request can set.
 - the actor recorded when it was armed, with permissions checked **now**,
   against live state, by the ordinary permission kernel: `x` / verb-owner
   / wizard. `direct_callable` is **not** consulted: that flag gates what an

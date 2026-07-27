@@ -323,6 +323,44 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     }
   });
 
+  it("answers /net-api/schedules for the room the caller is in (CO16.9)", async () => {
+    // Through the GATEWAY route, not the internal scope endpoint. Presence
+    // reports the SEMANTIC room (`capi_room`); the queue lives on the DO
+    // addressed as `room:capi_room`. An earlier cut authorized the former and
+    // then RPC'd it verbatim, reaching a DO that holds nothing — a test that
+    // called the scope endpoint directly could never have seen that.
+    const h = await buildHarness();
+    try {
+      const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+      const opened = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 60_000 } });
+      expect(opened.status, JSON.stringify(opened.body)).toBe(200);
+      const session = String((opened.body as { session: string }).session);
+
+      const listed = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/schedules?session=${encodeURIComponent(session)}&scope=capi_room`,
+        { token }
+      );
+      expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+      // The room echoes back, and the answer comes from the scope that
+      // actually holds the queue rather than a phantom DO.
+      expect(listed.body).toMatchObject({ room: "capi_room", scope: "room:capi_room" });
+      expect(Array.isArray((listed.body as { pending: unknown[] }).pending)).toBe(true);
+
+      // A room the caller is not in is refused, not answered emptily.
+      const foreign = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/schedules?session=${encodeURIComponent(session)}&scope=somewhere_else`,
+        { token }
+      );
+      expect(foreign.status).toBe(403);
+    } finally {
+      h.close();
+    }
+  });
+
   it("keeps API-key service sessions authoritative but out of the public room roster", async () => {
     const h = await buildHarness();
     try {

@@ -2076,6 +2076,16 @@ export class ScopeSequencer {
           return `schedule ${request.id} targets ${request.call.target} in scope ${targetScope}, not ${this.scope}`;
         }
       }
+      // ...and MUST NOT be one this same turn destroys. Lifecycle cleanup
+      // scans the queue before these entries are inserted, so a recycle and a
+      // schedule in one transcript left a pending entry aimed at a tombstone.
+      // Refusing is better than ordering the cleanup after the insert: arming
+      // work for an object you are destroying in the same breath is a bug in
+      // the caller, and silently dropping it would hide that.
+      if ((submit.transcript.recycles ?? []).some((entry) => entry.object === request.call.target)) {
+        return `schedule ${request.id} targets ${request.call.target}, which this same turn recycles`;
+      }
+
       // A target created by THIS turn is schedulable — but only if the create
       // actually lands here. Created cells route by the create's ANCHOR, so an
       // object anchored under something in another scope belongs to that

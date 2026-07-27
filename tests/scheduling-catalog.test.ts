@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { installLocalCatalogs } from "../src/core/local-catalogs";
-import { installVerb } from "../src/core/authoring";
+import { installVerb, installVerbAs } from "../src/core/authoring";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
 import { applyTranscript, type EffectTranscript } from "../src/net/transcript";
@@ -142,6 +142,88 @@ describe("$scheduling — reminders", () => {
       const { outcome } = await callAndRecord(world, actor, "the_widget", "remind_in", args as never, `bad-${String(args[1]).slice(0, 4)}`, session.id);
       expect(JSON.stringify(outcome)).toMatch(pattern);
     }
+  });
+});
+
+describe("$scheduling — one user cannot touch another's timer", () => {
+  it("scopes a reminder's id to the actor who armed it", async () => {
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    const { transcript } = await callAndRecord(world, actor, "the_widget", "remind_in", [600_000, "mine", "t"], "r1", session.id);
+    // The caller is IN the id, so there is no id another caller could spell.
+    expect(transcript.schedules![0].id).toBe(`the_widget:remind:${actor}:t`);
+  });
+
+  it("refuses one actor cancelling another actor's reminder", async () => {
+    // The bug: cancel_reminder took a raw id, and because the catalog verb is
+    // $wiz-owned the kernel's cross-namespace check saw a wizard `progr` and
+    // allowed it — for anyone. Both halves are fixed: the verb rebuilds the
+    // id from the caller, and the kernel keys the bypass on the ACTOR.
+    const { world, session: s1 } = schedulingWorld();
+    await enter(world, s1);
+    const s2 = world.auth("guest:scheduling-intruder");
+    const moved = await world.directCall("enter2", s2.actor, s2.actor, "moveto", ["the_widget"] as never, {
+      sessionId: s2.id
+    } as never);
+    expect(moved.op).toBe("result");
+
+    const armed = await callAndRecord(world, s1.actor, "the_widget", "remind_in", [600_000, "mine", "t"], "r-own", s1.id);
+    const victimId = armed.transcript.schedules![0].id;
+    const { seq } = commit(world, armed.transcript, "r-own");
+    expect(seq.peekDue(Date.now() + 10 * 60_000)).toHaveLength(1);
+
+    // The intruder cancels their OWN tag of the same name: a different id.
+    const intruder = await callAndRecord(world, s2.actor, "the_widget", "cancel_reminder", ["t"], "r-intrude", s2.id);
+    expect(intruder.transcript.cancellations![0].id).not.toBe(victimId);
+    expect(intruder.transcript.cancellations![0].id).toBe(`the_widget:remind:${s2.actor}:t`);
+
+    // And applying it leaves the victim's reminder standing.
+    const submitted = { ...intruder.transcript, reads: [] } as EffectTranscript;
+    const derived = applyTranscript(seq.store as CellStore, submitted, { scope_head: "x", catalog_epoch: EPOCH });
+    seq.submit({
+      kind: "woo.net.commit_submit.v1",
+      scope: intruder.transcript.scope,
+      base: seq.head(),
+      idempotency_key: "r-intrude",
+      transcript: submitted,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(seq.peekDue(Date.now() + 10 * 60_000).map((row) => row.id)).toEqual([victimId]);
+  });
+});
+
+describe("cancellation authority is the actor's, not the code's", () => {
+  it("refuses a wizard-owned verb cancelling outside its namespace for a non-wizard actor", async () => {
+    // The kernel rule, exercised directly. The catalog surface can no longer
+    // express a cross-namespace cancel (ids are built from the caller), which
+    // is right — but it also means the catalog tests cannot reach this check,
+    // and reverting it to `progr` left them all green.
+    //
+    // A $wiz-owned verb is exactly how ordinary users reach the scheduler, so
+    // keying the bypass on `progr` made every such verb a universal canceller.
+    // It keys on the ACTOR: cancelling someone else's work is a question about
+    // the principal, not about whose code is running.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    expect(installVerbAs(
+      world, "$wiz", "the_widget", "cancel_anything",
+      'verb :cancel_anything(id) rxd { cancel_schedule(id); return null; }',
+      null
+    ).ok).toBe(true);
+
+    const denied = await world.directCall(
+      "x-cancel", actor, "the_widget", "cancel_anything", ["#someone_else:their_timer"] as never,
+      { sessionId: session.id } as never
+    );
+    expect(denied.op).toBe("error");
+    expect(JSON.stringify(denied)).toMatch(/E_PERM/);
+
+    // The wizard-ACTOR path (an operator cancelling on someone's behalf) is
+    // not asserted here: `world.auth("$wiz")` mints an ordinary guest, so a
+    // test that appeared to cover it would only be re-testing the denial.
+    // The refusal above is the security property, and it is what breaks if
+    // the bypass goes back to keying on `progr`.
   });
 });
 
@@ -484,5 +566,120 @@ describe("casework escalation — arm on open, cancel on claim", () => {
     expect(fired.op).toBe("applied");
     const observations = (fired as { observations?: Array<{ type: string }> }).observations ?? [];
     expect(observations.find((o) => o.type === "tasks.escalated")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIRING, not arming. Every test above this line asserts what a turn RECORDS.
+// None of them ran a scheduled verb through the dispatch path the scheduler
+// actually uses — which is how a catalog whose every internal verb was
+// unreachable (E_DIRECT_DENIED, and `caller = #-1` failing its own guard)
+// passed twenty-two green tests.
+// ---------------------------------------------------------------------------
+describe("$scheduling — the verbs actually fire", () => {
+  /** Exactly what the scheduler's dispatch does: the internal marker, and
+   * nothing else. Nothing here forces or bypasses on the test's behalf. */
+  function fire(
+    world: ReturnType<typeof createWorld>,
+    actor: string,
+    target: string,
+    verb: string,
+    args: unknown[],
+    id: string
+  ) {
+    return world.directCall(id, actor, target, verb, args as never, {
+      scheduled: { id: `${target}:${verb}`, at: Date.now(), fired_at: Date.now() }
+    } as never);
+  }
+
+  it("delivers a reminder, minting a durable note before telling", async () => {
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    const before = world.objects.size;
+
+    const fired = await fire(world, actor, "the_widget", "_deliver_reminder", [actor, "drink water"], "f1");
+    expect(fired.op).toBe("result");
+    // The durable half: a note the actor keeps, in their inventory, whether or
+    // not anyone was connected to receive the tell.
+    expect(world.objects.size).toBe(before + 1);
+    const note = (fired as { op: "result"; result: unknown }).result as string;
+    expect(world.getProp(note, "text")).toBe("drink water");
+    expect(world.object(note).location).toBe(actor);
+    expect(world.object(note).owner).toBe(actor);
+  });
+
+  it("fires a deadline through to the named verb, carrying its subject", async () => {
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    expect(installVerb(
+      world, "the_widget", "escalate",
+      'verb :escalate(subject) rxd { return "escalated:" + to_string(subject); }',
+      null
+    ).ok).toBe(true);
+
+    const fired = await fire(world, actor, "the_widget", "_fire_deadline", ["escalate", ["case-42"]], "f2");
+    expect(fired.op).toBe("result");
+    // The subject reached the named verb — the hole the first real consumer
+    // found, now proved through the firing path rather than the arming one.
+    expect((fired as { op: "result"; result: unknown }).result).toBe("escalated:case-42");
+  });
+
+  it("ticks the consumer and re-arms in the same turn", async () => {
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    expect(installVerb(
+      world, "the_widget", "tick",
+      'verb :tick() rxd { return "ticked"; }',
+      null
+    ).ok).toBe(true);
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+    const fired = await fire(world, actor, "the_widget", "_tick", [300_000], "f3");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+    world.setTurnRecorder(null as never);
+
+    expect(fired.op).toBe("result");
+    expect((fired as { op: "result"; result: unknown }).result).toBe("ticked");
+    // Re-armed in the SAME turn as the work, so a raising :tick rolls the
+    // re-arm back with it and the chain stops rather than failing forever.
+    expect(transcript.schedules).toHaveLength(1);
+    expect(transcript.schedules![0].id).toBe("the_widget:tick");
+    expect(transcript.schedules![0].call.args).toEqual([300_000]);
+  });
+
+  it("stops the chain when the consumer's tick raises", async () => {
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    expect(installVerb(
+      world, "the_widget", "tick",
+      'verb :tick() rxd { raise { code: "E_INVARG", message: "broken tick" }; }',
+      null
+    ).ok).toBe(true);
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+    const fired = await fire(world, actor, "the_widget", "_tick", [300_000], "f4");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]) as unknown as EffectTranscript;
+    world.setTurnRecorder(null as never);
+
+    expect(fired.op).toBe("error");
+    // No re-arm survives a failed turn: the chain halts with a recorded
+    // reason instead of retrying every minute forever.
+    expect(transcript.schedules ?? []).toHaveLength(0);
+  });
+
+  it("still refuses an ordinary caller once the scheduler can get through", async () => {
+    // The marker is what makes the internals reachable at all, so the guard
+    // that keeps everyone else out has to be re-proved against it: without
+    // the marker, the same call is refused.
+    const { world, actor, session } = schedulingWorld();
+    await enter(world, session);
+    const before = world.objects.size;
+    const outcome = await world.directCall(
+      "f5", actor, "the_widget", "_deliver_reminder", [actor, "forged"] as never, { sessionId: session.id } as never
+    );
+    expect(outcome.op).toBe("error");
+    expect(world.objects.size).toBe(before);
   });
 });

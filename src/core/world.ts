@@ -446,6 +446,10 @@ export type MeSnapshot = {
 const DEFAULT_OBJECT_HOST = "world";
 
 export type DirectCallOptions = {
+  /** CO16.4 — present only on the scheduler's own dispatch path. Relaxes the
+   * `direct_callable` ingress gate (a scheduled turn is not client ingress)
+   * and presents `caller = $system` so a fired verb can tell it was woken. */
+  scheduled?: { id: string; at: number; fired_at: number };
   forceDirect?: boolean;
   forceReason?: string;
   sessionId?: string | null;
@@ -454,6 +458,8 @@ export type DirectCallOptions = {
 };
 
 type DirectDispatchFrameOptions = {
+  /** CO16.4 scheduled dispatch; see DirectCallOptions. */
+  scheduled?: { id: string; at: number; fired_at: number };
   startedAt: number;
   sessionId: string | null;
   audience: ObjRef | null;
@@ -1319,7 +1325,15 @@ export class WooWorld {
     // arming object, and a stable key may itself contain colons.
     const separator = scheduleId.indexOf(":");
     const namespace = separator < 0 ? "" : scheduleId.slice(0, separator);
-    if (namespace !== ctx.thisObj && !this.isWizard(ctx.progr)) {
+    // The cross-namespace bypass keys on the ACTOR, not on `progr`.
+    //
+    // Keying it on progr made every wizard-owned catalog verb a universal
+    // canceller: a $wiz-owned verb is exactly how ordinary users reach the
+    // scheduler (that is the CO16.6 gate working), so `progr` is a wizard on
+    // every such call and the check passed for anyone. One user could cancel
+    // another's timer by passing its id. Cancelling someone else's work is a
+    // question about the principal, not about whose code is running.
+    if (namespace !== ctx.thisObj && !this.isWizard(ctx.actor)) {
       throw wooError("E_PERM", `cannot cancel schedule ${scheduleId} outside ${ctx.thisObj}`, { id: scheduleId, this: ctx.thisObj });
     }
     this.recordTurnEvent({ kind: "cancel_schedule", id: scheduleId });
@@ -5003,7 +5017,12 @@ export class WooWorld {
       const { verb } = this.resolveVerb(target, verbName);
       const forceDirect = options.forceDirect === true && verb.direct_callable !== true;
       const wizard = this.isWizard(actor);
-      if (verb.direct_callable !== true && !forceDirect) {
+      // CO16.4: a scheduled turn is not client ingress, so the ingress flag
+      // does not apply to it. Without this the scheduler could only ever fire
+      // verbs a browser could also call directly — which excludes exactly the
+      // internal verbs a scheduled chain is made of.
+      const scheduled = options.scheduled !== undefined;
+      if (verb.direct_callable !== true && !forceDirect && !scheduled) {
         throw wooError("E_DIRECT_DENIED", `direct call denied for ${target}:${verbName}`, { target, verb: verbName });
       }
       if (forceDirect && !wizard) throw wooError("E_PERM", "only wizards may force direct calls", { actor, target, verb: verbName });
@@ -5018,6 +5037,7 @@ export class WooWorld {
         sessionId,
         audience,
         hostMemo,
+        ...(options.scheduled ? { scheduled: options.scheduled } : {}),
         initialObservations: forceDirect ? [{ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target }] : undefined,
         deferHostEffect: options.deferHostEffect,
         onSessionsEnded: options.onSessionsEnded
@@ -5049,7 +5069,9 @@ export class WooWorld {
       session: options.sessionId,
       actor,
       player: actor,
-      caller: "#-1",
+      // A scheduled turn was WOKEN, not called; presenting `$system` is what
+      // lets a fired verb tell the difference and refuse ordinary callers.
+      caller: options.scheduled ? "$system" : "#-1",
       callerPerms: actor,
       progr: actor,
       thisObj: target,

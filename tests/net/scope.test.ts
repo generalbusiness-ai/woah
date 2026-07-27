@@ -1110,6 +1110,22 @@ describe("scheduled-turn effects (CO16.2)", () => {
     expect(seq.peekDue(NOW + LEAD).map((row) => row.id)).toEqual(["#thing:survivor"]);
   });
 
+  it("refuses arming work for an object the same turn recycles", () => {
+    // Lifecycle cleanup scans the queue BEFORE this turn's schedules are
+    // inserted, so recycle-plus-schedule in one transcript used to leave a
+    // pending entry aimed at a tombstone. The earlier test only covered
+    // entries armed in previous turns.
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { scopeOf: () => SCOPE });
+    seedTarget(seq);
+    const reply = seq.submit(armingTurn(seq, {
+      recycles: [{ object: "#thing" }],
+      schedules: [armed({ id: "#thing:doomed" })]
+    }, "s1"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") expect(String(reply.detail?.schedule)).toMatch(/same turn recycles/);
+    expect(seq.peekDue(NOW + LEAD)).toEqual([]);
+  });
+
   it("refuses more schedules in one turn than the per-turn cap", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const many = Array.from({ length: 17 }, (_, i) => armed({ id: `#thing:many${i}` }));

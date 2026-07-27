@@ -55,6 +55,16 @@ the intended failure mode: a broken chain halts and leaves one recorded
 reason (CO16.8) instead of failing forever, once a minute, until someone
 notices.
 
+## What makes the internals reachable at all
+
+They are not `direct_callable`, so nothing outside can call them — including,
+for a while, the scheduler. The scheduler's dispatch carries an internal
+`scheduled` marker that relaxes the ingress gate and presents
+`caller = $system`. Both halves are needed: without the first the internals
+answer `E_DIRECT_DENIED`, and without the second they see `caller = #-1` and
+refuse their own guard. The marker is a top-level field on the turn call, not
+part of `body`, because `body` is client-supplied.
+
 ## Why the internals refuse their own callers
 
 `_deliver_reminder`, `_fire_deadline` and `_tick` run with the scheduler's
@@ -63,6 +73,16 @@ ingress — but any verb on the same object can `dispatch()` to them, which
 ingress never sees. Hence the `caller != $system` guard in each. Both
 defences are needed and both are tested; removing the guard alone leaves
 the ingress test green.
+
+## Why reminder ids embed the caller
+
+`cancel_reminder` takes a tag, not a schedule id, and rebuilds the id from the
+calling actor. An id parameter let one user cancel another's reminder: these
+verbs are `$wiz`-owned (that is the CO16.6 gate working), so the kernel's
+cross-namespace check saw a wizard `progr` and allowed it for anybody. The
+kernel now keys that bypass on the ACTOR, and the catalog no longer offers a
+way to name someone else's timer. Either fix alone would have been enough;
+both are cheap and they fail independently.
 
 ## Why `:deadline` carries `verb_args`
 

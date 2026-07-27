@@ -32,10 +32,11 @@
           "arg_spec": {
             "args": [
               "delay_ms",
-              "text"
+              "text",
+              "tag"
             ]
           },
-          "source": "verb :remind_in(delay_ms, text) rxd {\n  /* One-shot reminder for the CALLER. Armed `always`: a reminder whose\n     room happens to be empty must still fire, which is the whole point\n     of a reminder. Arming `always` needs wizard authority (CO16.6) and\n     this verb is catalog-owned ($wiz), so an ordinary actor reaches it\n     here and only here \u2014 that is what the gate is for. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"remind_in needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"remind_in needs a non-empty reminder\", value: text }; }\n  if (length(text) > 4096) { raise { code: \"E_QUOTA\", message: \"reminder text exceeds 4096 characters\", value: length(text) }; }\n  /* The scheduled turn runs as `actor`, so it can do no more than the\n     caller could. Passing the actor explicitly keeps the fired verb from\n     having to infer who asked. */\n  return schedule(this, \"_deliver_reminder\", [actor, text], delay_ms, { \"idle_policy\": \"always\" });\n}",
+          "source": "verb :remind_in(delay_ms, text, tag) rxd {\n  /* One-shot reminder for the CALLER. Armed `always`: a reminder whose\n     room happens to be empty must still fire, which is the whole point\n     of a reminder. Arming `always` needs wizard authority (CO16.6) and\n     this verb is catalog-owned ($wiz), so an ordinary actor reaches it\n     here and only here \u2014 that is what the gate is for. */\n  if (typeof(delay_ms) != \"number\") { raise { code: \"E_TYPE\", message: \"remind_in needs a delay in milliseconds\", value: delay_ms }; }\n  if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"remind_in needs a non-empty reminder\", value: text }; }\n  if (length(text) > 4096) { raise { code: \"E_QUOTA\", message: \"reminder text exceeds 4096 characters\", value: length(text) }; }\n  /* The scheduled turn runs as `actor`, so it can do no more than the\n     caller could. Passing the actor explicitly keeps the fired verb from\n     having to infer who asked. */\n  /* The key embeds the CALLER. Reminders used to return an opaque id that\n     cancel_reminder accepted verbatim, and because this verb is $wiz-owned\n     the kernel's cross-namespace check passed for anybody \u2014 one user could\n     cancel another's reminder just by naming its id. Deriving the key from\n     the actor means a caller can only ever address their own. */\n  let label = tag;\n  if (typeof(label) != \"string\" || !label) { label = \"default\"; }\n  if (length(label) > 64) { raise { code: \"E_INVARG\", message: \"reminder tag exceeds 64 characters\", value: label }; }\n  return schedule(this, \"_deliver_reminder\", [actor, text], delay_ms, { \"key\": \"remind:\" + to_string(actor) + \":\" + label, \"idle_policy\": \"always\" });\n}",
           "direct_callable": true,
           "tool_exposed": true
         },
@@ -44,10 +45,10 @@
           "perms": "rxd",
           "arg_spec": {
             "args": [
-              "id"
+              "tag"
             ]
           },
-          "source": "verb :cancel_reminder(id) rxd {\n  /* Takes the id `remind_in` returned. Cancelling something already\n     fired or never armed is a no-op, not an error (SC2). */\n  if (typeof(id) != \"string\" || !id) { raise { code: \"E_INVARG\", message: \"cancel_reminder needs a schedule id\", value: id }; }\n  cancel_schedule(id);\n  return null;\n}",
+          "source": "verb :cancel_reminder(tag) rxd {\n  /* Takes the TAG, never a raw schedule id. The id is rebuilt from the\n     calling actor here, so there is no way to spell another user's\n     reminder \u2014 which an id parameter allowed, since this verb runs with\n     wizard progr and the kernel used to accept that as authority.\n     Cancelling a tag that was never armed is a no-op (SC2). */\n  let label = tag;\n  if (typeof(label) != \"string\" || !label) { label = \"default\"; }\n  cancel_schedule(to_string(this) + \":remind:\" + to_string(actor) + \":\" + label);\n  return null;\n}",
           "direct_callable": true,
           "tool_exposed": true
         },

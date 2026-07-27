@@ -1432,6 +1432,13 @@ harmless.
   checks do not apply — there is no session and no connection to be
   present on.
 
+  The dispatch carries an internal `scheduled` marker — set only on the
+  scheduler's own path, never reachable from a request body — which is what
+  relaxes the ingress check and presents `caller = $system`. Without it the
+  scheduler could fire only verbs a browser could also call directly, which
+  excludes exactly the internal verbs a scheduled chain is made of; and a
+  fired verb would see `caller = #-1` and be unable to tell it was woken.
+
   **`direct_callable` is not consulted, and that is a real difference from
   the client surface.** The flag is an *ingress* gate: the gateway's
   client path refuses an externally-requested `direct` route to a verb
