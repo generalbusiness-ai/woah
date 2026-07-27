@@ -6,7 +6,7 @@ import {
   SmokeCascadeHalt,
   raceWithAbort
 } from "../scripts/smoke-walkthrough";
-import { ensureInChatroom } from "../scripts/smoke/scenario";
+import { ensureInChatroom, normalizeOutlinerObservation } from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
@@ -113,6 +113,41 @@ describe("smoke walkthrough harness", () => {
     } as unknown as SmokeSession;
 
     await expect(ensureInChatroom(session)).rejects.toThrow("active_scope=null");
+  });
+
+  it("normalizes both allowed Outliner rolling-upgrade observation shapes", () => {
+    expect(normalizeOutlinerObservation({
+      type: "outline_item_added",
+      version: 1,
+      payload: { item: "item_1", parent_id: null, index: 2 },
+      source: "the_outline"
+    })).toEqual({
+      mode: "act",
+      fact: { item: "item_1", parent_id: null, index: 2 }
+    });
+    const legacy = {
+      type: "outline_item_added",
+      item: "item_1",
+      parent_id: null,
+      index: 2,
+      text: "legacy prose",
+      source: "the_outline"
+    };
+    expect(normalizeOutlinerObservation(legacy)).toEqual({ mode: "legacy", fact: legacy });
+  });
+
+  it("does not reinterpret malformed Act envelopes as legacy observations", () => {
+    expect(normalizeOutlinerObservation({
+      type: "outline_item_added",
+      version: 2,
+      payload: { item: "item_1" }
+    })).toBeNull();
+    expect(normalizeOutlinerObservation({
+      type: "outline_item_added",
+      version: 1,
+      item: "item_1"
+    })).toBeNull();
+    expect(normalizeOutlinerObservation({ type: "said", item: "item_1" })).toBeNull();
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {

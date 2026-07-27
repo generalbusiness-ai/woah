@@ -1051,6 +1051,40 @@ export class NetScopeDO {
           body.destination,
           role
         );
+        // A fanout re-subscription is also a continuity handshake. The scope's
+        // counter is the highest row ENQUEUED for this destination, whereas a
+        // pending lane head has not necessarily reached the gateway yet. Thus
+        // the safe receiver baseline is either the current counter (no pending
+        // row) or one before the oldest pending stamped row. Returning this
+        // watermark lets an evicted/aged gateway backfill current state without
+        // reporting already-acknowledged pre-subscription history as a new gap,
+        // while every still-pending row remains deliverable in exact order.
+        let resumeDeliverySeq: number | undefined;
+        if (role === "fanout") {
+          const subscriber = sqlRows<{ delivery_seq: number }>(
+            this.state.storage.sql.exec(
+              "SELECT delivery_seq FROM net_scope_subscribers WHERE destination = ? AND role = 'fanout' LIMIT 1",
+              body.destination
+            )
+          )[0];
+          resumeDeliverySeq = Number(subscriber?.delivery_seq ?? 0);
+          const pending = sqlRows<{ body: string }>(
+            this.state.storage.sql.exec(
+              "SELECT body FROM net_scope_outbox WHERE route = '/fanout' AND destination = ? AND status = 'pending' ORDER BY scope, seq LIMIT 1",
+              body.destination
+            )
+          )[0];
+          if (pending) {
+            const pendingBody = JSON.parse(pending.body) as { delivery_seq?: unknown };
+            const pendingDeliverySeq = pendingBody.delivery_seq;
+            // An unstamped rolling-upgrade row has no continuity position.
+            // Baseline at zero so it is delivered compatibly and the next
+            // stamped row cannot be silently skipped.
+            resumeDeliverySeq = Number.isSafeInteger(pendingDeliverySeq) && Number(pendingDeliverySeq) > 0
+              ? Math.min(resumeDeliverySeq, Number(pendingDeliverySeq) - 1)
+              : 0;
+          }
+        }
         // Subscription loss presents as a healthy authority commit with no
         // peer push. Name the bounded gateway-shard registration here so a
         // workerd/deployed trace can distinguish missing subscription from a
@@ -1073,7 +1107,10 @@ export class NetScopeDO {
             this.host.setAlarm(SCOPE_ALARM_KEY, now, async () => {});
           }
         }
-        return json({ ok: true });
+        return json({
+          ok: true,
+          ...(resumeDeliverySeq !== undefined ? { resume_delivery_seq: resumeDeliverySeq } : {})
+        });
       }
       if (request.method === "POST" && url.pathname === "/net/adopt") {
         const body = (await request.json()) as {

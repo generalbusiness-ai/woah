@@ -154,7 +154,18 @@ that seam:
    live catalog response MUST echo the authority epoch and mismatch fails
    closed. Sessions, identity records, compatibility instances, and every
    non-catalog owner remain per-turn reads of the live authority even when
-   their current scope name is `catalog`. Cross-invocation promises MUST NOT
+   their current scope name is `catalog`. After fetching the round's owner
+   attestations, the gateway MAY compare their cell versions with the
+   transcript before submit. A disagreement is already the exact
+   `read_version_mismatch` the scope would return, so the gateway may skip that
+   provably doomed submit, refresh the named cells, and re-plan. Because no
+   submit occurred, that immediate re-plan MAY reuse an owner attestation from
+   the preflight round only when the entry exactly covers every cell, ordering,
+   and replay version the new transcript requires from that owner. A changed or
+   newly required version MUST fetch a live owner attestation. Scope-returned
+   conflicts do not use this reuse path, and only the scope may accept; this
+   optimization removes rejected/redundant RPCs but creates no acceptance path.
+   Cross-invocation promises MUST NOT
    coalesce authority I/O: they join otherwise-independent platform request
    lineages and can violate the CO2.7 subrequest-depth bound.
    **Ordering reads follow the same rule.** An owner-computed ordering read
@@ -240,6 +251,20 @@ destination. Receivers MUST diagnose a jump in `delivery_seq` as a named
 fanout gap; they MUST NOT infer delivery loss from a jump in authority `seq`.
 Rows without `delivery_seq` remain valid during rolling upgrades but provide
 no delivery-gap evidence.
+
+An idempotent fanout re-subscription returns the lane's safely acknowledged
+prefix. The scope computes that resume watermark as the current subscriber
+counter when no row is pending, or one less than the oldest pending stamped
+row. The gateway durably advances only its `delivery_seq` high-water to that
+prefix before pulling the current state backfill; it does not advance the
+authority `seq` high-water. Consequently acknowledged history before the
+subscription boundary cannot appear as a new gap after gateway cache loss,
+while every pending row remains the next contiguous delivery. An unstamped
+pending rolling-upgrade row forces the resume prefix to zero. If a pending
+row arrives while the gateway is awaiting the subscription response, the
+gateway defers gap classification for that scope and compares the first
+interleaved lane position with the returned prefix; state application and
+durable delivery high-water advancement still happen immediately.
 
 ### CO2.6 Materialization miss is not semantic absence
 

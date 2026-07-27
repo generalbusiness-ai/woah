@@ -392,6 +392,7 @@ export async function runSmokeWalkthrough(
   });
 
   let outlineAnchor: string | null = null;
+  let outlinerMode: OutlinerObservationMode | null = null;
   await step("outliner:add_item reaches peer", async (ctx) => {
     const { alice, bob } = pair;
     await bob.moveTo("the_outline", ctx.signal);
@@ -399,9 +400,10 @@ export async function runSmokeWalkthrough(
     await drain(bob, cfg, ctx.signal);
     const text = `outline-${runId}`;
     await alice.call("the_outline", "add_item", [text], ctx.signal);
-    // v3 deliberately keeps prose on the $outline_item artifact. The Act is
-    // the concise structural fact that tells peers WHICH artifact changed;
-    // tree_view is the authoritative read that supplies its current content.
+    // A runtime deploy does not rewrite an installed world's catalog pages.
+    // Production may therefore still emit the pre-v3 flat observation while a
+    // freshly installed world emits the v3 Act envelope. The catalog migration
+    // explicitly requires consumers to accept both during this interval.
     const added = await waitFor(
       bob,
       (obs) => obs.type === "outline_item_added",
@@ -409,20 +411,28 @@ export async function runSmokeWalkthrough(
       ctx.signal,
       cfg
     );
-    const payload = added.payload;
-    if (added.version !== 1 || !isRecord(payload)) {
-      throw new Error(`expected v1 outline_item_added Act; got ${JSON.stringify(added).slice(0, 600)}`);
+    const normalized = normalizeOutlinerObservation(added);
+    if (!normalized) {
+      throw new Error(`expected a legacy or v1 outline_item_added observation; got ${JSON.stringify(added).slice(0, 600)}`);
     }
-    const payloadKeys = Object.keys(payload).sort();
-    const expectedKeys = ["index", "item", "parent_id"];
-    if (JSON.stringify(payloadKeys) !== JSON.stringify(expectedKeys) ||
-        typeof payload.item !== "string" ||
-        (payload.parent_id !== null && typeof payload.parent_id !== "string") ||
-        !Number.isSafeInteger(payload.index)) {
-      throw new Error(`expected concise outline_item_added payload; got ${JSON.stringify(payload).slice(0, 600)}`);
+    const fact = normalized.fact;
+    if (normalized.mode === "act") {
+      // v3 deliberately keeps prose on the $outline_item artifact. Its Act
+      // payload must stay the exact concise structural fact.
+      const payloadKeys = Object.keys(fact).sort();
+      const expectedKeys = ["index", "item", "parent_id"];
+      if (JSON.stringify(payloadKeys) !== JSON.stringify(expectedKeys)) {
+        throw new Error(`expected concise outline_item_added payload; got ${JSON.stringify(fact).slice(0, 600)}`);
+      }
     }
-    await waitForOutlinerArtifact(bob, payload.item, text, waitMs, ctx.signal);
-    outlineAnchor = payload.item;
+    if (typeof fact.item !== "string" ||
+        (fact.parent_id !== null && typeof fact.parent_id !== "string") ||
+        !Number.isSafeInteger(fact.index)) {
+      throw new Error(`expected a valid outline_item_added fact; got ${JSON.stringify(fact).slice(0, 600)}`);
+    }
+    outlinerMode = normalized.mode;
+    await waitForOutlinerArtifact(bob, fact.item, text, normalized.mode, waitMs, ctx.signal);
+    outlineAnchor = fact.item;
   });
 
   // The bake criterion is the whole structural vocabulary, not add alone.
@@ -431,25 +441,33 @@ export async function runSmokeWalkthrough(
   await step("outliner: reorder, move, hide, remove, and undo converge", async (ctx) => {
     const { alice, bob } = pair;
     const anchor = outlineAnchor;
-    if (!anchor) throw new Error("outliner lifecycle requires the preceding add_item artifact");
+    const mode = outlinerMode;
+    if (!anchor || !mode) throw new Error("outliner lifecycle requires the preceding add_item artifact");
 
     const text = `outline-lifecycle-${runId}`;
     await alice.call("the_outline", "add_item", [text], ctx.signal);
     const added = await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_added" && isRecord(obs.payload) && typeof obs.payload.item === "string",
+      (obs) => matchesOutlinerFact(obs, "outline_item_added", (fact) => typeof fact.item === "string"),
       waitMs,
       ctx.signal,
       cfg
     );
-    const item = added.payload.item as string;
-    await waitForOutlinerArtifact(bob, item, text, waitMs, ctx.signal);
+    const addedFact = normalizeOutlinerObservation(added);
+    if (!addedFact || addedFact.mode !== mode || typeof addedFact.fact.item !== "string") {
+      throw new Error(`outliner observation shape changed during one walkthrough: ${JSON.stringify(added).slice(0, 600)}`);
+    }
+    const item = addedFact.fact.item;
+    await waitForOutlinerArtifact(bob, item, text, mode, waitMs, ctx.signal);
 
     await alice.call("the_outline", "reorder_item", [item, 0], ctx.signal);
     await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_reordered" && isRecord(obs.payload) &&
-        obs.payload.item === item && obs.payload.to_index === 0,
+      (obs) => matchesOutlinerFact(
+        obs,
+        "outline_item_reordered",
+        (fact) => fact.item === item && fact.to_index === 0
+      ),
       waitMs,
       ctx.signal,
       cfg
@@ -458,6 +476,7 @@ export async function runSmokeWalkthrough(
       bob,
       (items) => items.some((row) => row.id === item && row.parent_id === null && row.index === 0),
       `${item} reordered to root index 0`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -465,8 +484,11 @@ export async function runSmokeWalkthrough(
     await alice.call("the_outline", "move_item", [item, anchor, 0], ctx.signal);
     await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_moved" && isRecord(obs.payload) &&
-        obs.payload.item === item && obs.payload.to_parent === anchor && obs.payload.to_index === 0,
+      (obs) => matchesOutlinerFact(
+        obs,
+        "outline_item_moved",
+        (fact) => fact.item === item && fact.to_parent === anchor && fact.to_index === 0
+      ),
       waitMs,
       ctx.signal,
       cfg
@@ -475,6 +497,7 @@ export async function runSmokeWalkthrough(
       bob,
       (items) => items.some((row) => row.id === item && row.parent_id === anchor && row.index === 0),
       `${item} moved under ${anchor}`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -482,8 +505,11 @@ export async function runSmokeWalkthrough(
     await alice.call("the_outline", "hide", [item, true], ctx.signal);
     await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_hidden" && isRecord(obs.payload) &&
-        obs.payload.item === item && obs.payload.hidden === true,
+      (obs) => matchesOutlinerFact(
+        obs,
+        "outline_item_hidden",
+        (fact) => fact.item === item && fact.hidden === true
+      ),
       waitMs,
       ctx.signal,
       cfg
@@ -492,6 +518,7 @@ export async function runSmokeWalkthrough(
       bob,
       (items) => items.some((row) => row.id === item && row.hidden === true),
       `${item} hidden`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -499,8 +526,11 @@ export async function runSmokeWalkthrough(
     await alice.call("the_outline", "undo", [], ctx.signal);
     await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_hidden" && isRecord(obs.payload) &&
-        obs.payload.item === item && obs.payload.hidden === false,
+      (obs) => matchesOutlinerFact(
+        obs,
+        "outline_item_hidden",
+        (fact) => fact.item === item && fact.hidden === false
+      ),
       waitMs,
       ctx.signal,
       cfg
@@ -509,6 +539,7 @@ export async function runSmokeWalkthrough(
       bob,
       (items) => items.some((row) => row.id === item && row.hidden === false),
       `${item} unhidden by undo`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -516,7 +547,7 @@ export async function runSmokeWalkthrough(
     await alice.call("the_outline", "remove_item", [item], ctx.signal);
     await waitFor(
       bob,
-      (obs) => obs.type === "outline_item_removed" && isRecord(obs.payload) && obs.payload.item === item,
+      (obs) => matchesOutlinerFact(obs, "outline_item_removed", (fact) => fact.item === item),
       waitMs,
       ctx.signal,
       cfg
@@ -525,6 +556,7 @@ export async function runSmokeWalkthrough(
       bob,
       (items) => items.every((row) => row.id !== item),
       `${item} absent after remove`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -533,19 +565,38 @@ export async function runSmokeWalkthrough(
     if (typeof restored !== "string") {
       throw new Error(`remove undo should return the restored artifact id; got ${JSON.stringify(restored)}`);
     }
-    await waitFor(
-      bob,
-      (obs) => obs.type === "outline_item_added" && isRecord(obs.payload) &&
-        obs.payload.item === restored && obs.payload.parent_id === anchor,
-      waitMs,
-      ctx.signal,
-      cfg
-    );
-    await waitForOutlinerArtifact(bob, restored, text, waitMs, ctx.signal);
+    if (mode === "act") {
+      // v3 records the restoration as the same structural added Act used by a
+      // normal add_item. This is the peer's precise invalidation signal.
+      await waitFor(
+        bob,
+        (obs) => matchesOutlinerFact(
+          obs,
+          "outline_item_added",
+          (fact) => fact.item === restored && fact.parent_id === anchor
+        ),
+        waitMs,
+        ctx.signal,
+        cfg
+      );
+    } else {
+      // v2 restores the row before emitting its legacy outline_undone event;
+      // it does not emit a second outline_item_added. The following bounded
+      // list_items polls still prove the returned artifact and parent.
+      await waitFor(
+        bob,
+        (obs) => obs.type === "outline_undone" && obs.actor === alice.actor && obs.outliner === "the_outline",
+        waitMs,
+        ctx.signal,
+        cfg
+      );
+    }
+    await waitForOutlinerArtifact(bob, restored, text, mode, waitMs, ctx.signal);
     await waitForOutlinerState(
       bob,
       (items) => items.some((row) => row.id === restored && row.parent_id === anchor),
       `${restored} restored under ${anchor}`,
+      mode,
       waitMs,
       ctx.signal
     );
@@ -650,6 +701,35 @@ async function walkSouthToTaskboard(session: SmokeSession, signal?: AbortSignal)
 
 type DrainConfig = { drainBudgetMs: number; drainPollMs: number; log?: (message: string) => void };
 
+export type OutlinerObservationMode = "act" | "legacy";
+
+/** Normalize the two shapes allowed by the Outliner v2→v3 rolling contract.
+ * A partial/malformed Act never falls back to legacy: once either envelope
+ * field is present, both the exact version and a map payload are required. */
+export function normalizeOutlinerObservation(
+  observation: unknown
+): { mode: OutlinerObservationMode; fact: Record<string, any> } | null {
+  if (!isRecord(observation) || typeof observation.type !== "string" ||
+      !observation.type.startsWith("outline_item_")) {
+    return null;
+  }
+  if ("version" in observation || "payload" in observation) {
+    if (observation.version !== 1 || !isRecord(observation.payload)) return null;
+    return { mode: "act", fact: observation.payload };
+  }
+  return { mode: "legacy", fact: observation };
+}
+
+function matchesOutlinerFact(
+  observation: Record<string, any>,
+  type: string,
+  matches: (fact: Record<string, any>) => boolean
+): boolean {
+  if (observation.type !== type) return false;
+  const normalized = normalizeOutlinerObservation(observation);
+  return normalized !== null && matches(normalized.fact);
+}
+
 // Drain pending observations from a session's wait queue so the next assertion
 // only sees events emitted after this point. The deployed fan-out can take 1–2s
 // at tail percentiles, so poll until the queue reports empty or the budget
@@ -708,25 +788,23 @@ async function waitForOutlinerArtifact(
   session: SmokeSession,
   item: string,
   expectedText: string,
+  mode: OutlinerObservationMode,
   totalTimeoutMs: number,
   signal?: AbortSignal
 ): Promise<void> {
   const startedAt = Date.now();
-  let lastView = "no tree_view result";
+  let lastView = "no authoritative outliner result";
   while (Date.now() - startedAt < totalTimeoutMs) {
     throwIfAborted(signal);
-    const view = await session.call("the_outline", "tree_view", [], signal);
-    if (!isRecord(view) || !Array.isArray(view.items)) {
-      throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
-    }
-    const row = view.items.find((candidate: unknown) => isRecord(candidate) && candidate.id === item);
+    const items = await readOutlinerItems(session, mode, signal);
+    const row = items.find((candidate: unknown) => isRecord(candidate) && candidate.id === item);
     if (isRecord(row) && row.text === expectedText) return;
-    lastView = JSON.stringify(view).slice(0, 1000);
+    lastView = JSON.stringify(items).slice(0, 1000);
     const remaining = totalTimeoutMs - (Date.now() - startedAt);
     if (remaining > 0) await abortableDelay(Math.min(100, remaining), signal);
   }
   throw new Error(
-    `timeout after ${totalTimeoutMs}ms waiting for tree_view artifact ${item} ` +
+    `timeout after ${totalTimeoutMs}ms waiting for outliner artifact ${item} ` +
     `with text ${JSON.stringify(expectedText)}; last view=${lastView}`
   );
 }
@@ -735,24 +813,44 @@ async function waitForOutlinerState(
   session: SmokeSession,
   matches: (items: Array<Record<string, any>>) => boolean,
   expected: string,
+  mode: OutlinerObservationMode,
   totalTimeoutMs: number,
   signal?: AbortSignal
 ): Promise<void> {
   const startedAt = Date.now();
-  let lastView = "no tree_view result";
+  let lastView = "no authoritative outliner result";
   while (Date.now() - startedAt < totalTimeoutMs) {
     throwIfAborted(signal);
-    const view = await session.call("the_outline", "tree_view", [], signal);
-    if (!isRecord(view) || !Array.isArray(view.items)) {
-      throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
-    }
-    const items = view.items.filter(isRecord);
+    const items = (await readOutlinerItems(session, mode, signal)).filter(isRecord);
     if (matches(items)) return;
-    lastView = JSON.stringify(view).slice(0, 1000);
+    lastView = JSON.stringify(items).slice(0, 1000);
     const remaining = totalTimeoutMs - (Date.now() - startedAt);
     if (remaining > 0) await abortableDelay(Math.min(100, remaining), signal);
   }
-  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for tree_view state ${expected}; last view=${lastView}`);
+  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for outliner state ${expected}; last view=${lastView}`);
+}
+
+/** v3 couples rows to a structural Act watermark through tree_view. An aged v2
+ * catalog has no tree_view verb, so its authoritative list_items read is the
+ * corresponding source of truth. Select from the observed catalog shape
+ * instead of catching arbitrary read failures and silently weakening a v3 run. */
+async function readOutlinerItems(
+  session: SmokeSession,
+  mode: OutlinerObservationMode,
+  signal?: AbortSignal
+): Promise<unknown[]> {
+  if (mode === "legacy") {
+    const rows = await session.call("the_outline", "list_items", [], signal);
+    if (!Array.isArray(rows)) {
+      throw new Error(`list_items returned an invalid authoritative shape: ${JSON.stringify(rows).slice(0, 600)}`);
+    }
+    return rows;
+  }
+  const view = await session.call("the_outline", "tree_view", [], signal);
+  if (!isRecord(view) || !Array.isArray(view.items) || !Number.isSafeInteger(view.structure_at_seq)) {
+    throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
+  }
+  return view.items;
 }
 
 async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
