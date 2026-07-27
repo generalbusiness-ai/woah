@@ -240,17 +240,24 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const listedText = JSON.stringify(listed.result?.structuredContent?.result ?? {});
     expect(listedText, listedText.slice(0, 400)).toContain("return 42");
 
-    // (8) The second reachability gate. The widget is now in structural context
-    // (inventory), but inventory objects expose only EXPLICITLY tool_exposed
-    // verbs — mcpActiveCommandContext grants command-shaped affordances to the
-    // room and its contents, never to self or inventory. So a freshly installed
-    // verb is durable and callable in-world but is deliberately not yet a tool.
+    // (8) `tool_exposed` is a LISTING gate and nothing more (spec M2.1/M2.2).
+    // The widget is in structural context (inventory), but inventory objects
+    // advertise only EXPLICITLY tool_exposed verbs — mcpActiveCommandContext
+    // grants command-shaped affordances to the room and its contents, never to
+    // self or inventory. So the freshly installed verb is not yet a tool...
     const w = sanitize(widget);
     const beforeExposure = await listNames(progSession);
     expect(beforeExposure, "an unexposed authored verb must not be advertised").not.toContain(`${w}__hi`);
-    // woo_call agrees with the advertised set: same resolver, same answer.
+    // ...and yet `woo_call` reaches it, which is the contract `help tools`
+    // states ("calls any verb you may reach"). Gating woo_call on the
+    // advertising flag left an author unable to run the verb they had just
+    // written on an object in their own hand, with a refusal that named no
+    // remediation. woo_call's gates are reachability and existence; every
+    // authority check still runs inside the authoritative turn.
     const unexposedCall = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
-    expect(unexposedCall.result?.isError, JSON.stringify(unexposedCall).slice(0, 400)).toBe(true);
+    await settleAll();
+    expect(unexposedCall.result?.isError, JSON.stringify(unexposedCall).slice(0, 400)).not.toBe(true);
+    expect(unexposedCall.result?.structuredContent?.result, JSON.stringify(unexposedCall).slice(0, 400)).toBe(42);
 
     // The last tools/list pinned this session's digest; open the live stream so
     // the exposure change has somewhere to push its notification.

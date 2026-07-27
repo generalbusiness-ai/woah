@@ -103,6 +103,7 @@ import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
+import { verbAliasMatches } from "../../core/verb-name-match";
 import {
   GUEST_RESET_NATIVE,
   guestResetVerbPageFor,
@@ -4928,7 +4929,10 @@ export class NetGatewayDO {
           protocolVersion: "2025-06-18",
           capabilities: { tools: { listChanged: true } },
           serverInfo: { name: "woo-net", version: "1" },
-          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives.`
+          // This string is an agent's ENTIRE onboarding: many MCP clients
+          // never call anything they were not pointed at. Two sentences of
+          // orientation cost nothing and remove the "what now?" turn.
+          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives. Start with ${mcpSanitizeId(actor)}__help for orientation — with no topic it returns the index. Use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
         }
       },
       200,
@@ -4986,8 +4990,8 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const observations = await this.mcpWait(session, timeout, limit);
-      return this.mcpResult(id, { observations });
+      const drained = await this.mcpWait(session, timeout, limit);
+      return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
     // The relation mirror can be newer than this gateway's object-cell view.
     // Materialize only the bounded structural context before discovery or
@@ -5015,24 +5019,39 @@ export class NetGatewayDO {
       }
     }
     if (name === "woo_call") {
-      const object = typeof args.object === "string" ? args.object : "";
+      const requested = typeof args.object === "string" ? args.object : "";
       const verb = typeof args.verb === "string" ? args.verb : "";
-      if (!object || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
+      if (!requested || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
+      // `$me`/`$here` are the forms every user doc uses for "the session
+      // actor" and "the space I am in". They resolved nowhere, so each of
+      // those documented examples refused. They are transport-level session
+      // aliases — no world object is named `$me` or `$here` — and resolving
+      // them here keeps the world's own id vocabulary untouched.
+      const object = requested === "$me"
+        ? actor
+        : requested === "$here"
+          ? (this.mcpActiveScope(actor, session) ?? requested)
+          : requested;
+      if (requested === "$here" && object === requested) {
+        return this.mcpToolError(id, {
+          code: "E_PERM",
+          message: "$here does not resolve: this session has no active space",
+          detail: { reason: "no_active_scope", actor, remediation: "enter a space first" }
+        });
+      }
       if (!isConcreteRuntimeObjectId(object)) {
         return this.mcpToolError(id, { code: "E_INVARG", message: "target must be a concrete runtime object id", detail: { field: "target", reason: "invalid_object_id", value: object } });
       }
-      const tool = this.mcpContextTools(actor, session).find((candidate) =>
-        candidate.object === object && (candidate.verb === verb || candidate.aliases.includes(verb))
-      );
-      if (!tool) return this.mcpToolError(id, { code: "E_PERM", message: `tool is not available in this session context: ${object}:${verb}` });
+      const resolved = this.mcpResolveCall(actor, session, object, verb);
+      if ("error" in resolved) return this.mcpToolError(id, resolved.error);
       return this.mcpInvokeTurn(
         id,
         actor,
         session,
-        tool.object,
-        tool.verb,
+        resolved.tool.object,
+        resolved.tool.verb,
         Array.isArray(args.args) ? args.args : [],
-        tool.route,
+        resolved.tool.route,
         this.mcpTraceOf(request)
       );
     }
@@ -5127,30 +5146,121 @@ export class NetGatewayDO {
         reply?: { status?: string; reason?: string; detail?: unknown };
         result?: unknown;
         error?: unknown;
+        observations?: unknown;
         [key: string]: unknown;
       };
-      if (!turnResponse.ok) return this.mcpToolError(id, turn.error ?? turn);
-      if (turn.reply?.status !== "accepted") return this.mcpToolError(id, turn.reply ?? turn);
-      if (turn.error !== undefined) return this.mcpToolError(id, turn.error);
-      return this.mcpResult(id, turn.result ?? null);
+      const shape = (failure: unknown): Response =>
+        this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object));
+      if (!turnResponse.ok) return shape(turn.error ?? turn);
+      if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
+      if (turn.error !== undefined) return shape(turn.error);
+      return this.mcpResult(id, turn.result ?? null, this.mcpOwnTurnObservations(turn.observations, actor));
     } catch (err) {
       // Taxonomy throws are tool failures on this surface. The JSON-RPC
       // request must receive a tool envelope, never an HTTP transport error.
-      if (isNetError(err)) return this.mcpToolError(id, { code: err.code, message: err.message, detail: err.detail });
+      if (isNetError(err)) {
+        return this.mcpToolError(
+          id,
+          this.mcpShapeTurnError({ code: err.code, message: err.message, detail: err.detail }, actor, session, object)
+        );
+      }
       return this.mcpToolError(id, { code: "E_INTERNAL", message: String(err) });
     }
   }
 
+  /**
+   * Client-facing shaping for a refused turn. Engine-true refusals are not
+   * automatically agent-legible: "write set spans two distinct shared
+   * scopes" is exactly right and tells an agent nothing about what to do.
+   *
+   * The coherence rule itself is untouched — a turn whose write set spans two
+   * shared scopes is still terminal (CO2.3). This only adds the remediation
+   * an MCP client can act on: the target is a mounted space you have not
+   * entered, so enter it. That is the "move to use" rule the space model
+   * already enforces; naming it is what was missing.
+   */
+  private mcpShapeTurnError(failure: unknown, actor: string, session: string, target: string): unknown {
+    if (!failure || typeof failure !== "object" || Array.isArray(failure)) return failure;
+    const record = failure as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : typeof record.reason === "string" ? record.reason : "";
+    if (code !== "E_SCOPE_SPLIT") return failure;
+    const active = this.mcpActiveScope(actor, session);
+    if (target === active) return failure; // already standing in the target
+    const detail = mcpRecord(record.detail);
+    return {
+      ...record,
+      detail: {
+        ...detail,
+        active_scope: active,
+        target,
+        // The target is reachable (it was resolved from structural context)
+        // but writes at its own shared scope, so presence has to move there.
+        remediation:
+          `${target} is a separate shared scope from ${active ?? "your current position"}; ` +
+          `one turn cannot write both. Enter ${target} first — call ${mcpSanitizeId(target)}__enter, ` +
+          `or the movement verb that leads there — then retry, and re-list tools afterwards.`
+      }
+    };
+  }
+
+  /**
+   * The submitting session's seat for its OWN turn's observations.
+   *
+   * The gateway has always held this contract for the socket transports —
+   * `recentClientTurns` skips the submitter's sockets on the fanout precisely
+   * because "the submitting session receives its turn's observations on the
+   * turn reply". `/net-api/turn` honours it; the MCP envelope was the one
+   * transport that read `result`/`error` off that reply and dropped
+   * `observations` on the floor. Composed with the queue's echo dedupe (which
+   * stays exactly as it is, so nothing arrives twice), an MCP actor therefore
+   * never saw what its own action did — guest_2 walked out of the room and
+   * never read its own "You slide the glass door open…" line.
+   *
+   * Delivering them on the reply rather than through `woo_wait` is the
+   * deliberate choice: it pairs cause with effect in one round trip, which is
+   * what a turn-based agent needs, and it keeps `woo_wait` meaning exactly
+   * "what OTHER actors did".
+   *
+   * Directed lines addressed to somebody else are dropped. This mirrors the
+   * committed-fanout rule (`typeof obs.to !== "string" || obs.to === actor`)
+   * rather than inventing a second audience vocabulary; when the shared
+   * `observationReachesActor` predicate lands it should replace this
+   * expression outright.
+   */
+  private mcpOwnTurnObservations(observations: unknown, actor: string): unknown[] {
+    if (!Array.isArray(observations)) return [];
+    return observations.filter((observation) => {
+      const to = (observation as { to?: unknown } | null)?.to;
+      return typeof to !== "string" || to === actor;
+    });
+  }
+
   /** The scenario's client contract: payloads ride
    * `result.structuredContent.result`; errors set `isError` with the
-   * detail in structuredContent (unwrap() throws on it). */
-  private mcpResult(id: number | string, payload: unknown): Response {
+   * detail in structuredContent (unwrap() throws on it).
+   *
+   * `observations` is a SIBLING of `result`, never nested inside it: the
+   * payload is the verb's own return value and may be any JSON — a scalar,
+   * null — so there is nowhere inside it to put anything. Existing consumers
+   * read `structuredContent.result` and are unaffected. A second content
+   * block carries the same rows for text-rendering clients, which would
+   * otherwise never see them; the first block keeps its exact former shape.
+   *
+   * The field is present only for VERB INVOCATIONS — the protocol controls
+   * pass nothing, because a `woo_wait` reply carrying both its drained queue
+   * and an always-empty `observations` sibling would be actively misleading. */
+  private mcpResult(id: number | string, payload: unknown, observations?: unknown[]): Response {
     return json({
       jsonrpc: "2.0",
       id,
       result: {
-        content: [{ type: "text", text: JSON.stringify(payload) }],
-        structuredContent: { result: payload },
+        content: [
+          { type: "text", text: JSON.stringify(payload) },
+          ...(observations && observations.length > 0
+            ? [{ type: "text", text: JSON.stringify({ observations }) }]
+            : [])
+        ],
+        structuredContent: { result: payload, ...(observations ? { observations } : {}) },
         isError: false
       }
     });
@@ -5172,24 +5282,33 @@ export class NetGatewayDO {
    * `timeoutMs` for the next fanout enqueue. One waiter list per
    * session; every parked waiter wakes on the next delivery. Each wake drains
    * at most the caller's limit and leaves the remainder queued. Concurrent
-   * waiters cannot duplicate a row because splice claims each prefix once. */
-  private async mcpWait(session: string, timeoutMs: number, limit: number): Promise<unknown[]> {
+   * waiters cannot duplicate a row because splice claims each prefix once.
+   *
+   * Every reply carries `gap` (M5.1). Delivery stays at-most-once and
+   * entirely in memory; `gap` only tells a polling agent whether this
+   * gateway can still PROVE continuity since its last drain. A pending gap
+   * short-circuits the park so the agent learns to re-orient immediately
+   * instead of after a full long-poll. */
+  private async mcpWait(session: string, timeoutMs: number, limit: number): Promise<{ observations: unknown[]; gap: boolean }> {
     const queue = this.mcpQueues.get(session);
-    if (!queue) return [];
-    if (queue.buffer.length > 0) {
-      const drained = queue.buffer.splice(0, limit);
-      return drained;
-    }
-    if (timeoutMs === 0) return [];
-    return await new Promise<unknown[]>((resolve) => {
+    // No live state at all: nothing to drain and nothing to vouch for.
+    if (!queue) return { observations: [], gap: true };
+    const take = (): { observations: unknown[]; gap: boolean } => {
+      const gap = queue.gapPending;
+      queue.gapPending = false;
+      return { observations: queue.buffer.splice(0, limit), gap };
+    };
+    if (queue.gapPending || queue.buffer.length > 0) return take();
+    if (timeoutMs === 0) return take();
+    return await new Promise<{ observations: unknown[]; gap: boolean }>((resolve) => {
       const timer = setTimeout(() => {
         const index = queue.waiters.indexOf(wake);
         if (index >= 0) queue.waiters.splice(index, 1);
-        resolve(queue.buffer.splice(0, limit));
+        resolve(take());
       }, timeoutMs);
       const wake = (): void => {
         clearTimeout(timer);
-        resolve(queue.buffer.splice(0, limit));
+        resolve(take());
       };
       queue.waiters.push(wake);
     });
@@ -5203,7 +5322,13 @@ export class NetGatewayDO {
     const queue = this.mcpQueues.get(session);
     if (!queue || observations.length === 0) return false;
     queue.buffer.push(...observations);
-    if (queue.buffer.length > MCP_QUEUE_CAP) queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
+    if (queue.buffer.length > MCP_QUEUE_CAP) {
+      // Overflow silently discarded undelivered rows. Record the loss so the
+      // next drain can say so (M5.1) — the client cannot otherwise tell an
+      // empty room from a dropped conversation.
+      queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
+      queue.gapPending = true;
+    }
     const waiters = queue.waiters.splice(0, queue.waiters.length);
     for (const wake of waiters) wake();
     return true;
@@ -5229,6 +5354,11 @@ export class NetGatewayDO {
     if (notifyOnRecover) {
       created.listChangedDirty = true;
       created.listChangedPending = true;
+      // Same signal, applied to observations: this request found a durable
+      // session with no live queue behind it, so anything fanned out before
+      // now was dropped on the floor. An `initialize` installs state
+      // explicitly (notifyOnRecover=false) and therefore starts gap-free.
+      created.gapPending = true;
     }
     this.mcpQueues.set(session, created);
     return created;
@@ -5437,8 +5567,107 @@ export class NetGatewayDO {
     };
   }
 
+  /**
+   * `woo_call`'s target resolution — the wide contract `help tools` has
+   * always promised ("calls any verb you may reach, and still works when
+   * your cached tool list is stale").
+   *
+   * It is deliberately wider than the dynamic tool LISTING. The listing is a
+   * curated advertisement gated by `tool_exposed`; woo_call is the escape
+   * hatch, and gating it on an advertising flag made an author's freshly
+   * installed verb on an object in their own inventory uncallable until they
+   * discovered `set_verb_info {tool_exposed:true}` — with a refusal
+   * ("tool is not available in this session context") that named neither the
+   * flag nor any other remediation. The gates that remain are the two that
+   * mean something: structural reachability (M3) and verb existence, plus
+   * the generic execute prefilter. Every world-level authority check —
+   * E_PERM, the programmer/wizard flags, verb-body guards — still runs
+   * unchanged inside the authoritative turn.
+   *
+   * Refusals name ONE condition each, because they have different
+   * remediations: move/take vs. install the verb vs. get promoted.
+   */
+  private mcpResolveCall(
+    actor: string,
+    session: string,
+    object: string,
+    verb: string
+  ): { tool: NetMcpToolDraft } | { error: { code: string; message: string; detail?: unknown } } {
+    const context = this.mcpContextObjects(actor, session);
+    if (!context.has(object)) {
+      const active = this.mcpActiveScope(actor, session);
+      return {
+        error: {
+          code: "E_PERM",
+          message:
+            `${object} is not reachable from this session. Reachable objects are you (${actor}), ` +
+            `your space${active ? ` (${active})` : " — you are not in one"}, that space's contents, and your inventory.`,
+          detail: {
+            reason: "target_not_reachable",
+            target: object,
+            actor,
+            active_scope: active,
+            // The remediation, not a restatement of the rule.
+            remediation: active
+              ? `move to the object's space (a movement verb, or ${active}:enter <space>), or take it into your inventory`
+              : "you are not in a space; enter one first (for example with your home verb)"
+          }
+        }
+      };
+    }
+    const drafts = this.mcpObjectToolDrafts(actor, object, this.mcpActiveCommandContext(actor, session).has(object));
+    const tool = mcpMatchVerb(drafts, verb);
+    if (!tool) {
+      // Same shape the engine raises for a missing verb (world.ts): a client
+      // that already special-cases E_VERBNF keeps working.
+      return {
+        error: {
+          code: "E_VERBNF",
+          message: `verb not found: ${object}:${verb}`,
+          detail: {
+            obj: object,
+            name: verb,
+            reason: "verb_not_defined",
+            remediation: `${object} is reachable but defines no ${verb} on its class chain; list its verbs, or install one`
+          }
+        }
+      };
+    }
+    if (!tool.bytecode) {
+      return {
+        error: {
+          code: "E_PERM",
+          message: `${object}:${verb} is a native verb and has no portable Net execution body`,
+          detail: { reason: "native_verb", obj: object, name: verb }
+        }
+      };
+    }
+    if (!tool.executable) {
+      return {
+        error: {
+          code: "E_PERM",
+          message: `${object}:${verb} is not executable by you: its perms are "${tool.perms || "(none)"}" and you do not own it`,
+          detail: { reason: "verb_not_executable", obj: object, name: verb, perms: tool.perms, remediation: "the verb owner must add the x permission" }
+        }
+      };
+    }
+    if (tool.route === "direct" && !tool.directCallable) {
+      // The ingress gate (core.md C12.2) refuses this downstream too; naming
+      // it here keeps the vocabulary uniform across woo_call's refusals.
+      return {
+        error: {
+          code: "E_DIRECT_DENIED",
+          message: `verb ${verb} is not externally direct-callable`,
+          detail: { target: object, verb, reason: "not_direct_callable", remediation: "the verb needs the d permission to be invoked by an outside client" }
+        }
+      };
+    }
+    return { tool };
+  }
+
   /** The exact dynamic set advertised by standard tools/list and accepted by
-   * both dynamic-name calls and woo_call. Keep this one resolver authoritative. */
+   * dynamic-name calls. woo_call resolves through the same draft producer
+   * without the advertising gate — see mcpResolveCall. */
   private mcpContextTools(actor: string, session: string): NetMcpDynamicTool[] {
     return this.mcpToolsForObjects(
       actor,
@@ -5545,13 +5774,26 @@ export class NetGatewayDO {
     }
   }
 
+  /**
+   * The session's active space, or null when it has none.
+   *
+   * `$nowhere` is the substrate's placeless sentinel — the absence of a
+   * location, spelled as an object — so it must answer null here, exactly
+   * like a missing cell. Treating any non-empty string as a space made an
+   * unplaced actor "in" $nowhere: `$here` resolved to it (instead of the
+   * documented no-active-scope refusal), and $nowhere's own verbs were
+   * projected as tools, which is why the walkthrough saw an unplaced actor
+   * offered `nowhere__look` and `nowhere__set_description`. Freshly
+   * provisioned agents (AP11) are placeless, so this is the first state a new
+   * agent is in, not an edge case.
+   */
   private mcpActiveScope(actor: string, session: string): string | null {
     const view = this.ensureView();
     const row = view.get(sessionCellKey(session))?.value as { activeScope?: unknown; active_scope?: unknown } | undefined;
     const scoped = typeof row?.activeScope === "string" ? row.activeScope : typeof row?.active_scope === "string" ? row.active_scope : null;
-    if (scoped) return scoped;
+    if (scoped) return mcpPlacedScope(scoped);
     const live = view.get(cellKey("object_live", actor))?.value as { location?: unknown } | undefined;
-    return typeof live?.location === "string" && live.location ? live.location : null;
+    return typeof live?.location === "string" ? mcpPlacedScope(live.location) : null;
   }
 
   /** Contents normally expose their full explicit tool surface. A different
@@ -5606,17 +5848,36 @@ export class NetGatewayDO {
       (a === actor ? 0 : 1) - (b === actor ? 0 : 1) || a.localeCompare(b);
     const drafts: NetMcpToolDraft[] = [];
     for (const object of [...objects].sort(byObject)) {
-      drafts.push(...this.mcpObjectToolDrafts(actor, object, commandObjects.has(object)));
+      // The draft producer now yields every dispatchable page and marks the
+      // gates; LISTING applies them. woo_call reads the same drafts without
+      // the `exposed` gate (M2.1), so the two layers still share one resolver.
+      for (const draft of this.mcpObjectToolDrafts(actor, object, commandObjects.has(object))) {
+        if (draft.bytecode && draft.exposed && draft.executable) drafts.push(draft);
+      }
     }
     drafts.sort((a, b) => byObject(a.object, b.object) || a.verb.localeCompare(b.verb));
     const used = new Set<string>();
+    // Presentation — schema derivation and the doc-comment scan — happens
+    // here, AFTER the listing gates. Producing a draft for every dispatchable
+    // page is what lets woo_call reach unadvertised verbs; doing the
+    // presentation work for them too would have made every tools/list pay for
+    // pages nobody is going to see.
     return drafts.map((draft) => {
       const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
       let name = base;
       let suffix = 2;
       while (used.has(name)) name = `${base}_${suffix++}`;
       used.add(name);
-      return { ...draft, name };
+      const input = mcpInputSchema(draft.argSpec);
+      const paragraph = mcpFirstParagraph(draft.source);
+      const callForm = `${draft.object}:${draft.verb}(${input.args.join(", ")})`;
+      return {
+        ...draft,
+        name,
+        inputSchema: input.schema,
+        argNames: input.args,
+        description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`
+      };
     });
   }
 
@@ -5645,7 +5906,6 @@ export class NetGatewayDO {
           if (seenVerbs.has(verb)) continue;
           seenVerbs.add(verb); // an override hides every inherited page, exposed or not
           const page = cell.value as Record<string, unknown>;
-          if (page.kind !== "bytecode") continue;
           const argSpec = mcpRecord(page.arg_spec);
           const command = mcpRecord(argSpec.command);
           // The catalog's command contract is the one routing declaration
@@ -5654,24 +5914,39 @@ export class NetGatewayDO {
           // through the sequencer.
           const route = command.persistence === "live" ? "direct" : "sequenced";
           const commandShaped = Object.keys(command).length > 0;
-          const exposed = page.tool_exposed === true || (allowCommandShaped && commandShaped);
-          if (!exposed) continue;
           const perms = typeof page.perms === "string" ? page.perms : "";
           const owner = typeof page.owner === "string" ? page.owner : "";
-          if (!wizard && owner !== actor && !perms.includes("x")) continue;
           const aliases = Array.isArray(page.aliases) ? page.aliases.filter((value): value is string => typeof value === "string") : [];
-          const source = typeof page.source === "string" ? page.source : "";
-          const input = mcpInputSchema(argSpec);
-          const callForm = `${object}:${verb}(${input.args.join(", ")})`;
-          const paragraph = mcpFirstParagraph(source);
           out.push({
             object,
+            // The class (or feature ancestor) that actually holds this page.
+            // Verb-name resolution is per-definer (see mcpMatchVerb), so the
+            // draft has to remember where it came from.
+            definer: current,
             verb,
             route,
             aliases,
-            description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`,
-            inputSchema: input.schema,
-            argNames: input.args
+            // Raw inputs to presentation. Schema derivation and the
+            // doc-comment scan are deferred to mcpToolsForObjects so an
+            // unadvertised page costs one object, not one render.
+            source: typeof page.source === "string" ? page.source : "",
+            argSpec,
+            // Only bytecode pages have a portable Net execution body (M2.2).
+            // A native page still shadows its inherited namesakes, so it is
+            // carried as a draft: that is what lets woo_call answer "native,
+            // no Net body" instead of the wrong "verb not found".
+            bytecode: page.kind === "bytecode",
+            perms,
+            // LISTING gate. `tool_exposed` decides whether a verb is
+            // advertised; since the woo_call widening it decides nothing
+            // else (M2.1).
+            exposed: page.tool_exposed === true || (allowCommandShaped && commandShaped),
+            // Generic execute-permission prefilter. The authoritative turn
+            // re-checks; this only keeps unusable descriptors out of the
+            // listing and produces an early, precise refusal for woo_call.
+            executable: wizard || owner === actor || perms.includes("x"),
+            // Ingress flag consumed by the direct route (core.md C12.2).
+            directCallable: page.direct_callable === true
           });
         }
         const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
@@ -8787,6 +9062,8 @@ const MCP_SESSION_STATE_CAP = 512;
 const GATEWAY_CARRIER_QUERY_CHUNK = 64;
 const MCP_STANDARD_TOOL_PAGE = 128;
 const MCP_DISCOVERY_DEFAULT_PAGE = 64;
+/** Longest doc-comment paragraph carried into a tool description. */
+const MCP_DESCRIPTION_CAP = 500;
 const MCP_DISCOVERY_MAX_PAGE = 256;
 const MCP_CONTEXT_WARM_FAILURE_CAP = 512;
 const MCP_CONTEXT_WARM_SUCCESS_CAP = 512;
@@ -8807,6 +9084,11 @@ type NetMcpSessionState = {
   buffer: unknown[];
   waiters: Array<() => void>;
   ownEchoIds: Set<string>;
+  /** M5.1 continuity marker. True when this gateway cannot prove that the
+   * session's queue has been continuous since the client's last drain —
+   * a rebuilt (evicted/restarted) state, or a bounded-buffer overflow.
+   * Cleared by the woo_wait reply that carries it. */
+  gapPending: boolean;
   toolListDigest: string | null;
   listChangedDirty: boolean;
   listChangedPending: boolean;
@@ -8819,6 +9101,7 @@ function mcpSessionState(actor: string): NetMcpSessionState {
     buffer: [],
     waiters: [],
     ownEchoIds: new Set(),
+    gapPending: false,
     toolListDigest: null,
     listChangedDirty: false,
     listChangedPending: false,
@@ -8853,18 +9136,42 @@ type NetMcpToolScope = "active" | "here" | "object" | "space";
 
 type NetMcpToolDraft = {
   object: string;
+  /** The class or feature ancestor holding the page. Verb-name resolution is
+   * per-definer, so this is load-bearing for mcpMatchVerb, not decoration. */
+  definer: string;
   verb: string;
   /** Transport route derived from catalog command persistence. This stays
    * internal: clients invoke one capability; the gateway preserves its
    * declared live/durable semantics. */
   route: "direct" | "sequenced";
   aliases: string[];
+  /** Verb source, kept raw: the description is rendered from it only for
+   * pages that survive the listing gates. */
+  source: string;
+  /** Compiler-owned argument metadata, kept raw for the same reason. */
+  argSpec: Record<string, unknown>;
+  /** Bytecode-backed. A native page has no portable Net execution body. */
+  bytecode: boolean;
+  /** The page's raw perm string, for a refusal that can name the gate. */
+  perms: string;
+  /** Listing gate only: `tool_exposed`, or command-shaped on the active
+   * command surface. It has no bearing on `woo_call` (M2.1). */
+  exposed: boolean;
+  /** Generic execute-permission prefilter; the authoritative turn re-checks. */
+  executable: boolean;
+  /** Ingress flag consumed by the `direct` route (core.md C12.2). */
+  directCallable: boolean;
+};
+
+/** A draft plus its rendered presentation: the tool name, the derived input
+ * schema and positional argument order, and the description (the verb's first
+ * doc paragraph followed by the canonical call form). */
+type NetMcpDynamicTool = NetMcpToolDraft & {
+  name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   argNames: string[];
 };
-
-type NetMcpDynamicTool = NetMcpToolDraft & { name: string };
 
 type NetMcpToolPage = {
   scope: NetMcpToolScope;
@@ -8900,15 +9207,112 @@ function mcpCursor(value: unknown): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+/** Placelessness is spelled two ways — an absent/empty value and the
+ * `$nowhere` sentinel — and both mean "this session has no active space". */
+function mcpPlacedScope(location: string): string | null {
+  return location && location !== "$nowhere" ? location : null;
+}
+
 function mcpSanitizeId(value: string): string {
   return value.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
-function mcpFirstParagraph(source: string): string {
+/**
+ * Resolve a caller's word against a target's dispatchable pages, by the same
+ * rule the world dispatcher uses.
+ *
+ * Aliases are PATTERNS — `l@ook`, `@exam*ine`, `get*`, `a|b` — not literals.
+ * The gateway used to exact-compare `aliases.includes(verb)`, so `woo_call`
+ * answered E_VERBNF for names `world.resolveVerb` accepts.
+ *
+ * Precedence matters as much as matching, and is reproduced exactly: the world
+ * walks the chain definer by definer and, at EACH definer, tries every exact
+ * name before any alias pattern (world.ts ownVerbNamed). Flattening that into
+ * one global exact pass followed by one global alias pass would silently
+ * dispatch an ancestor's exactly-named verb where the world would have run a
+ * nearer class's aliased one — a wrong verb, which is worse than a refusal.
+ * `drafts` arrives in chain order and is contiguous per definer, so walking
+ * the groups in order preserves it.
+ */
+function mcpMatchVerb(drafts: NetMcpToolDraft[], name: string): NetMcpToolDraft | undefined {
+  for (let index = 0; index < drafts.length; ) {
+    const definer = drafts[index].definer;
+    let end = index;
+    while (end < drafts.length && drafts[end].definer === definer) end += 1;
+    const group = drafts.slice(index, end);
+    const exact = group.find((draft) => draft.verb === name);
+    if (exact) return exact;
+    const aliased = group.find((draft) => draft.aliases.some((alias) => verbAliasMatches(alias, name)));
+    if (aliased) return aliased;
+    index = end;
+  }
+  return undefined;
+}
+
+/**
+ * The verb doc-comment is the only prose an MCP client ever sees about a
+ * world verb, so take the first PARAGRAPH — not the first physical line.
+ *
+ * The line-comment branch used to return a single `//` line, which cut the
+ * seeded natives mid-sentence on the live surface ("Creates an object owned
+ * by the invoking actor. There is intentionally no", "…so the destination's"):
+ * doc-comments in the catalogs are written as wrapped `//` runs, so the first
+ * line is almost never a complete thought. A run ends at the first line that
+ * is not a `//` comment, or at a bare `//` (the author's paragraph break).
+ *
+ * Whichever style comes FIRST in the source wins. Preferring block comments
+ * unconditionally meant a verb documented with leading slash-slash lines
+ * advertised whatever bracketed comment it happened to contain later. A
+ * bundled builder command verb described itself with a one-line caveat from a
+ * `try` recovery some 3,000 characters below its actual documentation; the
+ * end-to-end pin for it is in tests/worker/net-mcp-legibility.test.ts.
+ *
+ * Exported for tests: the clamp boundary is not reachable through the seeded
+ * catalogs, and a truncation defect on this path is invisible until an agent
+ * reads a sentence that stops mid-word.
+ */
+export function mcpFirstParagraph(source: string): string {
   const block = /\/\*([\s\S]*?)\*\//.exec(source);
-  if (block) return block[1].split(/\n\s*\n/)[0].replace(/^\s*\*?\s?/gm, "").trim();
-  const line = /^\s*\/\/\s?(.*)$/m.exec(source);
-  return line?.[1]?.trim() ?? "";
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => /^\s*\/\//.test(line));
+  // Character offset of that first line-initial `//`, so the two styles are
+  // comparable by POSITION rather than by an arbitrary preference. (`+ 1`
+  // restores the newline each split removed.)
+  const lineOffset = start < 0
+    ? -1
+    : lines.slice(0, start).reduce((total, line) => total + line.length + 1, 0);
+  if (start >= 0 && (!block || lineOffset < block.index)) {
+    const paragraph: string[] = [];
+    for (let index = start; index < lines.length; index += 1) {
+      const match = /^\s*\/\/\s?(.*)$/.exec(lines[index]);
+      if (!match) break; // the contiguous comment run ended
+      const text = match[1].trim();
+      if (!text) break; // a bare `//` is the author's paragraph break
+      paragraph.push(text);
+    }
+    return mcpClampDescription(paragraph.join(" "));
+  }
+  if (block) {
+    // Strip the `*` gutter BEFORE splitting: a JSDoc paragraph break is a
+    // line holding only ` * `, which is not blank until the gutter is gone.
+    const body = block[1].replace(/^\s*\*?[ \t]?/gm, "");
+    return mcpClampDescription(body.split(/\n[ \t]*\n/)[0].trim());
+  }
+  return "";
+}
+
+/** A tool description is model context: an unbounded doc paragraph is a
+ * context tax on every tools/list, and a hard cut mid-word reads as
+ * corruption. Clamp on a word boundary with an explicit ellipsis. */
+function mcpClampDescription(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= MCP_DESCRIPTION_CAP) return collapsed;
+  const cut = collapsed.slice(0, MCP_DESCRIPTION_CAP);
+  const boundary = cut.lastIndexOf(" ");
+  // Only honour the word boundary when it is not absurdly early (a single
+  // 500-character "word" is pathological; a hard cut is better than nothing).
+  const kept = boundary > MCP_DESCRIPTION_CAP * 0.6 ? cut.slice(0, boundary) : cut;
+  return `${kept.replace(/[\s.,;:—-]+$/, "")}…`;
 }
 
 function mcpInputSchema(argSpec: Record<string, unknown>): { schema: Record<string, unknown>; args: string[] } {
@@ -8995,30 +9399,51 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
 const MCP_TOOL_DEFS = [
   {
     name: "woo_call",
-    description: "Call a verb on an object as the session's actor.",
+    description:
+      "Call any verb you can reach, as the session's actor. Works when your cached tool list is stale, and reaches verbs that are not advertised as tools. "
+      + "The target must be reachable: yourself, the space you are in, that space's contents, or your inventory. "
+      + "Refusals name the condition: unreachable target, undefined verb (E_VERBNF), or a permission gate.",
     inputSchema: {
       type: "object",
-      properties: { object: { type: "string" }, verb: { type: "string" }, args: { type: "array" } },
+      properties: {
+        object: { type: "string", description: "Canonical object id. `$me` is the session actor; `$here` is the space you are in." },
+        verb: { type: "string", description: "Verb name or alias." },
+        args: { type: "array", items: {}, description: "Positional arguments, in the verb's declared order." }
+      },
       required: ["object", "verb"]
     }
   },
   {
     name: "woo_wait",
-    description: "Long-poll the session's observation queue.",
-    inputSchema: { type: "object", properties: { timeout_ms: { type: "number" }, limit: { type: "number" } } }
-  },
-  {
-    name: "woo_list_reachable_tools",
-    description: "Page and filter dynamic tools in the session's structural context.",
+    description:
+      "Long-poll the session's observation queue — this is how you hear what other actors do. "
+      + "Returns {observations, gap}; `gap:true` means continuity could not be proven and some observations may have been lost, so re-orient (look/who) rather than assume you heard everything.",
     inputSchema: {
       type: "object",
       properties: {
-        scope: { type: "string", enum: ["active", "here", "object", "space"] },
-        object: { type: "string" },
-        query: { type: "string" },
-        limit: { type: "number" },
-        cursor: { type: "string" },
-        include_schema: { type: "boolean" }
+        timeout_ms: { type: "number", description: "How long to park when the queue is empty; 0–25000, default 1000." },
+        limit: { type: "number", description: "Maximum observations to drain; 1–256, default 64." }
+      }
+    }
+  },
+  {
+    name: "woo_list_reachable_tools",
+    description:
+      "Page and filter the DYNAMIC tools in the session's structural context. `total` counts dynamic tools only, and excludes these woo_* protocol controls. "
+      + "Note that standard tools/list returns at most 128 entries per page including the woo_* controls, so its first page and this total are not comparable.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["active", "here", "object", "space"],
+          description: "Presentation only, never authority: active = you + your space + its contents + inventory (default); here = your space and its contents; object = one named contextual object; space = one contextual space and its contents."
+        },
+        object: { type: "string", description: "Target object for scope `object`/`space`." },
+        query: { type: "string", description: "Case-insensitive match over name, object, verb, aliases, and description." },
+        limit: { type: "number", description: "Page size; 1–256, default 64." },
+        cursor: { type: "string", description: "Opaque cursor from a previous `next_cursor`." },
+        include_schema: { type: "boolean", description: "Add each descriptor's `input_schema`." }
       }
     }
   }

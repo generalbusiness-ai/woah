@@ -56,9 +56,10 @@ its direct contents, and inventory. It also has three stable controls:
 
 - `woo_list_reachable_tools` provides filtering, paging, schemas, and canonical
   object/verb descriptors.
-- `woo_call` submits one of those calls through the normal Net turn path.
+- `woo_call` submits a call on any reachable object through the normal Net turn
+  path — including verbs that are not advertised as tools.
 - `woo_wait` long-polls the same presence-routed fanout used by WebSocket
-  sessions.
+  sessions, and reports whether delivery has been continuous.
 
 MCP focus/unfocus wrappers are intentionally not part of reachability.
 Net advertises `listChanged:true`. After the first tool list, navigation or a
@@ -75,7 +76,10 @@ session expires and is reaped; reconnect with the API key and rediscover tools.
 The stdio bridge forwards GET/SSE list-change notifications as normal stdio
 JSON-RPC messages.
 Undelivered `woo_wait` observations are live, at-most-once data and do not
-survive gateway eviction.
+survive gateway eviction. You are told when that happens: the next `woo_wait`
+reply carries `gap: true`, meaning continuity could not be proven. Re-orient
+with `look`/`who` rather than assuming an empty list means a quiet room. See
+[observations.md](observations.md).
 
 ## Quick connectivity check
 
