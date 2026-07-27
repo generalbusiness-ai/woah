@@ -390,13 +390,23 @@ export async function runSmokeWalkthrough(
   // deterministic sequence (queued status read between order and cancel, and
   // exactly a canceled outcome).
   //
-  // LEAK GUARD: whatever happens, an order this step placed must not survive
-  // it as pending — an abandoned order would be drained by the plug within 15
-  // minutes, spending quota and delivering an unwanted note. The finally block
-  // cancels best-effort whenever no terminal reply was observed. (`cancel` is
-  // idempotent: delivered → {duplicate, reason:"delivered"}, already-canceled
-  // → {duplicate:true}.) If a delivered note does land (race lost), its ref is
-  // logged loudly; a dispensed note disperses when its holder drops it.
+  // LEAK GUARD (best-effort by construction, with the residual case named):
+  // an abandoned pending order would be drained by the plug within its poll
+  // interval, spending quota and delivering an unwanted note. The finally
+  // block therefore (a) runs its cleanup calls WITHOUT the step signal — a
+  // fired watchdog must abort the assertions, not the cleanup, and each call
+  // stays bounded by the session's own RPC deadline; (b) recovers a lost
+  // order id when the order committed server-side but its reply timed out, by
+  // scanning both sessions' observation queues for the ordered fact carrying
+  // this run's unique request string; and (c) cancels whenever no terminal
+  // reply was observed (`cancel` is idempotent: delivered → {duplicate,
+  // reason:"delivered"}, already-canceled → {duplicate:true}). A lost
+  // delivery race is cleaned up too: the terminal fact carries the note ref,
+  // and dropping it by literal `#id` disperses it (a `$dispensed_note`
+  // recycles on drop). The irreducible residual — the smoke process dying
+  // mid-window — leaves at most one order, which the live plug itself settles
+  // (delivery or plug-cancel) within its poll interval; that residual is
+  // documented, not denied.
   //
   // Rolling v0→v1 contract: a runtime deploy does not rewrite an installed
   // world's catalog pages, so an aged world may still run the pre-Acts
@@ -420,32 +430,40 @@ export async function runSmokeWalkthrough(
     const competing = options.dispenserCompetingConsumer === true;
     const admissionWaitMs = options.dispenserAdmissionWaitMs ?? DEFAULT_ADMISSION_WAIT_MS;
     const request = `walkthrough-order-${runId}`;
+    let orderAttempted = false;
     let orderId: string | null = null;
     let terminalReached = false;
     try {
+      orderAttempted = true;
       const reply = await orderWithAdmissionRetry(alice, request, admissionWaitMs, ctx.signal, cfg);
       if (!isRecord(reply) || reply.queued !== true || typeof reply.order_id !== "string" || !reply.order_id) {
         throw new Error(`dispenser order should return {order_id, queued:true}; got ${JSON.stringify(reply).slice(0, 300)}`);
       }
       orderId = reply.order_id;
 
-      let terminalKind: DispenserFactKind;
+      // Which terminal facts we accept, and which we then observed.
+      let expected: DispenserFactKind[];
       if (competing) {
-        // Cancel first, before any assertion widens the race window.
+        // Cancel first, before any assertion widens the race window. The
+        // reply classifies the race but cannot always name the winner: a
+        // pre-Acts page deletes the pending row both when the plug DELIVERS
+        // and when the plug CANCELS (its prepare_artifact call E_VERBNFs on
+        // that page and it cancels the order as permanent), and both read
+        // back as `not_pending`. An ambiguous reply therefore accepts either
+        // terminal fact and learns the outcome from whichever arrives.
         const canceled = await alice.call("the_horoscope", "cancel", [orderId], ctx.signal);
         const disposition = dispenserCancelDisposition(canceled);
         if (disposition === null) {
-          throw new Error(`dispenser cancel for ${orderId} returned neither a cancellation nor a delivery race; got ${JSON.stringify(canceled).slice(0, 300)}`);
+          throw new Error(`dispenser cancel for ${orderId} returned neither a cancellation nor a settled race; got ${JSON.stringify(canceled).slice(0, 300)}`);
         }
         terminalReached = true;
-        terminalKind = disposition;
-        if (terminalKind === "delivered") {
-          cfg.log?.(`    [${alice.label}] dispenser race lost: ${orderId} was delivered by the live plug before the cancel — a real note is now in ${alice.label}'s inventory (drop it to disperse)`);
-        }
+        expected = disposition === "canceled" ? ["canceled"]
+          : disposition === "delivered" ? ["delivered"]
+          : ["canceled", "delivered"];
       } else {
         // Strict fresh-world sequence: the queued status read is meaningful
         // only when nothing else can drain the queue underneath it.
-        await waitFor(bob, (obs) => matchesDispenserFact(obs, "ordered", "the_horoscope", orderId!), waitMs, ctx.signal, cfg);
+        await waitFor(bob, (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", orderId!) !== null, waitMs, ctx.signal, cfg);
         const status = await alice.call("the_horoscope", "status", [orderId], ctx.signal);
         if (!isRecord(status) || status.state !== "queued") {
           throw new Error(`dispenser status for ${orderId} should be queued; got ${JSON.stringify(status).slice(0, 300)}`);
@@ -455,17 +473,43 @@ export async function runSmokeWalkthrough(
           throw new Error(`dispenser cancel for ${orderId} should return canceled:true; got ${JSON.stringify(canceled).slice(0, 300)}`);
         }
         terminalReached = true;
-        terminalKind = "canceled";
+        expected = ["canceled"];
       }
 
       // The recorded ordered fact reaches the co-present peer through the
       // room's ordinary observation fanout (retained in bob's queue whether or
       // not the cancel already committed).
       if (competing) {
-        await waitFor(bob, (obs) => matchesDispenserFact(obs, "ordered", "the_horoscope", orderId!), waitMs, ctx.signal, cfg);
+        await waitFor(bob, (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", orderId!) !== null, waitMs, ctx.signal, cfg);
       }
-      // ... and so does the matching terminal fact.
-      await waitFor(bob, (obs) => matchesDispenserFact(obs, terminalKind, "the_horoscope", orderId!), waitMs, ctx.signal, cfg);
+      // ... and so does a terminal fact from the accepted set. The matched
+      // observation names the actual outcome (and, for a delivery, the note).
+      const terminalObs = await waitFor(
+        bob,
+        (obs) => findDispenserFact(obs, expected, "the_horoscope", orderId!) !== null,
+        waitMs,
+        ctx.signal,
+        cfg
+      );
+      const terminal = findDispenserFact(terminalObs, expected, "the_horoscope", orderId)!;
+
+      if (terminal.kind === "delivered") {
+        // Race lost: a real note landed in alice's inventory. Disperse it —
+        // the terminal fact carries the note ref, the room matcher resolves
+        // literal `#id`, and a $dispensed_note recycles on drop. Best-effort:
+        // a failed dispersal logs the residue instead of failing the step.
+        const note = terminal.note;
+        if (note) {
+          try {
+            await alice.call("the_deck", "drop", [`#${note}`], ctx.signal);
+            cfg.log?.(`    [${alice.label}] dispenser race lost: ${orderId} was delivered before the cancel; dispersed the delivered note ${note}`);
+          } catch {
+            cfg.log?.(`    [${alice.label}] dispenser race lost AND dispersal failed: delivered note ${note} remains in ${alice.label}'s inventory (drop it to disperse)`);
+          }
+        } else {
+          cfg.log?.(`    [${alice.label}] dispenser race lost: ${orderId} delivered; terminal fact carried no note ref, note remains in inventory`);
+        }
+      }
 
       // The terminal disposition is durably readable: whatever the outcome,
       // the order is no longer queued. (v1 keeps a terminal receipt; v0
@@ -488,17 +532,26 @@ export async function runSmokeWalkthrough(
         throw new Error(`the_horoscope:next_pending must refuse an ordinary actor with E_PERM; got ${refusal ?? "success"}`);
       }
     } finally {
-      // The leak guard. Swallowed individually so cleanup can never mask the
-      // step's real error.
+      // The leak guard. Deliberately signal-free: a fired watchdog aborts the
+      // assertions above, not this cleanup — each call is still bounded by
+      // the session's own RPC deadline. Swallowed individually so cleanup can
+      // never mask the step's real error.
+      if (orderId === null && orderAttempted) {
+        // The order may have committed server-side while its reply was lost.
+        // The ordered fact carries this run's unique request string; scan
+        // both sessions' observation queues for it to recover the id.
+        orderId = await recoverDispenserOrderId([alice, bob], request, cfg);
+      }
       if (orderId !== null && !terminalReached) {
         try {
-          await alice.call("the_horoscope", "cancel", [orderId], ctx.signal);
+          await alice.call("the_horoscope", "cancel", [orderId]);
+          cfg.log?.(`    [${alice.label}] dispenser leak-guard canceled ${orderId}`);
         } catch {
-          cfg.log?.(`    [${alice.label}] dispenser leak-guard cancel for ${orderId} failed; the live plug will drain it within its poll interval`);
+          cfg.log?.(`    [${alice.label}] dispenser leak-guard cancel for ${orderId} failed; the live plug will settle it within its poll interval`);
         }
       }
-      try { await drain(alice, cfg, ctx.signal); } catch { /* best-effort */ }
-      try { await drain(bob, cfg, ctx.signal); } catch { /* best-effort */ }
+      try { await drain(alice, cfg); } catch { /* best-effort */ }
+      try { await drain(bob, cfg); } catch { /* best-effort */ }
     }
   });
 
@@ -891,45 +944,98 @@ const DISPENSER_LEGACY_TYPES: Record<DispenserFactKind, string> = {
  * legacy words are generic and must not match another catalog's observation.
  * A partial/malformed Act never falls back to legacy — once the `dispenser.`
  * type is present, the exact envelope is required, mirroring the Outliner
- * normalizer above. */
+ * normalizer above. A delivered fact also surfaces its note ref (both shapes
+ * carry it) so the walkthrough can disperse a race-delivered note. */
 export function normalizeDispenserObservation(
   observation: unknown,
   kind: DispenserFactKind,
   block: string
-): { mode: "act" | "legacy"; orderId: string } | null {
+): { mode: "act" | "legacy"; orderId: string; note: string | null } | null {
   if (!isRecord(observation) || typeof observation.type !== "string") return null;
   if (observation.type === `dispenser.${kind}`) {
     if (observation.version !== 1 || observation.source !== block) return null;
     if (!isRecord(observation.payload) || typeof observation.payload.order_id !== "string") return null;
-    return { mode: "act", orderId: observation.payload.order_id };
+    const actNote = observation.payload.note;
+    return { mode: "act", orderId: observation.payload.order_id, note: typeof actNote === "string" && actNote ? actNote : null };
   }
   if (observation.type !== DISPENSER_LEGACY_TYPES[kind]) return null;
   if (observation.block !== block || typeof observation.order_id !== "string") return null;
-  return { mode: "legacy", orderId: observation.order_id };
+  const legacyNote = observation.note;
+  return { mode: "legacy", orderId: observation.order_id, note: typeof legacyNote === "string" && legacyNote ? legacyNote : null };
 }
 
-/** Classify a cancel reply from an order this run just placed. `canceled:true`
- * is the normal outcome. A lost race against the live plug reads as the v1
- * duplicate/delivered receipt, or — on a pre-Acts page, which deletes the
- * pending row at delivery — as `reason: "not_pending"`; for an order placed
- * seconds ago by this same session, both mean "delivered underneath us".
- * Anything else (including `reason: "unknown"`) is a real failure. */
-export function dispenserCancelDisposition(reply: unknown): "canceled" | "delivered" | null {
-  if (!isRecord(reply)) return null;
-  if (reply.canceled === true) return "canceled";
-  if (reply.duplicate === true && reply.reason === "delivered") return "delivered";
-  if (reply.reason === "not_pending") return "delivered";
+/** Match one observation against a set of acceptable dispenser fact kinds for
+ * a specific order, returning which kind matched (and the note ref, when the
+ * shape carries one). The set form exists because a settled race cannot
+ * always be classified from the cancel reply alone (see
+ * dispenserCancelDisposition): the caller accepts either terminal fact and
+ * learns the outcome from whichever arrives. */
+export function findDispenserFact(
+  observation: unknown,
+  kinds: readonly DispenserFactKind[],
+  block: string,
+  orderId: string
+): { kind: DispenserFactKind; note: string | null } | null {
+  for (const kind of kinds) {
+    const normalized = normalizeDispenserObservation(observation, kind, block);
+    if (normalized !== null && normalized.orderId === orderId) {
+      return { kind, note: normalized.note };
+    }
+  }
   return null;
 }
 
-function matchesDispenserFact(
-  observation: Record<string, any>,
-  kind: DispenserFactKind,
-  block: string,
-  orderId: string
-): boolean {
-  const normalized = normalizeDispenserObservation(observation, kind, block);
-  return normalized !== null && normalized.orderId === orderId;
+/** Classify a cancel reply for an order this run just placed. `canceled:true`
+ * is the normal outcome. The v1 duplicate/delivered receipt names a lost
+ * delivery race explicitly. `reason: "not_pending"` (pre-Acts page) only
+ * proves the order settled WITHOUT us: that page deletes the pending row both
+ * when the plug delivers and when the plug cancels (its `prepare_artifact`
+ * call E_VERBNFs there and the plug cancels the order as permanent) — so it
+ * classifies as "raced", and the caller must accept either terminal fact.
+ * Anything else (including `reason: "unknown"`) is a real failure. */
+export function dispenserCancelDisposition(reply: unknown): "canceled" | "delivered" | "raced" | null {
+  if (!isRecord(reply)) return null;
+  if (reply.canceled === true) return "canceled";
+  if (reply.duplicate === true && reply.reason === "delivered") return "delivered";
+  if (reply.reason === "not_pending") return "raced";
+  return null;
+}
+
+/** Recover a committed order's id when the order reply was lost (server-side
+ * commit, client-side timeout): the ordered fact carries the run's unique
+ * request string and fans out to every co-present session. Scans a few
+ * bounded `woo_wait` polls per session, signal-free — this runs from cleanup
+ * paths where the step signal may already be aborted. */
+export async function recoverDispenserOrderId(
+  sessions: readonly SmokeSession[],
+  request: string,
+  cfg: DrainConfig
+): Promise<string | null> {
+  for (const session of sessions) {
+    for (let poll = 0; poll < 3; poll += 1) {
+      let observations: unknown[];
+      try {
+        const result = await session.callTool("woo_wait", { timeout_ms: cfg.drainPollMs, limit: 100 });
+        observations = waitObservationsOf(result);
+      } catch {
+        break; // this session is unusable (reset/closed); try the next one
+      }
+      for (const obs of observations) {
+        if (!isRecord(obs)) continue;
+        const normalized = normalizeDispenserObservation(obs, "ordered", "the_horoscope");
+        if (normalized === null) continue;
+        const observedRequest = normalized.mode === "act"
+          ? (isRecord(obs.payload) ? obs.payload.request : undefined)
+          : obs.request;
+        if (observedRequest === request) {
+          cfg.log?.(`    [${session.label}] recovered lost dispenser order id ${normalized.orderId} from the ordered fact`);
+          return normalized.orderId;
+        }
+      }
+      if (observations.length === 0) break;
+    }
+  }
+  return null;
 }
 
 /** Extract the admission-window wait from a thrown E_RATE_LIMIT refusal. The

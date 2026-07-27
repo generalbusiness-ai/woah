@@ -160,8 +160,17 @@ disposition whose fact reaches the peer. On fresh-world lanes the step is
 strict (queued `status` read, then `cancel`). On the deployed lane the
 production plug is a live competing consumer of the same queue — `:order`
 sends it a synchronous wakeup — so the step cancels immediately after
-ordering, accepts a lost race as the legitimate `delivered` disposition, and
-guarantees by `finally` that no pending order it placed survives the run. The
+ordering and accepts a settled race: the pre-Acts page deletes the pending
+row both for plug delivery and for plug cancel (its `prepare_artifact`
+E_VERBNFs there), so an ambiguous cancel reply accepts either terminal fact
+and learns the outcome from whichever arrives. Cleanup is best-effort by
+construction with the residual named: `finally` runs signal-free (a fired
+watchdog aborts assertions, not cleanup), recovers a lost order id from the
+ordered fact's unique request string when the reply timed out after a
+server-side commit, cancels when no terminal reply was observed, and
+disperses a race-delivered note via a literal-`#id` drop. The irreducible
+residual — the smoke process dying mid-window — is at most one order, which
+the live plug itself settles within its poll interval. The
 walkthrough accepts both rolling-contract observation shapes (v1 Act envelope
 and the pre-Acts flat `order_placed`/`canceled`/`delivered`) because a runtime
 deploy does not rewrite an installed world's catalog pages. The plug's deliver

@@ -242,14 +242,16 @@ defect.
 ## 8. Migration (v1 → v2, CT14)
 
 Major-version bump `1.x` → `2.0.0` with `migration-v1-to-v2.json` shipped next
-to the manifest. **CT14 today executes structural steps only** — `custom` and
-`transform_property` are rejected `E_NOT_IMPLEMENTED`, and catalog updates run
-under the catalog registry's sequencer, not each world room's — so the
-stateful walk cannot be a CT14 step, and the first freeze draft's "one
-sequenced turn per registry that emits acts, folds rows, then drops the old
-properties" was not implementable (and its drops would have destroyed the
-seed state). The shape that IS implementable is the dispenser's proven
-two-part cutover, reused exactly:
+to the manifest. **CT14's step vocabulary is declarative** — renames, drops,
+adds, `reindex_ordered_edges`, and `transform_property`'s declarative op set
+are implemented; what remains deferred is inline/`custom` transform execution
+(`rename_class` likewise) — and catalog updates run under the catalog
+registry's sequencer, not each world room's. So the stateful walk (emitting
+acts and running folds on each registry's own log) cannot be a CT14 step, and
+the first freeze draft's "one sequenced turn per registry that emits acts,
+folds rows, then drops the old properties" was not implementable (and its
+drops would have destroyed the seed state). The shape that IS implementable
+is the dispenser's proven two-part cutover, reused exactly:
 
 1. **CT14 structural part (non-destructive)**: rename the v1 coordination
    properties to `legacy_*` (`_tracked_tasks` → `legacy_tracked_tasks`; the
@@ -265,23 +267,38 @@ two-part cutover, reused exactly:
    dispenser's `_ensure_acts`. In that registry's own sequenced turn it emits
    `tasks.genesis`, then one `tasks.legacy_opened` per valid legacy task
    (phase in the payload — the genesis turn's actor and time are not
-   historical), folds the rows, and marks `acts_initialized`. Until genesis
-   runs, the v2 verb pages serve reads from the legacy properties (the
-   dispenser's `status`/`next_pending` legacy fallback pattern).
-3. **Bounds refuse atomically, without destruction**: a registry whose legacy
-   state exceeds the §5 caps (more than 40 active tasks, an over-wide field,
-   a nonconforming wait condition) refuses genesis, stays fully functional on
-   the legacy path, and reports the violation for explicit operator repair.
-   Truncation and behind-the-fold seeding are forbidden.
-4. Idempotent: genesis re-entry on an initialized registry is a no-op
+   historical), folds the rows, and marks `acts_initialized`.
+3. **Legacy mode is a complete operating mode, not a read shim.** While
+   `acts_initialized` is false, the v2 verb pages run **both reads and
+   mutations** against the `legacy_*` properties with v1 semantics verbatim,
+   emitting the v1 plain observations so existing clients keep working — the
+   dispenser's legacy fallback pattern, extended to the whole lifecycle
+   surface. This is what makes the over-cap case safe (next item): a registry
+   that cannot reach genesis is not write-frozen; it simply keeps being a v1
+   registry.
+4. **Bounds refuse genesis atomically, without destruction and without a
+   retry storm**: a registry whose legacy state exceeds the §5 caps (more
+   than 40 active tasks, an over-wide field, a nonconforming wait condition)
+   refuses genesis, records a `genesis_blocked` marker naming the violation
+   (with a plain observation for operators), and continues in legacy mode.
+   While the marker is set, lifecycle touches do **not** re-attempt genesis —
+   no per-turn retry cost. Genesis is re-attempted only by the explicit
+   sequenced `initialize_board`, which clears the marker, re-validates, and
+   either completes genesis or re-records the refusal; the operator path is
+   therefore: drain/repair the registry below the caps (in legacy mode),
+   then `initialize_board`. Truncation and behind-the-fold seeding are
+   forbidden.
+5. Idempotent: genesis re-entry on an initialized registry is a no-op
    (`acts_initialized` + genesis receipt); partial-failure recovery re-enters
    safely because the marker commits in the same fold-carrying turn.
-5. Test-run on a local SQLite woo before merge (repo migration rule), plus a
+6. Test-run on a local SQLite woo before merge (repo migration rule), plus a
    vitest walking a populated v1 world through rename → lazy genesis and
    asserting the parity golden against the pre-migration `:listing` output,
-   and a refusal case that proves an over-cap registry keeps working on the
-   legacy path.
-6. Consumers accept both observation shapes during the rolling interval, as
+   and an over-cap case that proves: genesis refuses and records
+   `genesis_blocked`; legacy **mutations** (`claim`/`pass`/`create_task`)
+   still commit afterward; subsequent touches skip the genesis attempt; and
+   `initialize_board` succeeds after the registry is drained below the caps.
+7. Consumers accept both observation shapes during the rolling interval, as
    the walkthrough already does for outliner and dispenser; the client keeps
    the v1 handlers until the deployed world's registries have all reached
    genesis.
@@ -342,9 +359,13 @@ bake follow as their own step (adoption item 5), after the dispenser bake.
 6. **D6 config**: registry role/obligation/policy changes stay plain
    observations; rows insulate via open-time snapshot; orphan status stays
    view-computed.
-7. **D7 migration** (revised after review — CT14 has no custom execution and
-   runs under the catalog registry's sequencer): two-part cutover — CT14
+7. **D7 migration** (revised twice after review — CT14's declarative steps
+   are implemented but inline/`custom` execution is not, and updates run
+   under the catalog registry's sequencer): two-part cutover — CT14
    structural renames to `legacy_*` (non-destructive) plus per-registry lazy
    woocode genesis under each registry's own sequencer, the dispenser's
-   `_ensure_acts` precedent; over-cap registries refuse genesis and keep
-   working on the legacy path pending operator repair.
+   `_ensure_acts` precedent. Legacy mode is a complete operating mode: reads
+   AND mutations run v1 semantics verbatim until genesis, so an over-cap
+   registry is never write-frozen — it records `genesis_blocked` once (no
+   per-turn retry) and re-attempts only via explicit `initialize_board`
+   after operator drain/repair.
