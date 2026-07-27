@@ -103,6 +103,7 @@ import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
+import { verbAliasMatches } from "../../core/verb-name-match";
 import {
   GUEST_RESET_NATIVE,
   guestResetVerbPageFor,
@@ -5418,7 +5419,7 @@ export class NetGatewayDO {
       };
     }
     const drafts = this.mcpObjectToolDrafts(actor, object, this.mcpActiveCommandContext(actor, session).has(object));
-    const tool = drafts.find((candidate) => candidate.verb === verb || candidate.aliases.includes(verb));
+    const tool = mcpMatchVerb(drafts, verb);
     if (!tool) {
       // Same shape the engine raises for a missing verb (world.ts): a client
       // that already special-cases E_VERBNF keeps working.
@@ -5576,13 +5577,26 @@ export class NetGatewayDO {
     }
   }
 
+  /**
+   * The session's active space, or null when it has none.
+   *
+   * `$nowhere` is the substrate's placeless sentinel — the absence of a
+   * location, spelled as an object — so it must answer null here, exactly
+   * like a missing cell. Treating any non-empty string as a space made an
+   * unplaced actor "in" $nowhere: `$here` resolved to it (instead of the
+   * documented no-active-scope refusal), and $nowhere's own verbs were
+   * projected as tools, which is why the walkthrough saw an unplaced actor
+   * offered `nowhere__look` and `nowhere__set_description`. Freshly
+   * provisioned agents (AP11) are placeless, so this is the first state a new
+   * agent is in, not an edge case.
+   */
   private mcpActiveScope(actor: string, session: string): string | null {
     const view = this.ensureView();
     const row = view.get(sessionCellKey(session))?.value as { activeScope?: unknown; active_scope?: unknown } | undefined;
     const scoped = typeof row?.activeScope === "string" ? row.activeScope : typeof row?.active_scope === "string" ? row.active_scope : null;
-    if (scoped) return scoped;
+    if (scoped) return mcpPlacedScope(scoped);
     const live = view.get(cellKey("object_live", actor))?.value as { location?: unknown } | undefined;
-    return typeof live?.location === "string" && live.location ? live.location : null;
+    return typeof live?.location === "string" ? mcpPlacedScope(live.location) : null;
   }
 
   /** Contents normally expose their full explicit tool surface. A different
@@ -5708,6 +5722,10 @@ export class NetGatewayDO {
           const aliases = Array.isArray(page.aliases) ? page.aliases.filter((value): value is string => typeof value === "string") : [];
           out.push({
             object,
+            // The class (or feature ancestor) that actually holds this page.
+            // Verb-name resolution is per-definer (see mcpMatchVerb), so the
+            // draft has to remember where it came from.
+            definer: current,
             verb,
             route,
             aliases,
@@ -8877,6 +8895,9 @@ type NetMcpToolScope = "active" | "here" | "object" | "space";
 
 type NetMcpToolDraft = {
   object: string;
+  /** The class or feature ancestor holding the page. Verb-name resolution is
+   * per-definer, so this is load-bearing for mcpMatchVerb, not decoration. */
+  definer: string;
   verb: string;
   /** Transport route derived from catalog command persistence. This stays
    * internal: clients invoke one capability; the gateway preserves its
@@ -8945,8 +8966,46 @@ function mcpCursor(value: unknown): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+/** Placelessness is spelled two ways — an absent/empty value and the
+ * `$nowhere` sentinel — and both mean "this session has no active space". */
+function mcpPlacedScope(location: string): string | null {
+  return location && location !== "$nowhere" ? location : null;
+}
+
 function mcpSanitizeId(value: string): string {
   return value.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+/**
+ * Resolve a caller's word against a target's dispatchable pages, by the same
+ * rule the world dispatcher uses.
+ *
+ * Aliases are PATTERNS — `l@ook`, `@exam*ine`, `get*`, `a|b` — not literals.
+ * The gateway used to exact-compare `aliases.includes(verb)`, so `woo_call`
+ * answered E_VERBNF for names `world.resolveVerb` accepts.
+ *
+ * Precedence matters as much as matching, and is reproduced exactly: the world
+ * walks the chain definer by definer and, at EACH definer, tries every exact
+ * name before any alias pattern (world.ts ownVerbNamed). Flattening that into
+ * one global exact pass followed by one global alias pass would silently
+ * dispatch an ancestor's exactly-named verb where the world would have run a
+ * nearer class's aliased one — a wrong verb, which is worse than a refusal.
+ * `drafts` arrives in chain order and is contiguous per definer, so walking
+ * the groups in order preserves it.
+ */
+function mcpMatchVerb(drafts: NetMcpToolDraft[], name: string): NetMcpToolDraft | undefined {
+  for (let index = 0; index < drafts.length; ) {
+    const definer = drafts[index].definer;
+    let end = index;
+    while (end < drafts.length && drafts[end].definer === definer) end += 1;
+    const group = drafts.slice(index, end);
+    const exact = group.find((draft) => draft.verb === name);
+    if (exact) return exact;
+    const aliased = group.find((draft) => draft.aliases.some((alias) => verbAliasMatches(alias, name)));
+    if (aliased) return aliased;
+    index = end;
+  }
+  return undefined;
 }
 
 /**
@@ -8960,30 +9019,45 @@ function mcpSanitizeId(value: string): string {
  * line is almost never a complete thought. A run ends at the first line that
  * is not a `//` comment, or at a bare `//` (the author's paragraph break).
  *
+ * Whichever style comes FIRST in the source wins. Preferring block comments
+ * unconditionally meant a verb documented with leading slash-slash lines
+ * advertised whatever bracketed comment it happened to contain later. A
+ * bundled builder command verb described itself with a one-line caveat from a
+ * `try` recovery some 3,000 characters below its actual documentation; the
+ * end-to-end pin for it is in tests/worker/net-mcp-legibility.test.ts.
+ *
  * Exported for tests: the clamp boundary is not reachable through the seeded
  * catalogs, and a truncation defect on this path is invisible until an agent
  * reads a sentence that stops mid-word.
  */
 export function mcpFirstParagraph(source: string): string {
   const block = /\/\*([\s\S]*?)\*\//.exec(source);
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => /^\s*\/\//.test(line));
+  // Character offset of that first line-initial `//`, so the two styles are
+  // comparable by POSITION rather than by an arbitrary preference. (`+ 1`
+  // restores the newline each split removed.)
+  const lineOffset = start < 0
+    ? -1
+    : lines.slice(0, start).reduce((total, line) => total + line.length + 1, 0);
+  if (start >= 0 && (!block || lineOffset < block.index)) {
+    const paragraph: string[] = [];
+    for (let index = start; index < lines.length; index += 1) {
+      const match = /^\s*\/\/\s?(.*)$/.exec(lines[index]);
+      if (!match) break; // the contiguous comment run ended
+      const text = match[1].trim();
+      if (!text) break; // a bare `//` is the author's paragraph break
+      paragraph.push(text);
+    }
+    return mcpClampDescription(paragraph.join(" "));
+  }
   if (block) {
     // Strip the `*` gutter BEFORE splitting: a JSDoc paragraph break is a
     // line holding only ` * `, which is not blank until the gutter is gone.
     const body = block[1].replace(/^\s*\*?[ \t]?/gm, "");
     return mcpClampDescription(body.split(/\n[ \t]*\n/)[0].trim());
   }
-  const lines = source.split("\n");
-  const start = lines.findIndex((line) => /^\s*\/\//.test(line));
-  if (start < 0) return "";
-  const paragraph: string[] = [];
-  for (let index = start; index < lines.length; index += 1) {
-    const match = /^\s*\/\/\s?(.*)$/.exec(lines[index]);
-    if (!match) break; // the contiguous comment run ended
-    const text = match[1].trim();
-    if (!text) break; // a bare `//` is the author's paragraph break
-    paragraph.push(text);
-  }
-  return mcpClampDescription(paragraph.join(" "));
+  return "";
 }
 
 /** A tool description is model context: an unbounded doc paragraph is a

@@ -69,7 +69,11 @@ woo_call(
 )
 ```
 
-`$me` is your own actor and `$here` is the space you are in:
+`$me` is your own actor and `$here` is the space you are in. Verb names may be
+abbreviated exactly as they can in a command: if a verb lists `l@ook` among its
+aliases, `"l"`, `"lo"` and `"look"` all reach it. If you have not been placed
+anywhere yet — a brand-new agent has not — `$here` names nothing and is
+refused with `no_active_scope`; move somewhere first.
 
 ```
 woo_call("$me", "inventory", [])

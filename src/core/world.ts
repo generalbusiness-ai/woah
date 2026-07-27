@@ -39,6 +39,7 @@ import {
   type CustomerAttribution
 } from "./attribution";
 import { normalizeVerbPerms } from "./verb-perms";
+import { verbAliasMatches, verbPageAnswersTo } from "./verb-name-match";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
@@ -12951,29 +12952,10 @@ function findPreposition(tokens: ParsedToken[]): { index: number; length: number
   return null;
 }
 
-function verbAliasMatches(pattern: string, name: string): boolean {
-  for (const segment of pattern.split("|")) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-    if (trimmed === name) return true;
-    const star = trimmed.indexOf("*");
-    if (star === trimmed.length - 1) {
-      const literal = trimmed.slice(0, -1);
-      if (literal && name.startsWith(literal)) return true;
-      continue;
-    }
-    const abbreviation = star >= 0 ? star : trimmed.indexOf("@");
-    if (abbreviation >= 0) {
-      const literal = trimmed.slice(0, abbreviation) + trimmed.slice(abbreviation + 1);
-      if (literal && literal.startsWith(name) && name.length >= Math.max(1, abbreviation)) return true;
-      continue;
-    }
-  }
-  return false;
-}
-
+/** The alias-pattern rule now lives in ./verb-name-match so every surface that
+ * resolves a verb without going through the dispatcher shares it verbatim. */
 function verbNameMatches(verb: VerbDef, name: string): boolean {
-  return verb.name === name || verb.aliases.some((alias) => verbAliasMatches(alias, name));
+  return verbPageAnswersTo(verb.name, verb.aliases, name);
 }
 
 function commandPattern(argSpec: Record<string, WooValue> | undefined): CommandPattern | null {

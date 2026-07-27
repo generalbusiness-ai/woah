@@ -28,7 +28,9 @@ import { describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
-import { planNetInstall } from "../../src/net/install";
+import { netActivationCell, partitionInstallRelations, planNetInstall } from "../../src/net/install";
+import { cellsFromSerialized } from "../../src/net/bridge";
+import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import {
   NetGatewayDO,
   mcpFirstParagraph,
@@ -104,6 +106,28 @@ describe("mcpFirstParagraph", () => {
 
   it("returns an empty description when there is no doc comment", () => {
     expect(mcpFirstParagraph("verb :x() rxd { return 1; }")).toBe("");
+  });
+
+  // Mixed styles: whichever documentation comment comes FIRST wins. Preferring
+  // block comments unconditionally made $builder:create_command advertise an
+  // inline caveat from a `try` recovery 3,000 characters below its real docs.
+  it("prefers leading line docs over a later block comment", () => {
+    const source = [
+      "verb :create_command(argstr) rxd {",
+      "  // LambdaCore $builder:@create, faithfully ported. Parses",
+      "  // `@create <parent> named <name>` into a builder_create_object call.",
+      "  let x = 1;",
+      "  try { moveto(new_id, actor); } except err { /* :accept refused; leave at $nowhere. */ }",
+      "}"
+    ].join("\n");
+    expect(mcpFirstParagraph(source)).toBe(
+      "LambdaCore $builder:@create, faithfully ported. Parses `@create <parent> named <name>` into a builder_create_object call."
+    );
+  });
+
+  it("still prefers a block comment that comes first", () => {
+    const source = "verb :x() rxd {\n  /* block docs */\n  let y = 1; // a later aside\n}";
+    expect(mcpFirstParagraph(source)).toBe("block docs");
   });
 
   it("clamps a long paragraph on a word boundary with an ellipsis", () => {
@@ -238,6 +262,47 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const viaMe = await call(prog.session, "woo_call", { object: "$me", verb: "list_verb", args: [widget, "ping", {}] });
     await settleAll();
     expect(viaMe.result?.isError, JSON.stringify(viaMe).slice(0, 400)).not.toBe(true);
+
+    // ---- Alias PATTERNS resolve exactly as world dispatch resolves them ---
+    // `aliases` are LambdaMOO patterns, not literals. Exact-comparing them
+    // made woo_call answer E_VERBNF for names world.resolveVerb accepts, so a
+    // client could read an alias off a descriptor and still be refused.
+    const abbreviated = await call(prog.session, "woo_call", { object: "the_chatroom", verb: "l", args: [] });
+    await settleAll();
+    expect(abbreviated.result?.isError, JSON.stringify(abbreviated).slice(0, 400)).not.toBe(true);
+    const looked = await call(prog.session, "woo_call", { object: "the_chatroom", verb: "look", args: [] });
+    await settleAll();
+    // `l` is `l@ook`'s one-character abbreviation: same verb, same shape.
+    expect(Object.keys(abbreviated.result?.structuredContent?.result ?? {}).sort())
+      .toEqual(Object.keys(looked.result?.structuredContent?.result ?? {}).sort());
+
+    // A star pattern with a minimum-length prefix (`@cont*ents`), on a verb
+    // that is NOT tool_exposed and reached through the feature chain — the
+    // pattern rule and the woo_call widening compose.
+    const starred = await call(prog.session, "woo_call", { object: progAgent, verb: "@cont", args: [widget] });
+    await settleAll();
+    expect(starred.result?.isError, JSON.stringify(starred).slice(0, 400)).not.toBe(true);
+    // The full literal names the same verb.
+    const spelled = await call(prog.session, "woo_call", { object: progAgent, verb: "@contents", args: [widget] });
+    await settleAll();
+    expect(spelled.result?.isError, JSON.stringify(spelled).slice(0, 400)).not.toBe(true);
+
+    // Negative: `*` marks a MINIMUM, and a shorter abbreviation is not a verb.
+    // Pattern matching must not decay into "starts with".
+    const tooShort = await call(prog.session, "woo_call", { object: progAgent, verb: "@con", args: [widget] });
+    expect(errorOf(tooShort).code, JSON.stringify(tooShort).slice(0, 300)).toBe("E_VERBNF");
+
+    // ---- Fix 4 (mixed styles): the FIRST doc comment wins -----------------
+    // $builder:create_command opens with `//` docs and contains a bracketed
+    // aside 3,000 characters later. Block-comment-first advertised the aside.
+    // Found through the pager rather than tools/list page 1, so growing the
+    // fixture past the page cap cannot break this for an unrelated reason.
+    const found = await call(prog.session, "woo_list_reachable_tools", { query: "create_command", limit: 256 });
+    const createCommand = (found.result?.structuredContent?.result?.tools ?? [])
+      .find((tool: { name: string }) => tool.name === "wiz__create_command");
+    expect(createCommand, `wiz__create_command is not on the surface: ${JSON.stringify(found).slice(0, 300)}`).toBeTruthy();
+    expect(createCommand.description).toContain("LambdaCore $builder:@create");
+    expect(createCommand.description).not.toContain(":accept refused");
 
     // ---- Fix 1(b): an out-of-context target is still refused --------------
     // The widget sits in the PROGRAMMER's inventory, so it is not in the plain
@@ -399,6 +464,121 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     expect(settledWait.result?.structuredContent?.result?.gap).toBe(false);
 
     await settleAll();
+    for (const st of states) st.close();
+  });
+
+  // A freshly provisioned agent (AP11) is PLACELESS: create_agent mints it at
+  // `$nowhere` and its first move is its own. `$nowhere` is the substrate's
+  // spelling of "no location", so it must not read as an active space — but
+  // the gateway accepted any non-empty location string, which made `$here`
+  // resolve to $nowhere and projected $nowhere's own verbs as tools. This is
+  // the first state every new agent is in, not an edge case.
+  //
+  // Seeded the net-promote.test.ts way (cellsFromSerialized + partitionCells)
+  // rather than through planNetInstall, because install deliberately REHOMES
+  // imported actors to the catalog start room and would place the agent.
+  it("refuses $here for a placeless actor instead of resolving it to $nowhere", async () => {
+    const old = createWorld();
+    const start = await old.beginSignup("placeless@woo.dev", "password123");
+    const human = old.verifySignup(start.verification_token).actor as string;
+    const provisioned = (await old.directCall("prov", human, human, "create_agent", ["Placeless", "", false])) as any;
+    const agent = provisioned.result.actor_id as string;
+    // Owner-mint produces a ROUTED (`n1_`) key id carrying the agent's
+    // immutable authority root. An AP11 agent is ANCHORED to its human, so its
+    // cells live in the human's cluster, not one of its own; the routed id is
+    // what lets a cold gateway warm the right scope on the agent's first
+    // request — which is exactly the situation a brand-new agent is in.
+    const credential = old.createApiKeyForOwner(human, agent, "placeless");
+    // The premise: this agent really is nowhere. If provisioning ever starts
+    // placing agents, this test proves nothing and should fail here.
+    expect(old.object(agent).location, "a freshly provisioned agent is no longer placeless").toBe("$nowhere");
+
+    const cells = cellsFromSerialized(old.exportWorld());
+    const partitions = partitionCells(cells);
+    const relations = partitionInstallRelations(cells);
+    const epoch = "cat-net-mcp-legibility-placeless";
+    partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
+
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    let gateway: NetGatewayDO;
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable destination ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, scopeCells] of partitions) {
+      const st = netState(`placeless-scope-${scope}`);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: epoch, cells: scopeCells, relations: relations.get(scope) ?? [] })
+      });
+      expect((await instance.fetch(await signInternalRequest(scopeEnv, request))).ok, `seed ${scope}`).toBe(true);
+      states.push(st);
+      scopeDOs.set(scope, instance);
+    }
+    const gatewayState = netState("placeless-gateway");
+    states.push(gatewayState);
+    gateway = new NetGatewayDO(gatewayState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: resolve,
+      NET_GATEWAY_SELF: "gateway:net-api"
+    } as NetGatewayEnv);
+
+    let nextId = 100;
+    const mcp = async (body: Rpc, headers: Record<string, string> = {}) => {
+      const response = await gateway.fetch(new Request("https://do/net-api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body)
+      }));
+      const text = await response.text();
+      return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) as Record<string, any> : null };
+    };
+    const init = await mcp(
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { "mcp-token": `apikey:${credential.id}:${credential.secret}` }
+    );
+    expect(init.status, JSON.stringify(init.body)).toBe(200);
+    const session = init.headers.get("mcp-session-id") as string;
+    await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": session });
+
+    const call = async (name: string, args: Record<string, unknown>) =>
+      (await mcp(
+        { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name, arguments: args } },
+        { "mcp-session-id": session }
+      )).body as Record<string, any>;
+
+    // `$here` names nothing, and says so with the remediation that fixes it.
+    const here = await call("woo_call", { object: "$here", verb: "look", args: [] });
+    expect(here.result?.isError, JSON.stringify(here).slice(0, 400)).toBe(true);
+    const refusal = here.result?.structuredContent?.error ?? {};
+    expect(refusal.code).toBe("E_PERM");
+    expect(refusal.detail?.reason).toBe("no_active_scope");
+    expect(String(refusal.detail?.remediation)).toContain("enter a space");
+    // Not silently retargeted at $nowhere.
+    expect(JSON.stringify(here)).not.toContain("$nowhere:look");
+
+    // The same derivation feeds the tool projection: $nowhere is not a space,
+    // so its verbs are not this actor's affordances.
+    const listed = await mcp({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} }, { "mcp-session-id": session });
+    const names: string[] = (listed.body?.result?.tools ?? []).map((tool: { name: string }) => tool.name);
+    expect(names.filter((name) => name.startsWith("nowhere__")), "an unplaced actor was offered $nowhere's verbs").toEqual([]);
+    // It still has itself: placelessness removes a space, not the actor's suit.
+    const own = agent.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
+    expect(names.some((name) => name.startsWith(`${own}__`)), `the placeless actor lost its own tools: ${names.join(",")}`).toBe(true);
+
+    // The pager reports the same absence rather than inventing a focus.
+    const page = await call("woo_list_reachable_tools", { scope: "active" });
+    expect(page.result?.structuredContent?.result?.active_scope).toBeNull();
+
+    for (const st of states) await st.settle();
     for (const st of states) st.close();
   });
 });

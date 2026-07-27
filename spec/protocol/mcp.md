@@ -75,8 +75,18 @@ These are protocol controls, not world verbs.
 is deliberately **wider than the listing**. Its gates are exactly two:
 
 1. the target object is in the session's structural context (§M3); and
-2. the verb (or one of its aliases) resolves on the target's dispatch chain to
-   a bytecode page the actor passes the generic execute prefilter for.
+2. the verb name resolves on the target's dispatch chain to a bytecode page
+   the actor passes the generic execute prefilter for.
+
+Name resolution is **the world dispatcher's rule, unmodified**. Aliases are
+patterns, not literals — `l@ook` and `@exam*ine` mark an abbreviation point,
+a trailing `*` is a prefix wildcard, and `|` separates alternatives within one
+alias — and precedence is per definer: walking the chain, each definer is
+searched for an exact verb-name match before any alias pattern is tried there.
+A transport must share this rule with the dispatcher rather than restate it;
+exact-comparing alias strings refuses names `resolveVerb` accepts, and
+flattening the per-definer precedence dispatches a different verb than the
+world would.
 
 `tool_exposed` is a **listing** flag (§M2.2) and has no bearing on `woo_call`.
 Gating the escape hatch on an advertising flag made an author unable to invoke
@@ -91,6 +101,15 @@ authority grant — and now never an authority *denial* either.
 position, resolving to the session actor and the session's active space. They
 are transport-level conveniences; no world object bears either id, and they are
 not accepted anywhere else in the protocol.
+
+**A session has an active space only when its actor is placed.** `$nowhere` is
+the substrate's spelling of "no location", so it is not an active space: it
+answers the same as an absent session `activeScope` or a missing live cell.
+`$here` for such a session is refused (`no_active_scope`), never silently
+retargeted at `$nowhere`, and §M3's structural context reduces to the actor and
+its inventory — `$nowhere`'s own verbs are not that actor's affordances. A
+freshly provisioned agent is placeless until its first move, so this is the
+first state every agent is in, not an edge case.
 
 #### M2.1.1 Refusal vocabulary
 
@@ -189,7 +208,10 @@ discoverability decision, never an authority grant. The second bullet is a
 a reachable object.
 
 The description is the verb doc-comment's first **paragraph** followed by the
-canonical call form. A paragraph is the first block-comment paragraph, or the
+canonical call form. The doc-comment is whichever comment appears **first in
+the source**, whatever its style: preferring one style over the other makes a
+verb advertise an incidental aside from deep in its body instead of its opening
+documentation. A paragraph is that block comment's first paragraph, or the
 contiguous run of `//` lines beginning at the first one, ending at a bare `//`
 or at the first non-comment line. It is collapsed to a single line and clamped
 to 500 characters on a word boundary with a trailing ellipsis. Taking the first
