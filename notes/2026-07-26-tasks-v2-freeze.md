@@ -67,7 +67,7 @@ strings are bounded (§5); prose belongs on artifacts or in `tell(...)` lines.
 | `tasks.released` | `{task: obj}` | `release`, and the auto-release on completion |
 | `tasks.passed` | `{task: obj, obligation: str, evidence_code: str\|null}` | `pass` |
 | `tasks.rejected` | `{task: obj, obligation: str, why: str}` | `reject` |
-| `tasks.waited` | `{task: obj, condition: map}` | `wait`, and `yield` with `blocking` |
+| `tasks.waited` | `{task: obj, condition: map}` — condition is the closed §5 vocabulary, not an arbitrary map | `wait`, and `yield` with `blocking` |
 | `tasks.wait_cleared` | `{task: obj, condition: map}` | the registry's child-completion hook (v1 `_on_release` cleared silently; under Acts a row write with no act is a review-blocking defect) |
 | `tasks.yielded` | `{task: obj, child: obj, blocking: bool}` | `yield` |
 | `tasks.relabeled` | `{task: obj, labels: list}` | `set_labels` |
@@ -99,21 +99,29 @@ log_space == the registry`). Sole writer of:
 rows[task_id] = {
   "task": <ref>,
   "kind": str, "labels": list,
-  "obligations": list,          // [{key, met, evidence_code?}] snapshot at open, cursor advanced by folds
+  "obligations": list,          // [{key, met}] snapshot at open, cursor advanced by folds;
+                                // evidence_code is a journal fact (tasks.passed), never row state
   "waits": list, "links": list,
-  "phase": "active" | "closed" | "dropped",
+  "phase": "active",
   "opened_seq": int, "last_change_seq": int
 }
+receipts[task_id] = { "task": <ref>, "phase": "closed" | "dropped", "closed_seq": int }
 ```
 
-No name, no holder, no timestamps (seqs resolve from the log). The domain
+The closing/dropping fold evicts the full row into its compact receipt (§5) —
+terminal state is a receipt, never a retained row. No name, no holder, no
+timestamps (seqs resolve from the log). The domain
 verbs validate lifecycle transitions against the authoritative row and refuse
 `E_TRANSITION` out of terminal phases — fold defensiveness is not a substitute
 for the domain state machine (review finding 1, 2026-07-21).
 
 - `view(args)` joins per requested page: `task.name`, `location(task)` (→
   derived holder), resolved times from `*_seq`, computed cursor role — and
-  supplies every field of today's `:listing` contract (the parity golden).
+  supplies every field of today's `:listing` contract for **active** tasks
+  (the parity golden). Terminal tasks list from their receipts with reduced
+  fields (task, phase, resolved close time, artifact-joined name); this is a
+  **documented parity divergence** — v1 retained full terminal rows, v2 trades
+  them for the provable envelope (§5).
 - `view_row(task)` is the single-task form; `:detail` becomes a thin wrapper
   over `view_row` plus the artifact join.
 - `rebuild_from` is source-mediated recorded-observation replay (ACT6),
@@ -132,25 +140,51 @@ for the domain state machine (review finding 1, 2026-07-21).
 write amplification is O(rows) per act and every write re-ships the cell, so
 the wire ceiling — not the 256 KiB value cap — is the binding constraint. The
 dispenser's saturated 50-row proof measured ~48.3 KiB against the 64 KiB warm
-envelope; task rows are fatter (obligation snapshots), so the budget holds
-only with hard per-field bounds.
+envelope, and task rows are fatter than dispenser rows: review of the first
+freeze draft showed that 50 full rows at the draft's per-field caps already
+serialize to ~62 KiB before cell and proof metadata. Per-field caps alone
+therefore do not prove the envelope. Two structural changes make the
+arithmetic provable instead of hopeful:
+
+1. **An enforced per-row byte ceiling.** A serialized (canonical-JSON) active
+   row must not exceed **768 bytes**. The domain verb validates before
+   emitting; the fold refuses `E_INVARG` as the backstop. This is the load-
+   bearing bound — the per-field caps below exist to make normal rows land
+   well under it, not to prove the total.
+2. **Terminal rows are compact receipts, not retained full rows.** The
+   `tasks.closed`/`tasks.dropped` fold **evicts** the full row and writes
+   `receipts[task_id] = {task, phase, closed_seq}` (≤ 96 bytes). Retaining
+   full terminal rows is what made the draft's 100-row shape exceed the
+   envelope.
 
 **Bounds (contract, not defaults)**:
 
 | State | Cap | Overflow |
 |---|---:|---|
-| active rows per registry | 50 | refuse `E_QUOTA` at `tasks.opened` fold |
-| terminal rows (`closed`/`dropped`) | 50 | deterministic oldest-`last_change_seq` eviction |
-| obligations per task | 12 | refuse at `create_task` |
-| `kind` / obligation `key` / label | 32 / 48 / 24 chars; ≤ 6 labels | refuse `E_INVARG` |
-| `evidence_code` / `why` | 128 / 200 chars | refuse `E_INVARG` (prose goes on the artifact) |
-| `waits` / `links` per task | 6 / 12 | refuse `E_INVARG` |
+| serialized active row | 768 bytes | refuse `E_INVARG` at the verb; fold backstop |
+| active rows per registry | 40 | refuse `E_QUOTA` at `tasks.opened` fold |
+| terminal receipts | 50 | deterministic oldest-`closed_seq` eviction |
+| obligations per task (row stores `{key, met}` only) | 8 | refuse at `create_task` |
+| `kind` / obligation `key` / label | 24 / 32 / 16 chars; ≤ 4 labels | refuse `E_INVARG` |
+| `evidence_code` / `why` (journal-only; never in rows) | 64 / 200 chars | refuse `E_INVARG` (prose goes on the artifact) |
+| `waits` / `links` per task | 4 / 8 | refuse `E_INVARG` |
 
-A production-shaped saturated-envelope regression (50 active + 50 terminal
-rows, worst-case field widths, envelope < 64 KiB) is a release gate, exactly
-like the dispenser's.
+Wait conditions are **not arbitrary maps**: the `condition` value is a closed
+vocabulary — `{"kind": "child_complete", "task": <obj>}` or
+`{"kind": "external", "key": str≤32}` — enforced by the `wait` verb and by
+`_validate_payload` (the flat shape-tag language cannot express a closed map
+union, so the woocode validator carries it; the act schema tag stays `map`).
 
-Fifty active tasks per registry is the honest capacity of this storage form; a
+Worst-case arithmetic under these bounds: 40 active rows × 768 B = 30,720 B,
+plus 50 receipts × 96 B = 4,800 B, plus map syntax — the coordination cells
+stay under ~36 KiB, inside the dispenser-proven ~48 KiB budget with the
+envelope's transcript/submit overhead accounted. The production-shaped
+saturated-envelope regression (40 worst-case active rows + 50 receipts,
+envelope < 64 KiB) remains a release gate and is the arbiter: **if the
+measured envelope contradicts this arithmetic, the caps come down; they do
+not go up without the measurement.**
+
+Forty active tasks per registry is the honest capacity of this storage form; a
 registry is a case room, not a company backlog, and registries scale
 horizontally (Big-World discipline). **The named upgrade path is substrate
 per-row relation storage behind the unchanged `view()` seam** — the model's
@@ -175,22 +209,27 @@ release unit.
 
 ## 7. Complete field disposition
 
+"Retired" below means: renamed to `legacy_*` by the CT14 structural migration,
+served-from only until that registry's genesis, and physically dropped only by
+a later cleanup migration after fleet-wide genesis is proven (§8) — never
+destroyed while it is still the genesis seed.
+
 `$task_registry`:
 
 | Property | Disposition |
 |---|---|
 | `roles`, `obligations`, `policies` | stay (authoritative config; plain observations on change) |
-| `_tracked_tasks` | **dropped** — board rows are the roster; `listing` reads `board:view()` |
+| `_tracked_tasks` | **retired** → `legacy_tracked_tasks` — board rows are the roster; `listing` reads `board:view()` |
 
 `$task`:
 
 | Property | Disposition |
 |---|---|
 | `registry` | stays (anchor back-ref; emitter validation) |
-| `kind`, `obligations`, `wait_for`, `links`, `labels`, `terminal` | **dropped** — board row fields (`terminal` → `phase`) |
-| `log` | **dropped** — recorded acts |
-| `created_at`, `last_change` | **dropped** — `opened_seq` / `last_change_seq` + view-time resolution |
-| `source` | **dropped** — provenance belongs to the log envelope; the v1 property was write-only convenience |
+| `kind`, `obligations`, `wait_for`, `links`, `labels`, `terminal` | **retired** → `legacy_*` — board row fields (`terminal` → `phase`; row obligations store `{key, met}` only) |
+| `log` | **retired** → `legacy_log` — recorded acts are the history |
+| `created_at`, `last_change` | **retired** → `legacy_*` — `opened_seq` / `last_change_seq` + view-time resolution |
+| `source` | **retired** → `legacy_source` — provenance belongs to the log envelope; the v1 property was write-only convenience |
 | `transition_intent` | stays (transient lease-gate mechanism, never coordination state) |
 | `$note` inheritance (`name`/`description`/`text`/writers) | stays (artifact authority) |
 
@@ -203,26 +242,49 @@ defect.
 ## 8. Migration (v1 → v2, CT14)
 
 Major-version bump `1.x` → `2.0.0` with `migration-v1-to-v2.json` shipped next
-to the manifest, plus the structural property drops above. The stateful walk
-follows the dispenser's proven cutover pattern:
+to the manifest. **CT14 today executes structural steps only** — `custom` and
+`transform_property` are rejected `E_NOT_IMPLEMENTED`, and catalog updates run
+under the catalog registry's sequencer, not each world room's — so the
+stateful walk cannot be a CT14 step, and the first freeze draft's "one
+sequenced turn per registry that emits acts, folds rows, then drops the old
+properties" was not implementable (and its drops would have destroyed the
+seed state). The shape that IS implementable is the dispenser's proven
+two-part cutover, reused exactly:
 
-1. In one sequenced turn per registry: emit `tasks.genesis`, then one
-   `tasks.legacy_opened` per valid tracked task (phase carried in the payload
-   because the migration turn's actor and time are not historical); folds
-   build the rows; then drop `_tracked_tasks` and the per-task retired
-   properties.
-2. **Bounds refuse atomically**: a registry tracking more than 50 active
-   tasks, or any task exceeding a §5 field bound, aborts that registry's
-   cutover with an explicit operator-repair report. Truncation and
-   behind-the-fold seeding are forbidden.
-3. Idempotent: a rerun on a migrated registry (genesis receipt present) is a
-   no-op; partial-failure recovery re-enters safely.
-4. Test-run on a local SQLite woo before merge (repo migration rule), plus a
-   vitest walking a populated v1 world through the cutover and asserting the
-   parity golden against the pre-migration `:listing` output.
-5. Consumers accept both observation shapes during the rolling interval, as
+1. **CT14 structural part (non-destructive)**: rename the v1 coordination
+   properties to `legacy_*` (`_tracked_tasks` → `legacy_tracked_tasks`; the
+   per-task `kind`/`obligations`/`wait_for`/`links`/`labels`/`terminal`/
+   `log`/`created_at`/`last_change` likewise), add the v2 properties
+   (`acts_initialized`, `projections` binding seat), and install the v2 verb
+   pages. **Nothing is dropped.** The legacy properties are the genesis seed
+   and remain until a later cleanup migration lands after fleet-wide genesis
+   is proven — the dispenser retains its `legacy_*` properties the same way.
+2. **Lazy woocode genesis, per registry, under its own sequencer**: the first
+   sequenced lifecycle touch of a registry (or an explicit operator-invocable
+   sequenced `initialize_board`) runs `_ensure_board`, the analogue of the
+   dispenser's `_ensure_acts`. In that registry's own sequenced turn it emits
+   `tasks.genesis`, then one `tasks.legacy_opened` per valid legacy task
+   (phase in the payload — the genesis turn's actor and time are not
+   historical), folds the rows, and marks `acts_initialized`. Until genesis
+   runs, the v2 verb pages serve reads from the legacy properties (the
+   dispenser's `status`/`next_pending` legacy fallback pattern).
+3. **Bounds refuse atomically, without destruction**: a registry whose legacy
+   state exceeds the §5 caps (more than 40 active tasks, an over-wide field,
+   a nonconforming wait condition) refuses genesis, stays fully functional on
+   the legacy path, and reports the violation for explicit operator repair.
+   Truncation and behind-the-fold seeding are forbidden.
+4. Idempotent: genesis re-entry on an initialized registry is a no-op
+   (`acts_initialized` + genesis receipt); partial-failure recovery re-enters
+   safely because the marker commits in the same fold-carrying turn.
+5. Test-run on a local SQLite woo before merge (repo migration rule), plus a
+   vitest walking a populated v1 world through rename → lazy genesis and
+   asserting the parity golden against the pre-migration `:listing` output,
+   and a refusal case that proves an over-cap registry keeps working on the
+   legacy path.
+6. Consumers accept both observation shapes during the rolling interval, as
    the walkthrough already does for outliner and dispenser; the client keeps
-   the v1 handlers until the deployed world is migrated.
+   the v1 handlers until the deployed world's registries have all reached
+   genesis.
 
 The casework proof catalog (`$case`, `tasks.*` proof schemas, `$task_board`,
 `$kind_lanes`) retires from the bundle in the same release; existing-world
@@ -253,6 +315,10 @@ bake follow as their own step (adoption item 5), after the dispenser bake.
 - No dynamic projection attachment; the board binds at seed/genesis.
 - No cross-registry yields: `yield` refuses a child kind whose registry is not
   the parent's (v1 already mints in-registry; v2 states it).
+- No arbitrary wait conditions: the closed §5 condition vocabulary only; a new
+  wait kind is a schema'd vocabulary change, not a payload liberty.
+- No destructive migration drops: `legacy_*` properties survive until the
+  post-genesis cleanup migration (§8).
 - No per-task history projection in v2 (§6).
 - No substrate relation storage in v2 (§5) — named upgrade, not scope.
 - No chat routing for `tasks.*` acts.
@@ -261,8 +327,12 @@ bake follow as their own step (adoption item 5), after the dispenser bake.
 
 1. **D1 storage**: map-prop rows now; substrate per-row relations later behind
    `view()` (supersedes §7.2.2's open question with the envelope math).
-2. **D2 bounds**: 50 active / 50 terminal with deterministic eviction and the
-   §5 field caps as contract.
+2. **D2 bounds** (revised after review — the draft's 50 full active + 50 full
+   terminal rows serialized past the envelope): an enforced 768-byte
+   serialized-row ceiling, 40 active rows, terminal rows evicted to ≤ 96-byte
+   compact receipts (50, deterministic eviction), closed wait-condition
+   vocabulary, evidence out of rows; the saturated-envelope gate is the
+   arbiter and caps only ever come down from measurement.
 3. **D3 history**: log dropped; journal is history; per-task panel history is
    deferred fold-private aux state.
 4. **D4 emission**: registry-mediated internal emitter (`_record_task_act`)
@@ -272,3 +342,9 @@ bake follow as their own step (adoption item 5), after the dispenser bake.
 6. **D6 config**: registry role/obligation/policy changes stay plain
    observations; rows insulate via open-time snapshot; orphan status stays
    view-computed.
+7. **D7 migration** (revised after review — CT14 has no custom execution and
+   runs under the catalog registry's sequencer): two-part cutover — CT14
+   structural renames to `legacy_*` (non-destructive) plus per-registry lazy
+   woocode genesis under each registry's own sequencer, the dispenser's
+   `_ensure_acts` precedent; over-cap registries refuse genesis and keep
+   working on the legacy path pending operator repair.
