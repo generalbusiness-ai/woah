@@ -8038,14 +8038,26 @@ export class WooWorld {
         if (error.code !== "E_HELPNF") throw err;
       }
     }
-    if (dbs.length > 0) {
-      await this.dispatch({ ...ctx, caller: ctx.thisObj }, dbs[0], "record_miss", [topic]).catch(() => null);
+    // An unknown topic is a reply, not a failure. This used to record the miss
+    // on the first db as a `missed_topics` property write; that write is
+    // refused on Net worlds (E_CATALOG_MUTATION — ordinary turns cannot mutate
+    // installed catalog state), nothing ever read it back, and the refusal is a
+    // turn verdict rather than a catchable error, so it failed the whole help
+    // call. The reply now carries the valid topic list instead.
+    const topics: string[] = [];
+    for (const db of dbs) {
+      for (const name of Object.keys(this.helpDbTopics({ ...ctx, thisObj: db }))) {
+        if (!topics.includes(name)) topics.push(name);
+      }
     }
+    const lines = [`No help available for "${topic || "index"}".`];
+    if (topics.length > 0) lines.push(`Topics: ${topics.join(", ")}`);
     return {
       ok: false,
       status: "not_found",
       topic,
-      lines: [`No help available for "${topic || "index"}".`]
+      topics,
+      lines
     };
   }
 
@@ -8096,16 +8108,6 @@ export class WooWorld {
     }
     const lines = Array.isArray(raw) ? raw.map((line) => valueToText(line)) : [valueToText(raw)];
     return { ok: true, status: "found", topic, db, title: topic, lines };
-  }
-
-  private helpDbRecordMiss(ctx: CallContext, args: WooValue[]): WooValue {
-    const topic = helpTopic(args[0]);
-    if (!topic) return false;
-    const existing = this.propOrNull(ctx.thisObj, "missed_topics");
-    const misses = Array.isArray(existing) ? existing : [];
-    const entry: WooValue = { topic, actor: ctx.actor, ts: this.logicalNow("help_miss.now") };
-    this.setProp(ctx.thisObj, "missed_topics", [...misses.slice(-99), entry]);
-    return true;
   }
 
   chparentAuthoredObject(actor: ObjRef, objRef: ObjRef, parentRef: ObjRef): void {
@@ -11718,7 +11720,6 @@ export class WooWorld {
     this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
     this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
     this.nativeHandlers.set("help_db_dump_topic", (ctx, args) => this.helpDbDumpTopic(ctx, args));
-    this.nativeHandlers.set("help_db_record_miss", (ctx, args) => this.helpDbRecordMiss(ctx, args));
   }
 
   private chatPresent(room: ObjRef): ObjRef[] {

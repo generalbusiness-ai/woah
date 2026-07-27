@@ -1,0 +1,9 @@
+{
+  "from_version": "0.x.x",
+  "to_version": "1.x.x",
+  "spec_version": "v1",
+  "steps": [
+    { "kind": "drop_verb", "class": "$generic_help_db", "verb": "record_miss" },
+    { "kind": "drop_property", "class": "$generic_help_db", "name": "missed_topics" }
+  ]
+}
