@@ -5597,16 +5597,27 @@ export class NetGatewayDO {
     }
     drafts.sort((a, b) => byObject(a.object, b.object) || a.verb.localeCompare(b.verb));
     const used = new Set<string>();
-    // Descriptions are rendered here, after the listing gates, so an
-    // unadvertised page never pays the doc-comment scan on the tools/list
-    // hot path.
+    // Presentation — schema derivation and the doc-comment scan — happens
+    // here, AFTER the listing gates. Producing a draft for every dispatchable
+    // page is what lets woo_call reach unadvertised verbs; doing the
+    // presentation work for them too would have made every tools/list pay for
+    // pages nobody is going to see.
     return drafts.map((draft) => {
       const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
       let name = base;
       let suffix = 2;
       while (used.has(name)) name = `${base}_${suffix++}`;
       used.add(name);
-      return { ...draft, name, description: mcpDraftDescription(draft) };
+      const input = mcpInputSchema(draft.argSpec);
+      const paragraph = mcpFirstParagraph(draft.source);
+      const callForm = `${draft.object}:${draft.verb}(${input.args.join(", ")})`;
+      return {
+        ...draft,
+        name,
+        inputSchema: input.schema,
+        argNames: input.args,
+        description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`
+      };
     });
   }
 
@@ -5646,15 +5657,16 @@ export class NetGatewayDO {
           const perms = typeof page.perms === "string" ? page.perms : "";
           const owner = typeof page.owner === "string" ? page.owner : "";
           const aliases = Array.isArray(page.aliases) ? page.aliases.filter((value): value is string => typeof value === "string") : [];
-          const input = mcpInputSchema(argSpec);
           out.push({
             object,
             verb,
             route,
             aliases,
+            // Raw inputs to presentation. Schema derivation and the
+            // doc-comment scan are deferred to mcpToolsForObjects so an
+            // unadvertised page costs one object, not one render.
             source: typeof page.source === "string" ? page.source : "",
-            inputSchema: input.schema,
-            argNames: input.args,
+            argSpec,
             // Only bytecode pages have a portable Net execution body (M2.2).
             // A native page still shadows its inherited namesakes, so it is
             // carried as a draft: that is what lets woo_call answer "native,
@@ -8825,8 +8837,8 @@ type NetMcpToolDraft = {
   /** Verb source, kept raw: the description is rendered from it only for
    * pages that survive the listing gates. */
   source: string;
-  inputSchema: Record<string, unknown>;
-  argNames: string[];
+  /** Compiler-owned argument metadata, kept raw for the same reason. */
+  argSpec: Record<string, unknown>;
   /** Bytecode-backed. A native page has no portable Net execution body. */
   bytecode: boolean;
   /** The page's raw perm string, for a refusal that can name the gate. */
@@ -8840,15 +8852,15 @@ type NetMcpToolDraft = {
   directCallable: boolean;
 };
 
-type NetMcpDynamicTool = NetMcpToolDraft & { name: string; description: string };
-
-/** Tool description: the verb's first doc paragraph plus the canonical call
- * form, which is the only machine-checkable part an agent can rely on. */
-function mcpDraftDescription(draft: NetMcpToolDraft): string {
-  const callForm = `${draft.object}:${draft.verb}(${draft.argNames.join(", ")})`;
-  const paragraph = mcpFirstParagraph(draft.source);
-  return paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`;
-}
+/** A draft plus its rendered presentation: the tool name, the derived input
+ * schema and positional argument order, and the description (the verb's first
+ * doc paragraph followed by the canonical call form). */
+type NetMcpDynamicTool = NetMcpToolDraft & {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  argNames: string[];
+};
 
 type NetMcpToolPage = {
   scope: NetMcpToolScope;
