@@ -8,6 +8,7 @@
 //
 //   wrangler tail --format json | npx tsx scripts/net-metrics-report.ts
 //   npx tsx scripts/net-metrics-report.ts capture.log [--json]
+//   npx tsx scripts/net-metrics-report.ts capture.log --diagnostic
 //
 // Input tolerance: any text stream — raw workerd logs, wrangler-tail
 // JSON events, vitest output — anything carrying `woo.metric {…}`
@@ -28,6 +29,11 @@ type Metric = Record<string, unknown> & { kind?: string };
  */
 export function extractMetrics(text: string): Metric[] {
   const metrics: Metric[] = [];
+  const structuralValues = parseConcatenatedJson(text);
+  if (structuralValues.length > 0) {
+    for (const value of structuralValues) collectFromValue(value, metrics);
+    return metrics;
+  }
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -43,6 +49,52 @@ export function extractMetrics(text: string): Metric[] {
     else collectFromString(trimmed, metrics);
   }
   return metrics;
+}
+
+/** Wrangler currently pretty-prints one JSON event over many lines, then
+ * writes the next top-level object immediately after it. Parse that JSON value
+ * stream before falling back to raw log-line scanning. This is intentionally a
+ * structural parser: braces inside escaped metric payload strings do not
+ * change depth. */
+function parseConcatenatedJson(text: string): unknown[] {
+  const values: unknown[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (start === -1) {
+      if (/\s/.test(ch)) continue;
+      if (ch !== "{" && ch !== "[") return [];
+      start = index;
+      depth = 1;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inString && ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") depth -= 1;
+    if (depth !== 0) continue;
+    try {
+      values.push(JSON.parse(text.slice(start, index + 1)));
+    } catch {
+      return [];
+    }
+    start = -1;
+  }
+  return start === -1 ? values : [];
 }
 
 /** Walk a parsed tail event: message arrays carry console args as
@@ -269,6 +321,8 @@ async function readInput(path: string | undefined): Promise<string> {
 async function runWatch(intervalMs: number, minTurns: number, minSeconds: number): Promise<void> {
   const metrics: Metric[] = [];
   let carry = "";
+  let eventLines: string[] = [];
+  let eventDepth = 0;
   const startedAt = Date.now();
   const evaluate = (final: boolean): void => {
     const report = buildReport(metrics);
@@ -299,13 +353,69 @@ async function runWatch(intervalMs: number, minTurns: number, minSeconds: number
       carry += (chunk as Buffer).toString("utf8");
       const lines = carry.split("\n");
       carry = lines.pop() ?? "";
-      for (const line of lines) if (line.trim()) collectFromLine(line, metrics);
+      for (const line of lines) {
+        ({ eventLines, eventDepth } = collectStreamingLine(line, metrics, eventLines, eventDepth));
+      }
     }
-    if (carry.trim()) collectFromLine(carry, metrics);
+    if (carry.trim()) {
+      ({ eventLines, eventDepth } = collectStreamingLine(carry, metrics, eventLines, eventDepth));
+    }
+    if (eventLines.length > 0) {
+      for (const metric of extractMetrics(eventLines.join("\n"))) metrics.push(metric);
+    }
   } finally {
     clearInterval(ticker);
   }
   evaluate(true);
+}
+
+/** Accumulate Wrangler's pretty-printed top-level event object in watch mode;
+ * raw workerd lines still flow through the existing marker scanner. */
+function collectStreamingLine(
+  line: string,
+  out: Metric[],
+  eventLines: string[],
+  eventDepth: number
+): { eventLines: string[]; eventDepth: number } {
+  if (eventLines.length === 0) {
+    if (!line.trimStart().startsWith("{")) {
+      if (line.trim()) collectFromLine(line, out);
+      return { eventLines, eventDepth };
+    }
+    eventLines = [line];
+  } else {
+    eventLines.push(line);
+  }
+  eventDepth += braceDeltaOutsideStrings(line);
+  if (eventDepth === 0) {
+    for (const metric of extractMetrics(eventLines.join("\n"))) out.push(metric);
+    eventLines = [];
+  }
+  return { eventLines, eventDepth };
+}
+
+function braceDeltaOutsideStrings(line: string): number {
+  let delta = 0;
+  let inString = false;
+  let escaped = false;
+  for (const ch of line) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inString && ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") delta += 1;
+    else if (ch === "}") delta -= 1;
+  }
+  return delta;
 }
 
 /** One input line → metrics (the extractMetrics per-line logic, exposed
@@ -332,6 +442,7 @@ if (invokedDirectly) {
     const json = args.includes("--json");
     const file = args.find((arg) => !arg.startsWith("--") && Number.isNaN(Number(arg)));
     const allowEmpty = args.includes("--allow-empty");
+    const diagnostic = args.includes("--diagnostic");
     const minTurns = flag("--min-turns", 0);
     readInput(file)
       .then((text) => {
@@ -350,8 +461,14 @@ if (invokedDirectly) {
         if (minTurns > 0 && turns < minTurns) {
           alerts.push(`ABORT-SIGNAL: only ${turns} turns sampled (need --min-turns ${minTurns})`);
         }
-        for (const alert of alerts) console.error(alert);
-        if (alerts.length > 0) process.exit(2);
+        for (const alert of alerts) {
+          console.error(diagnostic ? alert.replace(/^ABORT-SIGNAL:/, "DIAGNOSTIC:") : alert);
+        }
+        // `wrangler tail` is sampled, global, and diagnostic-only during a
+        // production walkthrough; it can contain unrelated traffic and cannot
+        // be an acceptance gate. Canary/AE callers omit --diagnostic and retain
+        // the fail-closed exit.
+        if (alerts.length > 0 && !diagnostic) process.exit(2);
       })
       .catch((err) => {
         console.error(String(err));

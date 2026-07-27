@@ -24,6 +24,22 @@ describe("extractMetrics (finding 7)", () => {
     expect(metrics[0].wall_ms).toBe(40);
   });
 
+  it("parses Wrangler's pretty-printed stream of consecutive JSON events", () => {
+    const event = (metric: unknown) => JSON.stringify({
+      outcome: "ok",
+      logs: [{ message: ["woo.metric", JSON.stringify(metric)], level: "log", timestamp: 1 }]
+    }, null, 2);
+    const text = [
+      event(TURN),
+      event({ kind: "net_scope_submit", scope: "room:x", status: "accepted", ms: 3 })
+    ].join("\n");
+
+    expect(extractMetrics(text).map((metric) => metric.kind)).toEqual([
+      "net_turn_structure",
+      "net_scope_submit"
+    ]);
+  });
+
   it("parses message entries where the console line arrived as ONE concatenated string", () => {
     const event = JSON.stringify({
       logs: [{ message: [`woo.metric ${JSON.stringify(TURN)}`], level: "log", timestamp: 1 }]
