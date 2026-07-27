@@ -211,6 +211,19 @@ transition.
 
 The editor should not expose bytecode. It is a source-level room.
 
+**Unreadable editor.** The substrate refuses `editor_invoke` on anything that
+is not space-like with a private `sessions` property, and its refusal is
+deliberately generic — core may not name catalog objects. The catalog that owns
+the editor door MUST translate that refusal before it reaches a caller: the
+resulting error names the editor object, states that the world's editor is not
+installed or not readable (rather than implying a permission problem, which no
+grant would fix), names what still works, and points at the operator
+remediation. The bundled prog catalog raises `E_EDITOR_UNAVAILABLE` with
+`value: {editor, target, descriptor, remediation}`. Both aged-world shapes —
+an editor instance that was never seeded, and a stored `edit_verb` page
+predating the authority prefetch that warms it on a sparse shard — present as
+this same refusal, so the message covers both remedies.
+
 The existing programmer tools remain useful outside the editor room. The editor
 room is the collaborative authoring environment; the programmer class is the
 capability/tool surface.

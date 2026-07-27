@@ -301,6 +301,47 @@ describe("authoring", () => {
     }));
   });
 
+  it("names the editor and the operator remediation when the editor space is absent", async () => {
+    // The walkthrough hit this on the workerd lane and prod alike: with the
+    // seeded editor unreadable, edit_verb answered with the substrate's
+    // contract string ("editor must be space-like and define a private
+    // sessions property"). True, and useless — it names no object, no cause,
+    // and no fix, so neither the agent nor the operator reading its bug report
+    // can act. Core stays generic (it may not name catalog objects); the prog
+    // catalog, which owns the editor contract, translates.
+    const world = createWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const programmer = world.auth("guest:verb-editor-absent");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+    const baseCreated = await world.directCall("absent-editor-base", programmer.actor, programmer.actor, "create", ["$thing", { name: "Editor Base" }]);
+    expect(baseCreated.op).toBe("result");
+    const base = baseCreated.op === "result" ? (baseCreated.result as Record<string, string>).id : "";
+
+    // A world installed before the prog catalog's create_instance seed hook
+    // (or one whose sparse view has not warmed the editor) has no readable
+    // editor object at all.
+    expect(world.objects.delete("the_verb_editor")).toBe(true);
+
+    const refused = await world.directCall("absent-editor-open", programmer.actor, programmer.actor, "edit_verb", [base, "title", {}]);
+    expect(refused.op).toBe("error");
+    if (refused.op !== "error") return;
+    expect(refused.error.code).toBe("E_EDITOR_UNAVAILABLE");
+    expect(refused.error.message).toContain("the_verb_editor");
+    expect(refused.error.message).toContain("reinstalling the prog catalog");
+    expect(refused.error.message).toContain("repair:net-definitions");
+    expect(refused.error.message).toContain("install_verb and list_verb still work");
+    expect(refused.error.message, "the substrate's internal contract string must not reach the caller").not.toContain("space-like");
+    expect(refused.error.value).toMatchObject({
+      editor: "the_verb_editor",
+      target: base,
+      descriptor: "title",
+      remediation: "repair:net-definitions"
+    });
+  });
+
   it("supports verb editor room sessions through the programmer surface", async () => {
     const world = createWorld();
     // The verb editor exit-to-$nowhere assertions below assume the actor had
