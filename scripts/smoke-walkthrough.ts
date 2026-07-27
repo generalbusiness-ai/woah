@@ -78,6 +78,12 @@ async function main(): Promise<void> {
     await runSmokeWalkthrough(sessions, makeStepRunner(sessions), {
       runId,
       includeTakeDrop: true,
+      // Deployed reality for the dispenser step: the production horoscope plug
+      // is a live competing consumer of the same queue, and every step runs
+      // under STEP_TIMEOUT_MS — reserve 50s of it for the calls that follow an
+      // admission wait so the wait can never starve the rest of the step.
+      dispenserCompetingConsumer: true,
+      dispenserAdmissionWaitMs: Math.min(66_000, Math.max(0, STEP_TIMEOUT_MS - 50_000)),
       waitTimeoutMs: 10_000,
       log: verbose ? (msg) => console.log(msg) : undefined
     });

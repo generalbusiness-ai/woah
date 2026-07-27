@@ -7,6 +7,7 @@ import {
   raceWithAbort
 } from "../scripts/smoke-walkthrough";
 import {
+  dispenserCancelDisposition,
   ensureInChatroom,
   normalizeDispenserObservation,
   normalizeOutlinerObservation,
@@ -208,6 +209,37 @@ describe("smoke walkthrough harness", () => {
       type: "canceled",
       order_id: "ord_9"
     }, "canceled", "the_horoscope")).toBeNull();
+  });
+
+  it("recognizes a delivered fact in both rolling-contract shapes", () => {
+    expect(normalizeDispenserObservation({
+      type: "dispenser.delivered",
+      version: 1,
+      payload: { order_id: "ord_9", note: "o_note" },
+      source: "the_horoscope"
+    }, "delivered", "the_horoscope")).toEqual({ mode: "act", orderId: "ord_9" });
+    expect(normalizeDispenserObservation({
+      type: "delivered",
+      block: "the_horoscope",
+      order_id: "ord_9",
+      note: "o_note"
+    }, "delivered", "the_horoscope")).toEqual({ mode: "legacy", orderId: "ord_9" });
+    expect(normalizeDispenserObservation({
+      type: "delivered",
+      order_id: "ord_9"
+    }, "delivered", "the_horoscope")).toBeNull();
+  });
+
+  it("classifies cancel replies for an order this run just placed", () => {
+    // Normal cancellation.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: true, duplicate: false })).toBe("canceled");
+    // v1 lost race: the plug delivered before the cancel committed.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, duplicate: true, reason: "delivered" })).toBe("delivered");
+    // v0 lost race: delivery deletes the pending row, so cancel reads not_pending.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, reason: "not_pending" })).toBe("delivered");
+    // A genuinely unknown order is a real failure, not a race.
+    expect(dispenserCancelDisposition({ order_id: "ord_9", canceled: false, duplicate: false, reason: "unknown" })).toBeNull();
+    expect(dispenserCancelDisposition("nope")).toBeNull();
   });
 
   it("parses the admission-window wait only out of E_RATE_LIMIT refusals", () => {

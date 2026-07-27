@@ -155,14 +155,19 @@ fail-closed folds, dropped-reply idempotency, legacy genesis, rebuild,
 eviction, caps). The shared walkthrough (`scripts/smoke/scenario.ts`, run by
 the workerd and deployed lanes) drives the cross-actor half on
 `the_horoscope`: a sequenced `order` whose recorded fact reaches a co-present
-peer, the requester `status` read, an ordinary actor's `next_pending` refused
-`E_PERM`, and a requester `cancel` whose terminal fact reaches the peer. The
+peer, an ordinary actor's `next_pending` refused `E_PERM`, and a terminal
+disposition whose fact reaches the peer. On fresh-world lanes the step is
+strict (queued `status` read, then `cancel`). On the deployed lane the
+production plug is a live competing consumer of the same queue — `:order`
+sends it a synchronous wakeup — so the step cancels immediately after
+ordering, accepts a lost race as the legitimate `delivered` disposition, and
+guarantees by `finally` that no pending order it placed survives the run. The
 walkthrough accepts both rolling-contract observation shapes (v1 Act envelope
-and the pre-Acts flat `order_placed`/`canceled`) because a runtime deploy does
-not rewrite an installed world's catalog pages. The plug's deliver half is
-deliberately absent from the walkthrough — those verbs accept only the block
-actor or a wizard, and the walkthrough's job is to prove they refuse ordinary
-credentials.
+and the pre-Acts flat `order_placed`/`canceled`/`delivered`) because a runtime
+deploy does not rewrite an installed world's catalog pages. The plug's deliver
+half is deliberately absent from the walkthrough — those verbs accept only the
+block actor or a wizard, and the walkthrough's job is to prove they refuse
+ordinary credentials.
 
 ## Deliberate exclusions
 
