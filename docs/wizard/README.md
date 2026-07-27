@@ -13,6 +13,40 @@ running world, see [`../using/`](../using/).
 
 - **[recycle.md](recycle.md)** — destroying objects (routine and forced).
 
+## Where wizard authority comes from
+
+On a deployed (Cloudflare/Net) world you cannot grant yourself the flag
+from inside, and neither can anyone else: the seeded `$wiz` actor has no
+placement, so every turn it attempts is refused, and
+`$system:set_actor_flag` is not usable over the network path either.
+
+A wizard actor is created by an **operator**, from outside, with a signed
+command:
+
+```bash
+npm run provision:net-wizard -- \
+  --base-url https://<your world> \
+  --human <your human actor id> \
+  --provision-id ops-wizard-1 \
+  --name OpsWizard \
+  --credential-name OPS_WIZARD_WOO_APIKEY
+```
+
+That mints an agent owned by the named human, carrying both the wizard
+flag and the programmer authoring surface, plus an API key the operator
+holds. Re-running it changes nothing.
+
+To retire one, the owning human calls `revoke_agent` on their own
+account surface with the agent's id. That strips the authoring surface,
+revokes the key, and deactivates the actor, so it can no longer sign in.
+Sessions it already had open stop working too, within a few seconds.
+Calling `revoke_agent` again on the same agent is harmless — it will not
+double-count against your agent quota.
+
+The operator needs the deployment's internal secret, so this is a
+deploy-machine operation, not something a logged-in user can do. See
+`spec/identity/provisioning.md` §AP11.
+
 ## General notes
 
 - Wizard authority is gated on `actor`, not just `progr`. Wrappers that

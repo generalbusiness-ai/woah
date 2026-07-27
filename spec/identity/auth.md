@@ -252,6 +252,8 @@ Subsequent presentations of the same token return `E_TOKEN_CONSUMED`. The runtim
 
 If no other wizard path exists (operator has lost their session and never minted a second wizard), recovery is a fresh deploy of the same world archive into a new deployment. This is why minting at least one secondary wizard immediately after first claim is recommended.
 
+**Net profile: the seeded `$wiz` is not usable from a client at all.** On the Net (Cloudflare) profile the bootstrap wizard is a catalog identity with no placement, so its planning anchor classifies to the `catalog` scope and every client turn it attempts is refused `E_INVARG unplannable_scope`. The secondary wizard is therefore not merely recommended, it is the only usable one, and it is minted by the signed operator operation in [provisioning.md §AP11](provisioning.md#ap11-operator-wizard-provisioning-implemented) rather than by `$system:set_actor_flag` (which is an untracked native and is itself refused over Net). AP11 provisions a non-catalog agent anchored under an existing human account, which plans at that account's authority cluster even while located nowhere.
+
 A single-call `$system:rotate_bootstrap_token(new_token)` verb that combines both steps atomically is **deferred** — see §A12.
 
 **Forbidden alternatives** (must not ship):

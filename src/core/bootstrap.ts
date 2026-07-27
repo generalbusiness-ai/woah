@@ -1213,6 +1213,10 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$account", "created_at", 0, "int", "r");
   define(world, "$account", "deactivated_at", null, "int|null", "r");
   define(world, "$account", "recycle_on_delete", false, "bool", "r");
+  // AP11 idempotency ledger for signed-operator wizard provisioning:
+  // provision_id -> the agent minted for it. Bounded by the account's own agent
+  // quota; read only by the provisioning primitive that writes it.
+  define(world, "$account", "operator_provisioned_agents", {}, "map", "r");
   define(world, "$human", "account", null, "obj|null", "r");
   define(world, "$agent", "api_key_id", null, "str|null", "r");
   define(world, "$agent", "created_via", "wizard", "str", "r");
@@ -1221,6 +1225,10 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$agent", "purpose", "", "str", "r");
   define(world, "$agent", "scope", "write", "str", "r");
   define(world, "$agent", "deactivated_at", null, "int|null", "r");
+  // AP11: the operator token this agent was provisioned for. The reverse pointer
+  // of the account's operator_provisioned_agents ledger, checked before any idempotent
+  // re-run reuses the recorded agent.
+  define(world, "$agent", "provision_id", null, "str|null", "r");
   removeSeedProperty(world, "$player", "attached_sockets");
   // Legacy: $player.session_id was a write-only mirror of the session table
   // that no reader ever consulted. Retired now that session lifecycle lives
@@ -1346,10 +1354,18 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$system", "issue_signup_invite", "issue_signup_invite", "verb :issue_signup_invite(quantity, expires_at) rxd { /* native: wizard-only signup invite minting. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["quantity", "expires_at"] } });
   native(world, "$system", "gc_pending_credentials", "gc_pending_credentials", "verb :gc_pending_credentials() rxd { /* native: wizard-only sweep for expired bearer tokens, signup verifications, provision states, and stale invite records. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
   native(world, "$system", "set_actor_flag", "set_actor_flag", "verb :set_actor_flag(actor, flag, value) rxd { /* native: audited flag mutation with agent programmer quota checks. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "flag", "value"] } });
-  native(world, "$system", "set_quota", "set_quota", "verb :set_quota(account, kind, value) rxd { /* native: audited per-account quota mutation. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["account", "kind", "value"] } });
+  // The prefetch warms the account named by argument 0: without it a Net plan
+  // reads the unwarmed instance as the CLASS default and would write the new
+  // quota over a stale prior. `$system` (the turn target) is catalog-resident,
+  // so `target` is not a usable prefetch root here — the argument is.
+  native(world, "$system", "set_quota", "set_quota", "verb :set_quota(account, kind, value) rxd { /* native: audited per-account quota mutation. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["account", "kind", "value"], authority: { prefetch: [{ arg: 0 }] } } });
   native(world, "$human", "create_agent", "human_create_agent", "verb :create_agent(name, purpose?, programmer?) rxd { /* native: self-service agent provisioning. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["name", "purpose?", "programmer?"] } });
   native(world, "$human", "list_agents", "human_list_agents", "verb :list_agents() rxd { /* native: list agents owned by this human. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: [] } });
-  native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"] } });
+  // Same prefetch shape as promote/demote below, and for the same reason: the
+  // turn reads the account (programmer counter, agent count) and the owned
+  // agent (flags, features, api_key_id, its own api_keys record) beyond the
+  // target, and an unwarmed instance read silently returns the class default.
+  native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   // The prefetch warms the two authority objects this turn reads beyond the
   // target (the human): the account behind `target.account` (its
   // programmer_grant_quota / programmer_agent_count) and the owned agent named
@@ -1359,6 +1375,13 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "promote_agent_to_programmer", "human_promote_agent_to_programmer", "verb :promote_agent_to_programmer(actor_id) rxd { /* native: consume programmer-agent quota and set programmer flag. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   native(world, "$human", "demote_agent_from_programmer", "human_demote_agent_from_programmer", "verb :demote_agent_from_programmer(actor_id) rxd { /* native: clear programmer flag on an owned agent. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"], authority: { prefetch: [{ path: ["target", "account"] }, { arg: 0 }] } } });
   native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
+  // AP11 signed-operator wizard provisioning (spec/identity/provisioning.md §AP11).
+  // NOT tool_exposed: the only caller is the internal-signed
+  // /net-operator/wizard/provision route, and the handler additionally requires
+  // wizard authority. The prefetch warms the account (quotas, counters, and the
+  // provision_id ledger) plus every agent that ledger already names, so an
+  // idempotent re-run reads real instance state instead of class defaults.
+  native(world, "$human", "provision_wizard_agent", "human_provision_wizard_agent", "verb :provision_wizard_agent(provision_id, options?) rxd { /* native: operator-signed provisioning of a wizard-flagged, programmer-surfaced agent under this human's account. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["provision_id", "options?"], authority: { prefetch: [{ path: ["target", "account"] }, { path: ["target", "account", "operator_provisioned_agents"] }] } } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");
   sourceVerb(world, "$thing", "look", THING_LOOK_SOURCE, {

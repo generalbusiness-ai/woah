@@ -328,6 +328,23 @@ type TurnRequest = {
   counters?: PlanTurnInput["counters"];
 };
 
+/** /net/provision-wizard body (AP11; see operatorProvisionWizard). The
+ * internal-signed operator op that mints a usable wizard on a deployed world.
+ * Carries no credential material: the api-key id is a pointer whose verifier
+ * is installed by the separate /net-operator/credentials/ensure route. */
+type OperatorProvisionWizardRequest = {
+  /** The existing human actor whose account anchors the new agent. */
+  human: string;
+  /** Opaque operator-chosen idempotency token, durable on the operator machine
+   * before the first call so a lost reply replays exactly. */
+  provision_id: string;
+  name?: string;
+  purpose?: string;
+  /** Routed api-key id the operator generated locally; recorded on the agent so
+   * rotate/revoke find the credential the operator holds. */
+  api_key_id?: string;
+};
+
 /** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
  * the scope's outbox drain delivers. */
 type PlanScheduledRequest = {
@@ -1041,6 +1058,9 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/provision-wizard") {
+        return await this.operatorProvisionWizard((await request.json()) as OperatorProvisionWizardRequest);
       }
       if (request.method === "POST" && url.pathname === "/net/plan-scheduled") {
         return json(await this.planScheduled((await request.json()) as PlanScheduledRequest));
@@ -2370,6 +2390,175 @@ export class NetGatewayDO {
   }
 
   /**
+   * /net/provision-wizard — AP11 signed-operator wizard provisioning.
+   *
+   * Why this is a TURN and not a cell write like the repair family: every other
+   * signed operator op repairs state whose correct value is derivable outside
+   * the world (a definition page, a contents row, a seeded map). Provisioning
+   * an actor is not derivable — it consumes quota, advances counters, appends
+   * to `account.actors`, anchors an object, and composes the programmer
+   * surface. Writing those cells operator-side would fork the world's own
+   * accounting into a second implementation. Running the world's primitive
+   * through the ordinary planner keeps one implementation and makes the
+   * accepted transcript the audit record (AU1), exactly like the human's own
+   * self-service promote.
+   *
+   * The whole sequence is ONE turn, so it is atomic: a failure at any step
+   * commits nothing. Re-running with the same `provision_id` converges.
+   *
+   * The actor is the catalog wizard `$wiz` — usable here precisely because this
+   * is not a client turn: the client path refuses a `$`-anchored planning scope
+   * (`unplannable_scope`), which is the lock this op exists to break. The turn
+   * plans and commits at the HUMAN's authority cluster, where the account, the
+   * new agent, and its api-key record all live.
+   */
+  private async operatorProvisionWizard(body: OperatorProvisionWizardRequest): Promise<Response> {
+    const human = typeof body.human === "string" ? body.human.trim() : "";
+    const provisionId = typeof body.provision_id === "string" ? body.provision_id.trim() : "";
+    if (!human || !provisionId) {
+      return json({ error: { code: "E_INVARG", message: "provision requires human and provision_id" } }, 400);
+    }
+    if (!isConcreteRuntimeObjectId(human) || human.startsWith("$")) {
+      // A `$`-prefixed target is catalog substrate: its cells live in the
+      // catalog scope, so the turn could not write an account there anyway.
+      return json({ error: { code: "E_INVARG", message: "provision human must be a concrete non-catalog object id" } }, 400);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(provisionId)) {
+      return json({ error: { code: "E_INVARG", message: "provision_id must be 1..128 chars of [A-Za-z0-9._:-]" } }, 400);
+    }
+    const apiKeyId = typeof body.api_key_id === "string" ? body.api_key_id.trim() : "";
+    // Named world-state verdicts (not installed / not active) rather than the
+    // generic 500 the outer handler would give a ClientAuthError: an operator
+    // running this against a half-installed namespace must be able to tell
+    // "the world is not ready" from "the op is broken".
+    let epoch: string;
+    try {
+      epoch = (await this.catalogIdentity()).epoch;
+    } catch (err) {
+      if (err instanceof ClientAuthError) {
+        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
+      }
+      throw err;
+    }
+    const planningScope = await this.clientPlanningScope(human, human);
+    if (!planningScope.startsWith("cluster:")) {
+      return json({
+        error: {
+          code: "E_INVARG",
+          message: "provision human does not classify to an authority cluster",
+          detail: { human, scope: planningScope }
+        }
+      }, 400);
+    }
+    await this.warmScopes([CATALOG_SCOPE, { scope: planningScope, objects: [human] }], "net_provision_wizard_pull_miss_failed");
+    // Warm the account and, if this provision_id already minted an agent, that
+    // agent too. A property read of an unwarmed instance silently returns the
+    // CLASS default (quota 0, provision_id null) rather than an error the
+    // repair loop could act on, and here that would mean either a spurious
+    // refusal or a duplicate identity. The declared argSpec prefetch covers the
+    // same ground for any other caller; this is the explicit belt.
+    //
+    // These pulls are HARD, unlike the best-effort prefetch elsewhere: a
+    // degraded read here does not fail loudly, it produces a plan that reads
+    // class defaults (quota 0, provision_id null) and would then either refuse
+    // confusingly or grant the wrong headroom. Failing the operator's request
+    // is the correct outcome.
+    const account = this.netObjectProperty(human, "account");
+    if (typeof account === "string" && account) {
+      const prefetch = async (object: string, role: string): Promise<void> => {
+        try {
+          await this.pullTargeted(planningScope, `scope:${planningScope}`, [object]);
+        } catch (err) {
+          this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
+          throw netError("E_MISSING_STATE", `wizard provisioning could not read the ${role} authority state`, {
+            scope: planningScope,
+            object,
+            role
+          });
+        }
+      };
+      await prefetch(account, "account");
+      const ledger = this.netObjectProperty(account, "operator_provisioned_agents");
+      // OWN-key read. A provision_id is operator-chosen text and the wire
+      // grammar admits `constructor`, `toString`, and friends; plain indexing
+      // would resolve an inherited Object.prototype member and hand a function
+      // to the prefetch as if it were a recorded agent id.
+      const recorded = ledger && typeof ledger === "object" && !Array.isArray(ledger)
+        && Object.hasOwn(ledger as Record<string, unknown>, provisionId)
+        ? (ledger as Record<string, unknown>)[provisionId]
+        : undefined;
+      if (typeof recorded === "string" && recorded) await prefetch(recorded, "recorded agent");
+    }
+    // Each invocation is its OWN turn. The durable idempotency handle is the
+    // operator's `provision_id`, enforced inside the primitive: a re-run
+    // converges (creates nothing, grants nothing, returns the same agent). A
+    // stable turn key would instead replay the first commit's cached reply,
+    // which carries no result value — so a retry after a lost reply could not
+    // learn the agent id it needs for the credential step. Two concurrent runs
+    // are safe: the second loses the read-version check, repairs, replans
+    // against the committed state, and reports `created: false`.
+    const key = `operator-provision-wizard:${human}:${provisionId}:${crypto.randomUUID()}`;
+    // The acting principal is the OWNER of the provisioning primitive, read
+    // from the resolved verb page — the same data-driven derivation the guest
+    // door uses for `maintenance_principal`. The gateway therefore never names
+    // `$wiz`, and a world whose primitive is absent refuses here with a legible
+    // message instead of an E_VERBNF deep inside planning.
+    const page = this.callVerbPage(this.ensureView(), {
+      kind: "woo.turn_call.shadow.v1",
+      id: key,
+      route: "direct",
+      scope: human,
+      actor: human,
+      target: human,
+      verb: "provision_wizard_agent",
+      args: []
+    });
+    const principal = typeof page?.owner === "string" && page.owner ? page.owner : null;
+    if (!principal) {
+      return json({
+        error: {
+          code: "E_VERBNF",
+          message: "this world does not install the provision_wizard_agent primitive",
+          detail: { human, verb: "provision_wizard_agent" }
+        }
+      }, 409);
+    }
+    const result = await this.turn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: key,
+        route: "direct",
+        scope: human,
+        actor: principal,
+        target: human,
+        verb: "provision_wizard_agent",
+        args: [
+          provisionId,
+          {
+            ...(typeof body.name === "string" && body.name ? { name: body.name } : {}),
+            ...(typeof body.purpose === "string" ? { purpose: body.purpose } : {}),
+            ...(apiKeyId ? { api_key_id: apiKeyId } : {})
+          }
+        ] as PlanTurnInput["call"]["args"]
+      },
+      planningScope,
+      catalog_epoch: epoch,
+      idempotency_key: key
+    });
+    if (result.reply.status !== "accepted" || result.error !== undefined) {
+      this.metric({ kind: "net_provision_wizard", scope: planningScope, status: "error", error: JSON.stringify(result.error ?? result.reply) });
+      return json({
+        ok: false,
+        scope: planningScope,
+        reply: result.reply,
+        ...(result.error !== undefined ? { error: result.error } : {})
+      }, 409);
+    }
+    this.metric({ kind: "net_provision_wizard", scope: planningScope, status: "ok" });
+    return json({ ok: true, scope: planningScope, catalog_epoch: epoch, result: result.result ?? null, reply: result.reply });
+  }
+
+  /**
    * /net/session-open — CO14 minting. The credentialed client front is
    * POST /net-api/session (clientSession below); this internal route
    * remains for lanes/tests and trusted tooling (CO14: the gateway
@@ -2831,6 +3020,14 @@ export class NetGatewayDO {
         bearerSession = credential.session;
       } else {
         actor = (await this.verifyClientApiKey(identity.map, credential)).actor;
+        // The apikey class needs the SAME retirement gate as the bearer class
+        // above. Eligibility is otherwise only checked when a session is
+        // MINTED, so a retired actor presenting a long-lived key plus an
+        // already-minted session id kept transacting — verified: a revoked
+        // wizard committed a wizard-only set_quota turn this way. `revoke_agent`
+        // revokes only the key `agent.api_key_id` names, so any second
+        // credential on that actor survives retirement and reaches here.
+        this.assertActorNotRetired(actor);
       }
 
       // H4: rate limiting runs AFTER authentication resolves the actor
@@ -6122,11 +6319,55 @@ export class NetGatewayDO {
    * this explicit asynchronous layer. */
   private async authorizedActorForSessionBearer(session: string, legacyMap?: unknown): Promise<string> {
     const actor = this.actorForSessionBearer(session);
+    this.assertActorNotRetired(actor);
     const value = this.ensureView().get(sessionCellKey(session))?.value as { apikeyId?: unknown } | undefined;
     if (typeof value?.apikeyId === "string" && value.apikeyId) {
       await this.assertSessionApiKeyActive(value.apikeyId, actor, legacyMap);
     }
     return actor;
+  }
+
+  /**
+   * Retirement must reach LIVE credentials, not just new sessions.
+   *
+   * `assertActorEligible` runs at session MINT. Without this check both client
+   * credential classes outlived `revoke_agent` indefinitely: a session bearer
+   * presents a session id and never re-presents its key, and an apikey holder
+   * pairs a long-lived key with an already-minted session id. Both were
+   * verified to keep transacting after retirement — the apikey case committed
+   * a wizard-only `set_quota` turn. That is precisely the wrong failure mode
+   * for an operator-provisioned wizard: the actor is tombstoned and the
+   * transport keeps serving it.
+   *
+   * Deliberately VIEW-ONLY and conservative:
+   *
+   *  - It reads the tombstone cell already in this gateway's derived view and
+   *    never warms or fetches. This is a hot path on every session-bearer call;
+   *    a cross-DO hop per request is not acceptable, and the revocation commits
+   *    in the same authority cluster that hosts the session cell — a scope this
+   *    gateway subscribed to when it minted the session — so the tombstone
+   *    arrives by ordinary fanout.
+   *  - Absence of the cell is NOT a refusal. A gateway that has never seen the
+   *    actor's cluster cannot distinguish "not deactivated" from "not pulled",
+   *    and failing closed there would break every cold-view session.
+   *
+   * Propagation is therefore eventual (fanout latency — seconds, not instant),
+   * and the key check below remains the second, authoritative gate: it reads
+   * the verifier from the owning authority and catches a revoked credential
+   * even when the tombstone has not landed yet.
+   */
+  private assertActorNotRetired(actor: string): void {
+    const cell = this.ensureView().get(cellKey("property_cell", actor, "deactivated_at"))?.value as
+      | { value?: unknown }
+      | undefined;
+    if (cell && "value" in cell && cell.value != null) {
+      throw new ClientAuthError(
+        "identity deactivated",
+        { reason: "identity_deactivated", actor },
+        "E_PERM",
+        403
+      );
+    }
   }
 
   /** A session minted from a long-lived key remains subordinate to that key.
