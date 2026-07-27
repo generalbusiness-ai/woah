@@ -781,6 +781,19 @@ export class NetGatewayDO {
    * (idempotent server-side) — a dropped entry costs one redundant
    * subscribe/pull, never a lost subscription. */
   private readonly selfSubscribed = new Set<string>();
+  /**
+   * A scope may drain a pending fanout while this gateway is awaiting the
+   * idempotent `/subscribe` RPC. Until the response supplies the acknowledged
+   * lane prefix, a jump from the gateway's old local watermark is ambiguous:
+   * it can be aged acknowledged history rather than loss. Retain only the
+   * first delivery position during that one-RPC window, then judge it against
+   * the returned prefix before beginning the state backfill.
+   */
+  private readonly deliveryResumes = new Map<string, {
+    baseline: number;
+    firstDeliverySeq?: number;
+    firstAuthoritySeq?: number;
+  }>();
   private readonly roomPresentationActors = new Map<string, true>();
 
   /** H4 token buckets, PER-ISOLATE by design (see rate-limit.ts header):
@@ -1527,6 +1540,24 @@ export class NetGatewayDO {
     // retain that bounded answer across repair rounds so one look never
     // re-probes the same offline seats.
     const roomPresentationActors = new Set(this.roomPresentationActors.keys());
+    // `room_roster` is an owner-produced snapshot for this one logical turn.
+    // A repair round must re-execute semantic bytecode against refreshed cells,
+    // but re-fetching the same presentation snapshot only widens the turn and
+    // can consume the hard RPC budget without strengthening commit validation.
+    // Keep the first authoritative roster value sticky across this turn's
+    // bounded attempts, just like ordered/replay projections above.
+    let planningRoomRoster: { room: string; rows: readonly RoomRosterRow[] } | undefined;
+    // `undefined` means not resolved yet; `null` means this call has no roster
+    // dependency. A concurrent actor/session move can change the resolved room
+    // after repair, in which case the next attempt must fetch the new room.
+    let planningRoomRosterRoom: string | null | undefined;
+    // Only a gateway-local preflight mismatch (no submit issued) may carry the
+    // owner attestations it just fetched into the immediate re-plan. The
+    // attestation builder reuses an owner only when every new transcript
+    // version it must prove is exactly covered; any changed/new read goes live.
+    // Scope-returned conflicts never populate this cache and therefore retain
+    // the ordinary fresh-attestation retry.
+    let preflightRetryAttestations: CommitSubmit["attestations"];
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1541,7 +1572,11 @@ export class NetGatewayDO {
       // a recovery may have refreshed them).
       const view = this.ensureView();
       const classifier = this.classifierFor(request, view);
-      const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure, roomPresentationActors);
+      const resolvedRosterRoom = this.roomRosterRoom(request, view, classifier);
+      if (planningRoomRosterRoom === undefined || planningRoomRosterRoom !== resolvedRosterRoom) {
+        planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure, roomPresentationActors);
+        planningRoomRosterRoom = resolvedRosterRoom;
+      }
       // Seed the call target's ordering once (the generic "children of the
       // target" projection); repair rounds add any further parents the verb
       // reads. Idempotent: skipped once the target is already in the map.
@@ -1783,12 +1818,21 @@ export class NetGatewayDO {
       }
       // CO2.3 rider integrity (rule 1): attest every FOREIGN read — a
       // read whose object anchors to a scope other than the committing
-      // one — from its owner before submitting. Fetched fresh on EVERY
-      // round (including stale_head resubmits), so a read_version_
-      // mismatch repair — which refreshes the mismatched cells from
-      // their owners (refreshCells routes by the classifier) and
-      // re-plans — automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, classifier, planned, view, targetScope, structure);
+      // one — from its owner before submitting. Ordinary retries fetch
+      // fresh. A gateway-local preflight mismatch issued no submit, so its
+      // immediate re-plan may reuse an owner proof only when it exactly
+      // covers every version the new transcript records.
+      const priorPreflightAttestations = preflightRetryAttestations;
+      preflightRetryAttestations = undefined;
+      const attestations = await this.attestForeignReads(
+        request,
+        classifier,
+        planned,
+        view,
+        targetScope,
+        structure,
+        priorPreflightAttestations
+      );
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
@@ -1864,20 +1908,40 @@ export class NetGatewayDO {
       }
       assertEnvelopeCeiling(envelopeBytes, warm);
       let reply: CommitReply;
-      try {
-        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
-      } catch (err) {
-        // NC8b: never re-submit after a BUDGET refusal — the first submit
-        // was never issued, so there is nothing to disambiguate.
-        if (isNetError(err) && err.code === "E_BUDGET") throw err;
-        // CO2.5 recovery (fix 5b): the transport died in the reply
-        // window (kill_after_commit shape) — the scope may or may not
-        // have durably committed. ONE resubmit with the SAME idempotency
-        // key disambiguates: a committed turn returns its recorded
-        // reply; an uncommitted one validates fresh. Only a second
-        // transport failure surfaces (with the trace via fix 5d).
-        // MANDATORY: disambiguation must run even at the budget's edge.
-        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true, phase: "submit_disambiguate" })) as CommitReply;
+      const attestationMismatches = this.foreignAttestationMismatches(planned, submit.attestations);
+      if (attestationMismatches.length > 0) {
+        // The gateway has just fetched these owner versions. Sending a
+        // transcript whose recorded versions already disagree can only earn
+        // the scope's retryable read_version_mismatch verdict. Synthesize that
+        // exact repair input locally and preserve the submit RPC for the
+        // re-planned round. Acceptance still happens only at the scope; this
+        // optimization can skip a provably doomed write attempt, never accept.
+        preflightRetryAttestations = submit.attestations;
+        reply = {
+          kind: "woo.net.commit_reply.v1",
+          status: "rejected",
+          scope: targetScope,
+          reason: "read_version_mismatch",
+          retryable: true,
+          head: base,
+          mismatched_reads: attestationMismatches
+        };
+      } else {
+        try {
+          reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
+        } catch (err) {
+          // NC8b: never re-submit after a BUDGET refusal — the first submit
+          // was never issued, so there is nothing to disambiguate.
+          if (isNetError(err) && err.code === "E_BUDGET") throw err;
+          // CO2.5 recovery (fix 5b): the transport died in the reply
+          // window (kill_after_commit shape) — the scope may or may not
+          // have durably committed. ONE resubmit with the SAME idempotency
+          // key disambiguates: a committed turn returns its recorded
+          // reply; an uncommitted one validates fresh. Only a second
+          // transport failure surfaces (with the trace via fix 5d).
+          // MANDATORY: disambiguation must run even at the budget's edge.
+          reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true, phase: "submit_disambiguate" })) as CommitReply;
+        }
       }
       if (reply.status === "accepted") {
         // Retain the optimistic allocation/head hint only for an exact
@@ -5885,14 +5949,36 @@ export class NetGatewayDO {
     const self = this.selfDestination();
     if (!self || this.selfSubscribed.has(scope)) return;
     this.selfSubscribed.add(scope);
+    this.ensureView();
+    const deliveryResume = {
+      baseline: this.deliverySeen.get(scope) ?? 0
+    };
+    this.deliveryResumes.set(scope, deliveryResume);
     try {
-      await this.host.rpc(`scope:${scope}`, "/subscribe", { destination: self });
+      const subscribed = await this.host.rpc(`scope:${scope}`, "/subscribe", { destination: self }) as {
+        resume_delivery_seq?: unknown;
+      };
+      const resumeDeliverySeq = subscribed.resume_delivery_seq;
+      if (Number.isSafeInteger(resumeDeliverySeq) && Number(resumeDeliverySeq) >= 0) {
+        this.advanceDeliverySeen(scope, Number(resumeDeliverySeq));
+      }
+      this.finishDeliveryResume(
+        scope,
+        Number.isSafeInteger(resumeDeliverySeq) && Number(resumeDeliverySeq) >= 0
+          ? Number(resumeDeliverySeq)
+          : deliveryResume.baseline
+      );
       if (scope === CATALOG_SCOPE) {
         await this.pull({ scope, destination: `scope:${scope}` });
       } else {
         await this.pullTargeted(scope, `scope:${scope}`, []);
       }
     } catch (err) {
+      // The failed subscribe is already a named error. Without a successful
+      // response there is no authoritative prefix against which an
+      // interleaved delivery can be classified, so do not manufacture a
+      // second integrity incident from that ambiguous window.
+      this.deliveryResumes.delete(scope);
       this.selfSubscribed.delete(scope);
       this.metric({ kind: "net_self_subscribe_failed", scope, status: "error", error: String(err) });
     }
@@ -6289,8 +6375,34 @@ export class NetGatewayDO {
     structure: TurnStructure,
     knownPresenceActors: Set<string>
   ): Promise<{ room: string; rows: readonly RoomRosterRow[] } | undefined> {
+    const room = this.roomRosterRoom(request, view, classifier);
+    if (!room) return undefined;
+    const scope = classifier.scopeOf(room);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/room-roster",
+      { room }
+    ), { phase: "room_roster" }) as { room?: unknown; rows?: unknown };
+    if (response.room !== room || !Array.isArray(response.rows)) {
+      throw new Error(`room-roster authority returned malformed projection for ${room}`);
+    }
+    const rows = response.rows as RoomRosterRow[];
+    await this.warmRoomPresentationContents(request, room, scope, rows, classifier, structure, knownPresenceActors);
+    return { room, rows };
+  }
+
+  /** Resolve the topology-owned room for one compact roster read without IO.
+   *
+   * Kept separate from roomRosterProjection so repair rounds can reuse the
+   * same authoritative snapshot only while the actor/session still resolves to
+   * that room. A concurrent move changes this answer and forces a fresh read. */
+  private roomRosterRoom(
+    request: TurnRequest,
+    view: CellStore,
+    classifier: ScopeClassifier
+  ): string | null {
     const call = request.call;
-    if (!this.callReadsRoomPresence(view, call)) return undefined;
+    if (!this.callReadsRoomPresence(view, call)) return null;
     const session = typeof call.session === "string" ? view.get(cellKey("session", call.session)) : undefined;
     const activeScope = (session?.value as { activeScope?: unknown } | undefined)?.activeScope;
     const actorLive = view.get(cellKey("object_live", call.actor));
@@ -6307,19 +6419,7 @@ export class NetGatewayDO {
         : typeof actorLocation === "string" && actorLocation
           ? actorLocation
           : null);
-    if (!room) return undefined;
-    const scope = classifier.scopeOf(room);
-    const response = await structure.rpc(() => this.host.rpc(
-      this.destinationFor(request, scope),
-      "/room-roster",
-      { room }
-    ), { phase: "room_roster" }) as { room?: unknown; rows?: unknown };
-    if (response.room !== room || !Array.isArray(response.rows)) {
-      throw new Error(`room-roster authority returned malformed projection for ${room}`);
-    }
-    const rows = response.rows as RoomRosterRow[];
-    await this.warmRoomPresentationContents(request, room, scope, rows, classifier, structure, knownPresenceActors);
-    return { room, rows };
+    return room;
   }
 
   /** Materialize direct non-presence room members needed by presentation verbs.
@@ -6775,6 +6875,16 @@ export class NetGatewayDO {
       const ref = call.args[map.arg];
       return typeof ref === "string" && ref.trim().length > 0 ? [ref.trim()] : [];
     }
+    // `{ref: "<object>"}`: a fixed object the verb reaches that appears in
+    // neither the call nor the actor's context. A verb whose body targets a
+    // catalog's own seed instance (an editor room, a registry) cannot name it
+    // through `target`/`actor`/`scope` or an argument, and without warming it
+    // the instance is simply absent from the turn's world — its class chain
+    // resolves, so `isa()` against it silently answers false rather than
+    // raising anything the repair loop could act on. The literal lives in the
+    // catalog manifest that owns the object; core stays catalog-agnostic and
+    // only learns "warm the object this verb names".
+    if (typeof map.ref === "string" && map.ref.trim().length > 0) return [map.ref.trim()];
     if (!Array.isArray(map.path) || map.path.length === 0 || typeof map.path[0] !== "string") return [];
     let cursor: unknown = this.netAuthorityPrefetchRoot(map.path[0], call);
     for (const rawPart of map.path.slice(1)) {
@@ -7100,9 +7210,11 @@ export class NetGatewayDO {
     planned: PlanTurnResult,
     view: CellStore,
     targetScope: string,
-    structure?: TurnStructure
+    structure?: TurnStructure,
+    reusable?: CommitSubmit["attestations"]
   ): Promise<CommitSubmit["attestations"]> {
     const byOwner = new Map<string, Set<string>>();
+    const cellVersionsByOwner = new Map<string, Map<string, string>>();
     for (const read of planned.transcript.reads) {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
@@ -7137,6 +7249,11 @@ export class NetGatewayDO {
       const keys = byOwner.get(owner) ?? new Set<string>();
       keys.add(key);
       byOwner.set(owner, keys);
+      if (read.version !== undefined) {
+        const versions = cellVersionsByOwner.get(owner) ?? new Map<string, string>();
+        versions.set(key, String(read.version));
+        cellVersionsByOwner.set(owner, versions);
+      }
     }
     // R3: foreign ORDERING reads owner-attest exactly like foreign cell
     // reads — the same /net/attest reply reports the owner's CURRENT
@@ -7249,12 +7366,72 @@ export class NetGatewayDO {
       }
       return reply;
     };
-    const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
+    const canReuse = (
+      owner: string,
+      keys: Set<string>,
+      entry: NonNullable<CommitSubmit["attestations"]>[string] | undefined
+    ): entry is NonNullable<CommitSubmit["attestations"]>[string] => {
+      if (!entry) return false;
+      const expectedCells = cellVersionsByOwner.get(owner);
+      const cells = new Map(entry.cells.map((cell) => [cell.key, cell.version]));
+      for (const key of keys) {
+        const expected = expectedCells?.get(key);
+        if (expected === undefined || cells.get(key) !== expected) return false;
+      }
+
+      const orderings = new Map(
+        (entry.orderings ?? []).map((ordering) => [
+          orderedProjectionKey(ordering.container, ordering.parent),
+          ordering.version
+        ])
+      );
+      for (const read of planned.transcript.orderingReads ?? []) {
+        if (read.scope !== owner || read.scope === targetScope) continue;
+        if (orderings.get(orderedProjectionKey(read.container, read.parent)) !== read.version) return false;
+      }
+
+      const replays = new Map(
+        (entry.replays ?? []).map((page) => [replayPageQueryKey(page), page.version])
+      );
+      for (const read of planned.transcript.replayReads ?? []) {
+        if (read.scope !== owner || read.scope === targetScope) continue;
+        if (replays.get(replayPageQueryKey(read)) !== read.version) return false;
+      }
+      return true;
+    };
+
+    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
+    const liveOwners: Array<[string, Set<string>]> = [];
+    for (const [owner, keys] of owners) {
+      const prior = reusable?.[owner];
+      if (canReuse(owner, keys, prior)) {
+        // Carry only what the new transcript still requires. Besides keeping
+        // the wire envelope bounded, pruning prevents a stale extra cell from
+        // a prior owner entry competing with the same globally unique key if
+        // refreshed topology reclassifies another read during the re-plan.
+        const requiredOrderings = orderingsByOwner.get(owner);
+        const requiredReplays = replaysByOwner.get(owner);
+        const orderings = (prior.orderings ?? []).filter((ordering) =>
+          requiredOrderings?.has(orderedProjectionKey(ordering.container, ordering.parent))
+        );
+        const replays = (prior.replays ?? []).filter((page) =>
+          requiredReplays?.has(replayPageQueryKey(page))
+        );
+        attestations[owner] = {
+          owner_head: prior.owner_head,
+          cells: prior.cells.filter((cell) => keys.has(cell.key)),
+          ...(orderings.length > 0 ? { orderings } : {}),
+          ...(replays.length > 0 ? { replays } : {})
+        };
+      } else {
+        liveOwners.push([owner, keys]);
+      }
+    }
+    const actions: Array<() => Promise<unknown>> = liveOwners.map(([owner, keys]) => () => attest(owner, keys));
     const replies = structure
       ? await structure.rpcGroup(actions, { phase: "attest" })
       : await Promise.all(actions.map((action) => action()));
-    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
-    owners.forEach(([owner], index) => {
+    liveOwners.forEach(([owner], index) => {
       const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }>; replays?: Array<{ space: string; from: number; limit: number; version: string }> };
       attestations[owner] = {
         owner_head: reply.owner_head,
@@ -7273,6 +7450,37 @@ export class NetGatewayDO {
         : certified;
     }
     return attestations;
+  }
+
+  /**
+   * Compare a plan with the owner attestations fetched for this exact round.
+   *
+   * Only keys actually present in the attestation envelope participate.
+   * Locally owned reads and session reads proven by a room presence checkpoint
+   * intentionally have no foreign entry and still go to normal scope
+   * validation. The returned TranscriptCells are byte-for-byte the repair
+   * input the scope would place in `mismatched_reads`.
+   */
+  private foreignAttestationMismatches(
+    planned: PlanTurnResult,
+    attestations: CommitSubmit["attestations"]
+  ): EffectTranscript["reads"][number]["cell"][] {
+    if (!attestations) return [];
+    const currentVersions = new Map<string, string>();
+    for (const attestation of Object.values(attestations)) {
+      for (const cell of attestation.cells) currentVersions.set(cell.key, cell.version);
+    }
+    const mismatched: EffectTranscript["reads"][number]["cell"][] = [];
+    const seen = new Set<string>();
+    for (const read of planned.transcript.reads) {
+      const key = netCellKeyFor(read.cell);
+      if (key === null || seen.has(key) || !currentVersions.has(key)) continue;
+      if (currentVersions.get(key) !== String(read.version)) {
+        mismatched.push(read.cell);
+        seen.add(key);
+      }
+    }
+    return mismatched;
   }
 
   /** Rider forwarding directions for the committing scope (CA3): for
@@ -7970,6 +8178,54 @@ export class NetGatewayDO {
     this.seen.set(scope, seq);
   }
 
+  /** Advance only the subscriber-lane continuity watermark.
+   *
+   * `/net/subscribe` returns the acknowledged prefix immediately before the
+   * gateway performs its state backfill. Persist that prefix independently of
+   * the authority `seen_seq`: the following pull owns state freshness, while
+   * pending fanout rows own every delivery position above this watermark. */
+  private advanceDeliverySeen(scope: string, seq: number): void {
+    this.ensureView(); // Hydrates the durable high-water maps before max().
+    const last = this.deliverySeen.get(scope) ?? 0;
+    if (seq <= last) return;
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq) VALUES (?, 0, ?) ON CONFLICT(scope) DO UPDATE SET delivery_seen_seq = MAX(delivery_seen_seq, excluded.delivery_seen_seq)",
+      scope,
+      seq
+    );
+    this.deliverySeen.set(scope, seq);
+  }
+
+  /** Close the subscribe/delivery race and report only a proven lane gap. */
+  private finishDeliveryResume(scope: string, resumeDeliverySeq: number): void {
+    const resuming = this.deliveryResumes.get(scope);
+    this.deliveryResumes.delete(scope);
+    if (
+      resuming?.firstDeliverySeq !== undefined
+      && resuming.firstDeliverySeq > resumeDeliverySeq + 1
+    ) {
+      this.reportFanoutGap(
+        scope,
+        resumeDeliverySeq + 1,
+        resuming.firstDeliverySeq,
+        resuming.firstAuthoritySeq ?? 0
+      );
+    }
+  }
+
+  /** One normalized integrity event for ordinary and subscribe-race gaps. */
+  private reportFanoutGap(scope: string, expected: number, got: number, authoritySeq: number): void {
+    this.metric({
+      kind: "net_fanout_gap",
+      scope,
+      status: "error",
+      error: "E_FANOUT_GAP",
+      expected,
+      got,
+      reason: `authority_seq:${authoritySeq}`
+    });
+  }
+
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
@@ -7979,15 +8235,18 @@ export class NetGatewayDO {
     // Unstamped bodies are accepted for rolling-upgrade compatibility.
     const lastDelivery = this.deliverySeen.get(body.scope) ?? 0;
     if (body.delivery_seq !== undefined && body.delivery_seq > lastDelivery + 1) {
-      this.metric({
-        kind: "net_fanout_gap",
-        scope: body.scope,
-        status: "error",
-        error: "E_FANOUT_GAP",
-        expected: lastDelivery + 1,
-        got: body.delivery_seq,
-        reason: `authority_seq:${body.seq}`
-      });
+      const resuming = this.deliveryResumes.get(body.scope);
+      if (resuming) {
+        if (
+          resuming.firstDeliverySeq === undefined
+          || body.delivery_seq < resuming.firstDeliverySeq
+        ) {
+          resuming.firstDeliverySeq = body.delivery_seq;
+          resuming.firstAuthoritySeq = body.seq;
+        }
+      } else {
+        this.reportFanoutGap(body.scope, lastDelivery + 1, body.delivery_seq, body.seq);
+      }
     }
     const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {

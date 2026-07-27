@@ -74,7 +74,7 @@
               "opts?"
             ]
           },
-          "source": "verb :create(parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Creates an object owned by the invoking actor. There is intentionally no\n  // owner option on the builder surface; creating for another actor is wizard\n  // administration, not delegated building.\n  let result = builder_create_object(parent, opts);\n  observe({ type: \"builder_created\", actor: actor, id: result[\"id\"], parent: parent, ts: now() });\n  return result;\n}"
+          "source": "verb :create(parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Creates an object owned by the invoking actor. There is intentionally no\n  // owner option on the builder surface; creating for another actor is wizard\n  // administration, not delegated building.\n  //\n  // Placement default (LambdaMOO @create, plan §6.4): a new object with no\n  // explicit location lands in the AUTHOR'S INVENTORY. Placement is what makes\n  // a fresh object reachable — it enters the author's structural context, so\n  // `look`/inventory show it and an MCP session can target it once one of its\n  // verbs is tool_exposed. An object created into no container is invisible to\n  // every surface except its returned id. Pass an explicit `location` to place\n  // it elsewhere; pass `location: null` to deliberately leave it nowhere.\n  let create_opts = opts;\n  if (typeof(create_opts) != \"map\") { create_opts = {}; }\n  if (!has(create_opts, \"location\")) { create_opts[\"location\"] = actor; }\n  let result = builder_create_object(parent, create_opts);\n  observe({ type: \"builder_created\", actor: actor, id: result[\"id\"], parent: parent, ts: now() });\n  return result;\n}"
         },
         {
           "name": "chparent",
@@ -407,7 +407,13 @@
               "id",
               "descriptor",
               "opts?"
-            ]
+            ],
+            "authority": {
+              "prefetch": [
+                { "ref": "the_verb_editor" },
+                { "arg": 0 }
+              ]
+            }
           },
           "source": "verb :edit_verb(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Door into this catalog's seeded $verb_editor instance. The editor room\n  // owns the buffer session after this point; the target object stays where it is.\n  return editor_invoke(\"the_verb_editor\", id, descriptor, opts);\n}"
         },

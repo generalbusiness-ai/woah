@@ -148,6 +148,36 @@ Rebuild starts from declared empty state and reproduces rows, counters,
 indexes, receipts, genesis status, and `at_seq` from recorded observations.
 Composer source filters Acts for another Dispenser on the same room log.
 
+## Coverage
+
+`tests/dispenser-acts.test.ts` proves the queue contract (emission authority,
+fail-closed folds, dropped-reply idempotency, legacy genesis, rebuild,
+eviction, caps). The shared walkthrough (`scripts/smoke/scenario.ts`, run by
+the workerd and deployed lanes) drives the cross-actor half on
+`the_horoscope`: a sequenced `order` whose recorded fact reaches a co-present
+peer, an ordinary actor's `next_pending` refused `E_PERM`, and a terminal
+disposition whose fact reaches the peer. On fresh-world lanes the step is
+strict (queued `status` read, then `cancel`). On the deployed lane the
+production plug is a live competing consumer of the same queue — `:order`
+sends it a synchronous wakeup — so the step cancels immediately after
+ordering and accepts a settled race: the pre-Acts page deletes the pending
+row both for plug delivery and for plug cancel (its `prepare_artifact`
+E_VERBNFs there), so an ambiguous cancel reply accepts either terminal fact
+and learns the outcome from whichever arrives. Cleanup is best-effort by
+construction with the residual named: `finally` runs signal-free (a fired
+watchdog aborts assertions, not cleanup), recovers a lost order id from the
+ordered fact's unique request string when the reply timed out after a
+server-side commit, cancels when no terminal reply was observed, and
+disperses a race-delivered note via a literal-`#id` drop. The irreducible
+residual — the smoke process dying mid-window — is at most one order, which
+the live plug itself settles within its poll interval. The
+walkthrough accepts both rolling-contract observation shapes (v1 Act envelope
+and the pre-Acts flat `order_placed`/`canceled`/`delivered`) because a runtime
+deploy does not rewrite an installed world's catalog pages. The plug's deliver
+half is deliberately absent from the walkthrough — those verbs accept only the
+block actor or a wizard, and the walkthrough's job is to prove they refuse
+ordinary credentials.
+
 ## Deliberate exclusions
 
 - Note content and physical location retain artifact authority; the queue

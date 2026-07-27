@@ -399,6 +399,189 @@ describe("authoring", () => {
     expect(world.object(programmer.actor).location).toBe("$nowhere");
   });
 
+  it("refuses editor and install access to an existing verb the programmer does not own", async () => {
+    // Verb owner is the verb's execution authority (`progr`) — the
+    // set_verb_code / set_verb_info rule. Object authorship alone must not
+    // permit replacing a verb someone else owns on your object: a wizard-
+    // installed verb on a programmer-owned object stays the wizard's to
+    // edit. The editor's save path (programmerInstallVerb) historically
+    // skipped this check, letting edit_verb → replace → save modify and
+    // chown a $wiz-owned verb.
+    const world = createWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const programmer = world.auth("guest:verb-owner-gate");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+
+    const created = await world.directCall("owner-gate-create", programmer.actor, programmer.actor, "create", ["$thing", { name: "Gate Base" }]);
+    expect(created.op).toBe("result");
+    const base = created.op === "result" ? (created.result as Record<string, string>).id : "";
+    // A wizard plants a verb on the programmer's object; its owner is the
+    // wizard, not the object's owner.
+    const planted = installVerbAs(world, "$wiz", base, "wizonly", `verb :wizonly() rx {
+  return "wizard body";
+}`, null);
+    expect(planted.ok).toBe(true);
+    expect(world.ownVerb(base, "wizonly")?.owner).toBe("$wiz");
+
+    // The editor refuses at the door: a buffer the actor can never save
+    // must not open a session.
+    const opened = await world.directCall("owner-gate-open", programmer.actor, programmer.actor, "edit_verb", [base, "wizonly", {}]);
+    expect(opened.op).toBe("error");
+    if (opened.op === "error") expect(opened.error.code).toBe("E_PERM");
+    expect(world.propOrNull("the_verb_editor", "sessions") ?? {}).toEqual({});
+
+    // The install path refuses independently (defense in depth beneath the
+    // door check), for both save and dry-run shapes.
+    await expect(
+      world.programmerInstallVerb(programmer.actor, base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, {}, "$programmer")
+    ).rejects.toMatchObject({ code: "E_PERM" });
+    await expect(
+      world.programmerInstallVerb(programmer.actor, base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, { dry_run: true }, "$programmer")
+    ).rejects.toMatchObject({ code: "E_PERM" });
+    expect(world.ownVerb(base, "wizonly")?.source).toContain("wizard body");
+    expect(world.ownVerb(base, "wizonly")?.owner).toBe("$wiz");
+
+    // The ordinary install_verb surface agrees (set_verb_code's rule).
+    const surface = await world.directCall("owner-gate-surface", programmer.actor, programmer.actor, "install_verb", [base, "wizonly", `verb :wizonly() rx {
+  return "stolen";
+}`, {}]);
+    expect(surface.op).toBe("error");
+    if (surface.op === "error") expect(surface.error.code).toBe("E_PERM");
+
+    // A wizard updating a programmer-owned verb through the same path
+    // PRESERVES the original owner (set_verb_code semantics — ownership
+    // changes go through set_verb_info's explicit rule only).
+    const own = await world.directCall("owner-gate-own", programmer.actor, programmer.actor, "install_verb", [base, "mine", `verb :mine() rx {
+  return 1;
+}`, {}]);
+    expect(own.op).toBe("result");
+    expect(world.ownVerb(base, "mine")?.owner).toBe(programmer.actor);
+    const wizardEdit = await world.programmerInstallVerb("$wiz", base, "mine", `verb :mine() rx {
+  return 2;
+}`, {}, "$programmer") as Record<string, unknown>;
+    expect(wizardEdit.ok).toBe(true);
+    expect(world.ownVerb(base, "mine")?.source).toContain("return 2");
+    expect(world.ownVerb(base, "mine")?.owner).toBe(programmer.actor);
+
+    // Defining a NEW own verb still needs only object authorship. (The
+    // inherited-override loop is proven in the next test.)
+    const fresh = await world.directCall("owner-gate-fresh", programmer.actor, programmer.actor, "install_verb", [base, "fresh", `verb :fresh() rx {
+  return 3;
+}`, {}]);
+    expect(fresh.op).toBe("result");
+    expect(world.ownVerb(base, "fresh")?.owner).toBe(programmer.actor);
+  });
+
+  it("saves an inherited verb as a new own override, and revalidates the door on resume", async () => {
+    const world = createWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const programmer = world.auth("guest:verb-override");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+
+    // A class the programmer owns, carrying `greet`; a child instance that
+    // INHERITS it (no own slot on the child).
+    const parentCreated = await world.directCall("override-parent", programmer.actor, programmer.actor, "create", ["$thing", { name: "Widget Class" }]);
+    expect(parentCreated.op).toBe("result");
+    const parentId = parentCreated.op === "result" ? (parentCreated.result as Record<string, string>).id : "";
+    const parentInstall = await world.directCall("override-parent-verb", programmer.actor, programmer.actor, "install_verb", [parentId, "greet", `verb :greet() rx {
+  return "parent greeting";
+}`, {}]);
+    expect(parentInstall.op).toBe("result");
+    world.setObjectFlags("$wiz", parentId, { fertile: true });
+    const childCreated = await world.directCall("override-child", programmer.actor, programmer.actor, "create", [parentId, { name: "Widget" }]);
+    expect(childCreated.op).toBe("result");
+    const childId = childCreated.op === "result" ? (childCreated.result as Record<string, string>).id : "";
+    expect(world.ownVerb(childId, "greet")).toBeNull();
+
+    // --- 1. open the INHERITED verb: a define-mode session, no version CAS
+    // against the absent own slot (which used to fail every override save
+    // with E_VERSION).
+    const opened = await world.directCall("override-open", programmer.actor, programmer.actor, "edit_verb", [childId, "greet", {}]);
+    expect(opened.op).toBe("result");
+    if (opened.op === "result") {
+      expect(opened.result).toMatchObject({ install_mode: "define", expected_version: null });
+    }
+    // The buffer opens with the INHERITED source.
+    const openedView = await world.directCall("override-view", programmer.actor, "the_verb_editor", "view", [{}]);
+    expect(openedView.op).toBe("result");
+    if (openedView.op === "result") expect((openedView.result as Record<string, string>).buffer).toContain("parent greeting");
+    const replaced = await world.directCall("override-replace", programmer.actor, "the_verb_editor", "replace", [`verb :greet() rx {
+  return "child greeting";
+}`]);
+    expect(replaced.op).toBe("result");
+    const saved = await world.directCall("override-save", programmer.actor, "the_verb_editor", "save", []);
+    expect(saved.op, JSON.stringify(saved).slice(0, 400)).toBe("result");
+    if (saved.op === "result") expect(saved.result).toMatchObject({ ok: true, version: 1 });
+    // The override landed on the CHILD, owned by the programmer; the parent
+    // verb is untouched.
+    expect(world.ownVerb(childId, "greet")?.source).toContain("child greeting");
+    expect(world.ownVerb(childId, "greet")?.owner).toBe(programmer.actor);
+    expect(world.ownVerb(parentId, "greet")?.source).toContain("parent greeting");
+
+    // --- 2. define-mode conflict: an own slot that appears between open and
+    // save refuses (mode "define"'s absence check is the optimistic guard),
+    // and the buffer survives the refusal.
+    const child2Created = await world.directCall("override-child2", programmer.actor, programmer.actor, "create", [parentId, { name: "Widget 2" }]);
+    expect(child2Created.op).toBe("result");
+    const child2 = child2Created.op === "result" ? (child2Created.result as Record<string, string>).id : "";
+    const opened2 = await world.directCall("override-open2", programmer.actor, programmer.actor, "edit_verb", [child2, "greet", {}]);
+    expect(opened2.op).toBe("result");
+    const replaced2 = await world.directCall("override-replace2", programmer.actor, "the_verb_editor", "replace", [`verb :greet() rx {
+  return "buffered override";
+}`]);
+    expect(replaced2.op).toBe("result");
+    const racedDefine = await world.directCall("override-race", programmer.actor, programmer.actor, "install_verb", [child2, "greet", `verb :greet() rx {
+  return "raced own verb";
+}`, {}]);
+    expect(racedDefine.op).toBe("result");
+    const conflicted = await world.directCall("override-save2", programmer.actor, "the_verb_editor", "save", []);
+    expect(conflicted.op).toBe("error");
+    if (conflicted.op === "error") expect(conflicted.error.code).toBe("E_INVARG");
+    expect(world.ownVerb(child2, "greet")?.source).toContain("raced own verb");
+    const bufferAfter = await world.directCall("override-view2", programmer.actor, "the_verb_editor", "view", [{}]);
+    expect(bufferAfter.op).toBe("result");
+    if (bufferAfter.op === "result") expect((bufferAfter.result as Record<string, string>).buffer).toContain("buffered override");
+    const abortRaced = await world.directCall("override-abort2", programmer.actor, "the_verb_editor", "abort", []);
+    expect(abortRaced.op).toBe("result");
+
+    // --- 3. resume revalidates the door: pause a dirty session on an own
+    // verb, chown the verb away, and the same-target re-entry refuses
+    // WITHOUT moving the actor — the paused buffer is left intact.
+    const reopened = await world.directCall("override-reopen", programmer.actor, programmer.actor, "edit_verb", [childId, "greet", {}]);
+    expect(reopened.op).toBe("result");
+    if (reopened.op === "result") expect(reopened.result).toMatchObject({ install_mode: "upsert", expected_version: 1 });
+    const dirtied = await world.directCall("override-dirty", programmer.actor, "the_verb_editor", "replace", [`verb :greet() rx {
+  return "paused edit";
+}`]);
+    expect(dirtied.op).toBe("result");
+    const pausedResult = await world.directCall("override-pause", programmer.actor, "the_verb_editor", "pause", []);
+    expect(pausedResult.op).toBe("result");
+    world.setVerbInfoForActor("$wiz", childId, "greet", { owner: "$wiz" });
+    const refusedResume = await world.directCall("override-resume", programmer.actor, programmer.actor, "edit_verb", [childId, "greet", {}]);
+    expect(refusedResume.op).toBe("error");
+    if (refusedResume.op === "error") expect(refusedResume.error.code).toBe("E_PERM");
+    expect(world.object(programmer.actor).location).not.toBe("the_verb_editor");
+    expect(world.propOrNull("the_verb_editor", "sessions")).toHaveProperty(programmer.actor);
+    // Chown back: resume works again and the paused buffer survived.
+    world.setVerbInfoForActor("$wiz", childId, "greet", { owner: programmer.actor });
+    const resumed = await world.directCall("override-resume2", programmer.actor, programmer.actor, "edit_verb", [childId, "greet", {}]);
+    expect(resumed.op).toBe("result");
+    if (resumed.op === "result") expect(resumed.result).toMatchObject({ resumed: true, dirty: true });
+    const viewAfterResume = await world.directCall("override-view3", programmer.actor, "the_verb_editor", "view", [{}]);
+    expect(viewAfterResume.op).toBe("result");
+    if (viewAfterResume.op === "result") expect((viewAfterResume.result as Record<string, string>).buffer).toContain("paused edit");
+  });
+
   it("rejects non-wizard programmer attempting to set or chparent verb owner to another principal", async () => {
     const world = createWorld();
     const programmer = world.auth("guest:owner-attack");

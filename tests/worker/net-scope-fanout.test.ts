@@ -195,6 +195,115 @@ function outboxRows(state: NetScopeDurableState): Array<{ route: string; status:
 }
 
 describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
+  it("returns only the acknowledged fanout prefix as a re-subscribe resume watermark", async () => {
+    const gatewayState = netState("gateway-resume-watermark");
+    const gateway = new NetGatewayDO(gatewayState.state, { WOO_INTERNAL_SECRET: SECRET });
+    const recorder = recordingStub(gateway);
+    const room = netState(`scope-${ROOM_SCOPE}-resume-watermark`);
+    const roomEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "gateway:resume") return recorder.stub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    await call(roomDO, roomEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+
+    const fresh = await call<{ ok: boolean; resume_delivery_seq: number }>(
+      roomDO,
+      roomEnv,
+      "/subscribe",
+      { destination: "gateway:resume" }
+    );
+    expect(fresh).toEqual({ ok: true, resume_delivery_seq: 0 });
+
+    const head0 = (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head;
+    expect((await call<CommitReply>(roomDO, roomEnv, "/submit", rideAlongSubmit(head0))).status).toBe("accepted");
+    // The row has been assigned delivery_seq=1 but has not drained. A
+    // re-subscriber may baseline only through 0, so the pending row remains
+    // the next contiguous delivery.
+    const pending = await call<{ ok: boolean; resume_delivery_seq: number }>(
+      roomDO,
+      roomEnv,
+      "/subscribe",
+      { destination: "gateway:resume" }
+    );
+    expect(pending.resume_delivery_seq).toBe(0);
+
+    await roomDO.alarm();
+    await room.settle();
+    expect(outboxRows(room.state)).toEqual([]);
+    const caughtUp = await call<{ ok: boolean; resume_delivery_seq: number }>(
+      roomDO,
+      roomEnv,
+      "/subscribe",
+      { destination: "gateway:resume" }
+    );
+    expect(caughtUp.resume_delivery_seq).toBe(1);
+
+    room.close();
+    gatewayState.close();
+  });
+
+  it("baselines an aged acknowledged subscriber lane before its state backfill", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+
+    const room = netState(`scope-${ROOM_SCOPE}-aged-resume`);
+    const roomEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    await call(roomDO, roomEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+    // Production-aged shape: this destination's first five rows were already
+    // acknowledged, but a newly constructed gateway has no local continuity
+    // row. There is no pending outbox prefix to replay.
+    room.state.storage.sql.exec(
+      "INSERT INTO net_scope_subscribers (destination, role, delivery_seq) VALUES ('gateway:resume-aged', 'fanout', 5)"
+    );
+
+    const gatewayState = netState("gateway-resume-aged");
+    let gateway!: NetGatewayDO;
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_GATEWAY_SELF: "gateway:resume-aged",
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${ROOM_SCOPE}`) {
+          return {
+            fetch: async (request: Request) => {
+              const response = await roomDO.fetch(request);
+              if (new URL(request.url).pathname === "/net/subscribe") {
+                // A pending lane may drain while selfSubscribe is suspended
+                // at its outbound RPC. Deliver position 6 before the scope's
+                // resume=5 response reaches the gateway, reproducing the
+                // precise input-gate race the handshake must tolerate.
+                await call(gateway, gatewayEnv, "/fanout", {
+                  scope: ROOM_SCOPE,
+                  seq: 6,
+                  delivery_seq: 6,
+                  cells: [],
+                  observations: []
+                });
+              }
+              return response;
+            }
+          };
+        }
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    await (gateway as unknown as { selfSubscribe(scope: string): Promise<void> }).selfSubscribe(ROOM_SCOPE);
+
+    // Without in-flight reconciliation, position 6 above is compared with
+    // local zero before resume=5 arrives and emits the production false gap.
+    expect(metricLines.filter((line) => line.includes("net_fanout_gap"))).toEqual([]);
+
+    room.close();
+    gatewayState.close();
+  });
+
   it("delivers rider cells via /net/adopt and observations via /net/fanout; replays no-op", async () => {
     const scopeEnvBase = { WOO_INTERNAL_SECRET: SECRET };
 

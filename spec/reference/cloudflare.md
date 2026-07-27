@@ -1063,6 +1063,22 @@ Empty convention scopes are ordinary probe misses. Other RPC failures propagate.
 The direct-members cap is 128 and the turn RPC budget remains an independent
 upper bound.
 
+The room-roster response is held as the presentation snapshot for one logical
+turn across read-version repair rounds. It is fetched again only if refreshed
+actor/session topology resolves the call to a different room. A gateway-local
+attestation preflight that skips a doomed submit may carry an owner proof into
+the immediate re-plan only while that proof exactly covers every required
+version; a changed/new read and every scope-returned conflict attest live.
+Separately, an
+idempotent `/net/subscribe` response carries `resume_delivery_seq`: the
+acknowledged subscriber-lane prefix (current counter, or one before the oldest
+pending stamped row). A gateway persists that delivery watermark before its
+targeted state backfill; pending rows above it remain contiguous and the pull,
+not the delivery watermark, establishes current authority state. A fanout that
+interleaves with the subscribe RPC is applied immediately, but its gap judgment
+waits for the returned prefix so aged acknowledged history cannot produce a
+false integrity incident.
+
 Room membership used for MCP command resolution and visibility is also a
 repair-gated read. A sparse MCP shard may hold gateway projection rows for an
 active room, but those rows are stamped projection/cache, not owner authority.
