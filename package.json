@@ -31,6 +31,7 @@
     "repair:net-relations": "tsx scripts/net-repair-relations.ts",
     "repair:net-contents": "tsx scripts/net-repair-contents.ts",
     "repair:net-definitions": "tsx scripts/net-repair-definitions.ts",
+    "repair:net-seed-properties": "tsx scripts/net-repair-seed-properties.ts",
     "credential:net-ensure": "tsx scripts/net-ensure-credential.ts",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
     "task:time": "node scripts/task-time.mjs",

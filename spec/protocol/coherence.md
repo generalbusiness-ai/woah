@@ -832,6 +832,20 @@ One write path per fact (CO9), concretized:
   admission, coalesce concurrent repairs, back off after failure, and fail
   closed for missing or unrecognized pages. This is not a general client-
   controlled catalog-repair surface.
+- **Seeded property values upgrade the same way.** The signed
+  `repair-seed-properties` operator operation is the data twin of the
+  definition repair: it delivers a bundled catalog's corrected seeded map
+  values (declared as `merge_map` set_property hooks with `supersedes`
+  fingerprints, [catalogs.md §CT5.4](../discovery/catalogs.md#ct54-local-catalogs-and-auto-install))
+  to an active world's durable `property_cell`s. The addressed scope MUST be
+  authoritative for the target object's lineage, and the merge is computed
+  server-side against the stored value — added keys, fingerprint-gated
+  replacements, everything else preserved — so an operator-edited entry never
+  changes and a malformed stored value is skipped, not clobbered. Changed
+  cells commit as one ordered operator event (advanced head, tail entry,
+  refan); an unchanged replay is `empty`. The operator script mines its
+  entries from the bundled manifests only; arbitrary objects, properties, and
+  values are not operator inputs.
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination

@@ -1468,7 +1468,22 @@ npm run repair:net-definitions -- \
   'prop:$actor:api_keys'
 ```
 
-The command requires the currently deployed `WOO_INTERNAL_SECRET`. A missing
+For a Net world whose seeded map data a bundled catalog has since corrected —
+declared as `merge_map` set_property hooks with `supersedes` fingerprints
+([catalogs.md §CT5.4](../discovery/catalogs.md#ct54-local-catalogs-and-auto-install));
+the help v0.2.0 topic corrections are the first case — deploy the runtime and
+then run the idempotent seed-property repair (add `--dry-run` to size it
+first):
+
+```bash
+npm run repair:net-seed-properties -- https://woah1.generalbusiness.ai
+```
+
+It mines every bundled `merge_map` hook, posts each to the scope that owns the
+target cell, and merges key-wise on the server, so operator-edited entries are
+never overwritten and re-running is a no-op.
+
+These commands require the currently deployed `WOO_INTERNAL_SECRET`. A missing
 local copy is not recoverable from Cloudflare (Worker secret values are
 write-only); rotate that secret deliberately and store the replacement in the
 owner-only operations credential file before running signed repair/bootstrap

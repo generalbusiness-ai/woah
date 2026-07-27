@@ -59,7 +59,7 @@ Seed hooks are deliberately small:
 
 - `create_instance`: create a named object from a class.
 - `attach_feature`: append a feature to an actor or space.
-- `set_property`: set catalog registry/config data. Prefer `set_if_missing` or `append_unique` unless replacement is the explicit contract.
+- `set_property`: set catalog registry/config data. Prefer `set_if_missing` or `append_unique` unless replacement is the explicit contract. For a seeded map database whose wording the catalog may later correct (help topics), use `merge_map` with a `supersedes` block: missing keys are added, keys still holding a declared superseded value upgrade, and operator edits survive (spec §CT5.4).
 - `change_parent`: opt an existing object into a new class path, such as `$wiz` inheriting programmer tools.
 
 For public catalogs, write portable `source` verbs. `implementation: {kind: "native"}` is trusted-local only and should be a temporary bridge to a missing generic primitive.

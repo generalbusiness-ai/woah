@@ -60,13 +60,28 @@ cosmetic docs bug. Two constraints follow:
   absent tool only to deny it exists, in a sentence containing
   "There is no ..." — that phrasing is what the scanner uses to tell a denial
   from a claim, so keep denials in one such sentence.
-- **Editing the manifest is not enough for deployed worlds.** Seed-hook
+- **Editing the manifest is not enough for deployed worlds.** Plain seed
   properties are *initial* values; `reconcileSeedObject` never overwrites an
-  existing own property. A topic-text change therefore needs a boot migration
-  (`2026-07-25-help-mcp-topics` in `src/core/local-catalogs.ts`) to reach
-  already-installed worlds. That migration replaces a topic only when its
-  stored value still matches the shipped default byte-for-byte, so an
-  operator's edits survive.
+  existing own property. The topics therefore ship as a `merge_map`
+  `set_property` seed hook (spec §CT5.4): the hook's `value` is the current
+  wording, and its `supersedes` block declares the v0.1.1 values as
+  replaceable. A topic is replaced only while its stored value still matches
+  a superseded default byte-for-byte, so an operator's edits survive. The
+  same declaration serves every lane, with different vehicles:
+  - **Fresh worlds** seed the full map when the hook runs at install.
+  - **Aged local/classic worlds** heal on the next cold init: the boot drift
+    pass verifies the merge against the stored value, reports the unsatisfied
+    hook as `seed_property_drift`, and re-applies (`tests/catalogs.test.ts`,
+    including a SQLite round trip).
+  - **Aged Net worlds do NOT self-heal** — a Scope DO cold start rehydrates
+    durable cells as-is, and deployment never rewrites them. Delivery there is
+    the signed operator repair, run once after the deploy that carries the
+    new manifest: `npm run repair:net-seed-properties -- <worker>`
+    (net-cutover.md §NC5; proven end-to-end by
+    `tests/worker/net-help-topics-aged.test.ts`).
+  Any future topic-text change inherits this pattern: update the hook's
+  `value`, move the previous shipped values into `supersedes`, and run the
+  Net repair after deploy.
 
 ## Search Path
 

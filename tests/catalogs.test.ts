@@ -379,9 +379,13 @@ describe("local catalogs", () => {
   // help v0.1.1 seeded three topics that misdirected every MCP agent that read
   // them: `focus` named woo_focus/woo_unfocus/focus_list (no such tools), `wait`
   // named the tool `wait` rather than woo_wait, and `building` named no path to
-  // authoring authority. Seed-hook properties are initial values only, so the
-  // manifest fix alone reaches fresh worlds and leaves deployed ones misinformed.
-  const HELP_MIGRATION_ID = "2026-07-25-help-mcp-topics";
+  // authoring authority. Plain seed properties are initial values only, so a
+  // manifest fix alone reaches fresh worlds and leaves deployed ones
+  // misinformed. help v0.2.0 therefore seeds the topics through a `merge_map`
+  // set_property hook whose `supersedes` block declares the v0.1.1 values as
+  // replaceable — the boot drift pass detects the unsatisfied merge as
+  // seed_property_drift on every cold init and repairs it, with no
+  // hand-written migration in core (spec §CT5.4).
   const STALE_FOCUS_TOPIC = [
     "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
     "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
@@ -396,8 +400,9 @@ describe("local catalogs", () => {
   ];
 
   // Rewind a freshly-installed world to the help v0.1.1 topic shape: the three
-  // stale values restored, the topics this change adds removed, and the ledger
-  // entry cleared so the next install re-runs the migration.
+  // stale values restored and the topics this change adds removed. No ledger
+  // surgery is needed — the drift pass re-verifies the merge hook against the
+  // stored value on every cold init, so the rewound drift alone re-triggers it.
   function rewindHelpToV011(world: ReturnType<typeof createWorld>): void {
     const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
     topics.focus = [...STALE_FOCUS_TOPIC];
@@ -405,9 +410,6 @@ describe("local catalogs", () => {
     topics.building = [...STALE_BUILDING_TOPIC];
     for (const added of ["self", "suit", "me", "tools"]) delete topics[added];
     world.setProp("$help", "topics", topics as never);
-    const ledger = (world.getProp("$system", "applied_migrations") as string[])
-      .filter((id) => id !== HELP_MIGRATION_ID);
-    world.setProp("$system", "applied_migrations", ledger);
   }
 
   it("rewrites help v0.1.1 topics that named nonexistent MCP tools, and adds the orientation topics", async () => {
@@ -431,10 +433,9 @@ describe("local catalogs", () => {
     expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
     expect(topics.suit).toEqual(["*forward*", "self"]);
     expect(topics.me).toEqual(["*forward*", "self"]);
-    // Unrelated topics are untouched — the migration is surgical, not a
+    // Unrelated topics are untouched — the merge is surgical, not a
     // wholesale replacement of the topics map.
     expect(topics.look.join(" ")).toContain("look (no argument)");
-    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
   });
 
   it("leaves help topics an operator has edited alone", async () => {
@@ -443,7 +444,8 @@ describe("local catalogs", () => {
     rewindHelpToV011(world);
 
     // An operator who rewrote a topic must not be silently overwritten. The
-    // migration matches the v0.1.1 default byte-for-byte and skips otherwise.
+    // merge replaces a key only when its stored value still matches a
+    // declared superseded default byte-for-byte, and skips otherwise.
     const topics = { ...(world.getProp("$help", "topics") as Record<string, unknown>) };
     topics.focus = ["Our house rules for focus."];
     topics.self = ["Our own orientation text."];
@@ -457,30 +459,23 @@ describe("local catalogs", () => {
     // The topics the operator did not touch are still repaired.
     expect(after.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
     expect(after.tools.join(" ")).toContain("woo_list_reachable_tools");
-    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
   });
 
-  it("is idempotent: re-running the help topic migration changes nothing", async () => {
+  it("is idempotent: re-running the help topic merge changes nothing", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["help"]);
     rewindHelpToV011(world);
     installLocalCatalogs(world, ["help"]);
     const afterFirst = JSON.stringify(world.getProp("$help", "topics"));
 
-    // Both idempotency layers: the ledger short-circuit...
+    // After one repair every seeded key either equals the shipped value or
+    // was operator-edited, so a second and third cold init verify the merge
+    // as satisfied and write nothing — there is no one-shot ledger entry to
+    // clear because the gate is the value itself.
     installLocalCatalogs(world, ["help"]);
     expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
-
-    // ...and the per-key value gates, with the ledger entry cleared so the
-    // body actually re-executes against already-repaired data.
-    const ledger = (world.getProp("$system", "applied_migrations") as string[])
-      .filter((id) => id !== HELP_MIGRATION_ID);
-    world.setProp("$system", "applied_migrations", ledger);
     installLocalCatalogs(world, ["help"]);
     expect(JSON.stringify(world.getProp("$help", "topics"))).toBe(afterFirst);
-    expect(
-      (world.getProp("$system", "applied_migrations") as string[]).filter((id) => id === HELP_MIGRATION_ID)
-    ).toHaveLength(1);
   });
 
   it("repairs a world whose registry still records help v0.1.1, and advances the recorded version", async () => {
@@ -503,13 +498,12 @@ describe("local catalogs", () => {
     const topics = world.getProp("$help", "topics") as Record<string, string[]>;
     expect(topics.focus.join(" ")).toContain("no woo_focus");
     expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
-    expect(world.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
     // Minor drift needs no §CT14 migration file: runLocalCatalogVersionMigrations
     // routes only MAJOR edges through updateCatalogManifest, and the auto schema
     // sync covers the rest — including writing manifest.version back onto the
     // registry record. So the recorded version DOES advance on a minor bump.
-    // The boot migration must still not depend on that; its gate is the
-    // applied_migrations ledger, which is what makes it correct either way.
+    // The merge repair must still not depend on that; its gate is the stored
+    // value itself, which is what makes it correct either way.
     const after = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
       .find((record) => record.alias === "help");
     expect(after?.version).toBe("0.2.0");
@@ -525,7 +519,7 @@ describe("local catalogs", () => {
   it("help topics never name a verb an agent cannot call (unexposed, or native)", () => {
     const helpManifest = JSON.parse(
       readFileSync(join(root, "help", "manifest.json"), "utf8")
-    ) as { seed_hooks: Array<{ properties?: { topics?: Record<string, unknown> } }> };
+    ) as { seed_hooks: Array<{ kind: string; property?: string; value?: Record<string, unknown> }> };
     const progManifest = JSON.parse(
       readFileSync(join(root, "prog", "manifest.json"), "utf8")
     ) as { classes: Array<{ verbs?: Array<{ name: string; tool_exposed?: boolean }> }> };
@@ -564,7 +558,12 @@ describe("local catalogs", () => {
       return null;
     };
 
-    const topics = helpManifest.seed_hooks.find((hook) => hook.properties?.topics)?.properties?.topics ?? {};
+    // The topics ship as a merge_map set_property hook (the delivery vehicle
+    // for aged worlds), so the scanner reads the hook's value.
+    const topics = helpManifest.seed_hooks.find(
+      (hook) => hook.kind === "set_property" && hook.property === "topics"
+    )?.value ?? {};
+    expect(Object.keys(topics).length).toBeGreaterThan(0);
     for (const [name, value] of Object.entries(topics)) {
       const text = Array.isArray(value) ? value.join(" ") : String(value);
       // A topic may name an unreachable verb in order to say it is unreachable.
@@ -622,7 +621,6 @@ describe("local catalogs", () => {
       expect(topics.focus.join(" ")).toContain("no woo_focus");
       expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
       expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
-      expect(verifyWorld.getProp("$system", "applied_migrations")).toContain(HELP_MIGRATION_ID);
 
       // Rerunning against the already-repaired persisted world is a no-op.
       const before = JSON.stringify(topics);
@@ -632,6 +630,29 @@ describe("local catalogs", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // The generic merge behind the merge_map mode, at its edges. Both delivery
+  // lanes (local boot drift and the signed net operator repair) call this one
+  // function, so its contract is worth pinning independent of the help data.
+  it("merge_map semantics: adds, fingerprint-gated replaces, and malformed-value refusal", async () => {
+    const { mergeSeedMapProperty } = await import("../src/core/seed-property-merge");
+    const seeded = { a: ["new a"], b: ["new b"], c: ["c"] };
+    const supersedes = { a: [["old a"]], b: [["old b"]] };
+
+    // Absent stored value seeds the full map (the fresh-install case).
+    expect(mergeSeedMapProperty(undefined, seeded, supersedes)).toEqual({ merged: seeded, changed: true });
+    // Superseded values upgrade; an edited key survives; missing keys land.
+    const aged = { a: ["old a"], b: ["operator edit"] };
+    expect(mergeSeedMapProperty(aged, seeded, supersedes)).toEqual({
+      merged: { a: ["new a"], b: ["operator edit"], c: ["c"] },
+      changed: true
+    });
+    // Already-converged input reports no change.
+    expect(mergeSeedMapProperty(seeded, seeded, supersedes)?.changed).toBe(false);
+    // A malformed (non-map) stored value is left alone, not clobbered.
+    expect(mergeSeedMapProperty("broken", seeded, supersedes)).toBeNull();
+    expect(mergeSeedMapProperty(["broken"], seeded, supersedes)).toBeNull();
   });
 
   it("repairs older demoworld installs where the garden missed $conversational", async () => {

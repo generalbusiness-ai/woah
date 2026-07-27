@@ -1,6 +1,6 @@
 # Player self-ownership implementation plan
 
-Date: 2026-07-25  
+Date: 2026-07-25
 Status: implementation plan; not normative and not implemented.
 
 This note turns the self-ownership decision in

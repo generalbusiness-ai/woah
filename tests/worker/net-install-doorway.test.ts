@@ -360,6 +360,85 @@ describe("the /net-install doorway (route level)", () => {
     h.close();
   });
 
+  it("gates and merges the seed-property repair: signed, owned, fingerprint-gated, idempotent", async () => {
+    const h = buildHarness();
+    const lineage = { kind: "object_lineage", object: "$helpdb", value: { parent: "$thing", owner: "$wiz" } };
+    // The aged stored map: one superseded default, one operator edit, one
+    // untouched entry; the shipped additions are absent.
+    const agedCell = {
+      kind: "property_cell",
+      object: "$helpdb",
+      name: "topics",
+      value: { value: { stale: ["old text"], edited: ["operator text"], keep: ["kept"] } }
+    };
+    const seeded = await h.signedRequest("/net-install/scope/catalog/seed", seedBody("catalog", EPOCH, [lineage, agedCell]));
+    expect(seeded.status, await seeded.clone().text()).toBe(200);
+
+    const entries = [{
+      object: "$helpdb",
+      property: "topics",
+      value: { stale: ["new text"], edited: ["shipped text"], added: ["brand new"] },
+      supersedes: { stale: [["old text"]], edited: [["shipped default the operator replaced"]] }
+    }];
+    const body = {
+      method: "POST" as const,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ entries })
+    };
+
+    // Signature gate, then a dry run that mutates nothing.
+    expect((await h.request("/net-install/scope/catalog/repair-seed-properties", body)).status).toBe(401);
+    const sized = await h.signedRequest("/net-install/scope/catalog/repair-seed-properties", {
+      ...body,
+      body: JSON.stringify({ entries, dry_run: true })
+    });
+    expect(sized.status, await sized.clone().text()).toBe(200);
+    expect(await sized.json()).toMatchObject({ ok: true, status: "would_apply", dry_run: true, changed: ["property_cell:$helpdb:topics"] });
+
+    const repaired = await h.signedRequest("/net-install/scope/catalog/repair-seed-properties", body);
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    expect(await repaired.json()).toMatchObject({
+      ok: true,
+      scope: "catalog",
+      status: "applied",
+      head: { seq: 1 },
+      changed: ["property_cell:$helpdb:topics"]
+    });
+    const durable = h.scopeStates.get("catalog")!.storage.sql;
+    const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$helpdb:topics'").toArray();
+    expect(JSON.parse(String(stored[0]!.body))).toMatchObject({
+      value: {
+        value: {
+          stale: ["new text"],        // superseded default upgraded
+          edited: ["operator text"],  // operator edit preserved
+          keep: ["kept"],             // unrelated key untouched
+          added: ["brand new"]        // shipped addition landed
+        }
+      },
+      stamp: { scope_head: expect.stringMatching(/^1:/) }
+    });
+
+    // Replay is empty — after one merge every key is converged or edited.
+    const replayed = await h.signedRequest("/net-install/scope/catalog/repair-seed-properties", body);
+    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", changed: [], skipped: ["property_cell:$helpdb:topics"] });
+
+    // Rejections: unowned object, non-$ object, malformed entries and bounds.
+    const reject = async (payload: unknown) => {
+      const response = await h.signedRequest("/net-install/scope/catalog/repair-seed-properties", {
+        ...body,
+        body: JSON.stringify(payload)
+      });
+      expect(response.status).toBe(400);
+    };
+    await reject({ entries: [{ ...entries[0], object: "$not_seeded_here" }] });
+    await reject({ entries: [{ ...entries[0], object: "plainobj" }] });
+    await reject({ entries: [{ ...entries[0], value: ["not", "a", "map"] }] });
+    await reject({ entries: [{ ...entries[0], supersedes: { stale: "not-a-list" } }] });
+    await reject({ entries: [] });
+    await reject({ entries: Array.from({ length: 33 }, () => entries[0]) });
+    h.close();
+  });
+
   it("keeps a production-sized definition repair in one ordered event", async () => {
     const h = buildHarness();
     const lineage = {

@@ -1,6 +1,7 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
 import { firstRank, rankAfter } from "./fractional-rank";
 import { orderedEdgeFromPropertyValue, type OrderedEdgeValue } from "./ordered-edge";
+import { mergeSeedMapProperty } from "./seed-property-merge";
 import { hashSource } from "./source-hash";
 import { wooError, type ErrorValue, type ObjRef, type PresenceProjectionDef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -115,7 +116,15 @@ type CatalogSeedHook =
       object: string;
       property: string;
       value: WooValue;
-      mode?: "set" | "set_if_missing" | "append_unique";
+      mode?: "set" | "set_if_missing" | "append_unique" | "merge_map";
+      /**
+       * `merge_map` only: per-key historical shipped values this hook may
+       * replace. A stored key whose value matches one of its declared priors
+       * byte-for-byte is still the shipped default and is upgraded to the
+       * hook's current value; any other stored value is an operator edit and
+       * survives. See src/core/seed-property-merge.ts.
+       */
+      supersedes?: Record<string, WooValue[]>;
     }
   | {
       kind: "change_parent";
@@ -497,7 +506,7 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
       if (object) {
         const actual = world.propOrNull(object, hook.property);
         const expected = resolveCatalogValue(world, hook.value, localObjects, localSeeds, records);
-        if (!seedPropertySatisfied(actual, expected, hook.mode ?? "set")) {
+        if (!seedPropertySatisfied(actual, expected, hook.mode ?? "set", hook.supersedes)) {
           issues.push({
             severity: "warning",
             kind: "seed_property_drift",
@@ -1952,14 +1961,40 @@ function applySeedProperty(
     if (stableStringify(next) !== stableStringify(current)) world.setProp(object, hook.property, next);
     return;
   }
+  if (mode === "merge_map") {
+    // Key-wise seeded-map upgrade: adds missing keys and replaces only keys
+    // still holding a manifest-declared superseded value; operator-edited
+    // keys and a malformed (non-map) stored value are left untouched.
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const result = mergeSeedMapProperty(
+      world.propOrNull(object, hook.property),
+      value as Record<string, unknown>,
+      hook.supersedes
+    );
+    if (result?.changed) world.setProp(object, hook.property, result.merged as WooValue);
+    return;
+  }
   world.setProp(object, hook.property, value);
 }
 
-function seedPropertySatisfied(actual: WooValue, expected: WooValue, mode: "set" | "set_if_missing" | "append_unique"): boolean {
+function seedPropertySatisfied(
+  actual: WooValue,
+  expected: WooValue,
+  mode: "set" | "set_if_missing" | "append_unique" | "merge_map",
+  supersedes?: Record<string, WooValue[]>
+): boolean {
   if (mode === "append_unique") {
     if (!Array.isArray(actual)) return false;
     const expectedItems = Array.isArray(expected) ? expected : [expected];
     return expectedItems.every((item) => actual.some((actualItem) => stableStringify(actualItem) === stableStringify(item)));
+  }
+  if (mode === "merge_map") {
+    // Satisfied exactly when applying the merge would change nothing —
+    // which includes a malformed (non-map) stored value, deliberately left
+    // alone rather than reported as drift on every boot.
+    if (!expected || typeof expected !== "object" || Array.isArray(expected)) return true;
+    const result = mergeSeedMapProperty(actual, expected as Record<string, unknown>, supersedes);
+    return result === null || !result.changed;
   }
   if (mode === "set_if_missing" && actual !== null) return true;
   return stableStringify(actual) === stableStringify(expected);

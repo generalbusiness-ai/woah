@@ -224,11 +224,23 @@ Two things were learned in the doing, both recorded inline below:
    design, so seeded runtime state is never clobbered on cold init. L1.3's
    "it's a catalog-data edit and nothing blocks it" was therefore true of the
    fix but not of its delivery: fresh worlds got the corrected topics, and every
-   already-installed world would have kept serving the wrong ones. Closing it
-   needed a boot migration (`2026-07-25-help-mcp-topics`, §CT5.4.1) that
-   replaces a topic only where its stored value still matches the shipped
-   default byte-for-byte, so operator edits survive. **Any future L2.3
-   description or topic-text change inherits this constraint.**
+   already-installed world would have kept serving the wrong ones. A first
+   closure attempt was a hand-written boot migration
+   (`2026-07-25-help-mcp-topics`) in `src/core/local-catalogs.ts`; review
+   rejected it twice over — it embedded the help catalog's identity and prose
+   in core (a layering violation), and it never reached deployed NET worlds at
+   all, because a Scope DO cold start rehydrates durable cells without running
+   any boot-migration pass. The landed replacement is catalog-declared: the
+   topics ship as a `merge_map` set_property seed hook whose `supersedes`
+   block names the v0.1.1 values as replaceable (§CT5.4). A stored topic is
+   replaced only while it still matches a superseded default byte-for-byte,
+   so operator edits survive. Local worlds heal on cold init through the
+   ordinary drift pass; deployed Net worlds take the signed operator repair
+   `npm run repair:net-seed-properties -- <worker>` once after the deploy
+   (net-cutover.md §NC5; `tests/worker/net-help-topics-aged.test.ts` is the
+   aged-Net proof). **Any future L2.3 description or topic-text change
+   inherits this pattern: update the hook value, move the prior wording into
+   `supersedes`, run the Net repair after deploy.**
 
 ## 5. Phase L1 — orientation (independent, do first)
 

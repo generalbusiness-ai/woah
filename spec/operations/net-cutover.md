@@ -178,8 +178,9 @@ Activation requires ALL of, in order:
 `GET /net-install/scope/<name>/head`,
 `POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
 `POST /net-install/scope/<name>/repair-relations`,
-`POST /net-install/scope/<name>/repair-contents`, and
-`POST /net-install/scope/catalog/repair-definitions`, and
+`POST /net-install/scope/<name>/repair-contents`,
+`POST /net-install/scope/catalog/repair-definitions`,
+`POST /net-install/scope/<name>/repair-seed-properties`, and
 `GET /net-install/identity-export` are the entire surface. The repair operation
 is an idempotent, add-only recovery for initial `contents` rows omitted by an
 older installer; it accepts only rows whose owner object is authoritative at
@@ -204,6 +205,21 @@ plan, requires an explicit operator allow-list (`$object:verb` or
 declares the corresponding `drop_verb` or `drop_property` and the current bundle
 no longer defines that page. Runtime deployment alone never implies this
 durable-world update.
+The seed-property repair is the data twin of the definition repair, for seeded
+property VALUES a bundled catalog has corrected. Its inputs are exactly the
+bundled manifests' `merge_map` set_property hooks
+([catalogs.md §CT5.4](../discovery/catalogs.md#ct54-local-catalogs-and-auto-install)):
+the CLI (`npm run repair:net-seed-properties -- <worker> [--dry-run]`) mines
+every such hook, resolves each target cell's owning scope from a fresh install
+plan, and posts `{object, property, value, supersedes}` entries (1..32) to that
+scope; an operator cannot name an arbitrary object or property. The DO applies
+the same generic key-wise merge the local boot drift pass uses
+(`src/core/seed-property-merge.ts`) against the stored `property_cell`: missing
+keys are added, keys still holding a manifest-declared superseded value are
+replaced, operator-edited keys and malformed stored values are left untouched.
+Changed cells commit as one ordered operator event — advanced owner head,
+authoritative stamps, one tail entry — and refan to subscribers; an unchanged
+replay returns `empty` without touching the head.
 The trust model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 
