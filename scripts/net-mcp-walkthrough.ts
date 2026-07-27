@@ -48,44 +48,53 @@ async function main(): Promise<void> {
       );
 
       const transport: McpTransport = (init) => fetch(`${base}/net-api/mcp`, init);
-      const alice = await SmokeSession.open(transport, {
-        token: "apikey:walk-key-a:walk-secret-a",
-        label: "alice",
-        clientName: `net-mcp-walk-${runId}-alice`
-      });
-      const bob = await SmokeSession.open(transport, {
-        token: "apikey:walk-key-b:walk-secret-b",
-        label: "bob",
-        clientName: `net-mcp-walk-${runId}-bob`
-      });
-      console.log(`sessions: alice=${alice.actor} bob=${bob.actor}`);
+      let alice: SmokeSession | null = null;
+      let bob: SmokeSession | null = null;
+      try {
+        alice = await SmokeSession.open(transport, {
+          token: "apikey:walk-key-a:walk-secret-a",
+          label: "alice",
+          clientName: `net-mcp-walk-${runId}-alice`
+        });
+        bob = await SmokeSession.open(transport, {
+          token: "apikey:walk-key-b:walk-secret-b",
+          label: "bob",
+          clientName: `net-mcp-walk-${runId}-bob`
+        });
+        console.log(`sessions: alice=${alice.actor} bob=${bob.actor}`);
 
-      // Fail-fast step runner (the workerd-lane posture): the first
-      // failing step aborts the run with its full error — root causes
-      // over patching activity.
-      const step: StepRunner = async (name, body) => {
-        try {
-          await body({});
-          passed += 1;
-          console.log(`  ok    ${name}`);
-        } catch (err) {
-          failed += 1;
-          console.error(`  FAIL  ${name}: ${String(err).slice(0, 600)}`);
-          throw err;
-        }
-      };
+        // Fail-fast step runner (the workerd-lane posture): the first
+        // failing step aborts the run with its full error — root causes
+        // over patching activity.
+        const step: StepRunner = async (name, body) => {
+          try {
+            await body({});
+            passed += 1;
+            console.log(`  ok    ${name}`);
+          } catch (err) {
+            failed += 1;
+            console.error(`  FAIL  ${name}: ${String(err).slice(0, 600)}`);
+            throw err;
+          }
+        };
 
-      // PARITY CONFIGURATION: the same flag set as the workerd v2 lane
-      // (scripts/smoke-cf-dev.ts) — one scenario, both transports, same
-      // steps. This IS the parity gate.
-      await runSmokeWalkthrough({ alice, bob }, step, {
-        runId,
-        includeTakeDrop: true,
-        includeConcurrentMove: true,
-        includeCarryAcrossRooms: true,
-        includeToolSurfaceAfterMove: true,
-        log: (message) => console.log(`        ${message}`)
-      });
+        // PARITY CONFIGURATION: the same flag set as the workerd v2 lane
+        // (scripts/smoke-cf-dev.ts) — one scenario, both transports, same
+        // steps. This IS the parity gate.
+        await runSmokeWalkthrough({ alice, bob }, step, {
+          runId,
+          includeTakeDrop: true,
+          includeConcurrentMove: true,
+          includeCarryAcrossRooms: true,
+          includeToolSurfaceAfterMove: true,
+          log: (message) => console.log(`        ${message}`)
+        });
+      } finally {
+        // The shared session now carries the standard long-lived MCP GET/SSE
+        // channel. Close both sessions before stopping workerd so the channel
+        // cannot keep Node's connection pool alive after a successful run.
+        await Promise.allSettled([alice?.close(), bob?.close()]);
+      }
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

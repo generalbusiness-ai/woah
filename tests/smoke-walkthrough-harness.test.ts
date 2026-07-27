@@ -19,9 +19,21 @@ import {
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
-  it("uses the authenticated Net actor from initialize without probing removed native tools", async () => {
+  it("uses the authenticated Net actor and opens its standard notification carrier", async () => {
     const methods: string[] = [];
     const transport: McpTransport = async (request) => {
+      if (request.method === "GET") {
+        methods.push("GET notifications");
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("retry: 1000\n\n"));
+          }
+        }), { headers: { "content-type": "text/event-stream; charset=utf-8" } });
+      }
+      if (request.method === "DELETE") {
+        methods.push("DELETE session");
+        return new Response(null, { status: 204 });
+      }
       const body = request.body ? JSON.parse(String(request.body)) : {};
       methods.push(body.method);
       if (body.method === "initialize") {
@@ -47,7 +59,56 @@ describe("smoke walkthrough harness", () => {
     });
 
     expect(session.actor).toBe("carried_alice");
-    expect(methods).toEqual(["initialize", "notifications/initialized"]);
+    expect(methods).toEqual(["initialize", "notifications/initialized", "GET notifications"]);
+    await session.close();
+    expect(methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "GET notifications",
+      "DELETE session"
+    ]);
+  });
+
+  it("closes a newly minted session when its required notification carrier cannot open", async () => {
+    const methods: string[] = [];
+    const transport: McpTransport = async (request) => {
+      if (request.method === "GET") {
+        methods.push("GET notifications");
+        return new Response("unavailable", { status: 503 });
+      }
+      if (request.method === "DELETE") {
+        methods.push("DELETE session");
+        return new Response(null, { status: 204 });
+      }
+      const body = request.body ? JSON.parse(String(request.body)) : {};
+      methods.push(body.method);
+      if (body.method === "initialize") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            protocolVersion: "2025-06-18",
+            instructions: "You are woo actor carried_alice. Dynamic tools follow your context."
+          }
+        }, { headers: { "mcp-session-id": "s_net-api-0_failed-carrier" } });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected MCP method ${String(body.method)}`);
+    };
+
+    await expect(SmokeSession.open(transport, {
+      token: "apikey:key:secret",
+      label: "alice",
+      clientName: "smoke-session-failed-carrier-test"
+    })).rejects.toThrow("notification carrier failed: 503");
+    expect(methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "GET notifications",
+      "DELETE session"
+    ]);
   });
 
   it("requires two explicit API keys for the deployed Net MCP walkthrough", () => {

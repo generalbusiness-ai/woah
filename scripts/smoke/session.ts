@@ -35,9 +35,15 @@ export type SmokeSessionOptions = {
 };
 
 const DEFAULT_RPC_TIMEOUT_MS = 20_000;
+const NOTIFICATION_OPEN_TIMEOUT_MS = 5000;
+const NOTIFICATION_RECONNECT_DELAY_MS = 50;
 
 export class SmokeSession {
   private nextId = 2;
+  private readonly notificationAbort = new AbortController();
+  private notificationReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private notificationLoop: Promise<void> | null = null;
+  private closed = false;
   // Tracked from every move-style response that carries a `room` field in its
   // structuredContent.result. Guarded helpers (leaveIfIn, directional walks)
   // gate on this so a leave/direction verb is never issued from the wrong
@@ -81,7 +87,8 @@ export class SmokeSession {
       throw new Error(`notifications/initialized expected 202, got ${notified.status}`);
     }
     if (instructionActor) {
-      return new SmokeSession(transport, sessionId, instructionActor, options.label, rpcTimeoutMs);
+      const session = new SmokeSession(transport, sessionId, instructionActor, options.label, rpcTimeoutMs);
+      return await SmokeSession.readySession(session);
     }
 
     // Compatibility fallback for older deployed workers whose initialize
@@ -98,7 +105,20 @@ export class SmokeSession {
     if (!selfTool || typeof selfTool.object !== "string") {
       throw new Error(`could not resolve actor for ${options.label} from tool list (saw ${list.length} tools)`);
     }
-    return new SmokeSession(transport, sessionId, selfTool.object, options.label, rpcTimeoutMs);
+    const session = new SmokeSession(transport, sessionId, selfTool.object, options.label, rpcTimeoutMs);
+    return await SmokeSession.readySession(session);
+  }
+
+  private static async readySession(session: SmokeSession): Promise<SmokeSession> {
+    try {
+      // `open()` does not hand out a partially initialized session: either its
+      // required notification carrier is live or its durable session is closed.
+      await session.startNotificationCarrier();
+      return session;
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
   }
 
   async call(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<unknown> {
@@ -154,7 +174,77 @@ export class SmokeSession {
     return body;
   }
 
+  /** Keep the standard Streamable HTTP GET/SSE carrier open for the lifetime
+   * of the smoke session. Besides receiving list-change hints, this accurately
+   * models a real MCP client: the live carrier keeps the gateway's in-memory
+   * session state present while a peer action fans observations into
+   * `woo_wait`. The server bounds each listen, so reconnect every time it
+   * closes; a later transient failure retries, while the initial open must
+   * succeed before `open()` exposes the session to the walkthrough. */
+  private async startNotificationCarrier(): Promise<void> {
+    const first = await this.openNotificationCarrier();
+    this.notificationLoop = this.runNotificationCarrier(first);
+  }
+
+  private async openNotificationCarrier(): Promise<Response> {
+    const response = await fetchMcp(this.transport, NOTIFICATION_OPEN_TIMEOUT_MS, {
+      method: "GET",
+      headers: {
+        "mcp-session-id": this.sessionId,
+        accept: "text/event-stream"
+      },
+      signal: this.notificationAbort.signal
+    });
+    if (!response.ok) {
+      throw new Error(`MCP notification carrier failed: ${response.status} ${await response.text().catch(() => "")}`);
+    }
+    if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      throw new Error(`MCP notification carrier expected text/event-stream, got ${response.headers.get("content-type") ?? "none"}`);
+    }
+    return response;
+  }
+
+  private async runNotificationCarrier(first: Response): Promise<void> {
+    let response: Response | null = first;
+    while (!this.closed) {
+      try {
+        response ??= await this.openNotificationCarrier();
+        await this.consumeNotificationCarrier(response);
+        response = null;
+      } catch {
+        response = null;
+        if (this.closed || this.notificationAbort.signal.aborted) return;
+        // A bounded carrier can close at the same moment as a network
+        // interruption. Reconnect promptly without a hot failure loop.
+        await delayUnlessAborted(NOTIFICATION_RECONNECT_DELAY_MS, this.notificationAbort.signal);
+      }
+    }
+  }
+
+  private async consumeNotificationCarrier(response: Response): Promise<void> {
+    if (!response.body) throw new Error("MCP notification carrier response has no body");
+    const reader = response.body.getReader();
+    this.notificationReader = reader;
+    try {
+      while (!this.closed) {
+        const { done } = await reader.read();
+        if (done) return;
+        // Notifications are freshness hints. The walkthrough deliberately
+        // re-resolves reachable tools at each assertion that depends on them,
+        // so merely consuming the standard carrier is sufficient here.
+      }
+    } finally {
+      if (this.notificationReader === reader) this.notificationReader = null;
+      try { reader.releaseLock(); } catch { /* cancellation may already own the stream */ }
+    }
+  }
+
   async close(signal?: AbortSignal): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.notificationAbort.abort();
+    await this.notificationReader?.cancel().catch(() => undefined);
+    await this.notificationLoop?.catch(() => undefined);
     await fetchMcp(this.transport, 3000, {
       method: "DELETE",
       headers: { "mcp-session-id": this.sessionId },
@@ -235,6 +325,17 @@ function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
   if (b.aborted) merged.abort();
   else b.addEventListener("abort", relay, { once: true });
   return merged.signal;
+}
+
+function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
 }
 
 export async function parseMcpResponse(response: Response): Promise<any> {
