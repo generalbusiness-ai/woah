@@ -6868,6 +6868,16 @@ export class NetGatewayDO {
       const ref = call.args[map.arg];
       return typeof ref === "string" && ref.trim().length > 0 ? [ref.trim()] : [];
     }
+    // `{ref: "<object>"}`: a fixed object the verb reaches that appears in
+    // neither the call nor the actor's context. A verb whose body targets a
+    // catalog's own seed instance (an editor room, a registry) cannot name it
+    // through `target`/`actor`/`scope` or an argument, and without warming it
+    // the instance is simply absent from the turn's world — its class chain
+    // resolves, so `isa()` against it silently answers false rather than
+    // raising anything the repair loop could act on. The literal lives in the
+    // catalog manifest that owns the object; core stays catalog-agnostic and
+    // only learns "warm the object this verb names".
+    if (typeof map.ref === "string" && map.ref.trim().length > 0) return [map.ref.trim()];
     if (!Array.isArray(map.path) || map.path.length === 0 || typeof map.path[0] !== "string") return [];
     let cursor: unknown = this.netAuthorityPrefetchRoot(map.path[0], call);
     for (const rawPart of map.path.slice(1)) {

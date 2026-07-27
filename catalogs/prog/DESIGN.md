@@ -111,6 +111,91 @@ editor.
 
 See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md).
 
+### Status over Net (2026-07-26)
+
+The editor had no Net or worker coverage until
+`tests/worker/net-verb-editor.test.ts`. Proving it surfaced eight defects —
+five on the distributed path, an authorization gap, and two follow-on gaps in
+that gap's first fix — all now fixed; the full loop works end-to-end over Net.
+
+1. *Fixed.* The seeded instance lives in its own scope, which an ordinary turn
+   never warms, so it was absent from the turn's world and `isa(editor, $space)`
+   answered false — `edit_verb` raised `E_TYPE`. `edit_verb` now declares
+   `authority.prefetch: [{ ref: "the_verb_editor" }, { arg: 0 }]`. Because the
+   editor is named in the verb body rather than passed in, no derived prefetch
+   root could reach it; the literal form was added for exactly this shape.
+   **Aged worlds:** the gateway resolves the prefetch from the PERSISTED verb
+   page, and deployment alone never updates durable definitions
+   (spec/operations/net-cutover.md) — an already-installed world keeps failing
+   until the operator runs the signed definition repair:
+   `npm run repair:net-definitions -- <worker-base-url> '$programmer:edit_verb'`.
+   `tests/worker/net-verb-editor-aged.test.ts` proves the aged failure, the
+   repair, its idempotence, and the repaired entry/leave loop.
+2. *Fixed.* Entering moved the actor's body but not its session: for a
+   space-like destination `updatePresence` sets `activeScope` as a side effect,
+   so the CA8 `session_scope` event was recorded as a no-op, and over Net only
+   that event becomes the committed session cell the MCP active scope is read
+   from. Every editor verb answered "tool is not available in this session
+   context". `moveEditorActor` now captures the prior scope before the presence
+   update.
+3. *Fixed.* `pause`, `save`, and `abort` all move the actor OUT of the editor.
+   The turn commits in `room:the_verb_editor` (the call target's scope) and the
+   move writes the session cell, which is owned by the actor's cluster — so the
+   plan-time fold makes the turn both read AND write a foreign session cell.
+   `authorizeSessionSubmit` took the mint-write branch first and never recorded
+   the committing room's `session_presence` checkpoint as proof of the folded
+   read, so CO4 step 7 refused the commit `rider_unattested`. This was never a
+   design gap: CO14's local-proof rule (spec/protocol/coherence.md, "A room
+   authority has one equivalent local proof") already sanctions exactly this
+   proof, and applies whether or not the same turn writes the replacement row —
+   the written value is validated separately by the mint rule. The fix records
+   that proof in the write branch (`src/net/sessions.ts`); a commit anywhere
+   other than the active room still requires the ordinary CO2.3 owner
+   attestation.
+4. *Fixed.* Once (3) let a save commit at all, the commit was silently
+   non-durable: `programmerInstallVerb` — reachable only through the editor
+   machinery since the catalog verbs inlined the pipeline — mutated the
+   planning world via `addVerb` without recording the authored verb read/write
+   the way the `*ForActor` builtins do. The accepted transcript carried no verb
+   cell, nothing rode to the target's anchor scope, and `save` reported ok
+   while the live verb kept its old body. The fix records the page read
+   (optimistic conflict pin) and the written page there.
+5. *Fixed.* `moveEditorActor` relocated the body unconditionally, so a
+   SECONDARY session entering or leaving the editor dragged the shared body
+   with it, bypassing ordinary movement's primary-session gate
+   (spec/semantics/moveto.md M2.1 step 7). Editor movement now keys exit
+   presence by the moving session's active scope and physically relocates only
+   from the actor's primary session (or the sessionless object-graph fallback).
+6. *Fixed (authorization, not Net-specific).* `programmerInstallVerb` checked
+   only object authorship, so a non-wizard programmer could edit_verb →
+   replace → save a $wiz-owned verb on an object they own — modifying it and
+   taking ownership — where `set_verb_code` and ordinary `install_verb`
+   refuse. The install path now enforces the verb-owner rule (wizard, or the
+   actor owns the existing verb) at save and dry-run, an update preserves the
+   verb's existing owner instead of chowning to the installer, and
+   `editorInvoke` refuses at the door so a session that can never save does
+   not open (spec/authoring/editor-rooms.md E4 step 2;
+   `tests/authoring.test.ts` "refuses editor and install access…").
+7. *Fixed.* Inherited-verb overrides always failed to save: the session
+   recorded the INHERITED verb's version as `expected_version`, and save
+   compared it against the target's absent own slot — every override save
+   rejected E_VERSION. Sessions now carry `install_mode`, fixed at open: an
+   own slot opens `"upsert"` (version CAS as before); no own slot opens
+   `"define"` with a null `expected_version`, and mode `define`'s
+   own-slot-absence check is the optimistic guard (an own verb appearing
+   between open and save refuses "verb already exists" and keeps the
+   buffer). Spec: editor-rooms.md E3/E4.
+8. *Fixed.* Resuming a paused same-target session returned before the new
+   authorization door, so a verb chowned away while the session was paused
+   still admitted the actor (save then failed E_PERM inside the editor).
+   The door check now runs before the resume path — authorization is
+   revalidated on every entry, and a refusal leaves the paused session and
+   buffer untouched.
+
+The full loop — enter, edit, pause, resume, save, and the edited verb running
+with its new behavior — is exercised over the authoritative Net turn path by
+`tests/worker/net-verb-editor.test.ts`, including the secondary-session gate.
+
 ## Eval
 
 `$programmer:eval(source, opts?)` is the LambdaCore `eval` analogue. It compiles

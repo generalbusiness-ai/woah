@@ -12,6 +12,25 @@ editor is a room-like object: an actor enters it, runs ordinary verbs there, and
 leaves or resumes later. There is no separate workshop abstraction and no
 special coordination layer for agent teams.
 
+**Implementation status (2026-07-26).** Implemented in-memory and over Net.
+The full loop — enter, edit, pause, resume, save-through, and the edited verb
+running with its new behavior — is exercised on the authoritative Net turn path
+by `tests/worker/net-verb-editor.test.ts`. Two protocol notes that fell out of
+proving it:
+
+- A room verb that moves the actor OUT of the room it commits in (pause/save/
+  abort) makes the turn both read and write the actor-cluster-owned session
+  cell. CO14's local-proof rule (spec/protocol/coherence.md §CO14) covers this:
+  the committing room's exact `session_presence` checkpoint proves the folded
+  session read, while the written replacement validates under the mint rule.
+- Editor movement follows ordinary actor-movement semantics
+  (spec/semantics/moveto.md M2.1): exit presence keys off the moving session's
+  active scope, and only the actor's primary session physically relocates the
+  body — a secondary session entering the editor moves its own scope and
+  presence only.
+
+Defect history and rationale live in `catalogs/prog/DESIGN.md`.
+
 ## E1. Principle
 
 An editor room adds only editor-specific state and verbs:
@@ -69,6 +88,7 @@ Minimum session fields:
   kind: "verb",
   descriptor: str | int,
   slot: int | null,
+  install_mode: "upsert" | "define",
   expected_version: int | null,
   buffer: str,
   dirty: bool,
@@ -78,6 +98,14 @@ Minimum session fields:
   previous_location: obj | null
 }
 ```
+
+`install_mode` is fixed at open. An own slot on the target opens an
+`"upsert"` session whose save CAS-checks `expected_version` against that
+slot. No own slot — an inherited verb, or a new name — opens a `"define"`
+session: save creates a new own verb (an override, for the inherited case),
+`expected_version` stays null, and mode `define`'s own-slot-absence check is
+the optimistic guard. Seeding the CAS with the inherited verb's version
+would compare it against the absent own slot and fail every override save.
 
 The edited object does **not** move into the editor. "Bring this into the
 editor" means create or resume a session pointing at that object/member. The
@@ -98,7 +126,18 @@ The verb-editor flow:
 1. `invoke(target, descriptor)` or an equivalent command resolves the target
    using actor-scoped authoring lookup, not room matching.
 2. The editor checks that the actor may see the target and may attempt the
-   requested authoring operation.
+   requested authoring operation. Concretely: replacing an EXISTING own verb
+   requires the verb's execution authority — wizard, or the actor owns the
+   verb (the `set_verb_code`/`set_verb_info` rule; verb owner is dispatch's
+   `progr`) — and object authorship alone is not sufficient. The install path
+   (`programmerInstallVerb`) enforces the same rule independently at save and
+   dry-run, and an update preserves the verb's existing owner; only defining
+   a new own verb (including an override of an inherited verb) binds the
+   installing actor as owner under plain object authorship. The door check
+   runs on EVERY entry, resume included: authority may have changed while a
+   session was paused (the verb chowned away), and a resume must refuse
+   rather than admit the actor to a buffer whose save can only fail. The
+   refusal leaves the paused session and its buffer untouched.
 3. If the actor already has a dirty session, the editor refuses or asks the
    actor to `pause`, `save`, or `abort` first.
 4. The actor is moved into the editor room and `previous_location` is recorded.
@@ -107,8 +146,10 @@ The verb-editor flow:
 6. Editing verbs mutate only the session buffer.
 7. `dry_run` validates through the same install path that `save` uses, but
    mutates no target object.
-8. `save` installs source with optimistic version checking, records diagnostics
-   on failure, and exits on success.
+8. `save` installs source with optimistic concurrency checking — the
+   `expected_version` CAS for an `"upsert"` session, the own-slot-absence
+   check of mode `"define"` for an inherited-override/new-verb session —
+   records diagnostics on failure, and exits on success.
 9. `pause` leaves the room without deleting the session.
 10. `abort` deletes the session and returns the actor to the previous location.
 

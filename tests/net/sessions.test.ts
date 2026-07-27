@@ -535,6 +535,104 @@ describe("authorizeSessionSubmit at the owning scope (CO4 step 1)", () => {
       expect(refused.detail).toMatchObject({ session_verdict: "expired", source: "room_presence_projection" });
     }
   });
+
+  it("the checkpoint proof composes with a transition WRITE (the room verb that moves the actor out)", () => {
+    // A pause/save/abort-shaped turn: it commits at the session's active
+    // room and both READS the prior session row and WRITES its replacement
+    // (activeScope moves back to the previous room). The mint-write branch
+    // must still record the room checkpoint as proof of the folded read, or
+    // step 7 terminal-rejects rider_unattested and the actor cannot leave.
+    const prior = sessionRow({ activeScope: "r1" });
+    const projected = { value: prior, version: cellVersion(prior) };
+    const next = sessionRow({ activeScope: "r0" });
+    const transitionWrites = [
+      {
+        cell: { kind: "session" as const, object: "s1" },
+        value: next as never,
+        op: "set" as const,
+        writer: sessionWriter("#actor", "pause")
+      }
+    ];
+    const room = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      (id) => (id === "s1" ? projected : undefined)
+    );
+    room.seed(thingCells);
+    const transcript = transcriptWith({
+      scope: room.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: projected.version, value: prior as never }],
+      writes: transitionWrites as EffectTranscript["writes"],
+      hash: "sess-transition-projected-ok"
+    });
+    const accepted = room.submit(submitFor(room, transcript, "sess-transition-projected-ok"));
+    expect(accepted.status, JSON.stringify(accepted)).toBe("accepted");
+
+    // A lagging checkpoint stays RETRYABLE for the write shape too — never
+    // a terminal auth verdict (rule 3).
+    const lagged = sessionRow({ activeScope: "r1", started: NOW - 5_000 });
+    const laggedRoom = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      () => ({ value: lagged, version: cellVersion(lagged) })
+    );
+    laggedRoom.seed(thingCells);
+    const laggedTranscript = transcriptWith({
+      scope: laggedRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: projected.version, value: prior as never }],
+      writes: transitionWrites as EffectTranscript["writes"],
+      hash: "sess-transition-projected-stale"
+    });
+    const mismatch = laggedRoom.submit(submitFor(laggedRoom, laggedTranscript, "sess-transition-projected-stale"));
+    expect(mismatch.status).toBe("rejected");
+    if (mismatch.status === "rejected") {
+      expect(mismatch.reason).toBe("read_version_mismatch");
+      expect(mismatch.retryable).toBe(true);
+    }
+
+    // An EXPIRED prior row cannot authorize its own transition even though
+    // the written replacement is valid.
+    const expiredPrior = sessionRow({ activeScope: "r1", expiresAt: NOW - 1 });
+    const expiredRoom = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      () => ({ value: expiredPrior, version: cellVersion(expiredPrior) })
+    );
+    expiredRoom.seed(thingCells);
+    const expiredTranscript = transcriptWith({
+      scope: expiredRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: cellVersion(expiredPrior), value: expiredPrior as never }],
+      writes: transitionWrites as EffectTranscript["writes"],
+      hash: "sess-transition-projected-expired"
+    });
+    const refusedTransition = expiredRoom.submit(submitFor(expiredRoom, expiredTranscript, "sess-transition-projected-expired"));
+    expect(refusedTransition.status).toBe("rejected");
+    if (refusedTransition.status === "rejected") {
+      expect(refusedTransition.reason).toBe("unauthorized");
+      expect(refusedTransition.detail).toMatchObject({ session_verdict: "expired", source: "room_presence_projection" });
+    }
+
+    // No checkpoint row and no attestation: the pre-existing terminal
+    // refusal stands — a commit anywhere other than the active room still
+    // requires the ordinary CO2.3 owner attestation.
+    const blindRoom = sessionSequencer("room:r2", { owns: (object) => object === "#thing" || object === "#actor" });
+    blindRoom.seed(thingCells);
+    const blindTranscript = transcriptWith({
+      scope: blindRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: projected.version, value: prior as never }],
+      writes: transitionWrites as EffectTranscript["writes"],
+      hash: "sess-transition-unproved"
+    });
+    const unproved = blindRoom.submit(submitFor(blindRoom, blindTranscript, "sess-transition-unproved"));
+    expect(unproved.status).toBe("rejected");
+    if (unproved.status === "rejected") {
+      expect(unproved.reason).toBe("rider_unattested");
+    }
+  });
 });
 
 describe("plan-time session effects (CO14 fold; chunk 2)", () => {

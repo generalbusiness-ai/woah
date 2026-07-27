@@ -407,7 +407,13 @@
               "id",
               "descriptor",
               "opts?"
-            ]
+            ],
+            "authority": {
+              "prefetch": [
+                { "ref": "the_verb_editor" },
+                { "arg": 0 }
+              ]
+            }
           },
           "source": "verb :edit_verb(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Door into this catalog's seeded $verb_editor instance. The editor room\n  // owns the buffer session after this point; the target object stays where it is.\n  return editor_invoke(\"the_verb_editor\", id, descriptor, opts);\n}"
         },
