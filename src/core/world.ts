@@ -4146,12 +4146,76 @@ export class WooWorld {
      */
     private operatorProvisionedAgents(account: ObjRef): Record<string, ObjRef> {
       const raw = this.propOrNull(account, "operator_provisioned_agents");
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-      const map: Record<string, ObjRef> = {};
+      // NULL-PROTOTYPE on purpose. A provision_id is operator-chosen text, so
+      // it can be `constructor`, `toString`, or `__proto__`. On an ordinary
+      // object `map[id]` would then resolve an INHERITED member — a lookup for
+      // `constructor` returns `function Object()`, which the caller treats as a
+      // recorded agent and dereferences. A null prototype has nothing to
+      // inherit, so every read is an own-key read and every write (including
+      // `__proto__`) defines an own property instead of hitting the accessor.
+      const map: Record<string, ObjRef> = Object.create(null) as Record<string, ObjRef>;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return map;
+      // Object.entries is own-enumerable-keys only, so the stored cell cannot
+      // smuggle inherited members in either.
       for (const [key, value] of Object.entries(raw as Record<string, WooValue>)) {
         if (typeof value === "string" && value) map[key] = value;
       }
       return map;
+    }
+
+    /**
+     * Fail-closed validation for an operator-supplied `api_key_id` pointer.
+     *
+     * The pointer is what retirement follows: `revoke_agent` revokes
+     * `agent.api_key_id` and nothing else. A pointer that names a key which is
+     * not this agent's therefore means the agent's REAL credential survives
+     * retirement — a retired wizard that still authenticates. Accepting any
+     * non-empty string is not good enough, so all four facts are checked:
+     *
+     *  - the id parses as a routed (self-routing) id at all;
+     *  - it is bound to THIS agent;
+     *  - its immutable authority root matches the agent's anchor root, which is
+     *    what cold-gateway routing resolves the credential through;
+     *  - a live verifier record for it exists in the agent's OWN `api_keys`
+     *    map — the actor-owned store the signed credential-ensure route writes
+     *    (routed ids never live in the legacy catalog `$system.api_keys`).
+     *
+     * Requiring the record is safe because the operator runbook installs the
+     * credential BEFORE the call that records the pointer (AP11.6).
+     */
+    private assertBindableApiKeyPointer(agent: ObjRef, id: string): void {
+      const routed = parseRoutedApiKeyId(id);
+      if (!routed) {
+        throw wooError("E_INVARG", "api_key_id must be a routed api-key id", { agent, api_key_id: id });
+      }
+      if (routed.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id is bound to a different actor", { agent, api_key_id: id, bound_to: routed.actor });
+      }
+      const anchorRoot = this.authorityAnchorRoot(agent);
+      if (routed.authorityRoot !== anchorRoot) {
+        throw wooError("E_INVARG", "api_key_id authority root does not match the actor's anchor root", {
+          agent,
+          api_key_id: id,
+          authority_root: routed.authorityRoot,
+          anchor_root: anchorRoot
+        });
+      }
+      // Own-key read for the same reason as the ledger. The routed-id grammar
+      // above already makes an `n1_`-prefixed id structurally incapable of
+      // naming an Object.prototype member, so this is belt to that brace — but
+      // it means no reader has to reconstruct that argument to trust the line.
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, id) ? keys[id] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        throw wooError("E_INVARG", "api_key_id has no verifier record on this actor; install the credential first", { agent, api_key_id: id });
+      }
+      const entry = record as Record<string, WooValue>;
+      if (entry.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id verifier record names a different actor", { agent, api_key_id: id, record_actor: entry.actor ?? null });
+      }
+      if (entry.revoked_at != null) {
+        throw wooError("E_INVARG", "api_key_id names a revoked credential", { agent, api_key_id: id });
+      }
     }
 
     /**
@@ -4208,11 +4272,21 @@ export class WooWorld {
       this.assertSelfHuman(human, human);
       const account = assertObj(this.propOrNull(human, "account"));
       if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
-      if (!input.provisionId) throw wooError("E_INVARG", "provision_id is required");
+      // Shape bound only. The WIRE grammar (leading alphanumeric, a fixed
+      // punctuation set) is enforced by the operator route; this primitive is
+      // reachable by any wizard, so it guards the durable cell's size and must
+      // stay correct for whatever text it is handed — including keys that name
+      // Object.prototype members (see operatorProvisionedAgents).
+      if (!input.provisionId || input.provisionId.length > 128) {
+        throw wooError("E_INVARG", "provision_id must be 1..128 characters", { provision_id: input.provisionId });
+      }
       if (!input.name) throw wooError("E_INVARG", "name is required");
 
       const provisioned = this.operatorProvisionedAgents(account);
-      const recorded = provisioned[input.provisionId] ?? null;
+      // Own-key read. `provisioned` has a null prototype so plain indexing is
+      // already own-only; hasOwn states the intent so a later refactor to a
+      // normal object cannot silently reintroduce the inherited-member read.
+      const recorded = Object.hasOwn(provisioned, input.provisionId) ? provisioned[input.provisionId] : null;
       let agent: ObjRef | null = null;
       let created = false;
       if (recorded !== null) {
@@ -4264,6 +4338,10 @@ export class WooWorld {
         this.setProp(agent, "provision_id", input.provisionId);
         this.setProp(account, "actors", [...this.accountActors(account), agent]);
         this.setProp(account, "agent_count", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        // Object-literal spread + COMPUTED key, never `obj[key] = value`: a
+        // computed key defines an own property even for `__proto__`, whereas
+        // plain assignment on a normal object would invoke Object.prototype's
+        // `__proto__` setter and silently store nothing.
         this.setProp(account, "operator_provisioned_agents", { ...provisioned, [input.provisionId]: agent } as WooValue);
         created = true;
       }
@@ -4271,8 +4349,10 @@ export class WooWorld {
       // The api-key id is a pointer, not a credential: the verifier record
       // (hash+salt) is installed by the signed credential-ensure route from a
       // tuple generated on the operator machine, so no secret ever transits
-      // this turn. Kept in sync so rotate/revoke find the current key.
+      // this turn. Kept in sync so rotate/revoke find the current key — which
+      // is exactly why it is validated fail-closed rather than stored as given.
       if (input.apiKeyId && this.propOrNull(agent, "api_key_id") !== input.apiKeyId) {
+        this.assertBindableApiKeyPointer(agent, input.apiKeyId);
         this.setProp(agent, "api_key_id", input.apiKeyId);
       }
 
@@ -11389,9 +11469,24 @@ export class WooWorld {
         // Strip programmer state through the shared transition first: it clears
         // the flag, removes the surface, decrements the quota, and refuses
         // cross-host before any of that — idempotent if already non-programmer.
+        // Read the tombstone BEFORE any mutation: it decides whether this call
+        // is the one that returns the account's agent slot.
+        const alreadyDeactivated = this.propOrNull(agent, "deactivated_at") != null;
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
+        // Key revocation runs on BOTH paths and is itself idempotent
+        // (revokeApiKeyRecord returns early once revoked_at is set). Re-running
+        // therefore repairs an actor deactivated by some other path — e.g.
+        // $system:deactivate_actor, which tombstones without revoking.
         const key = this.propOrNull(agent, "api_key_id");
         if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
+        // Idempotent stop. `agent_count` is a QUOTA counter, not an event
+        // count: an already-deactivated agent has already returned its slot, so
+        // decrementing again would let the account mint more agents than its
+        // quota allows (revoke one agent twice with two live and the counter
+        // reaches 0 while one is still active). Re-stamping deactivated_at
+        // would also rewrite the retirement time and mint a duplicate audit
+        // record for an event that did not happen.
+        if (alreadyDeactivated) return true;
         this.setProp(agent, "deactivated_at", Date.now());
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
         // AU1 seam, not recordWizardAction: every durable effect above is

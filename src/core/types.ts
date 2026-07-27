@@ -730,7 +730,23 @@ function clonePlainDataRecursive<T>(value: T, path: Set<object> | undefined): T 
     }
     const copy: Record<string, unknown> = {};
     for (const key of Object.keys(node as Record<string, unknown>)) {
-      copy[key] = clonePlainDataRecursive((node as Record<string, unknown>)[key], ancestors);
+      const cloned = clonePlainDataRecursive((node as Record<string, unknown>)[key], ancestors);
+      // `copy[key] = v` is a [[Set]], and for exactly one key name that hits an
+      // ACCESSOR inherited from Object.prototype instead of defining a property.
+      // Woo map keys are ordinary data (a help topic, a provision id, a user's
+      // tag), so `__proto__` is reachable text, and the two outcomes are both
+      // wrong: an object value becomes the CLONE'S PROTOTYPE — a prototype
+      // pollution primitive expressible in plain woo data — and a primitive
+      // value is silently dropped, so the round-trip loses an entry. Own-key
+      // definition is the only correct copy. The branch is one comparison per
+      // key on a path that exists to be cheap; that is affordable, a
+      // null-prototype accumulator is not (callers require Object.prototype,
+      // and the guard above enforces it).
+      if (key === "__proto__") {
+        Object.defineProperty(copy, key, { value: cloned, writable: true, enumerable: true, configurable: true });
+      } else {
+        copy[key] = cloned;
+      }
     }
     out = copy;
   }

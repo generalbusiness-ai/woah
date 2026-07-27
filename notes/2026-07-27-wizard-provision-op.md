@@ -124,6 +124,81 @@ and is refused over Net before that line runs. Moving its audit to the sink
 would be inert while implying Net support that does not exist. Wizard authority
 on Net is granted by AP11.
 
+## Review round 1 — three defects, all probe-confirmed by the reviewer
+
+**R1 (P1) — repeated revocation corrupted quota accounting.** `revoke_agent`
+unconditionally stamped `deactivated_at` and decremented `agent_count`. Revoke
+one agent twice with two live and the counter reaches 0 while one is still
+active, so the next create/provision under-counts and the account mints past
+quota. Fixed: the tombstone is read before any mutation and decides whether the
+call is the one that returns the slot. Programmer-stripping and key revocation
+still run on the repeat (both idempotent), which makes a repeat a *repair* for
+an actor tombstoned by `$system:deactivate_actor`, which never revokes.
+`setProgrammerAgentState` was checked for the same shape and is already
+correct — it moves flag and counter only on a real transition — and now has a
+regression test rather than an assumption.
+
+**R2a (P1) — any non-empty `api_key_id` was stored.** Retirement follows that
+pointer and nothing else, so a misbound pointer meant the agent's REAL
+credential survived retirement. Now validated fail-closed on four axes (parses
+as routed, bound to this agent, authority root equals the anchor root, and a
+live verifier record exists on the agent with a matching actor). Note the
+reviewer's "record must exist in `$system.api_keys`" is the legacy global map:
+routed ids live in the ACTOR-owned `api_keys` property, which is where the
+check reads. The unit test that accepted `n1_x_y_z` was the bug's own alibi and
+is replaced with the valid case plus one refusal per axis.
+
+**R2b (P1) — a live session outlived retirement.** `assertActorEligible` runs
+only at session mint, and a bearer presents a session id, never its key. Added
+a view-only tombstone check to `authorizedActorForSessionBearer`, the single
+choke point for MCP, WS, and bearer paths. Conservative by design: no warm/fetch
+on the hot path, and an absent cell is not a refusal (a cold gateway cannot
+distinguish "not deactivated" from "not pulled"). Propagation is eventual —
+seconds, via the fanout the serving gateway is already subscribed to. Verified
+by negative test: disabling the one line makes the new MCP case fail. The case
+is built so the api-key check cannot mask it — the agent carries no `api_key_id`
+pointer, so revocation tombstones without revoking a key.
+
+**R2b widened: the APIKEY class had the same hole, and it was worse.** The
+finding was scoped to session bearers; probing the sibling branch showed a
+retired wizard authenticating with a long-lived key plus an already-minted
+session id and committing a wizard-only `set_quota` turn — 200 accepted, the
+account cell written. The enabling fact is that `revoke_agent` revokes only the
+key `agent.api_key_id` names, so any SECOND credential on that actor (exactly
+the AP11 state between runbook steps 2 and 3, or after any manual
+credential-ensure) survives retirement. The gate now runs on both credential
+classes at actor resolution. Probe transcript is in the test comment; the test
+asserts 403 and that the wizard-only write did not land.
+
+**R4 (P2) — `provision_id` collided with `Object.prototype`.** `constructor`
+resolved `function Object()` through inherited-member access and was
+dereferenced as an agent id. Fixed with a null-prototype ledger map, own-key
+reads (`Object.hasOwn`) in both the primitive and the gateway prefetch, and the
+object-literal computed-key form for the write (`obj[k] = v` would hit the
+`__proto__` setter; `{...m, [k]: v}` defines an own property). Added a 1..128
+bound on `provision_id` in the primitive — the wire grammar stays stricter at
+the route.
+
+**R4 uncovered a substrate bug.** `__proto__` still did not round-trip after
+the ledger fix. Root cause was NOT in AP11: `clonePlainData`
+(`src/core/types.ts`) copied with `copy[key] = value`, which for that one key
+name invokes the accessor inherited from `Object.prototype`. Two wrong
+outcomes, both reachable from ordinary woo map data (a tag, a help topic, a
+user-chosen key): a primitive value is silently DROPPED — every clone loses the
+entry — and an **object value becomes the clone's prototype**, i.e. a
+prototype-pollution primitive expressible in plain data. Fixed with
+`Object.defineProperty` for that key only (one string comparison per key on a
+path whose reason for existing is that it is cheap). Regression tests added to
+`tests/clone-plain-data.test.ts`. This affects every map property in the
+system, not just AP11's ledger.
+
+Honest scoping note: the gateway half of R4 (own-key prefetch read) is
+**defence in depth**, not a reproducible failure — an inherited lookup there
+yields a function, `typeof === "string"` rejects it, and the prefetch is merely
+skipped. The world half is the one that produced the reviewer's E_OBJNF. The
+fake-DO test seeds the ledger first so the gateway path is at least exercised
+in the ordering where it matters.
+
 ## Named residuals (not verified, not claimed)
 
 - **Other `recordWizardAction` call sites on cluster-local primitives** —
@@ -142,6 +217,12 @@ on Net is granted by AP11.
   (deactivation) is the lever for retiring an operator wizard. A deactivated
   actor cannot authenticate, so the residual flag grants nothing. Both halves
   are now proved end to end over the client doorway.
+- **Session-tombstone propagation is eventual, and unmeasured under real
+  fanout latency.** The fake-DO lane settles fanout synchronously, so the
+  window between a committed revocation and the serving gateway refusing an
+  open session is not characterized here. The api-key gate covers the window
+  whenever the retired actor carries an `api_key_id` pointer; an actor without
+  one relies solely on the tombstone.
 - **`revoke_api_key` has no authority prefetch.** Its argument is a key id, not
   an object the prefetch grammar can resolve, so the actor's `api_keys` cell is
   read cold and the turn pays one E_READ_VERSION repair round. It converges

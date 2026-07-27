@@ -7,6 +7,7 @@
 // accounting, authority gating, and the local-profile audit trail.
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
+import { routedApiKeyId } from "../src/core/api-key-id";
 import type { WooWorld } from "../src/core/world";
 
 type Provisioned = {
@@ -139,9 +140,78 @@ describe("AP11 operator wizard provisioning (core)", () => {
       .toEqual({ "ops-1": first.actor_id, "ops-2": second.actor_id });
   });
 
-  it("records the api_key_id pointer without minting any credential", async () => {
+  it("revoking an agent twice returns its quota slot exactly once", async () => {
+    const world = createWorld();
+    const { human, account } = await signup(world, "ap11j@woo.dev");
+    const doomed = await provision(world, "$wiz", human, "ops-doomed");
+    const survivor = await provision(world, "$wiz", human, "ops-survivor");
+    expect(world.propOrNull(account, "agent_count")).toBe(2);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(2);
+
+    const revoke = async (): Promise<unknown> => {
+      const frame = await world.directCall(`rev-${Math.random()}`, human, human, "revoke_agent", [doomed.actor_id] as never);
+      if (frame.op === "error") throw Object.assign(new Error(frame.error.message), { code: frame.error.code });
+      return (frame as unknown as { result: unknown }).result;
+    };
+
+    expect(await revoke()).toBe(true);
+    expect(world.propOrNull(account, "agent_count")).toBe(1);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    const retiredAt = world.propOrNull(doomed.actor_id, "deactivated_at");
+    expect(retiredAt).toBeTruthy();
+    const auditAfterFirst = wizardActions(world).length;
+
+    // `agent_count` is a QUOTA counter, not an event count. A second revoke of
+    // the same agent must not return a slot that is already back — otherwise
+    // the count drops below the number of live agents and the account can mint
+    // past its quota.
+    expect(await revoke()).toBe(true);
+    expect(world.propOrNull(account, "agent_count")).toBe(1);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    // Retirement time is not rewritten and no duplicate audit is minted.
+    expect(world.propOrNull(doomed.actor_id, "deactivated_at")).toBe(retiredAt);
+    expect(wizardActions(world).length).toBe(auditAfterFirst);
+
+    // A third revoke, and the survivor is still fully intact.
+    expect(await revoke()).toBe(true);
+    expect(world.propOrNull(account, "agent_count")).toBe(1);
+    expect(world.propOrNull(survivor.actor_id, "deactivated_at")).toBe(null);
+    expect(world.object(survivor.actor_id).flags.programmer).toBe(true);
+    expect(world.object(survivor.actor_id).flags.wizard).toBe(true);
+
+    // And the slot really is available exactly once: one more provisioning
+    // succeeds and lands the count back at the number of live agents.
+    const replacement = await provision(world, "$wiz", human, "ops-replacement");
+    expect(replacement.created).toBe(true);
+    expect(world.propOrNull(account, "agent_count")).toBe(2);
+  });
+
+  it("demoting a non-programmer agent does not double-decrement the programmer count", async () => {
+    const world = createWorld();
+    const { human, account } = await signup(world, "ap11k@woo.dev");
+    const a = await provision(world, "$wiz", human, "ops-a");
+    const b = await provision(world, "$wiz", human, "ops-b");
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(2);
+
+    const demote = async (agent: string): Promise<void> => {
+      const frame = await world.directCall(`dem-${Math.random()}`, human, human, "demote_agent_from_programmer", [agent] as never);
+      if (frame.op === "error") throw Object.assign(new Error(frame.error.message), { code: frame.error.code });
+    };
+
+    // The shared transition moves the flag and the counter only on a real
+    // transition, so repeats are no-ops rather than a slow drain to zero.
+    await demote(a.actor_id);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    await demote(a.actor_id);
+    await demote(a.actor_id);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    expect(world.object(b.actor_id).flags.programmer).toBe(true);
+  });
+
+  it("records the api_key_id pointer only after validating it fail-closed", async () => {
     const world = createWorld();
     const { human } = await signup(world, "ap11d@woo.dev");
+    const other = await signup(world, "ap11d2@woo.dev");
 
     const first = await provision(world, "$wiz", human, "ops-1");
     // No key is minted by the primitive: the pointer is null and the agent's
@@ -149,10 +219,85 @@ describe("AP11 operator wizard provisioning (core)", () => {
     expect(world.propOrNull(first.actor_id, "api_key_id")).toBe(null);
     expect(world.propOrNull(first.actor_id, "api_keys") ?? {}).toEqual({});
 
-    const pointed = await provision(world, "$wiz", human, "ops-1", { api_key_id: "n1_x_y_z" });
+    // The pointer is what retirement follows (revoke_agent revokes
+    // agent.api_key_id and nothing else), so a pointer naming a key that is not
+    // this agent's would leave the REAL credential alive through retirement.
+    // Every mismatch axis is refused, and nothing is stored.
+    const bogus: Array<[string, string]> = [
+      ["not a routed id at all", "plain-key-id"],
+      ["routed but bound to another actor", "n1_x_y_z"]
+    ];
+    for (const [why, id] of bogus) {
+      await expect(provision(world, "$wiz", human, "ops-1", { api_key_id: id }), why)
+        .rejects.toMatchObject({ code: "E_INVARG" });
+      expect(world.propOrNull(first.actor_id, "api_key_id"), why).toBe(null);
+    }
+
+    // Correctly shaped for this agent, but with no verifier record installed:
+    // still refused, because the runbook installs the credential BEFORE the
+    // call that records the pointer.
+    const unbacked = routedApiKeyId(human, first.actor_id, "a".repeat(32));
+    await expect(provision(world, "$wiz", human, "ops-1", { api_key_id: unbacked }))
+      .rejects.toMatchObject({ code: "E_INVARG" });
+    expect(world.propOrNull(first.actor_id, "api_key_id")).toBe(null);
+
+    // A real record, but minted for a DIFFERENT actor: the id parses, so only
+    // the actor binding catches it.
+    const otherAgent = await provision(world, "$wiz", other.human, "ops-other");
+    const otherKey = world.createApiKey("$wiz", otherAgent.actor_id, "other");
+    await expect(provision(world, "$wiz", human, "ops-1", { api_key_id: otherKey.id }))
+      .rejects.toMatchObject({ code: "E_INVARG" });
+    expect(world.propOrNull(first.actor_id, "api_key_id")).toBe(null);
+
+    // The valid case: a routed id minted for THIS agent under this authority
+    // root, with a live verifier record on the agent itself.
+    const key = world.createApiKey("$wiz", first.actor_id, "ops wizard");
+    const pointed = await provision(world, "$wiz", human, "ops-1", { api_key_id: key.id });
     expect(pointed.created).toBe(false);
-    expect(world.propOrNull(first.actor_id, "api_key_id")).toBe("n1_x_y_z");
-    expect(world.propOrNull(first.actor_id, "api_keys") ?? {}).toEqual({});
+    expect(world.propOrNull(first.actor_id, "api_key_id")).toBe(key.id);
+
+    // A revoked credential is not a valid pointer either — following it at
+    // retirement would be a no-op while a live key elsewhere kept working.
+    const stale = world.createApiKey("$wiz", first.actor_id, "stale");
+    world.revokeApiKey("$wiz", stale.id);
+    await expect(provision(world, "$wiz", human, "ops-1", { api_key_id: stale.id }))
+      .rejects.toMatchObject({ code: "E_INVARG" });
+    expect(world.propOrNull(first.actor_id, "api_key_id")).toBe(key.id);
+  });
+
+  it("treats a provision_id that names an Object.prototype member as ordinary text", async () => {
+    const world = createWorld();
+    const { human, account } = await signup(world, "ap11h@woo.dev");
+
+    // `constructor` passes the operator route's wire grammar; `__proto__` does
+    // not, but the primitive is reachable by any wizard and must be correct for
+    // both. With inherited-member access these resolve to `function Object()`
+    // and to the prototype setter respectively.
+    for (const provisionId of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      const minted = await provision(world, "$wiz", human, provisionId);
+      expect(minted.created, provisionId).toBe(true);
+      expect(minted.actor_id, provisionId).toMatch(/^agent_/);
+      expect(world.propOrNull(minted.actor_id, "provision_id"), provisionId).toBe(provisionId);
+
+      // And the ledger round-trips: the re-run must find the SAME agent, which
+      // it can only do through an own-key read of a stored own property.
+      const again = await provision(world, "$wiz", human, provisionId);
+      expect(again.actor_id, provisionId).toBe(minted.actor_id);
+      expect(again.created, provisionId).toBe(false);
+    }
+    expect(world.propOrNull(account, "agent_count")).toBe(4);
+    const ledger = world.propOrNull(account, "operator_provisioned_agents") as Record<string, string>;
+    expect(Object.keys(ledger).sort()).toEqual(["__proto__", "constructor", "hasOwnProperty", "toString"]);
+    // Nothing was written onto the prototype chain.
+    expect(Object.getPrototypeOf(ledger)).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>).constructor).toBe(Object);
+  });
+
+  it("refuses a provision_id longer than the durable cell should carry", async () => {
+    const world = createWorld();
+    const { human } = await signup(world, "ap11i@woo.dev");
+    await expect(provision(world, "$wiz", human, "x".repeat(129)))
+      .rejects.toMatchObject({ code: "E_INVARG" });
   });
 
   it("refuses fail-closed rather than minting a duplicate when the ledger disagrees", async () => {

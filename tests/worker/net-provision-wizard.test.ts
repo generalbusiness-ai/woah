@@ -378,6 +378,123 @@ describe("AP11 operator wizard provisioning (fake-DO lane)", () => {
     }
   });
 
+  it("retirement reaches a LIVE MCP session, not just new ones", async () => {
+    const h = await buildWorld();
+    try {
+      const provisioned = await provision(h, { human: h.human, provision_id: "ops-live", name: "OpsWizard" });
+      expect(provisioned.status, JSON.stringify(provisioned.body)).toBe(200);
+      const agent = provisioned.body?.result?.actor_id as string;
+      await h.settleAll();
+      const token = await ensureRoutedCredential(h, agent, "1");
+
+      const mcp = async (body: unknown, headers: Record<string, string> = {}) => {
+        const response = await h.gateway.fetch(new Request("https://do/net-api/mcp", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body)
+        }));
+        const text = await response.text();
+        return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) as Record<string, any> : null };
+      };
+      const init = await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, { "mcp-token": token });
+      const mcpSession = init.headers.get("mcp-session-id") as string;
+      expect(mcpSession, JSON.stringify(init.body)).toBeTruthy();
+      await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": mcpSession });
+
+      // The live session works: the provisioned wizard carries the programmer
+      // surface, so its authoring tools are listed.
+      const listed = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, { "mcp-session-id": mcpSession });
+      const prefix = agent.replace(/[^a-zA-Z0-9_]/g, "_");
+      expect((listed.body?.result?.tools ?? []).map((tool: any) => tool.name))
+        .toContain(`${prefix}__install_verb`);
+
+      // A /net-api session minted BEFORE retirement, to prove the apikey class
+      // below is gated too (an old session id plus a live key).
+      const preSession = await clientFetch(h, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+      expect(preSession.status, JSON.stringify(preSession.body)).toBe(200);
+      const netSession = preSession.body.session as string;
+
+      // Retire it. An MCP bearer presents only a session id and never
+      // re-presents the key, so without a tombstone check the session would
+      // outlive revocation indefinitely.
+      const humanToken = await ensureRoutedCredential(h, h.human, "9");
+      const humanSession = await clientFetch(h, "POST", "/net-api/session", { token: humanToken, body: { ttl_ms: 600_000 } });
+      expect(humanSession.status, JSON.stringify(humanSession.body)).toBe(200);
+      const revoked = await clientFetch(h, "POST", "/net-api/turn", {
+        token: humanToken,
+        body: { target: h.human, verb: "revoke_agent", args: [agent], session: humanSession.body.session, route: "direct" }
+      });
+      expect(revoked.body?.reply?.status, JSON.stringify(revoked.body).slice(0, 600)).toBe("accepted");
+      await h.settleAll();
+      expect(await scopeProp(h, h.clusterScope, agent, "deactivated_at")).toBeTruthy();
+
+      // The SAME session id is now refused — both a call and a fresh listing.
+      const afterCall = await mcp({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: `${prefix}__install_verb`, arguments: {} }
+      }, { "mcp-session-id": mcpSession });
+      expect(JSON.stringify(afterCall.body)).toContain("identity_deactivated");
+      const afterList = await mcp({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} }, { "mcp-session-id": mcpSession });
+      expect(JSON.stringify(afterList.body)).toContain("identity_deactivated");
+      // The APIKEY class is the sibling hole and is checked with the same
+      // rigour: this agent's key was never revoked (revoke_agent revokes only
+      // the key `api_key_id` names, and no pointer was recorded), so without
+      // the retirement gate a retired wizard pairs its live key with the
+      // already-minted session and commits a wizard-only turn. Verified: it
+      // returned 200 accepted before the fix.
+      const afterApiKey = await clientFetch(h, "POST", "/net-api/turn", {
+        token,
+        body: { target: "$system", verb: "set_quota", args: [h.account, "agent_quota", 42], session: netSession, route: "direct" }
+      });
+      expect(afterApiKey.status, JSON.stringify(afterApiKey.body).slice(0, 400)).toBe(403);
+      expect(afterApiKey.body?.error?.detail?.reason).toBe("identity_deactivated");
+      await h.settleAll();
+      // The wizard-only write did not land.
+      expect(await scopeProp(h, h.clusterScope, h.account, "agent_quota")).not.toBe(42);
+    } finally {
+      h.close();
+    }
+  });
+
+  it("treats a provision_id naming an Object.prototype member as ordinary text", async () => {
+    const h = await buildWorld();
+    try {
+      // Populate the ledger FIRST, so the prototype-named lookup below runs
+      // against an existing map. That is the ordering in which the gateway's
+      // own-key prefetch read matters: with plain indexing the lookup resolves
+      // `function Object()` rather than "absent", and the recorded-agent
+      // prefetch is silently skipped.
+      const seed = await provision(h, { human: h.human, provision_id: "ops-seed", name: "Seed" });
+      expect(seed.status, JSON.stringify(seed.body)).toBe(200);
+      await h.settleAll();
+
+      // `constructor` satisfies the route's wire grammar. Read through an
+      // inherited-member lookup it resolves to `function Object()`, which the
+      // world then dereferences as if it were a recorded agent id (E_OBJNF on
+      // `function Object()`).
+      const first = await provision(h, { human: h.human, provision_id: "constructor", name: "OpsWizard" });
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      const agent = first.body?.result?.actor_id as string;
+      expect(agent).toMatch(/^agent_/);
+      await h.settleAll();
+
+      // The re-run must converge on the SAME agent, which only an own-key read
+      // of the durable ledger can do.
+      const again = await provision(h, { human: h.human, provision_id: "constructor", name: "OpsWizard" });
+      expect(again.status, JSON.stringify(again.body)).toBe(200);
+      expect(again.body?.result?.actor_id).toBe(agent);
+      expect(again.body?.result?.created).toBe(false);
+      await h.settleAll();
+      expect(await scopeProp(h, h.clusterScope, h.account, "agent_count")).toBe(2);
+      expect(await scopeProp(h, h.clusterScope, h.account, "operator_provisioned_agents"))
+        .toEqual({ "ops-seed": seed.body?.result?.actor_id, constructor: agent });
+    } finally {
+      h.close();
+    }
+  });
+
   it("refuses unsigned, wrong-secret, malformed, and unknown-human requests", async () => {
     const h = await buildWorld();
     try {

@@ -123,6 +123,17 @@ Keys are UTF-8 strings only. Constraints:
 
 Why string-only: JSON-compatible serialization, simple equality, dominant ergonomic. Anyone who wants object-keyed maps can use a list of pairs.
 
+**A map is data, never a host-language object namespace.** `constructor`,
+`toString`, and `__proto__` are ordinary keys with no special meaning: they must
+round-trip through clone, equality, persistence, and the wire like any other,
+and no map entry may ever alter a host object's prototype. Implementations must
+therefore read map entries as OWN keys and write them as own-property
+definitions. In JavaScript hosts this is a real hazard rather than a formality:
+`copy[key] = value` invokes an accessor inherited from `Object.prototype` for
+exactly the key `__proto__`, which silently drops a scalar entry and turns an
+object entry into a prototype mutation. A conforming implementation loses
+neither entry and pollutes nothing.
+
 ---
 
 ## V7. Error values

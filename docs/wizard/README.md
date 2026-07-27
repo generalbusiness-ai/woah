@@ -39,6 +39,9 @@ holds. Re-running it changes nothing.
 To retire one, the owning human calls `revoke_agent` on their own
 account surface with the agent's id. That strips the authoring surface,
 revokes the key, and deactivates the actor, so it can no longer sign in.
+Sessions it already had open stop working too, within a few seconds.
+Calling `revoke_agent` again on the same agent is harmless — it will not
+double-count against your agent quota.
 
 The operator needs the deployment's internal secret, so this is a
 deploy-machine operation, not something a logged-in user can do. See

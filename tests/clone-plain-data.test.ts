@@ -81,6 +81,36 @@ describe("clonePlainData", () => {
     expect(frozen.nested.k).toBe("v");
   });
 
+  // `__proto__` is ordinary text in a woo map key (a tag, a help topic, an
+  // operator-chosen provision id). Copying with `copy[key] = value` invokes the
+  // accessor Object.prototype exposes under that one name, which BOTH loses
+  // primitive entries and lets an object entry redefine the clone's prototype —
+  // a prototype-pollution primitive expressible in plain data.
+  it("copies a __proto__ key as an own data property, never through the accessor", () => {
+    const source = { ...{}, ["__proto__"]: "kept", other: 1 };
+    expect(Object.prototype.hasOwnProperty.call(source, "__proto__")).toBe(true);
+
+    const clone = clonePlainData(source);
+    expect(Object.prototype.hasOwnProperty.call(clone, "__proto__")).toBe(true);
+    expect(Object.keys(clone).sort()).toEqual(["__proto__", "other"]);
+    expect((clone as Record<string, unknown>)["__proto__"]).toBe("kept");
+    // The prototype chain is untouched — the value did not become the proto.
+    expect(Object.getPrototypeOf(clone)).toBe(Object.prototype);
+  });
+
+  it("does not let an object-valued __proto__ entry pollute the clone's prototype", () => {
+    const source = { ...{}, ["__proto__"]: { polluted: true } };
+    const clone = clonePlainData(source);
+    expect(Object.getPrototypeOf(clone)).toBe(Object.prototype);
+    expect((clone as Record<string, unknown>)["__proto__"]).toEqual({ polluted: true });
+    // Deep-cloned, not shared, like every other nested value.
+    expect((clone as Record<string, unknown>)["__proto__"]).not.toBe(
+      (source as Record<string, unknown>)["__proto__"]
+    );
+    // Nothing leaked onto a bystander object.
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
   it("cloneValue delegates to clonePlainData for WooValue", () => {
     const value = { kind: "note", tags: ["a", "b"], meta: { n: 3 } };
     const clone = cloneValue(value);

@@ -2479,7 +2479,12 @@ export class NetGatewayDO {
       };
       await prefetch(account, "account");
       const ledger = this.netObjectProperty(account, "operator_provisioned_agents");
+      // OWN-key read. A provision_id is operator-chosen text and the wire
+      // grammar admits `constructor`, `toString`, and friends; plain indexing
+      // would resolve an inherited Object.prototype member and hand a function
+      // to the prefetch as if it were a recorded agent id.
       const recorded = ledger && typeof ledger === "object" && !Array.isArray(ledger)
+        && Object.hasOwn(ledger as Record<string, unknown>, provisionId)
         ? (ledger as Record<string, unknown>)[provisionId]
         : undefined;
       if (typeof recorded === "string" && recorded) await prefetch(recorded, "recorded agent");
@@ -3015,6 +3020,14 @@ export class NetGatewayDO {
         bearerSession = credential.session;
       } else {
         actor = (await this.verifyClientApiKey(identity.map, credential)).actor;
+        // The apikey class needs the SAME retirement gate as the bearer class
+        // above. Eligibility is otherwise only checked when a session is
+        // MINTED, so a retired actor presenting a long-lived key plus an
+        // already-minted session id kept transacting — verified: a revoked
+        // wizard committed a wizard-only set_quota turn this way. `revoke_agent`
+        // revokes only the key `agent.api_key_id` names, so any second
+        // credential on that actor survives retirement and reaches here.
+        this.assertActorNotRetired(actor);
       }
 
       // H4: rate limiting runs AFTER authentication resolves the actor
@@ -6306,11 +6319,55 @@ export class NetGatewayDO {
    * this explicit asynchronous layer. */
   private async authorizedActorForSessionBearer(session: string, legacyMap?: unknown): Promise<string> {
     const actor = this.actorForSessionBearer(session);
+    this.assertActorNotRetired(actor);
     const value = this.ensureView().get(sessionCellKey(session))?.value as { apikeyId?: unknown } | undefined;
     if (typeof value?.apikeyId === "string" && value.apikeyId) {
       await this.assertSessionApiKeyActive(value.apikeyId, actor, legacyMap);
     }
     return actor;
+  }
+
+  /**
+   * Retirement must reach LIVE credentials, not just new sessions.
+   *
+   * `assertActorEligible` runs at session MINT. Without this check both client
+   * credential classes outlived `revoke_agent` indefinitely: a session bearer
+   * presents a session id and never re-presents its key, and an apikey holder
+   * pairs a long-lived key with an already-minted session id. Both were
+   * verified to keep transacting after retirement — the apikey case committed
+   * a wizard-only `set_quota` turn. That is precisely the wrong failure mode
+   * for an operator-provisioned wizard: the actor is tombstoned and the
+   * transport keeps serving it.
+   *
+   * Deliberately VIEW-ONLY and conservative:
+   *
+   *  - It reads the tombstone cell already in this gateway's derived view and
+   *    never warms or fetches. This is a hot path on every session-bearer call;
+   *    a cross-DO hop per request is not acceptable, and the revocation commits
+   *    in the same authority cluster that hosts the session cell — a scope this
+   *    gateway subscribed to when it minted the session — so the tombstone
+   *    arrives by ordinary fanout.
+   *  - Absence of the cell is NOT a refusal. A gateway that has never seen the
+   *    actor's cluster cannot distinguish "not deactivated" from "not pulled",
+   *    and failing closed there would break every cold-view session.
+   *
+   * Propagation is therefore eventual (fanout latency — seconds, not instant),
+   * and the key check below remains the second, authoritative gate: it reads
+   * the verifier from the owning authority and catches a revoked credential
+   * even when the tombstone has not landed yet.
+   */
+  private assertActorNotRetired(actor: string): void {
+    const cell = this.ensureView().get(cellKey("property_cell", actor, "deactivated_at"))?.value as
+      | { value?: unknown }
+      | undefined;
+    if (cell && "value" in cell && cell.value != null) {
+      throw new ClientAuthError(
+        "identity deactivated",
+        { reason: "identity_deactivated", actor },
+        "E_PERM",
+        403
+      );
+    }
   }
 
   /** A session minted from a long-lived key remains subordinate to that key.

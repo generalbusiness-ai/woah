@@ -807,6 +807,17 @@ carries `provision_id` as the reverse pointer.
 Distinct `provision_id`s under one account mint distinct agents, each with its
 own unit of quota.
 
+**The ledger is a data map, not an object namespace.** A `provision_id` is
+operator-chosen text, so it may name a member of `Object.prototype`
+(`constructor`, `toString`, and — outside the wire grammar but reachable by any
+wizard calling the verb directly — `__proto__`). Every read of the ledger, in
+the primitive and in the gateway's prefetch alike, is an **own-key** read, and
+the map is constructed so that storing such a key defines an own property
+rather than reaching an inherited accessor. Without this, a lookup for
+`constructor` resolves the `Object` constructor and the caller dereferences a
+function as an agent id. The primitive additionally bounds `provision_id` to
+1..128 characters, since it becomes a durable key on the account cell.
+
 ### AP11.5 The signed operator route
 
 `POST /net-operator/wizard/provision`, alongside
@@ -843,6 +854,24 @@ is bound to, so it cannot exist before the agent does; the operator therefore:
 Every step is independently idempotent and the replayable secret never crosses
 the wire. `npm run provision:net-wizard` drives all three.
 
+**The pointer is validated fail-closed before it is stored.** Retirement
+follows `agent.api_key_id` and nothing else, so a pointer naming a key that is
+not this agent's would leave the agent's real credential alive through
+retirement — a retired wizard that still authenticates. A supplied
+`api_key_id` is accepted only when all of the following hold, and is otherwise
+refused `E_INVARG` naming the axis that mismatched:
+
+- it parses as a routed (self-routing) api-key id;
+- the id is bound to this agent;
+- its immutable authority root equals the agent's anchor root (what
+  cold-gateway routing resolves the credential through);
+- a verifier record for it exists in the agent's own `api_keys` map — the
+  actor-owned store the credential-ensure route writes; routed ids never live
+  in the legacy catalog `$system.api_keys` — with `record.actor` equal to the
+  agent and `revoked_at` unset.
+
+Requiring the record is safe because step 2 installs it before step 3 runs.
+
 ### AP11.7 Revocation
 
 `demote_agent_from_programmer` clears the `programmer` flag and the surface but
@@ -865,6 +894,42 @@ cluster. Its audit goes through the AU1 sink for the same reason as AP11.8:
 before that, `$system.wizard_actions` made every revocation fail
 `E_CATALOG_MUTATION`, which left account owners with no way to retire an agent
 on a Net world at all.
+
+**Revocation is idempotent (normative).** `account.agent_count` is a QUOTA
+counter, not an event count. Revoking an already-deactivated agent returns
+success and:
+
+- does **not** decrement `agent_count` again — a second decrement would drop
+  the count below the number of live agents and let the account mint past its
+  quota;
+- does **not** re-stamp `deactivated_at`, so the retirement time is stable;
+- does **not** mint a duplicate audit record for an event that did not happen.
+
+Programmer-state stripping and api-key revocation still run on the repeat, both
+being idempotent themselves: that makes a repeat call a *repair* for an actor
+tombstoned by another path (`$system:deactivate_actor` tombstones without
+revoking). The same rule holds for `demote_agent_from_programmer`: the shared
+transition moves the flag and `programmer_agent_count` only on a real
+transition, so repeats are no-ops.
+
+**Retirement reaches live credentials.** Eligibility is otherwise checked only
+when a session is MINTED, and both client credential classes evade that: a
+session bearer presents a session id and never re-presents its key, and an
+apikey holder pairs a long-lived key with an already-minted session id. Note
+`revoke_agent` revokes only the key named by `agent.api_key_id`, so any second
+credential on that actor survives retirement — a retired wizard was verified to
+commit a wizard-only `set_quota` turn this way. Both classes therefore refuse
+`E_PERM identity_deactivated` when the resolved actor's `deactivated_at` cell is
+present in the serving gateway's view with a non-null value. This check is deliberately **view-only and conservative**: it never warms
+or fetches (it is on every session-bearer request), and an absent cell is not a
+refusal, because a gateway that has not pulled the actor's cluster cannot
+distinguish "not deactivated" from "not pulled". Propagation is therefore
+**eventual** — the tombstone commits in the same authority cluster that hosts
+the session cell, a scope the serving gateway subscribed to when it minted the
+session, so it arrives by ordinary fanout in seconds, not instantly. The
+api-key check remains the second, authoritative gate: it reads the verifier
+from the owning authority and catches a revoked credential even before the
+tombstone lands.
 
 Re-running provisioning against a deactivated agent's `provision_id` refuses;
 a replacement uses a new `provision_id`.
