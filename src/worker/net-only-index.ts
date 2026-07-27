@@ -11,7 +11,7 @@ import { wooError } from "../core/types";
 import { cellKey, type CellTransfer } from "../net/cells";
 import { handleAdmin, type AdminEnv } from "./admin";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
-import { parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
+import { netGatewayShardForKey, parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 
 export { NetGatewayDO } from "./net/gateway-do";
@@ -307,8 +307,39 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
   } catch (error) {
     return json({ error: { code: "E_NOSESSION", message: `net-operator requires a signed internal request: ${errorMessage(error)}` } }, 401);
   }
-  if (request.method !== "POST" || url.pathname !== "/net-operator/credentials/ensure") {
-    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure" } }, 404);
+  if (request.method !== "POST") {
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure or /net-operator/wizard/provision" } }, 404);
+  }
+  // AP7 wizard provisioning runs a TURN, so it is addressed to a gateway shard
+  // rather than a scope authority. The edge still only forwards, freshly
+  // signed, exactly the routes on this allow-list.
+  if (url.pathname === "/net-operator/wizard/provision") {
+    try {
+      const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);
+      const text = new TextDecoder().decode(bytes);
+      const body = JSON.parse(text) as { human?: unknown };
+      if (typeof body.human !== "string" || !body.human) {
+        return json({ error: { code: "E_INVARG", message: "wizard provision requires human" } }, 400);
+      }
+      // Route by the human id so repeated operator runs for one account land
+      // on one shard and reuse its warm view (the same keying the client path
+      // uses for a session's actor).
+      const shard = netGatewayShardForKey(
+        `operator-provision:${body.human}`,
+        parseNetGatewayShardCount(env.NET_API_GATEWAY_SHARDS)
+      );
+      const stub = resolveNetDestination(env, `gateway:${shard}`);
+      return await stub.fetch(await signInternalRequest(env, new Request("https://do/net/provision-wizard", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: text
+      })));
+    } catch (error) {
+      return publicError(error);
+    }
+  }
+  if (url.pathname !== "/net-operator/credentials/ensure") {
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure or /net-operator/wizard/provision" } }, 404);
   }
   try {
     const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);

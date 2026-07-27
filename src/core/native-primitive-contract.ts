@@ -334,6 +334,71 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     },
     note: "Human self-service demote: the inverse of promote. Clears the agent's programmer flag through the lineage seam, removes the programmer surface feature, and decrements the account programmer count — all recorded, co-resident. Audit is the commit record; no catalog $system write on Net."
   },
+  set_quota: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "set_quota",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["actor wizard authority", "account.<kind> prior value"],
+    writes: ["account.agent_quota or account.programmer_grant_quota"],
+    emits: ["cell_write"],
+    open_seed: {
+      object_property_names: ["agent_quota", "programmer_grant_quota"]
+    },
+    note: "Wizard-only per-account quota mutation. The only durable effect is one property write on the (cluster-resident) account named by argument 0; the audit is the accepted commit record, with the $system.wizard_actions catalog write suppressed by the profile sink on Net (audit.md AU1). Tracked because a deployed world with no grantable quota cannot mint programmer agents at all — the account owner's self-service promote consumes exactly this counter."
+  },
+  human_provision_wizard_agent: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "human_provision_wizard_agent",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "actor wizard authority",
+      "human lineage and ancestry",
+      "human.account and account binding",
+      "account.deactivated_at",
+      "account.operator_provisioned_agents",
+      "account.agent_quota / agent_count",
+      "account.programmer_grant_quota / programmer_agent_count",
+      "account.actors",
+      "recorded agent lineage, ownership, provision_id, api_key_id, deactivated_at",
+      "$system.programmer_surface",
+      "agent.features and features_version",
+      "agent ancestry (surface composability)"
+    ],
+    writes: [
+      "account.agent_quota",
+      "account.programmer_grant_quota",
+      "account.agent_count",
+      "account.programmer_agent_count",
+      "account.actors",
+      "account.operator_provisioned_agents",
+      "new agent lineage (creation, then programmer + wizard flags via the object_lineage seam)",
+      "agent.name / purpose / created_via / provision_id / api_key_id",
+      "agent.features",
+      "agent.features_version"
+    ],
+    emits: ["object_create", "cell_write"],
+    open_seed: {
+      object_property_names: [
+        "account",
+        "actors",
+        "agent_quota",
+        "agent_count",
+        "programmer_grant_quota",
+        "programmer_agent_count",
+        "operator_provisioned_agents",
+        "provision_id",
+        "api_key_id",
+        "features",
+        "features_version"
+      ],
+      catalog_property_names: ["programmer_surface"]
+    },
+    note: "AP7 operator provisioning. Reached only through the internal-signed /net-operator/wizard/provision route and gated on wizard authority. Mints no credential material — the api-key id is a pointer whose verifier arrives through the separate signed credential-ensure route — so the primitive is fully deterministic apart from the counter-allocated object id and creation timestamps, exactly like every other recorded create. Every mutation is a recorded lineage/property write co-resident in the human's authority cluster; the audit is the accepted commit record, with the $system.wizard_actions catalog write suppressed by the profile sink on Net (audit.md AU1)."
+  },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "catalog_registry_install",

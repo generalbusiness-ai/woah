@@ -328,6 +328,23 @@ type TurnRequest = {
   counters?: PlanTurnInput["counters"];
 };
 
+/** /net/provision-wizard body (AP7; see operatorProvisionWizard). The
+ * internal-signed operator op that mints a usable wizard on a deployed world.
+ * Carries no credential material: the api-key id is a pointer whose verifier
+ * is installed by the separate /net-operator/credentials/ensure route. */
+type OperatorProvisionWizardRequest = {
+  /** The existing human actor whose account anchors the new agent. */
+  human: string;
+  /** Opaque operator-chosen idempotency token, durable on the operator machine
+   * before the first call so a lost reply replays exactly. */
+  provision_id: string;
+  name?: string;
+  purpose?: string;
+  /** Routed api-key id the operator generated locally; recorded on the agent so
+   * rotate/revoke find the credential the operator holds. */
+  api_key_id?: string;
+};
+
 /** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
  * the scope's outbox drain delivers. */
 type PlanScheduledRequest = {
@@ -1041,6 +1058,9 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/provision-wizard") {
+        return await this.operatorProvisionWizard((await request.json()) as OperatorProvisionWizardRequest);
       }
       if (request.method === "POST" && url.pathname === "/net/plan-scheduled") {
         return json(await this.planScheduled((await request.json()) as PlanScheduledRequest));
@@ -2367,6 +2387,146 @@ export class NetGatewayDO {
       catalog_epoch: body.catalog_epoch,
       idempotency_key: key
     });
+  }
+
+  /**
+   * /net/provision-wizard — AP7 signed-operator wizard provisioning.
+   *
+   * Why this is a TURN and not a cell write like the repair family: every other
+   * signed operator op repairs state whose correct value is derivable outside
+   * the world (a definition page, a contents row, a seeded map). Provisioning
+   * an actor is not derivable — it consumes quota, advances counters, appends
+   * to `account.actors`, anchors an object, and composes the programmer
+   * surface. Writing those cells operator-side would fork the world's own
+   * accounting into a second implementation. Running the world's primitive
+   * through the ordinary planner keeps one implementation and makes the
+   * accepted transcript the audit record (AU1), exactly like the human's own
+   * self-service promote.
+   *
+   * The whole sequence is ONE turn, so it is atomic: a failure at any step
+   * commits nothing. Re-running with the same `provision_id` converges.
+   *
+   * The actor is the catalog wizard `$wiz` — usable here precisely because this
+   * is not a client turn: the client path refuses a `$`-anchored planning scope
+   * (`unplannable_scope`), which is the lock this op exists to break. The turn
+   * plans and commits at the HUMAN's authority cluster, where the account, the
+   * new agent, and its api-key record all live.
+   */
+  private async operatorProvisionWizard(body: OperatorProvisionWizardRequest): Promise<Response> {
+    const human = typeof body.human === "string" ? body.human.trim() : "";
+    const provisionId = typeof body.provision_id === "string" ? body.provision_id.trim() : "";
+    if (!human || !provisionId) {
+      return json({ error: { code: "E_INVARG", message: "provision requires human and provision_id" } }, 400);
+    }
+    if (!isConcreteRuntimeObjectId(human) || human.startsWith("$")) {
+      // A `$`-prefixed target is catalog substrate: its cells live in the
+      // catalog scope, so the turn could not write an account there anyway.
+      return json({ error: { code: "E_INVARG", message: "provision human must be a concrete non-catalog object id" } }, 400);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(provisionId)) {
+      return json({ error: { code: "E_INVARG", message: "provision_id must be 1..128 chars of [A-Za-z0-9._:-]" } }, 400);
+    }
+    const apiKeyId = typeof body.api_key_id === "string" ? body.api_key_id.trim() : "";
+    const epoch = (await this.catalogIdentity()).epoch;
+    const planningScope = await this.clientPlanningScope(human, human);
+    if (!planningScope.startsWith("cluster:")) {
+      return json({
+        error: {
+          code: "E_INVARG",
+          message: "provision human does not classify to an authority cluster",
+          detail: { human, scope: planningScope }
+        }
+      }, 400);
+    }
+    await this.warmScopes([CATALOG_SCOPE, { scope: planningScope, objects: [human] }], "net_provision_wizard_pull_miss_failed");
+    // Warm the account and, if this provision_id already minted an agent, that
+    // agent too. A property read of an unwarmed instance silently returns the
+    // CLASS default (quota 0, provision_id null) rather than an error the
+    // repair loop could act on, and here that would mean either a spurious
+    // refusal or a duplicate identity. The declared argSpec prefetch covers the
+    // same ground for any other caller; this is the explicit belt.
+    const account = this.netObjectProperty(human, "account");
+    if (typeof account === "string" && account) {
+      await this.pullTargeted(planningScope, `scope:${planningScope}`, [account]).catch((err) => {
+        this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
+      });
+      const ledger = this.netObjectProperty(account, "operator_provisioned_agents");
+      const recorded = ledger && typeof ledger === "object" && !Array.isArray(ledger)
+        ? (ledger as Record<string, unknown>)[provisionId]
+        : undefined;
+      if (typeof recorded === "string" && recorded) {
+        await this.pullTargeted(planningScope, `scope:${planningScope}`, [recorded]).catch((err) => {
+          this.metric({ kind: "net_provision_wizard_prefetch", scope: planningScope, status: "error", error: String(err) });
+        });
+      }
+    }
+    // Each invocation is its OWN turn. The durable idempotency handle is the
+    // operator's `provision_id`, enforced inside the primitive: a re-run
+    // converges (creates nothing, grants nothing, returns the same agent). A
+    // stable turn key would instead replay the first commit's cached reply,
+    // which carries no result value — so a retry after a lost reply could not
+    // learn the agent id it needs for the credential step. Two concurrent runs
+    // are safe: the second loses the read-version check, repairs, replans
+    // against the committed state, and reports `created: false`.
+    const key = `operator-provision-wizard:${human}:${provisionId}:${crypto.randomUUID()}`;
+    // The acting principal is the OWNER of the provisioning primitive, read
+    // from the resolved verb page — the same data-driven derivation the guest
+    // door uses for `maintenance_principal`. The gateway therefore never names
+    // `$wiz`, and a world whose primitive is absent refuses here with a legible
+    // message instead of an E_VERBNF deep inside planning.
+    const page = this.callVerbPage(this.ensureView(), {
+      kind: "woo.turn_call.shadow.v1",
+      id: key,
+      route: "direct",
+      scope: human,
+      actor: human,
+      target: human,
+      verb: "provision_wizard_agent",
+      args: []
+    });
+    const principal = typeof page?.owner === "string" && page.owner ? page.owner : null;
+    if (!principal) {
+      return json({
+        error: {
+          code: "E_VERBNF",
+          message: "this world does not install the provision_wizard_agent primitive",
+          detail: { human, verb: "provision_wizard_agent" }
+        }
+      }, 409);
+    }
+    const result = await this.turn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: key,
+        route: "direct",
+        scope: human,
+        actor: principal,
+        target: human,
+        verb: "provision_wizard_agent",
+        args: [
+          provisionId,
+          {
+            ...(typeof body.name === "string" && body.name ? { name: body.name } : {}),
+            ...(typeof body.purpose === "string" ? { purpose: body.purpose } : {}),
+            ...(apiKeyId ? { api_key_id: apiKeyId } : {})
+          }
+        ] as PlanTurnInput["call"]["args"]
+      },
+      planningScope,
+      catalog_epoch: epoch,
+      idempotency_key: key
+    });
+    if (result.reply.status !== "accepted" || result.error !== undefined) {
+      this.metric({ kind: "net_provision_wizard", scope: planningScope, status: "error", error: JSON.stringify(result.error ?? result.reply) });
+      return json({
+        ok: false,
+        scope: planningScope,
+        reply: result.reply,
+        ...(result.error !== undefined ? { error: result.error } : {})
+      }, 409);
+    }
+    this.metric({ kind: "net_provision_wizard", scope: planningScope, status: "ok" });
+    return json({ ok: true, scope: planningScope, catalog_epoch: epoch, result: result.result ?? null, reply: result.reply });
   }
 
   /**

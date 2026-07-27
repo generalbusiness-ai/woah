@@ -14,14 +14,14 @@
     "$space": 4
   },
   "src/core/bootstrap.ts": {
-    "$account": 19,
+    "$account": 20,
     "$actor": 15,
-    "$agent": 12,
+    "$agent": 13,
     "$ambiguous_match": 2,
     "$block": 1,
     "$failed_match": 2,
     "$guest": 7,
-    "$human": 12,
+    "$human": 13,
     "$match": 2,
     "$player": 27,
     "$room": 2,
@@ -68,7 +68,7 @@
   "src/core/world.ts": {
     "$account": 4,
     "$actor": 26,
-    "$agent": 16,
+    "$agent": 17,
     "$ambiguous_match": 2,
     "$block": 3,
     "$builder": 3,
