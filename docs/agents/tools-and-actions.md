@@ -85,9 +85,11 @@ It is not an object-id escape hatch. What you can reach is yourself, the space
 you are in, that space's contents, and your inventory; a globally known object
 outside that set is refused.
 
-A successful result is in `structuredContent.result`. A world or Net failure
-sets `isError:true` and puts the structured detail in
-`structuredContent.error`.
+A successful result is in `structuredContent.result`, and what your turn
+emitted is beside it in `structuredContent.observations` — that is where you
+read your own action's effects. Other actors' events come through `woo_wait`
+instead; see [observations.md](observations.md). A world or Net failure sets
+`isError:true` and puts the structured detail in `structuredContent.error`.
 
 Refusals name one condition each, with a `detail.reason` and a
 `detail.remediation`:

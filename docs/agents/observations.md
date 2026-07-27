@@ -41,10 +41,32 @@ event that lost your queue lost your descriptor baseline.
 
 ## Calls and peer events
 
-`woo_call` returns the verb's value (or structured error), but Net does not
-duplicate emitted observations into that call result. Pull peer and room
-events separately through `woo_wait`. The gateway suppresses a submitter's own
-committed fanout echo, so an agent does not see its own action twice.
+There are two seats, and each event uses exactly one of them.
+
+**Your own actions arrive on the reply.** A verb call's result carries
+`structuredContent.observations` — what your turn emitted — alongside
+`structuredContent.result`, the verb's return value:
+
+```json
+{
+  "result": {"room": "the_deck", "from": "the_chatroom", "exit": "out"},
+  "observations": [
+    {"type": "text", "target": "guest_2",
+     "text": "You slide the glass door open and step out onto the deck."}
+  ]
+}
+```
+
+**Everyone else's actions arrive through `woo_wait`.** Your own emissions are
+deliberately kept out of your queue, so nothing is delivered twice: if you read
+both seats you see each event once.
+
+An agent that ignores the reply's `observations` will act and never learn what
+its action did — you moved, and the line describing your arrival was on the
+reply you discarded.
+
+Protocol controls (`woo_wait`, `woo_list_reachable_tools`) carry no
+`observations` sibling; only verb invocations do.
 
 After `notifications/tools/list_changed`, re-run standard `tools/list` (or
 `woo_list_reachable_tools`): the actor's presence or containment context
@@ -73,8 +95,8 @@ or protocol-level replay helper; those remain explicit parity decisions under
 ## A simple agent loop
 
 ```
-woo_call("the_chatroom", "say", ["hello"])
-woo_wait(timeout_ms: 1000, limit: 50)
+woo_call("the_chatroom", "say", ["hello"])   → read structuredContent.observations
+woo_wait(timeout_ms: 1000, limit: 50)        → read what everyone else did
 ```
 
 For a passive live observer, repeat waits with a timeout at or below 25

@@ -4948,6 +4948,7 @@ export class NetGatewayDO {
         reply?: { status?: string; reason?: string; detail?: unknown };
         result?: unknown;
         error?: unknown;
+        observations?: unknown;
         [key: string]: unknown;
       };
       const shape = (failure: unknown): Response =>
@@ -4955,7 +4956,7 @@ export class NetGatewayDO {
       if (!turnResponse.ok) return shape(turn.error ?? turn);
       if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
       if (turn.error !== undefined) return shape(turn.error);
-      return this.mcpResult(id, turn.result ?? null);
+      return this.mcpResult(id, turn.result ?? null, this.mcpOwnTurnObservations(turn.observations, actor));
     } catch (err) {
       // Taxonomy throws are tool failures on this surface. The JSON-RPC
       // request must receive a tool envelope, never an HTTP transport error.
@@ -5004,16 +5005,64 @@ export class NetGatewayDO {
     };
   }
 
+  /**
+   * The submitting session's seat for its OWN turn's observations.
+   *
+   * The gateway has always held this contract for the socket transports —
+   * `recentClientTurns` skips the submitter's sockets on the fanout precisely
+   * because "the submitting session receives its turn's observations on the
+   * turn reply". `/net-api/turn` honours it; the MCP envelope was the one
+   * transport that read `result`/`error` off that reply and dropped
+   * `observations` on the floor. Composed with the queue's echo dedupe (which
+   * stays exactly as it is, so nothing arrives twice), an MCP actor therefore
+   * never saw what its own action did — guest_2 walked out of the room and
+   * never read its own "You slide the glass door open…" line.
+   *
+   * Delivering them on the reply rather than through `woo_wait` is the
+   * deliberate choice: it pairs cause with effect in one round trip, which is
+   * what a turn-based agent needs, and it keeps `woo_wait` meaning exactly
+   * "what OTHER actors did".
+   *
+   * Directed lines addressed to somebody else are dropped. This mirrors the
+   * committed-fanout rule (`typeof obs.to !== "string" || obs.to === actor`)
+   * rather than inventing a second audience vocabulary; when the shared
+   * `observationReachesActor` predicate lands it should replace this
+   * expression outright.
+   */
+  private mcpOwnTurnObservations(observations: unknown, actor: string): unknown[] {
+    if (!Array.isArray(observations)) return [];
+    return observations.filter((observation) => {
+      const to = (observation as { to?: unknown } | null)?.to;
+      return typeof to !== "string" || to === actor;
+    });
+  }
+
   /** The scenario's client contract: payloads ride
    * `result.structuredContent.result`; errors set `isError` with the
-   * detail in structuredContent (unwrap() throws on it). */
-  private mcpResult(id: number | string, payload: unknown): Response {
+   * detail in structuredContent (unwrap() throws on it).
+   *
+   * `observations` is a SIBLING of `result`, never nested inside it: the
+   * payload is the verb's own return value and may be any JSON — a scalar,
+   * null — so there is nowhere inside it to put anything. Existing consumers
+   * read `structuredContent.result` and are unaffected. A second content
+   * block carries the same rows for text-rendering clients, which would
+   * otherwise never see them; the first block keeps its exact former shape.
+   *
+   * The field is present only for VERB INVOCATIONS — the protocol controls
+   * pass nothing, because a `woo_wait` reply carrying both its drained queue
+   * and an always-empty `observations` sibling would be actively misleading. */
+  private mcpResult(id: number | string, payload: unknown, observations?: unknown[]): Response {
     return json({
       jsonrpc: "2.0",
       id,
       result: {
-        content: [{ type: "text", text: JSON.stringify(payload) }],
-        structuredContent: { result: payload },
+        content: [
+          { type: "text", text: JSON.stringify(payload) },
+          ...(observations && observations.length > 0
+            ? [{ type: "text", text: JSON.stringify({ observations }) }]
+            : [])
+        ],
+        structuredContent: { result: payload, ...(observations ? { observations } : {}) },
         isError: false
       }
     });

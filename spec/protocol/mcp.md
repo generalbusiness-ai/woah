@@ -299,7 +299,7 @@ Successful `tools/call` results use:
 ```json
 {
   "content": [{"type": "text", "text": "<JSON result>"}],
-  "structuredContent": {"result": null},
+  "structuredContent": {"result": null, "observations": []},
   "isError": false
 }
 ```
@@ -309,9 +309,35 @@ World or Net failures use the same MCP tool-result envelope with
 an unknown tool name use a JSON-RPC error object. A missing, expired, or
 malformed MCP session is rejected before discovery or invocation.
 
-The gateway records the submitting turn echo id and suppresses the actor's own
-committed echo from `woo_wait`, so a call result and the observation queue do
-not duplicate the same action.
+### M4.1 The submitter's own observations
+
+**The reply is the seat for the submitting session's own turn observations.**
+A verb invocation's accepted reply carries `structuredContent.observations`:
+the turn's transcript observations, minus any line directed at a different
+actor. The stable `woo_*` protocol controls carry no such field — a `woo_wait`
+reply holding both its drained queue and an always-empty sibling would be
+misleading.
+
+This is not new policy; it is the rule the transport layer already assumed. The
+gateway records the submitting turn echo id and suppresses the actor's own
+committed echo from `woo_wait` *because* the reply is supposed to carry it.
+Honouring only one half — the suppression — left an MCP actor unable to observe
+its own action at all: it could move between rooms and never read its own
+arrival line, while everyone else did.
+
+The field is a **sibling of `result`, never nested inside it**: `result` is the
+verb's own return value and may be any JSON, including a scalar or `null`, so
+it has no room for transport metadata. A client that reads only text content
+sees the same rows in a second content block; the first block keeps the
+payload shape it has always had.
+
+Exactly one seat. `observations` on the reply and the queue's echo dedupe are
+two halves of one rule, so a client that reads both never receives an event
+twice, and delivery to every other session is unaffected.
+
+A detected idempotent replay (§CO2.5) commits nothing this round and therefore
+carries no observations. MCP mints a fresh idempotency key per `tools/call`, so
+that case is unreachable on this transport.
 
 ## M5. Observation queue
 

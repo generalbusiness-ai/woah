@@ -333,6 +333,54 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     expect(String(splitError.detail?.remediation), JSON.stringify(splitError).slice(0, 500)).toContain("the_outline__enter");
     expect(splitError.detail?.target).toBe("the_outline");
 
+    // ---- The submitter's own turn observations ---------------------------
+    // The gateway's echo dedupe deliberately keeps a session's own emissions
+    // out of its woo_wait queue, because "the submitting session receives its
+    // turn's observations on the turn reply". /net-api/turn honours that; the
+    // MCP envelope used to read result/error off the same reply and drop
+    // `observations`, so the two halves composed into an actor that could act
+    // and never learn what its action did.
+    const spoken = await call(prog.session, "woo_call", { object: "the_chatroom", verb: "say", args: ["own turn echo probe"] });
+    await settleAll();
+    expect(spoken.result?.isError, JSON.stringify(spoken).slice(0, 400)).not.toBe(true);
+    const ownObservations: Array<Record<string, any>> = spoken.result?.structuredContent?.observations ?? [];
+    expect(
+      ownObservations.some((obs) => obs?.type === "said" && String(obs.text).includes("own turn echo probe")),
+      `the submitter did not receive its own turn's observations: ${JSON.stringify(spoken).slice(0, 600)}`
+    ).toBe(true);
+    // `result` keeps its exact former meaning — the verb's return value — and
+    // `observations` is a sibling, never nested inside it. Existing consumers
+    // (scripts/smoke/session.ts unwrap()) read `result` and are unaffected.
+    expect(spoken.result?.structuredContent).toHaveProperty("result");
+    // A text-rendering client that never reads structuredContent still sees
+    // them: the payload block keeps its shape, the rows ride a second block.
+    expect(spoken.result?.content?.[0]?.text).toBe(JSON.stringify(spoken.result?.structuredContent?.result));
+    expect(String(spoken.result?.content?.[1]?.text)).toContain("own turn echo probe");
+
+    // ...and they are NOT also delivered through the submitter's own queue.
+    // Exactly one seat, so an agent that reads both never sees it twice.
+    const ownEcho = await call(prog.session, "woo_wait", { timeout_ms: 0 });
+    const ownEchoed: Array<Record<string, any>> = ownEcho.result?.structuredContent?.result?.observations ?? [];
+    expect(
+      ownEchoed.some((obs) => String(obs?.text ?? "").includes("own turn echo probe")),
+      `the submitter's own turn leaked into its wait queue: ${JSON.stringify(ownEchoed).slice(0, 400)}`
+    ).toBe(false);
+
+    // Delivery to OTHER actors is untouched: the room broadcast still reaches
+    // the bystander's queue. (A room `said` line, deliberately not a directed
+    // one — directed-text audience is being repaired on another branch.)
+    const bystander = await call(plain.session, "woo_wait", { timeout_ms: 0 });
+    const heard: Array<Record<string, any>> = bystander.result?.structuredContent?.result?.observations ?? [];
+    expect(
+      heard.some((obs) => obs?.type === "said" && String(obs.text).includes("own turn echo probe")),
+      `a bystander in the room stopped hearing the broadcast: ${JSON.stringify(heard).slice(0, 400)}`
+    ).toBe(true);
+
+    // The protocol controls carry no `observations` sibling — a woo_wait reply
+    // holding both its drained queue and an always-empty sibling would be
+    // actively misleading.
+    expect(ownEcho.result?.structuredContent).not.toHaveProperty("observations");
+
     // ---- Fix 3: the observation gap marker -------------------------------
     // A session whose state was installed by `initialize` and never lost has
     // proven continuity: no false gap on the first wait.
