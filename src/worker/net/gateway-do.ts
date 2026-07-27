@@ -5224,11 +5224,13 @@ export class NetGatewayDO {
    * what a turn-based agent needs, and it keeps `woo_wait` meaning exactly
    * "what OTHER actors did".
    *
-   * Directed lines addressed to somebody else are dropped. This mirrors the
-   * committed-fanout rule (`typeof obs.to !== "string" || obs.to === actor`)
-   * rather than inventing a second audience vocabulary; when the shared
-   * `observationReachesActor` predicate lands it should replace this
-   * expression outright.
+   * Directed lines addressed to somebody else are dropped. This deliberately
+   * does NOT reuse `observationReachesActor` (src/core/types.ts): that
+   * predicate answers the FANOUT question "may this actor hear this?", and for
+   * `text` it sets `from: null` — the sender gets no echo. This seat answers a
+   * different question, "what did my own turn emit?": the submitter's outbound
+   * tell lines belong in the reply even though delivery would never echo them.
+   * The only exclusion is a row explicitly `to`-addressed to a different actor.
    */
   private mcpOwnTurnObservations(observations: unknown, actor: string): unknown[] {
     if (!Array.isArray(observations)) return [];
