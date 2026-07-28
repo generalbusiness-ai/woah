@@ -68,17 +68,29 @@ export function mergeSeedMapProperty(
   const base: Record<string, unknown> = isPlainMap(current) ? current : {};
   const merged: Record<string, unknown> = { ...base };
   let changed = false;
-  for (const [key, value] of Object.entries(seeded)) {
-    if (!(key in merged)) {
+  // Own-key reads and own-property writes throughout (values.md V6). `key in
+  // merged` is an INHERITED test — `"constructor" in {}` is true — so a
+  // manifest key named after an Object.prototype member would be treated as
+  // already present and never seeded, and `merged[key] = value` would drop a
+  // `__proto__` entry outright.
+  const put = (key: string, value: unknown): void => {
+    if (key === "__proto__") {
+      Object.defineProperty(merged, key, { value, writable: true, enumerable: true, configurable: true });
+    } else {
       merged[key] = value;
+    }
+  };
+  for (const [key, value] of Object.entries(seeded)) {
+    if (!Object.hasOwn(merged, key)) {
+      put(key, value);
       changed = true;
       continue;
     }
     const storedKey = stableValueKey(merged[key]);
     if (storedKey === stableValueKey(value)) continue;
-    const priors = supersedes?.[key];
+    const priors = Object.hasOwn(supersedes ?? {}, key) ? supersedes?.[key] : undefined;
     if (priors?.some((prior) => stableValueKey(prior) === storedKey)) {
-      merged[key] = value;
+      put(key, value);
       changed = true;
     }
   }

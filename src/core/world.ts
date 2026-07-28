@@ -2014,7 +2014,14 @@ export class WooWorld {
         }
         const next = this.scrubTombstoneRefs(entry);
         if (!valuesEqual(entry, next)) changed = true;
-        out[key] = next;
+        // Own-property definition, not [[Set]] (values.md V6): a `__proto__`
+        // entry would otherwise vanish from any map that survives a tombstone
+        // scrub, turning a GC pass into silent data loss.
+        if (key === "__proto__") {
+          Object.defineProperty(out, key, { value: next, writable: true, enumerable: true, configurable: true });
+        } else {
+          out[key] = next;
+        }
       }
       return changed ? out as WooValue : value;
     }
@@ -4093,7 +4100,12 @@ export class WooWorld {
       // gap the audit trail surfaces, never a guess.
       const derived = deriveCustomerAttribution(this.attributionSource(), id);
       if (derived !== null) this.setCustomerOf(id, { ...derived, bound_at: Date.now() });
-      this.recordWizardAction(caller, "actor_provisioned", { actor: id, class: classRef, owner });
+      // Routed through the profile audit adapter (AU1), not recordWizardAction
+      // directly: `$system` is catalog-scoped on Net, so appending
+      // wizard_actions here would make every provisioning turn an
+      // E_CATALOG_MUTATION. Local/SQLite profiles still materialize the entry
+      // through the default sink; on Net the accepted transcript is the record.
+      this.recordProvisioningAudit(caller, "actor_provisioned", { actor: id, class: classRef, owner });
       return { actor: id };
     }
 
@@ -4127,8 +4139,321 @@ export class WooWorld {
       this.setProp(account, "actors", [...this.accountActors(account), actor]);
       this.setProp(account, "agent_count", count + 1);
       if (programmer) this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
-      this.recordWizardAction(human, "actor_provisioned", { actor, owner: human, account, surface: "create_agent" });
+      // Same AU1 seam as provisionActorInternal above: the catalog `$system`
+      // write is suppressed on Net and materialized everywhere else.
+      this.recordProvisioningAudit(human, "actor_provisioned", { actor, owner: human, account, surface: "create_agent" });
       return { actor_id: actor, api_key: `apikey:${key.id}:${key.secret}`, api_key_id: key.id, api_key_secret: key.secret, label: key.label, created_at: key.created_at };
+    }
+
+    /**
+     * The account map that makes operator wizard provisioning idempotent:
+     * `provision_id` (an opaque operator-chosen token) -> the agent minted for
+     * it. Bounded by the account's own agent quota, read from the account the
+     * turn already touches, and never enumerated globally.
+     */
+    private operatorProvisionedAgents(account: ObjRef): Record<string, ObjRef> {
+      const raw = this.propOrNull(account, "operator_provisioned_agents");
+      // NULL-PROTOTYPE on purpose. A provision_id is operator-chosen text, so
+      // it can be `constructor`, `toString`, or `__proto__`. On an ordinary
+      // object `map[id]` would then resolve an INHERITED member — a lookup for
+      // `constructor` returns `function Object()`, which the caller treats as a
+      // recorded agent and dereferences. A null prototype has nothing to
+      // inherit, so every read is an own-key read and every write (including
+      // `__proto__`) defines an own property instead of hitting the accessor.
+      const map: Record<string, ObjRef> = Object.create(null) as Record<string, ObjRef>;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return map;
+      // Object.entries is own-enumerable-keys only, so the stored cell cannot
+      // smuggle inherited members in either.
+      for (const [key, value] of Object.entries(raw as Record<string, WooValue>)) {
+        if (typeof value === "string" && value) map[key] = value;
+      }
+      return map;
+    }
+
+    /**
+     * When was this agent's account quota slot returned, or null if it is still
+     * counted against `account.agent_count`?
+     *
+     * `deactivated_at` cannot answer this. It is an AUTHENTICATION fact — "this
+     * identity may not sign in" — and it is REVERSIBLE
+     * (`$system:reactivate_actor` clears it). Retirement is a different,
+     * PERMANENT fact that happens to also set the auth tombstone. Reading one
+     * as the other breaks both directions:
+     *
+     *  - reading `deactivated_at` as "slot returned" leaks the slot forever
+     *    when `$system:deactivate_actor` tombstoned the agent first — that path
+     *    never touches the counter, so nothing ever returns it;
+     *  - reading it as "slot NOT returned" double-returns on a repeat revoke,
+     *    letting the account mint past its quota.
+     *
+     * `retired_at` is the explicit marker for the permanent fact.
+     *
+     * The second branch is a BOUNDED inference for pre-marker data only. Worlds
+     * revoked before `retired_at` existed carry the old shape — auth tombstone
+     * set AND the agent's current key already revoked — which
+     * `$system:deactivate_actor` never produces (it tombstones without touching
+     * keys). Inferring only from that exact conjunction keeps the unsafe
+     * direction (double-return) closed; the residual false positive is an
+     * operator who deactivated and hand-revoked the key, which errs toward
+     * leaving the slot counted, the safe direction.
+     */
+    private agentSlotReturnedAt(agent: ObjRef): number | null {
+      const retiredAt = this.propOrNull(agent, "retired_at");
+      if (typeof retiredAt === "number") return retiredAt;
+      const deactivatedAt = this.propOrNull(agent, "deactivated_at");
+      if (typeof deactivatedAt !== "number") return null;
+      const keyId = this.propOrNull(agent, "api_key_id");
+      if (typeof keyId !== "string" || !keyId) return null;
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, keyId) ? keys[keyId] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+      return (record as Record<string, WooValue>).revoked_at != null ? deactivatedAt : null;
+    }
+
+    /**
+     * Fail-closed validation for an operator-supplied `api_key_id` pointer.
+     *
+     * The pointer is what retirement follows: `revoke_agent` revokes
+     * `agent.api_key_id` and nothing else. A pointer that names a key which is
+     * not this agent's therefore means the agent's REAL credential survives
+     * retirement — a retired wizard that still authenticates. Accepting any
+     * non-empty string is not good enough, so all four facts are checked:
+     *
+     *  - the id parses as a routed (self-routing) id at all;
+     *  - it is bound to THIS agent;
+     *  - its immutable authority root matches the agent's anchor root, which is
+     *    what cold-gateway routing resolves the credential through;
+     *  - a live verifier record for it exists in the agent's OWN `api_keys`
+     *    map — the actor-owned store the signed credential-ensure route writes
+     *    (routed ids never live in the legacy catalog `$system.api_keys`).
+     *
+     * Requiring the record is safe because the operator runbook installs the
+     * credential BEFORE the call that records the pointer (AP11.6).
+     */
+    private assertBindableApiKeyPointer(agent: ObjRef, id: string): void {
+      const routed = parseRoutedApiKeyId(id);
+      if (!routed) {
+        throw wooError("E_INVARG", "api_key_id must be a routed api-key id", { agent, api_key_id: id });
+      }
+      if (routed.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id is bound to a different actor", { agent, api_key_id: id, bound_to: routed.actor });
+      }
+      const anchorRoot = this.authorityAnchorRoot(agent);
+      if (routed.authorityRoot !== anchorRoot) {
+        throw wooError("E_INVARG", "api_key_id authority root does not match the actor's anchor root", {
+          agent,
+          api_key_id: id,
+          authority_root: routed.authorityRoot,
+          anchor_root: anchorRoot
+        });
+      }
+      // Own-key read for the same reason as the ledger. The routed-id grammar
+      // above already makes an `n1_`-prefixed id structurally incapable of
+      // naming an Object.prototype member, so this is belt to that brace — but
+      // it means no reader has to reconstruct that argument to trust the line.
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, id) ? keys[id] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        throw wooError("E_INVARG", "api_key_id has no verifier record on this actor; install the credential first", { agent, api_key_id: id });
+      }
+      const entry = record as Record<string, WooValue>;
+      if (entry.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id verifier record names a different actor", { agent, api_key_id: id, record_actor: entry.actor ?? null });
+      }
+      if (entry.revoked_at != null) {
+        throw wooError("E_INVARG", "api_key_id names a revoked credential", { agent, api_key_id: id });
+      }
+    }
+
+    /**
+     * AP11 — signed-operator provisioning of a wizard-flagged agent anchored
+     * under an existing human account.
+     *
+     * Motivation (auth.md A11 "backup wizard", identity/provisioning.md §AP11):
+     * a deployed world whose only wizard is the unplaced catalog seed `$wiz`
+     * has no usable wizard on the client/MCP surface, and programmer minting is
+     * quota-gated to zero with only a wizard able to raise the quota. A non-`$`
+     * actor anchored to a human authority root plans at that cluster even while
+     * located nowhere, so it is immediately usable; this primitive mints one.
+     *
+     * The sequence deliberately mirrors the ordinary in-world flow so every
+     * counter and audit record stays consistent with self-service provisioning:
+     *
+     *   1. grant the account exactly the quota headroom the next two steps
+     *      consume (`set_quota` semantics + `account_quota_changed` audit),
+     *   2. create the agent (`create_agent` semantics: the agent kind, owned by
+     *      the human, anchored at the family root, `agent_count`, `actors`,
+     *      `actor_provisioned` audit) — WITHOUT minting a key, because the
+     *      operator holds a locally generated verifier that the separate signed
+     *      credential-ensure route installs,
+     *   3. promote to programmer through the shared transition
+     *      (`setProgrammerAgentState`): consumes the grant quota, increments
+     *      `programmer_agent_count`, sets the flag, attaches the published
+     *      programmer surface. REQUIRED before step 4 — the wizard flag supplies
+     *      authority, the surface supplies the tools, and an actor with one and
+     *      not the other has half a capability,
+     *   4. set `flags.wizard` through the lineage seam so it commits over Net.
+     *
+     * Idempotent by construction: the account's `operator_provisioned_agents`
+     * map short-circuits the mint, quota headroom is only granted when the next
+     * step would actually exceed it, `setProgrammerAgentState` moves the flag
+     * and counter only on a real transition, and the wizard flag write is
+     * skipped when already set. A re-run with the same `provision_id` therefore
+     * changes nothing and returns the same agent.
+     *
+     * Fail-closed: if the recorded map names an object that is not a live
+     * live agent owned by this human carrying the same `provision_id`, the call
+     * refuses rather than minting a second agent (a stale/unwarmed read must
+     * never become a duplicate identity).
+     */
+    private async provisionOperatorWizardAgent(
+      caller: ObjRef,
+      human: ObjRef,
+      input: { provisionId: string; name: string; purpose: string; apiKeyId: string | null }
+    ): Promise<Record<string, WooValue>> {
+      if (!this.canBypassPerms(caller)) {
+        throw wooError("E_PERM", "wizard authority required to provision an operator wizard agent", { actor: caller });
+      }
+      // assertSelfHuman is the shared kind check (caller === human holds
+      // trivially here; the operator's authority was proved above).
+      this.assertSelfHuman(human, human);
+      const account = assertObj(this.propOrNull(human, "account"));
+      if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
+      // Shape bound only. The WIRE grammar (leading alphanumeric, a fixed
+      // punctuation set) is enforced by the operator route; this primitive is
+      // reachable by any wizard, so it guards the durable cell's size and must
+      // stay correct for whatever text it is handed — including keys that name
+      // Object.prototype members (see operatorProvisionedAgents).
+      if (!input.provisionId || input.provisionId.length > 128) {
+        throw wooError("E_INVARG", "provision_id must be 1..128 characters", { provision_id: input.provisionId });
+      }
+      if (!input.name) throw wooError("E_INVARG", "name is required");
+
+      const provisioned = this.operatorProvisionedAgents(account);
+      // Own-key read. `provisioned` has a null prototype so plain indexing is
+      // already own-only; hasOwn states the intent so a later refactor to a
+      // normal object cannot silently reintroduce the inherited-member read.
+      const recorded = Object.hasOwn(provisioned, input.provisionId) ? provisioned[input.provisionId] : null;
+      let agent: ObjRef | null = null;
+      let created = false;
+      if (recorded !== null) {
+        // Every branch here is fail-closed: the only accepted outcome is an
+        // agent that unambiguously belongs to this provision_id.
+        //
+        // assertOwnedAgent is the shared kind + ownership check, and it opens
+        // with `this.object(recorded)` on purpose: under a sparse guarded plan
+        // that emits a materialization probe and drives the repair loop, so an
+        // unmaterialized recorded agent converges on retry instead of failing
+        // as a semantic absence. The reverse provision_id pointer below is what
+        // makes the match unambiguous.
+        this.assertOwnedAgent(human, recorded);
+        if (this.propOrNull(recorded, "provision_id") !== input.provisionId) {
+          throw wooError("E_INVARG", "recorded operator-provisioned agent does not match this provision_id", { account, provision_id: input.provisionId, agent: recorded });
+        }
+        // Neither a retired nor a merely deactivated agent is usable, so both
+        // refuse — but they are different facts and the message says which, so
+        // an operator knows whether reactivation is even on the table.
+        if (this.propOrNull(recorded, "retired_at") != null) {
+          throw wooError("E_PERM", "recorded operator-provisioned agent was permanently retired; choose a new provision_id", { agent: recorded });
+        }
+        if (this.propOrNull(recorded, "deactivated_at") != null) {
+          throw wooError("E_PERM", "recorded operator-provisioned agent is deactivated; reactivate it or choose a new provision_id", { agent: recorded });
+        }
+        agent = recorded;
+      }
+
+      const quotaGrants: Array<Record<string, WooValue>> = [];
+      // Step 1 — quota headroom, granted with `set_quota` semantics but only in
+      // the amount the following steps consume. `set_quota` itself is a
+      // `$system` native whose target is catalog-scoped, so the equivalent
+      // effect is applied here against the (cluster-resident) account.
+      const grant = (kind: "agent_quota" | "programmer_grant_quota", need: number): void => {
+        const old = Number(this.propOrNull(account, kind) ?? 0);
+        if (old >= need) return;
+        this.setProp(account, kind, need);
+        this.recordProvisioningAudit(caller, "account_quota_changed", { account, kind, old, new: need });
+        quotaGrants.push({ kind, old, new: need });
+      };
+
+      if (agent === null) {
+        grant("agent_quota", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        // Step 2 — mint the actor. provisionActorInternal is the shared
+        // primitive behind $system:provision_actor and create_agent: it picks
+        // the id, anchors an agent to its owner's authority root, stamps
+        // customer attribution, and records the actor_provisioned audit.
+        const provision = this.provisionActorInternal(
+          "$agent",
+          human,
+          { name: input.name, purpose: input.purpose, created_via: "operator_wizard_provision" },
+          caller
+        );
+        agent = provision.actor;
+        this.setProp(agent, "provision_id", input.provisionId);
+        this.setProp(account, "actors", [...this.accountActors(account), agent]);
+        this.setProp(account, "agent_count", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        // Object-literal spread + COMPUTED key, never `obj[key] = value`: a
+        // computed key defines an own property even for `__proto__`, whereas
+        // plain assignment on a normal object would invoke Object.prototype's
+        // `__proto__` setter and silently store nothing.
+        this.setProp(account, "operator_provisioned_agents", { ...provisioned, [input.provisionId]: agent } as WooValue);
+        created = true;
+      }
+
+      // The api-key id is a pointer, not a credential: the verifier record
+      // (hash+salt) is installed by the signed credential-ensure route from a
+      // tuple generated on the operator machine, so no secret ever transits
+      // this turn. Kept in sync so rotate/revoke find the current key — which
+      // is exactly why it is validated fail-closed rather than stored as given.
+      if (input.apiKeyId && this.propOrNull(agent, "api_key_id") !== input.apiKeyId) {
+        this.assertBindableApiKeyPointer(agent, input.apiKeyId);
+        this.setProp(agent, "api_key_id", input.apiKeyId);
+      }
+
+      // Step 3 — programmer promotion through the shared transition. Grant the
+      // quota it will consume first, and only when this is a real transition:
+      // an already-promoted agent needs no headroom.
+      const alreadyProgrammer = this.object(agent).flags.programmer === true;
+      if (!alreadyProgrammer) {
+        grant("programmer_grant_quota", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
+      }
+      await this.setProgrammerAgentState(caller, agent, account, true, "agent_promoted_to_programmer");
+
+      // Step 4 — wizard authority. setObjectFlags is the in-world equivalent
+      // but writes $system.wizard_actions unconditionally; the flag write and
+      // surface reconciliation are reproduced here through the Net-safe seams.
+      const flaggedBefore = this.object(agent).flags.wizard === true;
+      if (!flaggedBefore) {
+        const target = agent;
+        this.mutateLineage(target, () => { this.object(target).flags.wizard = true; });
+        this.markObjectDirty(target);
+        this.reconcileProgrammerSurface(target, true);
+        this.recordProvisioningAudit(caller, "actor_wizard_flag_set", { target, account, transition: true });
+      }
+
+      this.recordProvisioningAudit(caller, "operator_wizard_agent_provisioned", {
+        target: agent,
+        account,
+        owner: human,
+        provision_id: input.provisionId,
+        created,
+        promoted: !alreadyProgrammer,
+        flagged: !flaggedBefore
+      });
+      return {
+        actor_id: agent,
+        account,
+        owner: human,
+        provision_id: input.provisionId,
+        created,
+        promoted: !alreadyProgrammer,
+        flagged: !flaggedBefore,
+        api_key_id: (this.propOrNull(agent, "api_key_id") ?? null) as WooValue,
+        agent_quota: Number(this.propOrNull(account, "agent_quota") ?? 0),
+        agent_count: Number(this.propOrNull(account, "agent_count") ?? 0),
+        programmer_grant_quota: Number(this.propOrNull(account, "programmer_grant_quota") ?? 0),
+        programmer_agent_count: Number(this.propOrNull(account, "programmer_agent_count") ?? 0),
+        quota_grants: quotaGrants as unknown as WooValue
+      };
     }
 
     private assertSelfHuman(caller: ObjRef, human: ObjRef): void {
@@ -4351,7 +4676,10 @@ export class WooWorld {
           last_seen: this.propOrNull(obj.id, "last_seen_at"),
           scope: String(this.propOrNull(obj.id, "scope") ?? "write"),
           programmer: obj.flags.programmer === true,
-          deactivated_at: this.propOrNull(obj.id, "deactivated_at")
+          deactivated_at: this.propOrNull(obj.id, "deactivated_at"),
+          // Distinct from deactivated_at: reversible auth tombstone vs the
+          // permanent retirement that returned the account's quota slot.
+          retired_at: this.propOrNull(obj.id, "retired_at")
         });
       }
       out.sort((a, b) => String(a.actor_id).localeCompare(String(b.actor_id)));
@@ -10196,6 +10524,13 @@ export class WooWorld {
     if (changes.programmer || changes.wizard) {
       this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
     }
+    // Deliberately still recordWizardAction. `$system:set_actor_flag`, the only
+    // caller, is an UNTRACKED native and is therefore refused over Net before
+    // this line can run (incomplete_transcript) — routing the audit through the
+    // AU1 sink would be inert while implying Net support that does not exist.
+    // On Net, wizard authority is granted by the AP11 provisioning op
+    // (spec/identity/provisioning.md §AP11), which writes the flag through the
+    // lineage seam and audits through the sink.
     this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
     this.markObjectDirty(target);
     return { ...obj.flags };
@@ -11101,6 +11436,16 @@ export class WooWorld {
     this.nativeHandlers.set("reactivate_actor", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to reactivate actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
+      // Symmetry with retirement: reactivating a RETIRED actor would restore a
+      // live identity whose quota slot has already been returned, so the
+      // account would carry N live agents against a count of N-1 — the same
+      // bypass as a double-return, arrived at from the other side. Retirement
+      // is permanent by contract; a replacement is a fresh provisioning.
+      // Plain deactivation stays fully reversible: it never returned a slot,
+      // so there is nothing to restore.
+      if (this.propOrNull(target, "retired_at") != null) {
+        throw wooError("E_PERM", "actor was permanently retired; provision a replacement instead of reactivating", { actor: target });
+      }
       this.setProp(target, "deactivated_at", null);
       this.recordWizardAction(ctx.actor, "actor_reactivated", { actor: target });
       return true;
@@ -11163,7 +11508,12 @@ export class WooWorld {
       if (kind !== "agent_quota" && kind !== "programmer_grant_quota") throw wooError("E_INVARG", "unknown quota kind", kind);
       const old = Number(this.propOrNull(account, kind) ?? 0);
       this.setProp(account, kind, value);
-      this.recordWizardAction(ctx.actor, "account_quota_changed", { account, kind, old, new: value });
+      // AU1 seam, not recordWizardAction: the quota cell is cluster-resident but
+      // `$system` is catalog-scoped on Net, so appending wizard_actions here made
+      // every set_quota turn fail E_CATALOG_MUTATION — which left a deployed
+      // world with no way to grant programmer quota at all, even holding a
+      // working wizard. Local profiles still materialize the entry.
+      this.recordProvisioningAudit(ctx.actor, "account_quota_changed", { account, kind, old, new: value });
       return true;
     });
     this.nativeHandlers.set("human_create_agent", (ctx, args) => {
@@ -11182,15 +11532,45 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        // Strip programmer state through the shared transition first: it clears
-        // the flag, removes the surface, decrements the quota, and refuses
-        // cross-host before any of that — idempotent if already non-programmer.
+        const reason = typeof args[1] === "string" ? args[1] : null;
+        // Has the quota slot already been returned? This is deliberately NOT
+        // `deactivated_at` — see agentSlotReturnedAt. Read before any mutation.
+        const slotReturnedAt = this.agentSlotReturnedAt(agent);
+        // The permanent-retirement WORK runs on every call and each step is
+        // individually idempotent, so a repeat call repairs an agent that some
+        // other path left half-retired: $system:deactivate_actor tombstones
+        // without stripping programmer state or revoking keys.
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         const key = this.propOrNull(agent, "api_key_id");
-        if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
-        this.setProp(agent, "deactivated_at", Date.now());
+        const keyNewlyRevoked = typeof key === "string" && key
+          ? this.revokeApiKeyRecordById(ctx.actor, key, true)
+          : false;
+        const now = Date.now();
+        if (slotReturnedAt !== null) {
+          // Backfill the explicit marker when it was inferred, so the next call
+          // needs no inference at all.
+          if (this.propOrNull(agent, "retired_at") == null) this.setProp(agent, "retired_at", slotReturnedAt);
+          // No counter change and no duplicate "this agent retired" record —
+          // but a repeat that actually repaired something is still auditable,
+          // marked as the repair it is.
+          if (keyNewlyRevoked) {
+            this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason, repair: true });
+          }
+          return true;
+        }
+        // Preserve an earlier deactivation time: when deactivate_actor ran
+        // first, THAT is when the identity stopped authenticating. `retired_at`
+        // separately records when the slot came back.
+        if (this.propOrNull(agent, "deactivated_at") == null) this.setProp(agent, "deactivated_at", now);
+        this.setProp(agent, "retired_at", now);
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        this.recordWizardAction(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
+        // AU1 seam, not recordWizardAction: every durable effect above is
+        // cluster-resident (agent lineage, agent props, account counter, the
+        // actor-owned api-key record), but `$system` is catalog-scoped on Net,
+        // so appending wizard_actions made the whole revocation fail
+        // E_CATALOG_MUTATION — leaving account owners with no way to retire an
+        // agent at all. Local profiles still materialize the entry.
+        this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason });
         return true;
       });
       this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {
@@ -11206,6 +11586,22 @@ export class WooWorld {
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         return true;
+      });
+      // AP11 operator provisioning. Defined on the human kind — and therefore invoked
+      // with the HUMAN as the turn target — so the whole transition commits in
+      // the human's authority cluster, where the account, the new agent, and
+      // its api-key record all live. A $system-targeted verb would commit at
+      // the catalog scope and could not write any of them.
+      this.nativeHandlers.set("human_provision_wizard_agent", async (ctx, args) => {
+        const options = args[1] && typeof args[1] === "object" && !Array.isArray(args[1])
+          ? args[1] as Record<string, WooValue>
+          : {};
+        return await this.provisionOperatorWizardAgent(ctx.actor, ctx.thisObj, {
+          provisionId: assertString(args[0] ?? ""),
+          name: typeof options.name === "string" && options.name ? options.name : assertString(args[0] ?? ""),
+          purpose: typeof options.purpose === "string" ? options.purpose : "",
+          apiKeyId: typeof options.api_key_id === "string" && options.api_key_id ? options.api_key_id : null
+        }) as unknown as WooValue;
       });
       this.nativeHandlers.set("human_rotate_agent_key", (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);

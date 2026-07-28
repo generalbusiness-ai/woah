@@ -1458,6 +1458,34 @@ arguments, or repository files. Operator tooling generates the secret
 locally and writes the one-time full token to an owner-only (`0600`) file
 before sending the verifier or installing it as a Worker secret.
 
+The entry exposes one further internal-signed operator operation:
+`POST /net-operator/wizard/provision`
+([provisioning.md §AP11](../identity/provisioning.md#ap11-operator-wizard-provisioning-implemented)).
+Unlike the credential and repair operations it runs a **turn**, so it is
+addressed to a gateway shard (keyed by the target human) rather than to a scope
+authority. It mints a non-catalog, wizard-flagged, programmer-surfaced agent
+anchored under an existing human account — the only way to obtain a usable
+wizard on a deployed world, because the seeded `$wiz` cannot plan a client turn
+at all. It is idempotent on an operator-supplied `provision_id` and mints no
+credential material.
+
+Deploy-day runbook (the two operator commands are separate steps; code landing
+is not a healed world):
+
+```bash
+npm run provision:net-wizard -- \
+  --base-url https://woah1.generalbusiness.ai \
+  --human <human actor id> \
+  --provision-id ops-wizard-1 \
+  --name OpsWizard \
+  --credential-name OPS_WIZARD_WOO_APIKEY
+```
+
+The driver provisions, then installs a locally generated verifier through
+`/net-operator/credentials/ensure`, then re-runs provisioning to record the key
+pointer. The replayable token lands only in the owner-only credential file.
+Re-running the whole command is a no-op.
+
 For a Net world installed before `$actor.api_keys` existed, deploy the runtime
 and then run the explicit, idempotent bootstrap-definition migration before
 minting through block verbs:
