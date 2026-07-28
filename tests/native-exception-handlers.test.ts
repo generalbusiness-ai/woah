@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import {
   nativePrimitiveContract,
-  nativePrimitiveContractDisciplineErrors
+  nativePrimitiveContractDisciplineErrors,
+  nativePrimitiveFailureContract,
+  nativePrimitiveFailureContractHandlers
 } from "../src/core/native-primitive-contract";
 import type { MetricEvent } from "../src/core/types";
 import type { WooWorld } from "../src/core/world";
@@ -279,5 +281,26 @@ describe("tracked native failure contracts", () => {
       .toEqual({ mutation_scope: "single_authority", on_error: "rollback" });
     expect(nativePrimitiveContract("revoke_api_key")?.failure?.post_commit)
       .toContain("session-ended transport notification");
+    expect(nativePrimitiveFailureContract("set_actor_flag"))
+      .toEqual({ mutation_scope: "single_authority", on_error: "rollback" });
+    expect(nativePrimitiveFailureContract("deactivate_actor")?.post_commit)
+      .toContain("session-ended transport notification");
+    expect(nativePrimitiveFailureContract("rotate_api_key"))
+      .toEqual({ mutation_scope: "single_authority", on_error: "rollback" });
+    expect(nativePrimitiveContract("catalog_registry_update")?.failure)
+      .toEqual({ mutation_scope: "durable_progress", on_error: "idempotent_progress" });
+  });
+
+  it("fails closed when a mutating built-in is omitted from handler classification", () => {
+    const handlers = new Map(
+      nativePrimitiveFailureContractHandlers().map((name) => [
+        name,
+        name === "return_guest" ? "live_only" as const : "authoritative" as const
+      ])
+    );
+    handlers.delete("set_actor_flag");
+
+    expect(nativePrimitiveContractDisciplineErrors(handlers))
+      .toContain("set_actor_flag: failure contract has no built-in handler classification");
   });
 });

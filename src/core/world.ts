@@ -88,6 +88,10 @@ import {
   type OrderedNeighborsQuery
 } from "./ordered-edge";
 import { REPLAY_PAGE_DEFAULT_LIMIT, replayPageQueryKey, validReplayPageBounds } from "./replay-page";
+import {
+  nativePrimitiveFailureContract,
+  type BuiltinNativeHandlerMutationKind
+} from "./native-primitive-contract";
 
 /** What a same-run ordered-edge writer's PRE-WRITE ordering membership was
  * (R1 overlay). `known: false` = the sparse planning world had no local value
@@ -2654,6 +2658,31 @@ export class WooWorld {
   // the implementation.
   registerNativeHandler(name: string, handler: NativeHandler): void {
     this.assertOutsideBehaviorMutation("registerNativeHandler");
+    this.nativeHandlers.set(name, handler);
+  }
+
+  /**
+   * Register a substrate-owned native together with its state-effect class.
+   * The explicit class is consumed by the static failure-contract guard; the
+   * runtime assertion keeps a direct construction from bypassing that gate.
+   * Extension handlers use registerNativeHandler and remain untracked unless
+   * they have a separately published primitive contract.
+   */
+  private registerBuiltinNativeHandler(
+    name: string,
+    mutationKind: BuiltinNativeHandlerMutationKind,
+    handler: NativeHandler
+  ): void {
+    const failure = nativePrimitiveFailureContract(name);
+    if (mutationKind === "read_only" ? failure !== null : failure === null) {
+      throw new Error(`native handler ${name} has inconsistent ${mutationKind} failure classification`);
+    }
+    if (mutationKind === "live_only" && failure?.mutation_scope !== "live_only") {
+      throw new Error(`native handler ${name} must declare live-only failure semantics`);
+    }
+    if (mutationKind === "authoritative" && failure?.mutation_scope === "live_only") {
+      throw new Error(`native handler ${name} cannot use live-only failure semantics`);
+    }
     this.nativeHandlers.set(name, handler);
   }
 
@@ -13605,15 +13634,15 @@ export class WooWorld {
   }
 
   private registerNativeHandlers(): void {
-    this.nativeHandlers.set("player_on_disfunc", () => true);
-    this.nativeHandlers.set("player_moveto", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("player_on_disfunc", "read_only", () => true);
+    this.registerBuiltinNativeHandler("player_moveto", "authoritative", async (ctx, args) => {
       if (ctx.thisObj !== ctx.actor && !this.isWizard(ctx.actor)) throw wooError("E_PERM", "players may only move themselves", { actor: ctx.actor, target: ctx.thisObj });
       const target = assertObj(args[0] ?? "$nowhere");
       await this.movetoChecked(ctx, ctx.thisObj, target);
       return { room: target, here_request: true, look_deferred: true };
     });
-    this.nativeHandlers.set("player_join", (ctx, args) => this.playerJoin(ctx, args));
-    this.nativeHandlers.set("guest_on_disfunc", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("player_join", "authoritative", (ctx, args) => this.playerJoin(ctx, args));
+    this.registerBuiltinNativeHandler("guest_on_disfunc", "authoritative", async (ctx, args) => {
       const homeValue = this.propOrNullLive(ctx.thisObj, "home");
       // The optional destination is for trusted session cleanup (the net guest
       // door restores a claimed seat to its catalog-declared initial room).
@@ -13643,18 +13672,18 @@ export class WooWorld {
       this.returnGuest(ctx.thisObj);
       return true;
     });
-    this.nativeHandlers.set("return_guest", (ctx, args) => {
+    this.registerBuiltinNativeHandler("return_guest", "live_only", (ctx, args) => {
       if (!this.isWizard(ctx.actor)) throw wooError("E_PERM", "only wizards may return guests", ctx.actor);
       this.returnGuest(assertObj(args[0]));
       return true;
     });
-    this.nativeHandlers.set("set_object_flags", (ctx, args) => {
+    this.registerBuiltinNativeHandler("set_object_flags", "authoritative", (ctx, args) => {
       const target = assertObj(args[0]);
       const flags = args[1];
       if (!flags || typeof flags !== "object" || Array.isArray(flags)) throw wooError("E_TYPE", "set_object_flags requires a flags map", { value: flags as WooValue });
       return this.setObjectFlags(ctx.actor, target, flags as Record<string, unknown>) as unknown as WooValue;
     });
-    this.nativeHandlers.set("mint_session_for", (ctx, args) => {
+    this.registerBuiltinNativeHandler("mint_session_for", "authoritative", (ctx, args) => {
       if (!this.isWizard(ctx.actor)) throw wooError("E_PERM", "wizard authority required to mint sessions", ctx.actor);
       const target = assertObj(args[0]);
       this.objectLive(target);
@@ -13663,19 +13692,19 @@ export class WooWorld {
       this.recordWizardAction(ctx.actor, "mint_session_for", { actor: target, session: session.id });
       return { id: session.id, actor: session.actor, expires_at: session.expiresAt, token_class: session.tokenClass } as unknown as WooValue;
     });
-    this.nativeHandlers.set("create_api_key", (ctx, args) => {
+    this.registerBuiltinNativeHandler("create_api_key", "authoritative", (ctx, args) => {
       const target = assertObj(args[0]);
       const label = typeof args[1] === "string" ? args[1] : null;
       const result = this.createApiKey(ctx.actor, target, label);
       return result as unknown as WooValue;
     });
-    this.nativeHandlers.set("create_api_key_for_owner", (ctx, args) => {
+    this.registerBuiltinNativeHandler("create_api_key_for_owner", "authoritative", (ctx, args) => {
       const target = assertObj(args[0]);
       const label = typeof args[1] === "string" ? args[1] : null;
       const result = this.createApiKeyForOwner(ctx.actor, target, label);
       return result as unknown as WooValue;
     });
-    this.nativeHandlers.set("revoke_api_key", (ctx, args) => {
+    this.registerBuiltinNativeHandler("revoke_api_key", "authoritative", (ctx, args) => {
       const id = String(args[0] ?? "");
       if (!id) throw wooError("E_INVARG", "revoke_api_key requires an id");
       const result = this.revokeApiKeyWithClosedSessions(ctx.actor, id);
@@ -13685,23 +13714,23 @@ export class WooWorld {
       }
       return result.revoked;
     });
-    this.nativeHandlers.set("list_api_keys", (ctx) => {
+    this.registerBuiltinNativeHandler("list_api_keys", "read_only", (ctx) => {
       return this.listApiKeys(ctx.actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("list_api_keys_for_owner", (ctx, args) => {
+    this.registerBuiltinNativeHandler("list_api_keys_for_owner", "read_only", (ctx, args) => {
       // The bounded authority is an explicit contract argument. Frame
       // topology (`caller`) is not an access-control input.
       const target = assertObj(args[0]);
       return this.listApiKeysForOwner(ctx.actor, target) as unknown as WooValue;
     });
-    this.nativeHandlers.set("provision_actor", (ctx, args) => {
+    this.registerBuiltinNativeHandler("provision_actor", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to provision actors", { actor: ctx.actor });
       const classRef = assertObj(args[0]);
       const owner = assertObj(args[1]);
       const attrs = args[2] && typeof args[2] === "object" && !Array.isArray(args[2]) ? args[2] as Record<string, WooValue> : {};
       return this.provisionActorInternal(classRef, owner, attrs, ctx.actor).actor;
     });
-    this.nativeHandlers.set("rotate_api_key", (ctx, args) => {
+    this.registerBuiltinNativeHandler("rotate_api_key", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to rotate api keys", { actor: ctx.actor });
       const agent = assertObj(args[0]);
       // createApiKey performs the same check, but it must happen before the old
@@ -13713,7 +13742,7 @@ export class WooWorld {
       this.setProp(agent, "api_key_id", key.id);
       return { api_key: `apikey:${key.id}:${key.secret}`, id: key.id, actor: agent, created_at: key.created_at } as unknown as WooValue;
     });
-    this.nativeHandlers.set("deactivate_actor", (ctx, args) => {
+    this.registerBuiltinNativeHandler("deactivate_actor", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to deactivate actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
       const now = Date.now();
@@ -13732,7 +13761,7 @@ export class WooWorld {
       }
       return true;
     });
-    this.nativeHandlers.set("reactivate_actor", (ctx, args) => {
+    this.registerBuiltinNativeHandler("reactivate_actor", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to reactivate actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
       // Symmetry with retirement: reactivating a RETIRED actor would restore a
@@ -13749,14 +13778,14 @@ export class WooWorld {
       this.recordWizardAction(ctx.actor, "actor_reactivated", { actor: target });
       return true;
     });
-    this.nativeHandlers.set("recycle_actor", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("recycle_actor", "authoritative", async (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to recycle actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
       await this.recycleChecked(ctx.progr, ctx.actor, target, { force: true, force_reserved: true });
       this.recordWizardAction(ctx.actor, "actor_recycled", { actor: target });
       return true;
     });
-    this.nativeHandlers.set("issue_signup_invite", (ctx, args) => {
+    this.registerBuiltinNativeHandler("issue_signup_invite", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to issue invites", { actor: ctx.actor });
       this.gcPendingCredentials();
       const quantity = Math.max(1, Math.min(100, Math.floor(Number(args[0] ?? 1))));
@@ -13768,13 +13797,13 @@ export class WooWorld {
       this.recordWizardAction(ctx.actor, "signup_invite_issued", { quantity, expires_at: expiresAt });
       return created as unknown as WooValue;
     });
-    this.nativeHandlers.set("gc_pending_credentials", (ctx) => {
+    this.registerBuiltinNativeHandler("gc_pending_credentials", "authoritative", (ctx) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to gc pending credentials", { actor: ctx.actor });
       const changed = this.gcPendingCredentials();
       this.recordWizardAction(ctx.actor, "gc_pending_credentials", { changed });
       return changed;
     });
-    this.nativeHandlers.set("set_actor_flag", (ctx, args) => {
+    this.registerBuiltinNativeHandler("set_actor_flag", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set actor flags", { actor: ctx.actor });
       const target = assertObj(args[0]);
       const flag = String(args[1] ?? "");
@@ -13803,7 +13832,7 @@ export class WooWorld {
       }
       return this.applyObjectFlagPlan(ctx.actor, flagPlan) as unknown as WooValue;
     });
-    this.nativeHandlers.set("set_quota", (ctx, args) => {
+    this.registerBuiltinNativeHandler("set_quota", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set quotas", { actor: ctx.actor });
       const account = assertObj(args[0]);
       const kind = String(args[1] ?? "");
@@ -13819,7 +13848,7 @@ export class WooWorld {
       this.recordProvisioningAudit(ctx.actor, "account_quota_changed", { account, kind, old, new: value });
       return true;
     });
-    this.nativeHandlers.set("human_create_agent", (ctx, args) => {
+    this.registerBuiltinNativeHandler("human_create_agent", "authoritative", (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const name = assertString(args[0] ?? "");
         const purpose = typeof args[1] === "string" ? args[1] : "";
@@ -13827,11 +13856,11 @@ export class WooWorld {
         ctx.observe({ type: "agent_created", source: ctx.thisObj, actor: result.actor_id, name, _audience_override: [ctx.thisObj] });
         return { actor_id: result.actor_id, api_key: result.api_key, mcp_url: this.propOrNullLive("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
       });
-      this.nativeHandlers.set("human_list_agents", (ctx) => {
+      this.registerBuiltinNativeHandler("human_list_agents", "read_only", (ctx) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         return this.listAgentsForHuman(ctx.thisObj) as unknown as WooValue;
       });
-      this.nativeHandlers.set("human_revoke_agent", async (ctx, args) => {
+      this.registerBuiltinNativeHandler("human_revoke_agent", "authoritative", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
@@ -13876,14 +13905,14 @@ export class WooWorld {
         this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason });
         return true;
       });
-      this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {
+      this.registerBuiltinNativeHandler("human_promote_agent_to_programmer", "authoritative", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
         await this.setProgrammerAgentState(ctx.actor, agent, account, true, "agent_promoted_to_programmer");
         return true;
       });
-      this.nativeHandlers.set("human_demote_agent_from_programmer", async (ctx, args) => {
+      this.registerBuiltinNativeHandler("human_demote_agent_from_programmer", "authoritative", async (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
@@ -13895,7 +13924,7 @@ export class WooWorld {
       // the human's authority cluster, where the account, the new agent, and
       // its api-key record all live. A $system-targeted verb would commit at
       // the catalog scope and could not write any of them.
-      this.nativeHandlers.set("human_provision_wizard_agent", async (ctx, args) => {
+      this.registerBuiltinNativeHandler("human_provision_wizard_agent", "authoritative", async (ctx, args) => {
         const options = args[1] && typeof args[1] === "object" && !Array.isArray(args[1])
           ? args[1] as Record<string, WooValue>
           : {};
@@ -13906,24 +13935,24 @@ export class WooWorld {
           apiKeyId: typeof options.api_key_id === "string" && options.api_key_id ? options.api_key_id : null
         }) as unknown as WooValue;
       });
-      this.nativeHandlers.set("human_rotate_agent_key", (ctx, args) => {
+      this.registerBuiltinNativeHandler("human_rotate_agent_key", "authoritative", (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const key = this.rotateAgentKey(ctx.thisObj, agent, args[1] === true);
         return { actor_id: agent, api_key: `apikey:${key.id}:${key.secret}`, mcp_url: this.propOrNullLive("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
       });
-      this.nativeHandlers.set("feature_can_be_attached_by", (ctx, args) => {
+      this.registerBuiltinNativeHandler("feature_can_be_attached_by", "read_only", (ctx, args) => {
       const actor = assertObj(args[0] ?? ctx.actor);
       return actor === this.objectLive(ctx.thisObj).owner;
     });
-    this.nativeHandlers.set("thing_moveto", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("thing_moveto", "authoritative", async (ctx, args) => {
       const target = assertObj(args[0] ?? "$nowhere");
       return await this.movetoChecked(ctx, ctx.thisObj, target);
     });
-    this.nativeHandlers.set("add_feature", (ctx, args) => this.addFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
-    this.nativeHandlers.set("remove_feature", (ctx, args) => this.removeFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
-    this.nativeHandlers.set("has_feature", (ctx, args) => this.featureList(ctx.thisObj).includes(assertObj(args[0])));
-    this.nativeHandlers.set("replay", (ctx, args) => {
+    this.registerBuiltinNativeHandler("add_feature", "authoritative", (ctx, args) => this.addFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
+    this.registerBuiltinNativeHandler("remove_feature", "authoritative", (ctx, args) => this.removeFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
+    this.registerBuiltinNativeHandler("has_feature", "read_only", (ctx, args) => this.featureList(ctx.thisObj).includes(assertObj(args[0])));
+    this.registerBuiltinNativeHandler("replay", "read_only", (ctx, args) => {
       const from = Number(args[0] ?? 1);
       const limit = Number(args[1] ?? REPLAY_PAGE_DEFAULT_LIMIT);
       // SL2/SL8: `from < 1` or `limit` outside 1..1000 is E_RANGE. The
@@ -13953,7 +13982,7 @@ export class WooWorld {
     // when the actor's home DO wakes from hibernation via /__internal/remote-
     // dispatch — that path does not construct an McpHost, so handlers installed
     // by McpHost's constructor would not be present on the fresh world.
-    this.nativeHandlers.set("actor_focus", (ctx, args) => {
+    this.registerBuiltinNativeHandler("actor_focus", "authoritative", (ctx, args) => {
       const target = String(args[0] ?? "");
       if (!target) throw wooError("E_INVARG", `focus target not found: ${target}`);
       if (!this.objects.has(target)) throw wooError("E_OBJNF", `focus target not found: ${target}`, target);
@@ -13972,24 +14001,24 @@ export class WooWorld {
       }
       return list as unknown as WooValue;
     });
-    this.nativeHandlers.set("actor_unfocus", (ctx, args) => {
+    this.registerBuiltinNativeHandler("actor_unfocus", "authoritative", (ctx, args) => {
       const target = String(args[0] ?? "");
       const actor = ctx.thisObj;
       const list = this.focusListOf(actor).filter((id) => id !== target);
       this.setProp(actor, "focus_list", list);
       return list as unknown as WooValue;
     });
-    this.nativeHandlers.set("actor_focus_list", (ctx) => this.focusListOf(ctx.thisObj) as unknown as WooValue);
+    this.registerBuiltinNativeHandler("actor_focus_list", "read_only", (ctx) => this.focusListOf(ctx.thisObj) as unknown as WooValue);
     // $actor:wait normally short-circuits in McpHost.invokeTool (drainWait) so
     // this native rarely runs. It exists for non-MCP callers (e.g. woocode
     // dispatching $actor:wait directly) — they have no session queue, so the
     // correct behavior is an empty drain rather than a missing-handler error.
-    this.nativeHandlers.set("actor_wait", () => ({
+    this.registerBuiltinNativeHandler("actor_wait", "read_only", () => ({
       observations: [] as unknown as WooValue,
       more: false,
       queue_depth: 0
     } as unknown as WooValue));
-    this.nativeHandlers.set("catalog_registry_install", (ctx, args) => {
+    this.registerBuiltinNativeHandler("catalog_registry_install", "authoritative", (ctx, args) => {
       if (!this.objectLive(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may install catalogs", ctx.actor);
       const manifest = assertMap(args[0]) as unknown as CatalogManifest;
       const alias = typeof args[2] === "string" ? args[2] : manifest.name;
@@ -14001,7 +14030,7 @@ export class WooWorld {
         provenance
       }) as unknown as WooValue;
     });
-    this.nativeHandlers.set("catalog_registry_update", (ctx, args) => {
+    this.registerBuiltinNativeHandler("catalog_registry_update", "authoritative", (ctx, args) => {
       if (!this.objectLive(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may update catalogs", ctx.actor);
       const manifest = assertMap(args[0]) as unknown as CatalogManifest;
       const alias = typeof args[2] === "string" ? args[2] : manifest.name;
@@ -14020,20 +14049,20 @@ export class WooWorld {
     // catalog_registry_list is now a compiled sourceVerb (bootstrap.ts) —
     // `verb :list() rxd { return this.installed_catalogs; }` — so it carries
     // verb_bytecode and rides the net path; no native handler is needed.
-    this.nativeHandlers.set("catalog_registry_migration_state", (_ctx, args) => {
+    this.registerBuiltinNativeHandler("catalog_registry_migration_state", "read_only", (_ctx, args) => {
       const alias = assertString(args[0] ?? "");
       const records = this.propOrNullLive("$catalog_registry", "installed_catalogs");
       if (!Array.isArray(records)) return null;
       const record = records.find((item) => item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, WooValue>).alias === alias);
       return record && typeof record === "object" && !Array.isArray(record) ? ((record as Record<string, WooValue>).migration_state ?? null) : null;
     });
-    this.nativeHandlers.set("match_object", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("match_object", "read_only", async (ctx, args) => {
       const actor = await this.publicCommandActor(ctx, undefined);
       const location = await this.publicCommandLocation(ctx, actor, args[1]);
       const match = await this.matchObjectForActorAsync(assertString(args[0] ?? ""), ctx, location, actor);
       return match.value;
     });
-    this.nativeHandlers.set("match_verb", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("match_verb", "read_only", async (ctx, args) => {
       const name = assertString(args[0] ?? "");
       const target = assertObj(args[1]);
       if (!await this.canSeeCommandObject(ctx, target)) throw wooError("E_PERM", `${ctx.actor} cannot match verbs on ${target}`, { actor: ctx.actor, target });
@@ -14062,14 +14091,14 @@ export class WooWorld {
         return this.matchSentinelRef("failed");
       }
     });
-    this.nativeHandlers.set("match_command_verb", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("match_command_verb", "read_only", async (ctx, args) => {
       const cmd = commandMapFromValue(args[0]);
       const target = assertObj(args[1]);
       if (!await this.canSeeCommandObject(ctx, target)) throw wooError("E_PERM", `${ctx.actor} cannot match command verbs on ${target}`, { actor: ctx.actor, target });
       const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
       return matched ? matched as unknown as WooValue : this.matchSentinelRef("failed");
     });
-    this.nativeHandlers.set("plan_command", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("plan_command", "read_only", async (ctx, args) => {
       const space = assertObj(args[1] ?? ctx.caller);
       return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space, {
         // Catalog command-plan wrappers are read-only planners. When the
@@ -14079,15 +14108,15 @@ export class WooWorld {
         skipPresenceCheck: this.currentVerbSkipsPresenceCheck(ctx)
       }) as unknown as WooValue;
     });
-    this.nativeHandlers.set("parse_command", async (ctx, args) => {
+    this.registerBuiltinNativeHandler("parse_command", "read_only", async (ctx, args) => {
       const actor = await this.publicCommandActor(ctx, args[1]);
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
       return await this.parseCommandMap(assertString(args[0] ?? ""), ctx, location, actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("space_live_audience", (ctx, args) => this.spaceLiveAudience(ctx, args));
-    this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
-    this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
-    this.nativeHandlers.set("help_db_dump_topic", (ctx, args) => this.helpDbDumpTopic(ctx, args));
+    this.registerBuiltinNativeHandler("space_live_audience", "read_only", (ctx, args) => this.spaceLiveAudience(ctx, args));
+    this.registerBuiltinNativeHandler("help_db_find_topics", "read_only", (ctx, args) => this.helpDbFindTopics(ctx, args));
+    this.registerBuiltinNativeHandler("help_db_get_topic", "read_only", (ctx, args) => this.helpDbGetTopic(ctx, args));
+    this.registerBuiltinNativeHandler("help_db_dump_topic", "read_only", (ctx, args) => this.helpDbDumpTopic(ctx, args));
   }
 
   private chatPresent(room: ObjRef): ObjRef[] {
@@ -14792,7 +14821,8 @@ export class WooWorld {
    * Transitional implementation of the native plan_command primitive.
    * Command grammar belongs to catalog wrappers; scripts/guard-command-planning
    * enforces that ordinary server/client conveniences dispatch those wrappers
-   * and that this helper is called only from nativeHandlers.set("plan_command").
+   * and that this helper is called only from the classified built-in
+   * plan_command registration.
    */
   private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef, options: PublicCommandLocationOptions = {}): Promise<WooValue> {
     const text = input.trim();

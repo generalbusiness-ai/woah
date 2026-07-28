@@ -16,10 +16,12 @@ export type NativePrimitiveContract = {
 };
 
 export type NativePrimitiveFailureContract = {
-  mutation_scope: "single_authority" | "cross_authority_saga" | "live_only";
+  mutation_scope: "single_authority" | "durable_progress" | "cross_authority_saga" | "live_only";
   on_error: "rollback" | "idempotent_progress" | "best_effort";
   post_commit?: string[];
 };
+
+export type BuiltinNativeHandlerMutationKind = "read_only" | "authoritative" | "live_only";
 
 export type NativePrimitiveOpenSeedVerbLookup = {
   receiver: "scope" | "actor_location";
@@ -38,6 +40,65 @@ export type NativePrimitiveOpenSeedContract = {
 const SINGLE_AUTHORITY_ROLLBACK: NativePrimitiveFailureContract = {
   mutation_scope: "single_authority",
   on_error: "rollback"
+};
+
+/**
+ * Failure semantics and transcript eligibility are deliberately separate
+ * registries. An untracked native is refused by Net, but it still executes in
+ * local worlds and therefore still needs an explicit rollback boundary.
+ * Keeping this registry complete prevents "untracked" from becoming an
+ * accidental synonym for "partial commits are unspecified".
+ */
+const FAILURE_CONTRACTS: Record<string, NativePrimitiveFailureContract> = {
+  player_moveto: {
+    ...SINGLE_AUTHORITY_ROLLBACK,
+    post_commit: ["remote presence-mirror notification"]
+  },
+  player_join: {
+    ...SINGLE_AUTHORITY_ROLLBACK,
+    post_commit: ["remote presence-mirror notification"]
+  },
+  guest_on_disfunc: SINGLE_AUTHORITY_ROLLBACK,
+  return_guest: {
+    mutation_scope: "live_only",
+    on_error: "best_effort"
+  },
+  set_object_flags: SINGLE_AUTHORITY_ROLLBACK,
+  mint_session_for: SINGLE_AUTHORITY_ROLLBACK,
+  create_api_key: SINGLE_AUTHORITY_ROLLBACK,
+  create_api_key_for_owner: SINGLE_AUTHORITY_ROLLBACK,
+  revoke_api_key: {
+    ...SINGLE_AUTHORITY_ROLLBACK,
+    post_commit: ["session-ended transport notification"]
+  },
+  provision_actor: SINGLE_AUTHORITY_ROLLBACK,
+  rotate_api_key: SINGLE_AUTHORITY_ROLLBACK,
+  deactivate_actor: {
+    ...SINGLE_AUTHORITY_ROLLBACK,
+    post_commit: ["session-ended transport notification"]
+  },
+  reactivate_actor: SINGLE_AUTHORITY_ROLLBACK,
+  recycle_actor: SINGLE_AUTHORITY_ROLLBACK,
+  issue_signup_invite: SINGLE_AUTHORITY_ROLLBACK,
+  gc_pending_credentials: SINGLE_AUTHORITY_ROLLBACK,
+  set_actor_flag: SINGLE_AUTHORITY_ROLLBACK,
+  set_quota: SINGLE_AUTHORITY_ROLLBACK,
+  human_create_agent: SINGLE_AUTHORITY_ROLLBACK,
+  human_revoke_agent: SINGLE_AUTHORITY_ROLLBACK,
+  human_promote_agent_to_programmer: SINGLE_AUTHORITY_ROLLBACK,
+  human_demote_agent_from_programmer: SINGLE_AUTHORITY_ROLLBACK,
+  human_provision_wizard_agent: SINGLE_AUTHORITY_ROLLBACK,
+  human_rotate_agent_key: SINGLE_AUTHORITY_ROLLBACK,
+  thing_moveto: SINGLE_AUTHORITY_ROLLBACK,
+  add_feature: SINGLE_AUTHORITY_ROLLBACK,
+  remove_feature: SINGLE_AUTHORITY_ROLLBACK,
+  catalog_registry_install: SINGLE_AUTHORITY_ROLLBACK,
+  catalog_registry_update: {
+    mutation_scope: "durable_progress",
+    on_error: "idempotent_progress"
+  },
+  actor_focus: SINGLE_AUTHORITY_ROLLBACK,
+  actor_unfocus: SINGLE_AUTHORITY_ROLLBACK
 };
 
 const CONTRACTS: Record<string, NativePrimitiveContract> = {
@@ -64,10 +125,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "session_scope",
       "cell_write"
     ],
-    failure: {
-      ...SINGLE_AUTHORITY_ROLLBACK,
-      post_commit: ["remote presence-mirror notification"]
-    },
+    failure: FAILURE_CONTRACTS.player_moveto,
     open_seed: {
       dispatch_verb_names: ["moveto"],
       verb_lookups: [
@@ -112,7 +170,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "guest.features_version"
     ],
     emits: ["object_move", "cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.guest_on_disfunc,
     note: "Guest reset is transcript-safe because inventory ejection and actor placement use recorded movement, while every durable reset field uses recorded property writes. The optional destination is a trusted cleanup override; omitted calls retain home/$nowhere behavior. returnGuest only updates the classic runtime's in-memory allocator and is a no-op while a live exclusive session owns the actor."
   },
   thing_moveto: {
@@ -135,7 +193,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "object_move",
       "cell_write"
     ],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.thing_moveto,
     open_seed: {
       dispatch_verb_names: ["moveto"],
       verb_lookups: [
@@ -242,7 +300,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "actor wizard authority"],
     writes: ["target actor api_keys"],
     emits: [],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.create_api_key,
     note: "Wizard-authority minting: the target actor cluster owns the verifier record; the accepted authenticated transcript is the issuance audit. Cleartext is returned once and never stored."
   },
   create_api_key_for_owner: {
@@ -254,7 +312,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "target actor ownership", "actor wizard authority"],
     writes: ["target actor api_keys"],
     emits: [],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.create_api_key_for_owner,
     note: "Owner-mint path used by block mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
   },
   list_api_keys: {
@@ -288,10 +346,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["routed actor api_keys or legacy $system.api_keys", "actor ownership", "local sessions"],
     writes: ["routed actor api_keys.revoked_at or legacy $system.api_keys.revoked_at", "local sessions"],
     emits: [],
-    failure: {
-      ...SINGLE_AUTHORITY_ROLLBACK,
-      post_commit: ["session-ended transport notification"]
-    },
+    failure: FAILURE_CONTRACTS.revoke_api_key,
     note: "Revocation records the credential and local-session mutations in the transcript. The session-ended transport notification is host-only post-commit work: its rejection is measured and cannot rewrite the accepted result."
   },
   human_promote_agent_to_programmer: {
@@ -316,7 +371,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.programmer_agent_count"
     ],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.human_promote_agent_to_programmer,
     open_seed: {
       object_property_names: [
         "account",
@@ -349,7 +404,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.programmer_agent_count"
     ],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.human_demote_agent_from_programmer,
     open_seed: {
       object_property_names: [
         "account",
@@ -370,7 +425,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["actor wizard authority", "account.<kind> prior value"],
     writes: ["account.agent_quota or account.programmer_grant_quota"],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.set_quota,
     open_seed: {
       object_property_names: ["agent_quota", "programmer_grant_quota"]
     },
@@ -409,7 +464,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "agent.features_version"
     ],
     emits: ["object_create", "cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.human_provision_wizard_agent,
     open_seed: {
       object_property_names: [
         "account",
@@ -455,7 +510,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.agent_count"
     ],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.human_revoke_agent,
     open_seed: {
       object_property_names: [
         "account",
@@ -481,7 +536,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object existence", "actor wizard authority"],
     writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "world event schemas", "feature attachments"],
     emits: ["catalog_install"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.catalog_registry_install,
     note: "Catalog install runs as a sequenced $catalog_registry call. All authoritative mutations (class creation, seed_hook instance creation, feature attachment) flow through the recorded transcript; recovery from a partial install is operator-driven (CT14.3)."
   },
   catalog_registry_update: {
@@ -493,8 +548,8 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object state", "actor wizard authority"],
     writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "migration_state"],
     emits: ["catalog_update", "migration_failed"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
-    note: "Catalog update reuses the install pipeline plus any optional migration steps; same transcript-completeness contract."
+    failure: FAILURE_CONTRACTS.catalog_registry_update,
+    note: "Catalog update intentionally retains completed idempotent migration steps and records migration_state when a later step fails. A retry re-derives the plan from the held source version, skips or safely repeats completed work, and converges; this is durable idempotent progress, not rollback of the whole update."
   },
   help_db_find_topics: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -538,10 +593,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target player name", "target player location", "actor location"],
     writes: ["actor location", "room contents", "presence mirrors through movement hooks"],
     emits: ["text observations", "left observation", "entered observation", "object_move", "cell_write", "logical_input"],
-    failure: {
-      ...SINGLE_AUTHORITY_ROLLBACK,
-      post_commit: ["remote presence-mirror notification"]
-    },
+    failure: FAILURE_CONTRACTS.player_join,
     note: "Join is transcript-safe through movetoChecked plus logical timestamps for emitted movement observations."
   },
   actor_focus: {
@@ -553,7 +605,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target existence", "target actor ancestry", "target name visibility", "actor focus_list"],
     writes: ["actor focus_list"],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.actor_focus,
     note: "Focus is transcript-safe because it only appends a validated object ref to the bounded actor-owned focus_list property."
   },
   actor_unfocus: {
@@ -565,7 +617,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["actor focus_list"],
     writes: ["actor focus_list"],
     emits: ["cell_write"],
-    failure: SINGLE_AUTHORITY_ROLLBACK,
+    failure: FAILURE_CONTRACTS.actor_unfocus,
     note: "Unfocus is transcript-safe because it only removes an object ref from the actor-owned focus_list property."
   },
   actor_focus_list: {
@@ -597,6 +649,16 @@ export function nativePrimitiveContract(handler: string | undefined): NativePrim
   return CONTRACTS[handler] ?? null;
 }
 
+export function nativePrimitiveFailureContract(handler: string | undefined): NativePrimitiveFailureContract | null {
+  if (!handler) return null;
+  const contract = FAILURE_CONTRACTS[handler];
+  return contract ? structuredClone(contract) : null;
+}
+
+export function nativePrimitiveFailureContractHandlers(): string[] {
+  return Object.keys(FAILURE_CONTRACTS).sort();
+}
+
 export function nativePrimitiveIsTranscriptTracked(handler: string | undefined): boolean {
   return nativePrimitiveContract(handler)?.transcript === "tracked";
 }
@@ -614,7 +676,9 @@ export function nativePrimitiveContractValue(handler: string | undefined): WooVa
  * boundary must fail tests rather than silently inheriting an ambiguous
  * partial-commit policy.
  */
-export function nativePrimitiveContractDisciplineErrors(): string[] {
+export function nativePrimitiveContractDisciplineErrors(
+  builtinHandlers?: ReadonlyMap<string, BuiltinNativeHandlerMutationKind>
+): string[] {
   const errors: string[] = [];
   for (const [name, contract] of Object.entries(CONTRACTS)) {
     if (contract.handler !== name) errors.push(`${name}: handler field is ${contract.handler}`);
@@ -622,10 +686,16 @@ export function nativePrimitiveContractDisciplineErrors(): string[] {
       errors.push(`${name}: mutating contract has no failure discipline`);
       continue;
     }
+    if (contract.writes.length > 0 && contract.failure !== FAILURE_CONTRACTS[name]) {
+      errors.push(`${name}: tracked mutation does not use the handler failure contract`);
+    }
     const failure = contract.failure;
     if (!failure) continue;
     if (failure.mutation_scope === "single_authority" && failure.on_error !== "rollback") {
       errors.push(`${name}: single-authority mutation must roll back on error`);
+    }
+    if (failure.mutation_scope === "durable_progress" && failure.on_error !== "idempotent_progress") {
+      errors.push(`${name}: durable progress protocol must retain only idempotent progress`);
     }
     if (failure.mutation_scope === "cross_authority_saga" && failure.on_error !== "idempotent_progress") {
       errors.push(`${name}: cross-authority saga must retain only idempotent progress`);
@@ -640,6 +710,37 @@ export function nativePrimitiveContractDisciplineErrors(): string[] {
     }
     if (new Set(postCommit).size !== postCommit.length) {
       errors.push(`${name}: post-commit effect names must be unique`);
+    }
+  }
+  for (const [name, failure] of Object.entries(FAILURE_CONTRACTS)) {
+    const postCommit = failure.post_commit ?? [];
+    if (postCommit.some((item) => item.trim().length === 0)) {
+      errors.push(`${name}: post-commit effect names must be non-empty`);
+    }
+    if (new Set(postCommit).size !== postCommit.length) {
+      errors.push(`${name}: post-commit effect names must be unique`);
+    }
+  }
+  if (builtinHandlers) {
+    for (const [name, mutationKind] of builtinHandlers) {
+      const failure = FAILURE_CONTRACTS[name];
+      if (mutationKind === "read_only") {
+        if (failure) errors.push(`${name}: read-only handler declares a failure contract`);
+        continue;
+      }
+      if (!failure) {
+        errors.push(`${name}: ${mutationKind} handler has no failure contract`);
+        continue;
+      }
+      if (mutationKind === "live_only" && failure.mutation_scope !== "live_only") {
+        errors.push(`${name}: live-only handler declares ${failure.mutation_scope} mutation scope`);
+      }
+      if (mutationKind === "authoritative" && failure.mutation_scope === "live_only") {
+        errors.push(`${name}: authoritative handler declares live-only mutation scope`);
+      }
+    }
+    for (const name of Object.keys(FAILURE_CONTRACTS)) {
+      if (!builtinHandlers.has(name)) errors.push(`${name}: failure contract has no built-in handler classification`);
     }
   }
   return errors;

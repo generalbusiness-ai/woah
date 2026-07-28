@@ -42,8 +42,9 @@ The principled close is implemented at the mutation boundary:
   outer journal is released, so storage refusal restores memory and storage;
 - public values, cached outcomes, bytecode, seeds, and replies cross detached,
   immutable boundaries rather than retaining aliases into authority;
-- the declarative native contract registry requires every tracked mutating
-  primitive to name its rollback, saga, or live-only failure discipline.
+- classified built-in native registrations require every authoritative or
+  live-only primitive—tracked or deliberately untracked—to name its rollback,
+  durable-progress, saga, or live-only failure discipline.
 
 Authority validation remains the independent trust-boundary backstop. This is
 important even with the by-construction producer close: stale, imported, or
@@ -615,12 +616,18 @@ as a trust-boundary backstop against stale or defective planners.
 
 ### Phase 5: make native failure discipline declarative
 
-Extend `NativePrimitiveContract` so every tracked mutating primitive declares
-its failure boundary. A representative shape is:
+Keep transcript eligibility separate from a complete built-in native failure
+registry. Every built-in registration declares `read_only`, `authoritative`, or
+`live_only`; every non-read-only handler declares its failure boundary. A
+representative shape is:
 
 ```ts
 failure: {
-  mutation_scope: "single_authority" | "cross_authority_saga" | "live_only";
+  mutation_scope:
+    | "single_authority"
+    | "durable_progress"
+    | "cross_authority_saga"
+    | "live_only";
   on_error: "rollback" | "idempotent_progress" | "best_effort";
   post_commit?: string[];
 }
@@ -629,13 +636,21 @@ failure: {
 Contract rules:
 
 - `single_authority` mutations use `rollback`;
+- `durable_progress` retains only bounded, idempotent progress with a
+  re-derivable retry plan. Catalog update uses this class: completed migration
+  steps and `migration_state` survive a later step refusal while the published
+  version remains held back;
 - `cross_authority_saga` documents durable progress markers, stable operation
   identity, retry behavior, and terminal repair;
 - `live_only` and `post_commit` work cannot create authoritative domain writes
   or turn accepted behavior into an error;
 - every tracked mutating native has a negative test that throws or rejects
   after its first possible mutation;
-- a guard fails when a new mutating native omits this declaration.
+- the fast guard derives the handler vocabulary and mutation class from
+  `registerBuiltinNativeHandler` call sites, rejects direct unclassified
+  registrations, and fails when any authoritative or live-only handler omits a
+  declaration. An untracked handler remains refused on Net even though its
+  local failure semantics are explicit.
 
 Critical handlers should use a shared prepare/apply form: prepare may read and
 raise but cannot write; apply consumes a validated plan and should contain no
