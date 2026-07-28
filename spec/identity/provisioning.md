@@ -1051,8 +1051,13 @@ identity — opposite remedies. The two are now distinguished:
 `POST /net-operator/wizard/provision` with `{probe: true}` reports the world's
 state **without mutating anything**: `human_present`, `human_class` (the
 target's parent chain, so an operator can see it really is a `$human`),
-`primitive_installed`, `recorded_agent`, and a `next` field naming the command
-to run. This is the sanctioned way to answer "does a human exist on this
+`primitive_installed`, `recorded_agent`, and a `next` LIST naming every
+remaining step in order. The primitive's presence is read from the class page
+directly rather than from verb resolution, which runs through the target's
+lineage chain and so could not answer at all when the human is absent — one
+probe therefore reports both facts instead of costing a round trip per missing
+thing. The anchor op accepts `{probe: true}` for the same reason, so resolving
+a token to its ids never seeds one. This is the sanctioned way to answer "does a human exist on this
 world?" — `/net-api/cell` is presence-scoped and refuses identically for
 present and absent objects, so absence is not provable there.
 

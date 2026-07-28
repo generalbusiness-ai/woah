@@ -367,6 +367,10 @@ type OperatorProvisionAnchorRequest = {
   anchor_id: string;
   label?: string;
   agent_quota?: number;
+  /** Report the ids this token derives and whether they already exist, without
+   * creating anything. Lets the operator's read-only probe resolve a token to
+   * a human id without the probe itself seeding an identity. */
+  probe?: boolean;
 };
 
 /** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
@@ -2469,7 +2473,11 @@ export class NetGatewayDO {
     // below would also collapse idempotently, but answering from the authority
     // read keeps a re-run free of a write attempt entirely.
     await this.warmScopes([{ scope: clusterScope, objects: [human] }], "net_provision_anchor_pull_miss_failed");
-    if (this.ensureView().has(cellKey("object_lineage", human))) {
+    const present = this.ensureView().has(cellKey("object_lineage", human));
+    if (body.probe === true) {
+      return json({ ok: true, probe: true, created: false, exists: present, human, account, scope: clusterScope, catalog_epoch: epoch });
+    }
+    if (present) {
       return json({ ok: true, created: false, human, account, scope: clusterScope, catalog_epoch: epoch });
     }
 
@@ -2639,6 +2647,18 @@ export class NetGatewayDO {
     // anchor). Separate them explicitly from the view.
     const humanPresent = this.ensureView().has(cellKey("object_lineage", human));
     if (probe) {
+      // The primitive's presence is read from the CLASS PAGE directly, not from
+      // `principal`: verb resolution runs through the target's lineage chain,
+      // so with no human it could not answer at all — and a probe that can only
+      // report the first missing thing costs the operator a round trip per
+      // missing thing. Both facts are independent, so report both.
+      const primitiveInstalled = principal !== null
+        || this.ensureView().has(cellKey("verb_bytecode", ANCHOR_HUMAN_CLASS, "provision_wizard_agent"));
+      const steps: string[] = [];
+      if (!humanPresent) steps.push("seed an operator anchor (POST /net-operator/identity/anchor)");
+      if (!primitiveInstalled) {
+        steps.push("install the primitive (npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent')");
+      }
       return json({
         ok: true,
         probe: true,
@@ -2648,15 +2668,10 @@ export class NetGatewayDO {
         human_present: humanPresent,
         human_class: humanPresent ? this.netAncestry(human, 6) : [],
         account: typeof account === "string" ? account : null,
-        primitive_installed: principal !== null,
+        primitive_installed: primitiveInstalled,
         recorded_agent: recordedAgent,
-        // The remedy the operator should run next, so the probe is actionable
-        // rather than merely descriptive.
-        next: !humanPresent
-          ? "seed an operator anchor (POST /net-operator/identity/anchor)"
-          : principal === null
-            ? "install the primitive (npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent')"
-            : "ready: run the provisioning op"
+        // Every remaining step, in order, so one probe is a complete plan.
+        next: steps.length === 0 ? ["ready: run the provisioning op"] : steps
       });
     }
     if (!humanPresent) {

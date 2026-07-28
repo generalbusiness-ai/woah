@@ -244,7 +244,11 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       const noHuman = await signedPost(h, "/net/provision-wizard", { human, provision_id: "ops-1", probe: true });
       expect(noHuman.status, JSON.stringify(noHuman.body)).toBe(200);
       expect(noHuman.body?.human_present).toBe(false);
-      expect(noHuman.body?.next).toMatch(/anchor/);
+      // Both facts in ONE probe: this world lacks the human AND the primitive,
+      // so one call is a complete plan rather than a round trip per problem.
+      expect(noHuman.body?.primitive_installed).toBe(false);
+      expect(JSON.stringify(noHuman.body?.next)).toMatch(/anchor/);
+      expect(JSON.stringify(noHuman.body?.next)).toMatch(/repair:net-definitions/);
 
       // The non-probe call names the identity, not the verb.
       const refused = await signedPost(h, "/net/provision-wizard", { human, provision_id: "ops-1" });
@@ -262,7 +266,8 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(noVerb.body?.human_present).toBe(true);
       expect(noVerb.body?.human_class).toContain("$human");
       expect(noVerb.body?.primitive_installed).toBe(false);
-      expect(noVerb.body?.next).toMatch(/repair:net-definitions/);
+      expect(JSON.stringify(noVerb.body?.next)).toMatch(/repair:net-definitions/);
+      expect(JSON.stringify(noVerb.body?.next)).not.toMatch(/anchor/);
 
       const verbRefused = await signedPost(h, "/net/provision-wizard", { human: seededHuman, provision_id: "ops-1" });
       expect(verbRefused.status).toBe(409);
@@ -272,7 +277,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       await repairDefinitions(h, [bundledVerbPage(h, "$human", AP11_VERB)]);
       const ready = await signedPost(h, "/net/provision-wizard", { human: seededHuman, provision_id: "ops-1", probe: true });
       expect(ready.body?.primitive_installed).toBe(true);
-      expect(ready.body?.next).toMatch(/ready/);
+      expect(JSON.stringify(ready.body?.next)).toMatch(/ready/);
 
       // No probe mutated anything: nothing was provisioned.
       expect(ready.body?.recorded_agent ?? null).toBe(null);
@@ -346,6 +351,23 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // A different token is a different identity.
       const other = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-anchor-2" });
       expect(other.body?.human).not.toBe(human);
+
+      // A probe run resolves the token to its ids WITHOUT creating anything —
+      // which is what lets the operator's read-only probe start from a token.
+      const probeOther = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-anchor-3", probe: true });
+      expect(probeOther.status).toBe(200);
+      expect(probeOther.body?.probe).toBe(true);
+      expect(probeOther.body?.exists).toBe(false);
+      expect(probeOther.body?.created).toBe(false);
+      const probedHuman = probeOther.body?.human as string;
+      await h.settleAll();
+      // Nothing was committed: a real run afterwards still reports created.
+      const realised = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-anchor-3" });
+      expect(realised.body?.created).toBe(true);
+      expect(realised.body?.human).toBe(probedHuman);
+      // ...and probing an EXISTING anchor reports it exists.
+      const probeExisting = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-anchor-3", probe: true });
+      expect(probeExisting.body?.exists).toBe(true);
 
       // Malformed tokens refuse.
       expect((await signedPost(h, "/net/provision-anchor", { anchor_id: "bad token" })).status).toBe(400);

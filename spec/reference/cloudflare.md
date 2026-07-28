@@ -1484,8 +1484,9 @@ named refusal that says which one is missing:
 in one command. Step 2 is a separate, explicit operator action because it
 changes catalog definitions.
 
-Probe first — this reports the world's state without mutating anything, and
-names the command to run next:
+Probe first — this reports the world's state without mutating anything (the
+anchor hop is probed too, so no identity is seeded) and names EVERY remaining
+step in order, so one probe is a complete plan:
 
 ```bash
 npm run provision:net-wizard -- \

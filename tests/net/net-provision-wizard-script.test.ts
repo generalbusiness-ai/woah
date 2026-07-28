@@ -186,6 +186,23 @@ describe("AP11 operator wizard provisioning CLI", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe("https://woo.test/net-operator/wizard/provision");
     expect(calls[0]!.body).toEqual({ human: "human_2", provision_id: "ops-wizard-1", probe: true });
+    calls.length = 0;
+
+    // Probing from a TOKEN must stay read-only too: the anchor hop is flagged
+    // as a probe and carries no label, so it cannot seed an identity.
+    await provisionNetWizard([
+      "--base-url", "https://woo.test",
+      "--anchor-id", "ops-anchor",
+      "--provision-id", "ops-wizard-1",
+      "--probe",
+      "--credential-file", credentialFile
+    ], { homeDir: home, fetch: fetchImpl, log: () => {} });
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://woo.test/net-operator/identity/anchor",
+      "https://woo.test/net-operator/wizard/provision"
+    ]);
+    expect(calls[0]!.body).toEqual({ anchor_id: "ops-anchor", probe: true });
+    expect(calls[1]!.body.probe).toBe(true);
     // No credential was generated at all — probe does not even create the file.
     expect(existsSync(credentialFile)).toBe(false);
   });

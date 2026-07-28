@@ -153,14 +153,23 @@ async function postSigned(url: string, secret: string, payload: unknown, doFetch
 /** Seed (or find) the operator anchor identity this provisioning will hang
  * from. A fresh net world seeds no `$human` at all, so without this the whole
  * runbook has nothing to anchor to. Idempotent on the token. */
-async function ensureAnchor(args: Args, secret: string, doFetch: typeof fetch, log: (m: string) => void): Promise<string> {
+async function ensureAnchor(
+  args: Args,
+  secret: string,
+  doFetch: typeof fetch,
+  log: (m: string) => void
+): Promise<string> {
   const receipt = await postSigned(`${args.baseUrl}/net-operator/identity/anchor`, secret, {
     anchor_id: args.anchorId,
-    label: `operator anchor ${args.anchorId}`
+    // A probe run must stay read-only end to end, so it asks the anchor route
+    // only what ids the token derives and whether they exist.
+    ...(args.probe ? { probe: true } : { label: `operator anchor ${args.anchorId}` })
   }, doFetch);
   const human = typeof receipt.human === "string" ? receipt.human : "";
   if (receipt.ok !== true || !human) throw new Error(`identity anchor returned an invalid receipt: ${JSON.stringify(receipt)}`);
-  log(`anchor ${human} (account ${String(receipt.account)}) ${receipt.created === true ? "created" : "already present"}`);
+  log(args.probe
+    ? `anchor ${human} (account ${String(receipt.account)}) ${receipt.exists === true ? "exists" : "does NOT exist yet"}`
+    : `anchor ${human} (account ${String(receipt.account)}) ${receipt.created === true ? "created" : "already present"}`);
   return human;
 }
 
