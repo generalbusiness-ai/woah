@@ -294,13 +294,27 @@ authenticated actor grows authority storage without limit out of repeated
 effect-free acts, and the quota MUST be enforced at insertion, memory and
 durable rows in one step.
 
-A replay arriving after its reply pruned re-enters validation as a new turn.
-Any routing state a gateway keeps to send a retry back to the scope that
-recorded its reply — a selection pin — MUST be retained to cover that scope's
-reply window; if it expires first, a retry re-plans and may commit at a second
-scope, which is the double execution this section exists to prevent. Per-surface
-client contract, including the exact windows, the retained byte ceiling and what
-a client is promised on retry:
+A recorded outcome MUST also expire on a wall-clock LEASE, independently of
+those quotas. Routing state a gateway keeps to send a retry back to the scope
+that recorded its reply — a selection pin — MUST outlive that lease; if it
+expires first, a retry re-plans and may commit at a second scope, which is the
+double execution this section exists to prevent.
+
+Row counts MUST NOT be used to establish that ordering. The two stores prune on
+unrelated triggers, so a bound on rows in one implies nothing about age in the
+other, and an implementation that sizes one against the other will evict a live
+route under pressure it did not anticipate. A shared clock is the only ordering
+both sides can honour, and the routing lease MUST exceed the outcome lease by
+enough to absorb clock skew between the two hosts.
+
+An unexpired routing record MUST NOT be evicted to make room. At capacity an
+implementation MUST refuse a new retry-safe admission before planning or
+submitting anything, and report that refusal to the client, rather than issue a
+guarantee it cannot keep.
+
+A replay arriving after its reply expired re-enters validation as a new turn.
+Per-surface client contract, including the exact leases, the guarantee's stated
+exclusions, the retained byte ceiling and what a client is promised on retry:
 [mcp.md §M4.2](mcp.md#m42-retry-safety-the-operation-id).
 
 Fanout carries two distinct monotonic positions. The authority `seq` gates

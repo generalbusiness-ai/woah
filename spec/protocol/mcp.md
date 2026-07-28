@@ -621,14 +621,52 @@ most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
 of insertion, in memory and in durable storage together: a prune that can lag
 its insert is the unbounded cache it was meant to prevent.
 
-**The gateway's scope pin is retained to cover that window**, counted PER SCOPE
-(2048 keys, above the 1280 a scope can retain) rather than shard-wide. The pin
-decides where a retry is routed and the recorded reply decides whether it
-executes, so a pin that expires while its reply is live would let a retry
-re-plan into a second scope and commit there — the same double execution, by a
-different door. The converse is not required: the pin is necessarily written
-before its submit (that is what makes it survive a lost response), so pins with
-no reply behind them are expected, and a pin outliving its reply is harmless.
+**The retention boundary is a LEASE, and it is shared.** Two stores decide
+whether a retry is safe: the gateway's selection pin decides where the retry is
+routed, and the authority's recorded reply decides whether it executes when it
+gets there. If the pin expires while the reply is live, the retry re-plans, may
+select a second scope, and commits there — the same double execution, by a
+different door.
+
+Row counts cannot establish that ordering and MUST NOT be used to try. The two
+stores prune on unrelated triggers, so a limit in one says nothing about age in
+the other; two successive attempts to size this were both disproved by direct
+probes (a shard-wide ceiling deleting by global row order regardless of scope,
+and a per-scope cap counting pins rather than pins with a live outcome). The
+boundary is therefore a clock both sides share:
+
+- a recorded outcome expires **10 minutes** after it is recorded, whatever the
+  count quotas above would allow;
+- a pin for a client-supplied operation id expires after **20 minutes**. The
+  gap is slack: the two stores are different Durable Objects with independent
+  clocks, and the pin must outlive the reply even under skew;
+- an unexpired pin is **never evicted**. At capacity the gateway REFUSES a new
+  retry-safe admission with `E_RETRY_CAPACITY` rather than drop a live one.
+  Nothing is planned or submitted; the client is told that the retry
+  *guarantee* was refused, not the operation, and MAY retry shortly or re-issue
+  without an operation id and accept at-least-once semantics knowingly. A
+  visible refusal is the intended cost — the alternative is a guarantee that
+  silently does not hold.
+
+**The guarantee, exactly.** A recorded outcome younger than the 10-minute
+authority lease has a live pin routing its retry back to the scope that holds
+it. It does NOT hold, and MUST NOT be relied on, when:
+
+- the retry reaches a **different gateway shard** than the one that admitted
+  the operation. Shard routing follows the session, then the API key, so
+  retries on one credential are shard-stable; a retry presenting a *different*
+  credential for the same actor may land on a shard that never held the pin;
+- the admitting shard **lost its durable storage**;
+- the operation id was **gateway-minted** rather than client-supplied. Minted
+  keys are never reusable by a client, so they carry no retained-route promise
+  and their pins are evicted freely;
+- either lease has **expired** — see the paragraph below, which is the ordinary
+  case and not a failure.
+
+The converse containment is deliberately not claimed: a pin outliving its reply
+is expected and harmless. The pin is necessarily written BEFORE its submit —
+that is what makes it survive a lost response — so at write time there is no
+outcome to condition on.
 
 A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read
