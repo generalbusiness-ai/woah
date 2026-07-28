@@ -183,11 +183,19 @@ export type NetTurnOutcome = {
    * THREW still commits, so check `error` before trusting `result`). */
   result?: unknown;
   error?: unknown;
-  /** The turn's observations (empty on rejected and on replayed — a
-   * detected idempotent replay omits them rather than inventing a
-   * re-planned execution; see gateway TurnResult.replayed). */
+  /** The turn's observations. Empty on rejected. On a detected idempotent
+   * replay these are the RECORDED observations of the execution that
+   * committed — never the replay's own re-planned ones (see gateway
+   * TurnResult.replayed) — and empty when the authority retained none. */
   observations: Record<string, unknown>[];
   replayed?: boolean;
+  /** CO2.5: how much of the committed execution's outcome a replay could
+   * show (`full` / `partial` / `none`); `replay_omitted` names the missing
+   * parts. Present only alongside `replayed`. On `partial`/`none`, an
+   * absent `result` means "not retained", NOT "the verb returned nothing".
+   * See spec/protocol/mcp.md §M4.2. */
+  replay_outcome?: "full" | "partial" | "none";
+  replay_omitted?: Array<"result" | "error" | "observations">;
   raw: Record<string, unknown>;
 };
 
@@ -679,6 +687,12 @@ export class NetFeed {
       ...(body.error !== undefined ? { error: body.error } : {}),
       observations: deliveredObservations,
       ...(body.replayed === true ? { replayed: true } : {}),
+      ...(typeof body.replay_outcome === "string"
+        ? { replay_outcome: body.replay_outcome as "full" | "partial" | "none" }
+        : {}),
+      ...(Array.isArray(body.replay_omitted)
+        ? { replay_omitted: body.replay_omitted as Array<"result" | "error" | "observations"> }
+        : {}),
       raw: body
     };
   }

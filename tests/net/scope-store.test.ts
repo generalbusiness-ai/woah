@@ -96,7 +96,9 @@ describe("hydrate round-trip (CO5 copy #1)", () => {
     // Idempotent replay of a pre-eviction key returns the RECORDED reply
     // (marked replayed per B2 — same verdict/head/touched otherwise).
     const replay = b.submit(submitFor(b, transcript("t2", "two"), "k2"));
-    expect(replay).toEqual({ ...r2, replayed: true });
+    // CO2.5: the replay also carries the RECORDED outcome of the execution
+    // that committed — here just its actor binding (no result, no lines).
+    expect(replay).toEqual({ ...r2, replayed: true, replay_output: { actor: "#a" } });
     expect(b.head().seq).toBe(2); // no double-commit
   });
 
@@ -142,7 +144,12 @@ describe("authoritative sequenced log (SL1/SL4)", () => {
     // hydrated cells; an idempotent retry appends nothing.
     const cold = new ScopeSequencer(SCOPE, EPOCH, { durable: store, now: () => 202 });
     expect(cold.replayPage(SCOPE, 1, 10)).toHaveLength(1);
-    expect(cold.submit(submitFor(cold, t1, "log-k1"))).toEqual({ ...accepted, replayed: true });
+    expect(cold.submit(submitFor(cold, t1, "log-k1"))).toEqual({
+      ...accepted,
+      replayed: true,
+      // CO2.5: the committed act's observations replay with the reply.
+      replay_output: { actor: "#a", observations: [{ type: "test.act", version: 1, payload: { n: 1 } }] }
+    });
     expect(cold.replayPage(SCOPE, 1, 10)).toHaveLength(1);
 
     const t2 = loggedTranscript(cold, "log-2", 2, { code: "E_TEST", message: "refused" });

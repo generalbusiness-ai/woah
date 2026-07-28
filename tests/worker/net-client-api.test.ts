@@ -98,6 +98,7 @@ type TurnBody = {
   result?: unknown;
   observations?: Array<Record<string, unknown>>;
   replayed?: boolean;
+  replay_outcome?: string;
 };
 
 async function buildHarness(options: { credentialTtlMs?: string } = {}) {
@@ -820,8 +821,11 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(deniedDirect.status).toBe(403);
     expect(deniedDirect.body.error).toMatchObject({ code: "E_DIRECT_DENIED" });
 
-    // Client-supplied idempotency key replays per the item-1 contract:
-    // the recorded reply comes back marked, without an invented result.
+    // Client-supplied idempotency key replays per the item-1 contract: the
+    // recorded reply comes back marked, carrying the RECORDED outcome of the
+    // execution that committed (CO2.5 / M4.2) — never an invented one from
+    // this round's re-plan. `bump` returned 1 the first time and returns 1
+    // here, while the counter stays at 1.
     const replay = await clientFetch(h.gateway, "POST", "/net-api/turn", {
       token,
       body: { target: "capi_box", verb: "bump", session: sid, idempotency_key: "capi-t1" }
@@ -830,7 +834,9 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const replayBody = replay.body as unknown as TurnBody;
     expect(replayBody.reply.status).toBe("accepted");
     expect(replayBody.replayed).toBe(true);
-    expect(replayBody.result).toBeUndefined();
+    expect(replayBody.replay_outcome).toBe("full");
+    expect(replayBody.result).toBe(1);
+    expect(replayBody.observations?.map((o) => o.type)).toContain("bumped");
 
     // Authenticated reads: the committed counter is in the view
     // (install-on-accept), and the relation roster read serves from the

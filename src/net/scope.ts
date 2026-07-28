@@ -135,6 +135,28 @@ export type CommitSubmit = {
   /** Same-scope reads were replaced by the exact complete base generation.
    * Such a submit may not use retained-head rebasing. */
   owned_reads_compacted?: true;
+  /** CO2.5 replay outcome: the executor's verb return value, carried so the
+   * authority can serve it back on a replay of this key.
+   *
+   * `compactTranscriptForSubmit` deliberately strips `result` from the WIRE
+   * transcript — the scope never executes bytecode and never consumes a
+   * return value, so it has no business inside the hashed transcript body.
+   * But a client whose response was lost has no other way to learn what its
+   * committed turn returned: the retry re-plans a DIFFERENT execution, whose
+   * result must never be presented as the committed one. So the value rides
+   * as an unhashed SIBLING, opaque to validation, stored with the recorded
+   * reply and returned only to a replay by the same actor.
+   *
+   * The planner attaches it only for a MUTATING transcript within
+   * REPLAY_OUTPUT_BYTE_CAP (see plan.ts replaySubmitOutput): a read is safe
+   * to re-issue under a fresh key, and every read envelope must keep its
+   * exact former size against the CO7 ceiling. */
+  replay_result?: EffectTranscript["result"];
+  /** Set when a result EXISTS but was deliberately not carried (too large,
+   * or a non-mutating turn). Distinguishes "the verb returned nothing" from
+   * "the verb returned something this replay cannot show you" — without it a
+   * replay would report `null` for both. */
+  replay_result_omitted?: true;
   /** CO2.3 rider integrity (rule 1): owner attestations for the
    * transcript's FOREIGN-anchored reads, keyed by owning scope. The
    * gateway fetches these at plan time (`POST /net/attest` — one async
@@ -227,6 +249,11 @@ export type CommitReply =
        * Stamped on a copy at return time; the cached reply never carries
        * it, so replay-of-a-replay stays stable. */
       replayed?: boolean;
+      /** CO2.5 replay outcome: the RECORDED output of the execution that
+       * actually committed under this key. Present only on a replayed reply
+       * (a fresh accept's caller already holds its own planned transcript),
+       * and only when the replaying actor is the one that committed it. */
+      replay_output?: ReplayOutput;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -240,6 +267,36 @@ export type CommitReply =
       mismatched_reads?: TranscriptCell[];
       detail?: Record<string, unknown>;
     };
+
+/**
+ * CO2.5: what a client learns when its retry is deduplicated.
+ *
+ * Idempotency without this is hollow. Deduplicating the commit stops the
+ * double-execution, but a client whose response was lost still has to
+ * discover the outcome, and the retry's own re-plan describes an execution
+ * that never committed. So the authority retains the committed execution's
+ * output beside its recorded reply and serves that instead.
+ */
+export type ReplayOutput = {
+  /** The actor whose turn committed under this key. The retained output is
+   * bound to it: a submit from a DIFFERENT actor replaying the same key
+   * still gets the dedupe verdict (it committed nothing) but never the
+   * first actor's return value or its directed lines. Idempotency keys are
+   * client-chosen on `/net-api/turn` and the WS turn frame, so two clients
+   * CAN pick the same string; that must never become a read channel. */
+  actor?: string;
+  /** The verb's return value (submit.replay_result), when carried. */
+  result?: EffectTranscript["result"];
+  /** The recorded transcript error — a verb that THREW still commits, so a
+   * replay without this would report the failure as a success. */
+  error?: EffectTranscript["error"];
+  /** The committed transcript's observations. These ride the wire already
+   * (the scope needs them for fanout), so retaining them is free. */
+  observations?: EffectTranscript["observations"];
+  /** Parts that exist but were not retained, so a replay can say so instead
+   * of presenting an absence as an empty success. */
+  omitted?: Array<"result" | "error" | "observations">;
+};
 
 export type ScheduledTurn = {
   id: string;
@@ -317,6 +374,18 @@ export type ScopeSequencerOptions = {
  * per turn forever. The recovery-tail window is never pruned, so the count
  * retained BEYOND the window is this cap minus the in-window replies. */
 export const REPLY_CACHE_CAP = 1024;
+
+/**
+ * CO2.5: the serialized byte ceiling for ONE recorded reply's ReplayOutput.
+ *
+ * The reply cache is bounded by COUNT, so an unbounded per-entry payload
+ * would be an unbounded cache. With this cap the whole cache is bounded at
+ * REPLY_CACHE_CAP * REPLAY_OUTPUT_BYTE_CAP ≈ 4 MiB of retained output, on
+ * top of the replies themselves. It is also well inside the CO7 warm
+ * envelope ceiling (64 KiB), so attaching a result never turns a committing
+ * turn into an E_ENVELOPE refusal.
+ */
+export const REPLAY_OUTPUT_BYTE_CAP = 4096;
 
 export class ScopeSequencer {
   readonly scope: string;
@@ -799,7 +868,20 @@ export class ScopeSequencer {
     // must not fabricate output. The stored reply's own `replayed` stays
     // unset, so replay-of-a-replay remains stable.
     const recorded = this.replies.get(submit.idempotency_key);
-    if (recorded) return recorded.status === "accepted" ? { ...recorded, replayed: true } : recorded;
+    if (recorded) {
+      if (recorded.status !== "accepted") return recorded;
+      // The retained outcome is bound to the actor that committed it. A
+      // mismatch still replays the VERDICT (this submit committed nothing —
+      // that is the whole safety property) but never the other actor's
+      // return value or lines. Aged rows carry no `actor`, so they replay
+      // their output as before this rule existed only when they have none.
+      const output = recorded.replay_output;
+      if (output?.actor !== undefined && output.actor !== submit.transcript.call.actor) {
+        const { replay_output: _withheld, ...verdict } = recorded;
+        return { ...verdict, replayed: true };
+      }
+      return { ...recorded, replayed: true };
+    }
 
     // Step 1: envelope/actor/session authority (CO14: the shell wires
     // authorizeSessionSubmit here). A thrown error carrying a structured
@@ -1382,7 +1464,12 @@ export class ScopeSequencer {
       ...(derived.local.length > 0 ? { relations: derived.local } : {}),
       ...(relationsForeign.length > 0 ? { relations_foreign: relationsForeign } : {})
     };
-    this.replies.set(submit.idempotency_key, reply);
+    // CO2.5: the CACHED reply carries the committed execution's output; the
+    // reply RETURNED to this fresh accept does not, because its caller holds
+    // the planned transcript already and re-sending it would double every
+    // observation on the wire.
+    const recordedReply: CommitReply = { ...reply, replay_output: this.recordedOutput(submit) };
+    this.replies.set(submit.idempotency_key, recordedReply);
     // H2a: bound the reply cache on each accepted commit (memory and the
     // durable rows prune in lockstep inside the transaction below).
     const prunedReplies = this.pruneReplies();
@@ -1400,7 +1487,7 @@ export class ScopeSequencer {
           else durable.deleteCell(key);
         }
         durable.writeMeta(this.metaRow());
-        durable.writeReply(submit.idempotency_key, reply);
+        durable.writeReply(submit.idempotency_key, recordedReply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
         if (logEntry) durable.appendLogEntry(logEntry);
@@ -2551,6 +2638,52 @@ export class ScopeSequencer {
    * Returns the pruned keys so the caller deletes the durable rows in
    * the same transaction (memory-follows-durable in lockstep).
    */
+  /**
+   * CO2.5: the outcome retained with an accepted reply, so a replay can tell
+   * its client what actually happened.
+   *
+   * Three sources, all already at hand — no second execution and no new wire
+   * field beyond `replay_result`: the actor and observations come from the
+   * committed transcript, the error comes from the transcript (a verb that
+   * threw still commits, and a replay reporting that as success would be the
+   * worst outcome of all), and the return value rides as an unhashed sibling.
+   *
+   * Degradation is explicit, never silent. Over the byte cap, observations
+   * drop first — they are the bulk, and a client can re-orient with a fresh
+   * read — and the dropped part is NAMED in `omitted` so the replay says "I
+   * am not showing you this" instead of showing an empty list.
+   */
+  private recordedOutput(submit: CommitSubmit): ReplayOutput {
+    const omitted: Array<"result" | "error" | "observations"> = [];
+    if (submit.replay_result_omitted === true) omitted.push("result");
+    const core: ReplayOutput = {
+      actor: submit.transcript.call.actor,
+      ...(submit.replay_result !== undefined ? { result: submit.replay_result } : {}),
+      ...(submit.transcript.error !== undefined ? { error: submit.transcript.error } : {})
+    };
+    const observations = submit.transcript.observations ?? [];
+    const full: ReplayOutput = observations.length > 0 ? { ...core, observations } : core;
+    // One serialization per accepted commit, on a value the durable write
+    // below serializes again anyway — the cap has to be measured over what
+    // is actually retained.
+    if (JSON.stringify(full).length <= REPLAY_OUTPUT_BYTE_CAP) {
+      return omitted.length > 0 ? { ...full, omitted } : full;
+    }
+    omitted.push("observations");
+    if (JSON.stringify(core).length <= REPLAY_OUTPUT_BYTE_CAP) return { ...core, omitted };
+    // Even result+error alone is oversized (pathological, but it must not
+    // silently become an empty success). Retain the binding and name every
+    // part that existed and is not being shown.
+    return {
+      actor: submit.transcript.call.actor,
+      omitted: [
+        ...(core.result !== undefined || submit.replay_result_omitted === true ? ["result" as const] : []),
+        ...(core.error !== undefined ? ["error" as const] : []),
+        "observations" as const
+      ]
+    };
+  }
+
   private pruneReplies(): string[] {
     const limit = this.options.replyLimit ?? REPLY_CACHE_CAP;
     if (this.replies.size <= limit) return [];
