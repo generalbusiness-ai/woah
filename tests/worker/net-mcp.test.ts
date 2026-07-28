@@ -637,7 +637,15 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const expiredState = queues.get("s_state_1");
     let waitWakes = 0;
     let streamCloses = 0;
-    expiredState.waiters.push(() => { waitWakes += 1; });
+    // Waiters are records now, keyed by request id so an explicit
+    // notifications/cancelled can release exactly one (M5). Disposal wakes
+    // them CANCELLED: the buffer is being cleared anyway, and a disposed
+    // session must not record a drain watermark it will never use.
+    let cancelledWake: boolean | null = null;
+    expiredState.waiters.push({
+      requestId: "s_state_1_wait",
+      wake: (cancelled: boolean) => { waitWakes += 1; cancelledWake = cancelled; }
+    });
     expiredState.sseWaiters.push({ deliver: () => false, close: () => { streamCloses += 1; } });
     expiredState.buffer.push({ retained: true });
     expiredState.ownEchoIds.add("echo:retained");
@@ -648,6 +656,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     expect(queues.has("s_state_1")).toBe(false);
     expect(queues.has("s_state_0")).toBe(true);
     expect(waitWakes).toBe(1);
+    expect(cancelledWake).toBe(true);
     expect(streamCloses).toBe(1);
     expect(expiredState.buffer).toEqual([]);
     expect(expiredState.ownEchoIds.size).toBe(0);

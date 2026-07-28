@@ -313,6 +313,13 @@ type TurnRequest = {
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
+  /** CO2.5: the CLIENT chose this key and expects retry semantics. Set by an
+   * MCP `operation_id` and by `retry_safe:true` on /net-api/turn; NOT set
+   * for a gateway-minted key, nor for the browser's per-turn ids, which are
+   * unique by construction and would only add a storage write per turn. It
+   * makes an effect-free but externally visible turn (speech) record a
+   * receipt so its retry cannot emit the act a second time. */
+  retry_receipt?: boolean;
   /** DEPRECATED-FOR-PRODUCTION topology overrides (lane/test fixtures
    * only — CO15 forbids request-supplied topology on the production
    * path). When ALL THREE are absent the gateway derives everything:
@@ -4837,10 +4844,18 @@ export class NetGatewayDO {
     }, planningScope);
     // Client retries reuse their supplied idempotency key (CO2.5); an
     // unkeyed request gets a fresh turn identity.
-    const key =
+    const suppliedKey =
       typeof body.idempotency_key === "string" && body.idempotency_key.length > 0
         ? body.idempotency_key
-        : `napi:${randomHex(12)}`;
+        : null;
+    const key = suppliedKey ?? `napi:${randomHex(12)}`;
+    // CO2.5 receipt opt-in. Supplying a key is NOT the signal on its own:
+    // the browser mints a fresh uuid per turn (net-feed.ts) and never reuses
+    // it, so treating that as an opt-in would add a storage write to every
+    // view refresh — exactly the cost the effect-free direct path avoids.
+    // `retry_safe` is the explicit statement "this key is stable and I will
+    // reuse it"; MCP sets it from an `operation_id`.
+    const retryReceipt = suppliedKey !== null && body.retry_safe === true;
     // Echo dedupe (item 3 chunk 2): recorded BEFORE the submit leaves —
     // the committing scope's outbox drain races the turn reply, so a
     // post-reply registration could let the fanout push arrive first and
@@ -4897,7 +4912,8 @@ export class NetGatewayDO {
       trace,
       planningScope,
       catalog_epoch: epoch,
-      idempotency_key: key
+      idempotency_key: key,
+      ...(retryReceipt ? { retry_receipt: true } : {})
     });
     // H1: keep this gateway subscribed to the scope the session is NOW
     // present in — its activeScope AFTER any transition this turn folded
@@ -5099,8 +5115,20 @@ export class NetGatewayDO {
       return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
     }
     // Notifications (no id) acknowledge with 202 and no body — the MCP
-    // handshake's notifications/initialized.
+    // handshake's notifications/initialized. `notifications/cancelled` is
+    // ACTED ON first: with a bounded waiter set, dropping it would leave a
+    // client unable to reclaim its own parked slots before their timeouts.
     if (rpc.id === undefined || rpc.id === null) {
+      if (rpc.method === "notifications/cancelled") {
+        const params = mcpRecord(rpc.params);
+        const requestId = params.requestId;
+        // Cancellation is advisory and unauthenticated beyond the session
+        // header: it can only ever release a waiter parked under THIS
+        // session id, and releasing one drains nothing.
+        if (typeof requestId === "string" || typeof requestId === "number") {
+          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", String(requestId));
+        }
+      }
       return new Response(null, { status: 202 });
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
@@ -5307,7 +5335,8 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const drained = await this.mcpWait(session, actor, timeout, limit);
+      const drained = await this.mcpWait(session, actor, timeout, limit, String(id));
+      if ("refused" in drained) return this.mcpToolError(id, drained.refused);
       return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
     // The relation mirror can be newer than this gateway's object-cell view.
@@ -5469,7 +5498,19 @@ export class NetGatewayDO {
       }
       const turnResponse = await this.clientTurn(
         actor,
-        { target: object, verb, args, route, session, idempotency_key: turnId },
+        {
+          target: object,
+          verb,
+          args,
+          route,
+          session,
+          idempotency_key: turnId,
+          // CO2.5: an operation id is a promise the client will reuse this
+          // key, so an effect-free but externally visible turn (speech)
+          // records a receipt and its retry cannot emit the act twice. The
+          // minted fallback key sets nothing — it is never reused.
+          ...(operationId ? { retry_safe: true } : {})
+        },
         identity.epoch,
         // AU2 MCP carrier (threaded from mcpToolsCall, which holds the
         // request): an MCP agent framework that emits traceparent joins
@@ -5486,19 +5527,12 @@ export class NetGatewayDO {
         replay_omitted?: unknown;
         [key: string]: unknown;
       };
-      const shape = (failure: unknown): Response =>
-        this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object));
-      if (!turnResponse.ok) return shape(turn.error ?? turn);
-      if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
-      // A replayed turn whose RECORDED outcome was an error replays that
-      // error: the verb threw, its (effect-less or partial) transcript still
-      // committed, and reporting it as success would be worse than the
-      // double-execution this whole path exists to prevent.
-      if (turn.error !== undefined) return shape(turn.error);
       // CO2.5: a replay carries the committed execution's outcome plus the
       // markers that say how much of it survived retention. `result` is
       // omitted (not `null`) when the outcome exists but was not retained,
       // so a client can tell "returned nothing" from "cannot show you".
+      // Computed BEFORE the failure branches: a replayed FAILURE is still a
+      // replay, and the client needs to know it did not just re-run.
       const replay = turn.replayed === true
         ? {
             replayed: true as const,
@@ -5506,6 +5540,22 @@ export class NetGatewayDO {
             ...(Array.isArray(turn.replay_omitted) ? { omitted: turn.replay_omitted } : {})
           }
         : undefined;
+      const shape = (failure: unknown, observations?: unknown[]): Response =>
+        this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object), observations, replay);
+      // A transport failure and a rejected commit never executed a verb, so
+      // there are no own-turn observations to carry.
+      if (!turnResponse.ok) return shape(turn.error ?? turn);
+      if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
+      // An ACCEPTED commit whose verb THREW is a failure that still ran: its
+      // transcript committed, and it may have emitted lines before throwing.
+      // Those lines are the submitter's ONLY copy — the gateway suppresses
+      // its own committed echo from woo_wait precisely because the reply is
+      // supposed to carry them (§M4.1) — so returning early here dropped
+      // them on the floor and left an MCP actor unable to see what its own
+      // failed action did. A replayed failure replays the RECORDED lines.
+      if (turn.error !== undefined) {
+        return shape(turn.error, this.mcpOwnTurnObservations(turn.observations, actor));
+      }
       const resultKnown = !(replay !== undefined && turn.result === undefined && replay.outcome !== "full");
       return this.mcpResult(
         id,
@@ -5542,6 +5592,25 @@ export class NetGatewayDO {
     if (!failure || typeof failure !== "object" || Array.isArray(failure)) return failure;
     const record = failure as Record<string, unknown>;
     const code = typeof record.code === "string" ? record.code : typeof record.reason === "string" ? record.reason : "";
+    // CO2.5 / M4.2: key reuse for a DIFFERENT call. This needs its own code,
+    // not a generic argument error: the client's arguments are fine — what
+    // is wrong is that it reused an operation id, and only a specific code
+    // tells it which of the two to change. Nothing about the original call
+    // is echoed; the holder of a colliding key must not learn it.
+    if (code === "idempotency_conflict") {
+      const detail = mcpRecord(record.detail);
+      return {
+        code: "E_IDEMPOTENCY_CONFLICT",
+        message: "this operation_id was already used for a different call",
+        detail: {
+          ...detail,
+          reason: "operation_id_reused",
+          remediation:
+            "if you meant to retry the earlier call, send it again UNCHANGED under this operation_id; "
+            + "if this is a new operation, give it a new operation_id"
+        }
+      };
+    }
     if (code !== "E_SCOPE_SPLIT") return failure;
     const active = this.mcpActiveScope(actor, session);
     if (target === active) return failure; // already standing in the target
@@ -5662,13 +5731,48 @@ export class NetGatewayDO {
     });
   }
 
-  private mcpToolError(id: number | string, detail: unknown): Response {
+  /**
+   * A failed tool call.
+   *
+   * `observations` is the same seat as on a successful reply (§M4.1), and it
+   * matters MORE here: a verb that threw after emitting lines still commits
+   * its transcript, the gateway suppresses the submitter's own committed
+   * echo from `woo_wait` because the reply is supposed to carry them, and so
+   * an error envelope without them loses those lines entirely — the actor
+   * can never learn what its own failed action did. Absent for transport
+   * failures and rejected commits, which ran no verb.
+   *
+   * `replay` marks a failure that is the RECORDED outcome of an earlier
+   * committed turn rather than a fresh one. Without it a client sees an
+   * error and cannot tell whether its retry ran again or replayed.
+   */
+  private mcpToolError(
+    id: number | string,
+    detail: unknown,
+    observations?: unknown[],
+    replay?: { replayed: true; outcome: string; omitted?: unknown[] }
+  ): Response {
     return json({
       jsonrpc: "2.0",
       id,
       result: {
-        content: [{ type: "text", text: JSON.stringify(detail) }],
-        structuredContent: { error: detail },
+        content: [
+          { type: "text", text: JSON.stringify(detail) },
+          ...(observations && observations.length > 0
+            ? [{ type: "text", text: JSON.stringify({ observations }) }]
+            : [])
+        ],
+        structuredContent: {
+          error: detail,
+          ...(observations ? { observations } : {}),
+          ...(replay
+            ? {
+                replayed: true,
+                replay_outcome: replay.outcome,
+                ...(Array.isArray(replay.omitted) && replay.omitted.length > 0 ? { replay_omitted: replay.omitted } : {})
+              }
+            : {})
+        },
         isError: true
       }
     });
@@ -5685,7 +5789,13 @@ export class NetGatewayDO {
    * gateway can still PROVE continuity since its last drain. A pending gap
    * short-circuits the park so the agent learns to re-orient immediately
    * instead of after a full long-poll. */
-  private async mcpWait(session: string, actor: string, timeoutMs: number, limit: number): Promise<{ observations: unknown[]; gap: boolean }> {
+  private async mcpWait(
+    session: string,
+    actor: string,
+    timeoutMs: number,
+    limit: number,
+    requestId: string
+  ): Promise<{ observations: unknown[]; gap: boolean } | { refused: Record<string, unknown> }> {
     const queue = this.mcpQueues.get(session);
     // No live state at all: nothing to drain and nothing to vouch for.
     if (!queue) return { observations: [], gap: true };
@@ -5702,18 +5812,66 @@ export class NetGatewayDO {
     };
     if (queue.gapPending || queue.buffer.length > 0) return take();
     if (timeoutMs === 0) return take();
+    // Bounded parking. Each parked call holds a closure and a live timer for
+    // up to 25s, so an unbounded set is a resource-exhaustion vector on an
+    // authenticated-but-public surface. One outstanding long-poll is the
+    // well-behaved shape; the cap leaves room for a retry or two in flight
+    // and refuses beyond that with a code that names the condition.
+    if (queue.waiters.length >= MCP_MAX_SESSION_WAITS) {
+      // Refused as a TOOL result, not a thrown taxonomy error: a throw here
+      // would escape the woo_wait branch as an HTTP failure instead of the
+      // MCP envelope a client can read.
+      return {
+        refused: {
+          code: "E_WAIT_LIMIT",
+          message: "too many concurrent woo_wait calls for this session",
+          detail: {
+            reason: "wait_concurrency",
+            outstanding: queue.waiters.length,
+            limit: MCP_MAX_SESSION_WAITS,
+            remediation:
+              "keep at most one woo_wait in flight per session; await it, or cancel it with "
+              + "notifications/cancelled naming its request id"
+          }
+        }
+      };
+    }
     return await new Promise<{ observations: unknown[]; gap: boolean }>((resolve) => {
-      const timer = setTimeout(() => {
-        const index = queue.waiters.indexOf(wake);
+      const release = (): void => {
+        clearTimeout(timer);
+        const index = queue.waiters.findIndex((entry) => entry.wake === wake);
         if (index >= 0) queue.waiters.splice(index, 1);
+      };
+      const timer = setTimeout(() => {
+        release();
         resolve(take());
       }, timeoutMs);
-      const wake = (): void => {
-        clearTimeout(timer);
-        resolve(take());
+      const wake = (cancelled: boolean): void => {
+        release();
+        // A CANCELLED wait must not drain: the client is no longer reading
+        // this response, and `take()` would consume buffered rows into a
+        // reply nobody sees — at-most-once delivery turning into none.
+        resolve(cancelled ? { observations: [], gap: false } : take());
       };
-      queue.waiters.push(wake);
+      queue.waiters.push({ requestId, wake });
     });
+  }
+
+  /**
+   * MCP `notifications/cancelled`: release the parked request it names.
+   *
+   * Ignoring cancellation left a client with no way to reclaim a parked slot
+   * short of waiting out its timeout, which — with a bounded waiter set —
+   * would turn a client's own abandoned polls into a self-inflicted refusal.
+   * Unknown ids are silently fine: the request may have completed already,
+   * and a cancellation is advisory by construction.
+   */
+  private mcpCancelWait(session: string, requestId: string): void {
+    const queue = this.mcpQueues.get(session);
+    if (!queue) return;
+    const index = queue.waiters.findIndex((entry) => entry.requestId === requestId);
+    if (index < 0) return;
+    queue.waiters[index].wake(true);
   }
 
   /** Fanout-side feed (called after the same server-side submitter echo
@@ -5732,7 +5890,7 @@ export class NetGatewayDO {
       queue.gapPending = true;
     }
     const waiters = queue.waiters.splice(0, queue.waiters.length);
-    for (const wake of waiters) wake();
+    for (const waiter of waiters) waiter.wake(false);
     return true;
   }
 
@@ -5804,8 +5962,10 @@ export class NetGatewayDO {
     state.toolListDigest = null;
     state.listChangedDirty = false;
     state.listChangedPending = false;
+    // Cancelled, not drained: the buffer above is already cleared, and a
+    // disposed session must not record a drain watermark it will never use.
     const waiters = state.waiters.splice(0, state.waiters.length);
-    for (const wake of waiters) wake();
+    for (const waiter of waiters) waiter.wake(true);
     const streams = state.sseWaiters.splice(0, state.sseWaiters.length);
     for (const stream of streams) stream.close();
   }
@@ -8792,6 +8952,7 @@ export class NetGatewayDO {
       classifier,
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
+      ...(request.retry_receipt === true ? { retryReceipt: true } : {}),
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
       // Repaired objects ride into the seed slice so a re-plan keeps the
       // cells a prior round pulled (see PlanTurnInput.seedObjects).
@@ -9645,6 +9806,10 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 /** MCP adapter bounds (client-shell phase i). */
+/** Bounded per-session `woo_wait` parking (M5). One outstanding long-poll is
+ * the well-behaved shape; the slack covers a retry in flight. */
+const MCP_MAX_SESSION_WAITS = 4;
+
 const MCP_QUEUE_CAP = 256;
 const MCP_SESSION_STATE_CAP = 512;
 /** Conservative SQLite bind chunk for scope ∩ local-carrier queries. */
@@ -9671,7 +9836,11 @@ type NetMcpSseWaiter = {
 type NetMcpSessionState = {
   actor: string;
   buffer: unknown[];
-  waiters: Array<() => void>;
+  /** Parked `woo_wait` calls. Keyed by JSON-RPC request id so an explicit
+   * `notifications/cancelled` can release exactly one, and BOUNDED
+   * (MCP_MAX_SESSION_WAITS) because this is a public surface: without a cap
+   * a client could park closures and timers without limit. */
+  waiters: NetMcpWaiter[];
   ownEchoIds: Set<string>;
   /** M5.1 continuity marker. True when this gateway cannot prove that the
    * session's queue has been continuous since the client's last drain —
@@ -9683,6 +9852,10 @@ type NetMcpSessionState = {
   listChangedPending: boolean;
   sseWaiters: NetMcpSseWaiter[];
 };
+
+/** One parked woo_wait. `wake(cancelled)` resolves it; a cancelled wake must
+ * NOT drain, or a client that walked away would consume rows it never read. */
+type NetMcpWaiter = { requestId: string; wake: (cancelled: boolean) => void };
 
 function mcpSessionState(actor: string): NetMcpSessionState {
   return {

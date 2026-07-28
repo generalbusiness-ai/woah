@@ -111,6 +111,56 @@ export async function runSmokeWalkthrough(
     await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text), waitMs, ctx.signal, cfg);
   });
 
+  // CO2.5 / §M4.2 — the OBSERVATION-ONLY half of retry safety, over the real
+  // transport. `say` is `persistence:"live"`: it writes no authority cell, so
+  // the scope classifies it as a pure read and would not cache it. A retry
+  // therefore used to re-emit the line to every peer. What proves the fix is
+  // the PEER's queue, which is why this step needs both actors — and why it
+  // runs in the chatroom, immediately after the `chat:say reaches peer`
+  // baseline: both actors are provably co-present there and that step
+  // already establishes that one `say` reaches the peer exactly once.
+  //
+  // Room choice is load-bearing, and this cost a red run to learn: counting
+  // `said` rows is only a proxy for "how many times did it execute" in a
+  // room that emits ONE row per utterance. At `the_pinboard` a single say
+  // emits TWO — same actor, same text, same `ts`, sources `the_pinboard` and
+  // `the_deck` — because a tool space relays speech to the room it is
+  // mounted in. That is one execution with two observations, by design, and
+  // an assertion placed there fails while the mechanism is working.
+  await step("retry safety: an observation-only act reaches the peer exactly once", async (ctx) => {
+    const { alice, bob } = pair;
+    const text = `walkthrough-idem-say-${runId}`;
+    const args = { object: "the_chatroom", verb: "say", args: [text], operation_id: `smoke-idem-say-${runId}` };
+    const first = await alice.callTool("woo_call", args, { signal: ctx.signal });
+    if (first?.result?.isError) {
+      throw new Error(`say refused: ${JSON.stringify(first?.result?.structuredContent).slice(0, 300)}`);
+    }
+    // Consume the first copy before retrying, so anything the peer sees
+    // afterwards is unambiguously a SECOND emission.
+    await waitFor(bob, (obs) =>
+      obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text),
+    waitMs, ctx.signal, cfg);
+
+    const retry = await alice.callTool("woo_call", args, { signal: ctx.signal });
+    const retryBody = retry?.result?.structuredContent;
+    if (retryBody?.replayed !== true) {
+      throw new Error(`the retry was NOT deduplicated: ${JSON.stringify(retryBody).slice(0, 300)}`);
+    }
+    // Give a genuine second emission time to arrive before declaring none.
+    await abortableDelay(750, ctx.signal);
+    const echoes: Record<string, any>[] = [];
+    try {
+      echoes.push(await waitFor(bob, (obs) =>
+        obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text),
+      750, ctx.signal, cfg));
+    } catch {
+      // A timeout here is the PASS: the peer heard the line only once.
+    }
+    if (echoes.length > 0) {
+      throw new Error(`the peer heard the line twice — the retry re-emitted it: ${JSON.stringify(echoes[0]).slice(0, 300)}`);
+    }
+  });
+
   // B6 / CA14.3: two actors moving through the same destination concurrently
   // must both commit independently (each at its own actor-location authority,
   // off the room sequencer) and both retain membership — no lost destination
