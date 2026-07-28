@@ -96,3 +96,46 @@ export function mergeSeedMapProperty(
   }
   return { merged, changed };
 }
+
+/**
+ * The scalar twin of `mergeSeedMapProperty`, behind seed-hook mode `"set"`.
+ *
+ * `merge_map` only covers map databases. A catalog that begins publishing a
+ * plain scalar — a reference to a class, a default, a URL — has no way to
+ * deliver it to an already-installed world: `repair-definitions` carries
+ * definition PAGES, and the seed-property repair mined only `merge_map`. The
+ * gap was not theoretical: `$system.programmer_surface` is a `mode: "set"`
+ * scalar, and a world installed before it was published could never learn it,
+ * so every wizard provisioned there received authority with no authoring
+ * surface.
+ *
+ * The overwrite rule is the scalar analogue of `supersedes`, and it is
+ * deliberately narrower than plain `set`:
+ *
+ *   - stored value ABSENT  → deliver it. This is the aged-world case the repair
+ *     exists for: the world never learned the scalar, so there is no operator
+ *     intent to destroy.
+ *   - stored value EQUAL   → no change (idempotent replay).
+ *   - stored value PRESENT and different → refuse, UNLESS the manifest declares
+ *     it in `supersedes`, i.e. the catalog itself attests that value was one of
+ *     its own historical defaults. An operator edit is never overwritten,
+ *     exactly as in the map path.
+ *
+ * `supersedes` for a scalar is a flat list of historical shipped values, where
+ * the map form is keyed. Returns `null` when nothing should change, so callers
+ * can treat null as "skip" identically to the map path.
+ */
+export type SeedScalarSetResult = { value: unknown; changed: true };
+
+export function applySeedScalarProperty(
+  current: unknown,
+  currentPresent: boolean,
+  seeded: unknown,
+  supersedes: readonly unknown[] | undefined
+): SeedScalarSetResult | null {
+  if (!currentPresent) return { value: seeded, changed: true };
+  const storedKey = stableValueKey(current);
+  if (storedKey === stableValueKey(seeded)) return null;
+  const superseded = (supersedes ?? []).some((prior) => stableValueKey(prior) === storedKey);
+  return superseded ? { value: seeded, changed: true } : null;
+}

@@ -25,6 +25,7 @@ import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { verbCellSlot } from "../../src/net/verb-slots";
 import { identityAnchorIds } from "../../src/net/identity-anchor";
+import { provisionNetWizard } from "../../scripts/net-provision-wizard";
 
 const SECRET = "net-anchor-test-secret";
 const EPOCH = "cat-anchor-1";
@@ -42,12 +43,17 @@ function netState(name: string) {
 }
 
 /** A world shaped like the deployed one: no human, and (optionally) without the
- * AP11 verb page, so the primitive genuinely has to be installed. */
-async function buildAgedWorld(options: { withPrimitive?: boolean } = {}) {
+ * AP11 verb page or the published authoring-surface reference, so each aged-world
+ * gap genuinely has to be repaired. */
+async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef?: boolean } = {}) {
   const old = createWorld();
   const cells = cellsFromSerialized(old.exportWorld()).filter((cell) =>
-    options.withPrimitive === true ||
-    !(cell.kind === "verb_bytecode" && cell.object === "$human" && cell.name === AP11_VERB)
+    (options.withPrimitive === true ||
+      !(cell.kind === "verb_bytecode" && cell.object === "$human" && cell.name === AP11_VERB)) &&
+    // A world installed before the prog catalog began publishing the surface
+    // reference carries no such cell at all. This is exactly prod's state.
+    (options.withSurfaceRef === true ||
+      !(cell.kind === "property_cell" && cell.object === "$system" && cell.name === "programmer_surface"))
   );
   const partitions = partitionCells(cells);
   const relations = partitionInstallRelations(cells);
@@ -151,6 +157,76 @@ function bundledVerbPage(h: Aged, object: string, name: string): Record<string, 
 }
 
 describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)", () => {
+  it("DEFECT 3: the CLI probe survives every (anchor, primitive) combination", async () => {
+    // The previous CLI test stubbed fetch with an always-200 fake, so it could
+    // not have caught a refusal. This drives the REAL driver against the REAL
+    // routes on a world that has neither the anchor nor the primitive — the
+    // exact prod state where the probe threw instead of printing the plan.
+    const h = await buildAgedWorld();
+    try {
+      const edgeFetch: typeof fetch = async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        const url = new URL(request.url);
+        const route = url.pathname === "/net-operator/identity/anchor"
+          ? "/net/provision-anchor"
+          : "/net/provision-wizard";
+        return await h.gateway.fetch(await signInternalRequest(
+          { WOO_INTERNAL_SECRET: SECRET },
+          new Request(`https://do${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: await request.text() })
+        ));
+      };
+      const logs: string[] = [];
+      const run = async () => {
+        logs.length = 0;
+        await provisionNetWizard([
+          "--base-url", "https://woo.test",
+          "--anchor-id", "ops-wizard",
+          "--provision-id", "ops-wizard-1",
+          "--probe"
+        ], { homeDir: "/tmp", fetch: edgeFetch, log: (m) => logs.push(m), secret: SECRET });
+        return logs.join("\n");
+      };
+
+      // (a) no anchor, no primitive — the prod state.
+      let out = await run();
+      expect(out).toMatch(/does NOT exist yet/);
+      expect(out).toMatch(/"human_present": false/);
+      expect(out).toMatch(/"primitive_installed": false/);
+      expect(out).toMatch(/repair:net-definitions/);
+
+      // (b) anchor present, primitive absent.
+      const seeded = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-wizard" });
+      expect(seeded.status).toBe(200);
+      await h.settleAll();
+      out = await run();
+      expect(out).toMatch(/exists/);
+      expect(out).toMatch(/"human_present": true/);
+      expect(out).toMatch(/"primitive_installed": false/);
+
+      // (c) both present, but the surface scalar still missing — the probe
+      // reports the remaining step rather than claiming ready.
+      await repairDefinitions(h, [bundledVerbPage(h, "$human", AP11_VERB)]);
+      await h.settleAll();
+      out = await run();
+      expect(out).toMatch(/"primitive_installed": true/);
+      expect(out).toMatch(/repair:net-seed-properties/);
+
+      // (d) everything present -> ready.
+      const catalogScope = h.scopeDOs.get(CATALOG_SCOPE)!;
+      await catalogScope.fetch(await signInternalRequest(h.scopeEnv, new Request("https://do/net/repair-seed-properties", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ entries: [{ object: "$system", property: "programmer_surface", value: "$programmer", mode: "set" }] })
+      })));
+      await h.settleAll();
+      out = await run();
+      expect(out).toMatch(/"authoring_surface": "\$programmer"/);
+      expect(out).toMatch(/ready/);
+    } finally {
+      h.close();
+    }
+  });
+
   it("BLOCKER A: repair-definitions ADDs a new bootstrap verb, allocating its slot above the object's existing pages", async () => {
     const h = await buildAgedWorld();
     try {
@@ -247,8 +323,14 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // Both facts in ONE probe: this world lacks the human AND the primitive,
       // so one call is a complete plan rather than a round trip per problem.
       expect(noHuman.body?.primitive_installed).toBe(false);
+      // The surface scalar too: provisioning refuses without it, so the probe
+      // must predict that rather than let it be discovered by a real run. This
+      // is also the only way to read the value from outside — /net-api/cell is
+      // presence-scoped and refuses it even for a wizard.
+      expect(noHuman.body?.authoring_surface).toBe(null);
       expect(JSON.stringify(noHuman.body?.next)).toMatch(/anchor/);
       expect(JSON.stringify(noHuman.body?.next)).toMatch(/repair:net-definitions/);
+      expect(JSON.stringify(noHuman.body?.next)).toMatch(/repair:net-seed-properties/);
 
       // The non-probe call names the identity, not the verb.
       const refused = await signedPost(h, "/net/provision-wizard", { human, provision_id: "ops-1" });
@@ -277,7 +359,9 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       await repairDefinitions(h, [bundledVerbPage(h, "$human", AP11_VERB)]);
       const ready = await signedPost(h, "/net/provision-wizard", { human: seededHuman, provision_id: "ops-1", probe: true });
       expect(ready.body?.primitive_installed).toBe(true);
-      expect(JSON.stringify(ready.body?.next)).toMatch(/ready/);
+      // Still not ready: this aged world has no surface scalar either.
+      expect(ready.body?.authoring_surface).toBe(null);
+      expect(JSON.stringify(ready.body?.next)).toMatch(/repair:net-seed-properties/);
 
       // No probe mutated anything: nothing was provisioned.
       expect(ready.body?.recorded_agent ?? null).toBe(null);
@@ -377,7 +461,104 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
     }
   });
 
-  it("THE RUNBOOK: anchor -> install primitive -> provision, on a world that had neither", async () => {
+  it("DEFECT 1: provisioning REFUSES when no authoring surface is published, instead of reporting a wizard with no tools", async () => {
+    // Root cause, confirmed by construction rather than inferred: with
+    // `$system.programmer_surface` absent, `programmerSurface()` returns null,
+    // `attachProgrammerSurface` no-ops, and the shared transition still sets the
+    // flag — so the op used to return `promoted: true, flagged: true` for an
+    // actor whose `features` cell was never written. That is the exact prod
+    // symptom: 10 tools, no eval/create/install_verb, `features` cell null.
+    const h = await buildAgedWorld({ withPrimitive: true });
+    try {
+      const anchor = await signedPost(h, "/net/provision-anchor", { anchor_id: "ops-anchor" });
+      const human = anchor.body?.human as string;
+      await h.settleAll();
+
+      const refused = await signedPost(h, "/net/provision-wizard", {
+        human, provision_id: "ops-wizard-1", name: "OpsWizard"
+      });
+      expect(refused.status, JSON.stringify(refused.body).slice(0, 600)).not.toBe(200);
+      expect(JSON.stringify(refused.body)).toMatch(/programmer_surface/);
+
+      // And nothing was half-provisioned: the turn is atomic, so no agent, no
+      // counter movement, no quota grant.
+      const scope = h.scopeDOs.get(`cluster:${human}`)!;
+      const account = anchor.body?.account as string;
+      const response = await scope.fetch(await signInternalRequest(h.scopeEnv, new Request("https://do/net/closure", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ keys: [`property_cell:${account}:agent_count`, `property_cell:${account}:operator_provisioned_agents`], known: [] })
+      })));
+      const closure = await response.json() as { cells?: Array<{ key: string; value?: { value?: unknown } }> };
+      expect(closure.cells?.find((c) => c.key === `property_cell:${account}:agent_count`)?.value?.value).toBe(0);
+      expect(closure.cells?.find((c) => c.key === `property_cell:${account}:operator_provisioned_agents`)).toBeUndefined();
+    } finally {
+      h.close();
+    }
+  });
+
+  it("DEFECT 2: the repair MINES the scalar hook from the bundled manifests", async () => {
+    // An operator cannot name an arbitrary cell: entries come from bundled
+    // manifests only. The surface reference must actually be among them, or the
+    // prod remedy does not exist however well the server handles `set`.
+    const { seedPropertyRepairInputs } = await import("../../scripts/net-repair-seed-properties");
+    const byScope = await seedPropertyRepairInputs();
+    const all = [...byScope.values()].flat();
+    const surface = all.find((entry) => entry.object === "$system" && entry.property === "programmer_surface");
+    expect(surface, "the prog catalog no longer publishes programmer_surface as a set hook").toBeTruthy();
+    expect(surface?.mode).toBe("set");
+    expect(surface?.value).toBe("$programmer");
+    // Instance-targeted hooks stay out: CT14.7 gives instance rewrites no
+    // operator op, and mining one would only produce a refused request.
+    expect(all.every((entry) => entry.object.startsWith("$"))).toBe(true);
+  });
+
+  it("DEFECT 2: the seed-property repair delivers a scalar the aged world never learned", async () => {
+    const h = await buildAgedWorld({ withPrimitive: true });
+    try {
+      const key = "property_cell:$system:programmer_surface";
+      expect(await catalogCell(h, key)).toBeUndefined();
+
+      const scope = h.scopeDOs.get(CATALOG_SCOPE)!;
+      const repair = async (entries: unknown[]) => {
+        const response = await scope.fetch(await signInternalRequest(h.scopeEnv, new Request("https://do/net/repair-seed-properties", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ entries })
+        })));
+        const text = await response.text();
+        return { status: response.status, body: text ? JSON.parse(text) as Record<string, any> : null };
+      };
+      const entry = { object: "$system", property: "programmer_surface", value: "$programmer", mode: "set" };
+
+      // ABSENT -> delivered. This is the aged-world case: no operator intent to
+      // destroy, because the world never had a value.
+      const applied = await repair([entry]);
+      expect(applied.status, JSON.stringify(applied.body)).toBe(200);
+      expect(applied.body?.status).toBe("applied");
+      expect((await catalogCell(h, key))?.value).toMatchObject({ value: "$programmer" });
+
+      // EQUAL -> idempotent no-op.
+      const again = await repair([entry]);
+      expect(again.body?.status).toBe("empty");
+
+      // PRESENT AND DIFFERENT -> refused, because an operator edit is never
+      // overwritten. This is the scalar analogue of the map path's supersedes.
+      const edited = await repair([{ ...entry, value: "$something_else" }]);
+      expect(edited.body?.status).toBe("empty");
+      expect((await catalogCell(h, key))?.value).toMatchObject({ value: "$programmer" });
+
+      // ...unless the manifest attests the stored value was its OWN historical
+      // default, exactly as `supersedes` works for a map key.
+      const superseded = await repair([{ ...entry, value: "$newer_surface", supersedes: ["$programmer"] }]);
+      expect(superseded.body?.status).toBe("applied");
+      expect((await catalogCell(h, key))?.value).toMatchObject({ value: "$newer_surface" });
+    } finally {
+      h.close();
+    }
+  });
+
+  it("THE RUNBOOK: anchor -> install primitive -> repair surface ref -> provision", async () => {
     const h = await buildAgedWorld();
     try {
       // 1. Seed the anchor.
@@ -389,6 +570,17 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // 2. Install the primitive the aged world predates.
       const installed = await repairDefinitions(h, [bundledVerbPage(h, "$human", AP11_VERB)]);
       expect(installed.status, JSON.stringify(installed.body)).toBe(200);
+      await h.settleAll();
+
+      // 2b. Deliver the scalar the aged world never learned. Without this the
+      // provisioning below REFUSES rather than minting a toolless wizard.
+      const catalogScope = h.scopeDOs.get(CATALOG_SCOPE)!;
+      const seedRepair = await catalogScope.fetch(await signInternalRequest(h.scopeEnv, new Request("https://do/net/repair-seed-properties", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ entries: [{ object: "$system", property: "programmer_surface", value: "$programmer", mode: "set" }] })
+      })));
+      expect(seedRepair.ok, await seedRepair.clone().text()).toBe(true);
       await h.settleAll();
 
       // 3. Provision — the step that returned E_VERBNF on the deployed world.

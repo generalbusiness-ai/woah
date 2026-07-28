@@ -826,7 +826,18 @@ carry:
 | `drop_verb`, `drop_property` | `repair-definitions`, `remove` array |
 | new/changed verb bodies and property definitions | `repair-definitions`, `cells` array |
 | corrected seeded map values (`merge_map` hooks) | `repair-seed-properties` |
+| newly published or corrected seeded SCALARS (`set` hooks) | `repair-seed-properties` (see below) |
+| a NEW bootstrap verb page an aged world predates | `repair-definitions`, `cells` array — the page is ADDED, and the authority allocates its slot ([provisioning.md §AP11.11](../identity/provisioning.md)) |
 | instance data rewrites (`transform_property`, `rename_property`) | **no operator op — see below** |
+
+A `set` hook is the scalar twin of `merge_map`, and it closes a gap that was
+not theoretical: before it, a world installed before a catalog began publishing
+a scalar could never learn it, and `$system.programmer_surface` was exactly
+that scalar — leaving every wizard provisioned on such a world with authority
+and no authoring surface. The overwrite rule mirrors `merge_map`: an absent
+value is delivered, an equal value is a no-op, and a DIFFERENT stored value is
+refused unless the manifest lists it in `supersedes` (a flat list for a scalar,
+keyed per key for a map). Operator edits survive either way.
 
 Two further family members repair aged RUNTIME data rather than catalog content,
 so they are addressed at the scopes that own the data, not at the catalog:

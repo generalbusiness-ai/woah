@@ -84,8 +84,11 @@ describe("Help topic aged-world repair (fake-DO lane)", () => {
     const helpEntry = repairsByScope.get(ownerScope!)!.find((entry) => entry.object === "$help")!;
     // Fingerprint integrity: the manifest's supersedes block still declares
     // the v0.1.1 values this test ages the world back to.
-    expect(helpEntry.supersedes?.focus).toContainEqual(V011_FOCUS);
-    expect(helpEntry.supersedes?.wait).toContainEqual(V011_WAIT);
+    // `supersedes` is keyed for merge_map hooks (a flat list is the scalar
+    // `set` form, which this entry is not).
+    const helpSupersedes = helpEntry.supersedes as Record<string, unknown[]> | undefined;
+    expect(helpSupersedes?.focus).toContainEqual(V011_FOCUS);
+    expect(helpSupersedes?.wait).toContainEqual(V011_WAIT);
 
     // AGE the world: the durable topics cell predates help v0.2.0. Everything
     // else — code, gateway, manifest — is current, exactly the state a deploy

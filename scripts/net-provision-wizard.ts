@@ -138,7 +138,13 @@ type ProvisionResult = {
   programmer_agent_count: number;
 };
 
-async function postSigned(url: string, secret: string, payload: unknown, doFetch: typeof fetch): Promise<Record<string, unknown>> {
+async function postSigned(
+  url: string,
+  secret: string,
+  payload: unknown,
+  doFetch: typeof fetch,
+  options: { tolerateRefusal?: boolean } = {}
+): Promise<Record<string, unknown>> {
   const request = new Request(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -146,7 +152,18 @@ async function postSigned(url: string, secret: string, payload: unknown, doFetch
   });
   const response = await doFetch(await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, request));
   const body = await response.text();
-  if (!response.ok) throw new Error(`${url} failed: ${response.status} ${body}`);
+  if (!response.ok) {
+    // A DIAGNOSTIC must not fail closed. A probe exists to tell the operator
+    // what state the world is in; throwing on a refusal tells them nothing and
+    // is exactly the failure this command exists to prevent. Refusals are
+    // reported as data — with the status, so nothing is hidden.
+    if (options.tolerateRefusal) {
+      let parsed: unknown = null;
+      try { parsed = JSON.parse(body); } catch { parsed = body; }
+      return { ok: false, refused: true, status: response.status, error: parsed } as Record<string, unknown>;
+    }
+    throw new Error(`${url} failed: ${response.status} ${body}`);
+  }
   return JSON.parse(body) as Record<string, unknown>;
 }
 
@@ -164,8 +181,14 @@ async function ensureAnchor(
     // A probe run must stay read-only end to end, so it asks the anchor route
     // only what ids the token derives and whether they exist.
     ...(args.probe ? { probe: true } : { label: `operator anchor ${args.anchorId}` })
-  }, doFetch);
+  }, doFetch, { tolerateRefusal: args.probe });
   const human = typeof receipt.human === "string" ? receipt.human : "";
+  if (args.probe && !human) {
+    // Even the id derivation failed. Report it and keep going with nothing —
+    // the provisioning probe below still reports what the world holds.
+    log(`anchor lookup refused: ${JSON.stringify(receipt)}`);
+    return "";
+  }
   if (receipt.ok !== true || !human) throw new Error(`identity anchor returned an invalid receipt: ${JSON.stringify(receipt)}`);
   log(args.probe
     ? `anchor ${human} (account ${String(receipt.account)}) ${receipt.exists === true ? "exists" : "does NOT exist yet"}`
@@ -194,13 +217,13 @@ async function postProvision(
 
 export async function provisionNetWizard(
   argv: string[],
-  deps: { homeDir?: string; fetch?: typeof fetch; log?: (message: string) => void } = {}
+  deps: { homeDir?: string; fetch?: typeof fetch; log?: (message: string) => void; secret?: string } = {}
 ): Promise<ProvisionResult> {
   const homeDir = deps.homeDir ?? homedir();
   const args = parseArgs(argv, homeDir);
   const doFetch = deps.fetch ?? fetch;
   const log = deps.log ?? console.log;
-  const secret = internalSecret(homeDir, args.credentialFile);
+  const secret = deps.secret ?? internalSecret(homeDir, args.credentialFile);
 
   // Step 0 — the anchor. A fresh net world seeds no `$human`, so when the
   // operator names a token instead of an existing actor, seed/reuse it first.
@@ -209,12 +232,18 @@ export async function provisionNetWizard(
   // A read-only report: what does the world hold, and what should run next?
   // The only way to tell "no human" from "no primitive" without mutating.
   if (args.probe) {
-    const receipt = await postSigned(`${args.baseUrl}/net-operator/wizard/provision`, secret, {
-      human: args.human,
-      provision_id: args.provisionId,
-      probe: true
-    }, doFetch);
+    const receipt = args.human
+      ? await postSigned(`${args.baseUrl}/net-operator/wizard/provision`, secret, {
+          human: args.human,
+          provision_id: args.provisionId,
+          probe: true
+        }, doFetch, { tolerateRefusal: true })
+      : { ok: false, refused: true, error: "no human id to probe" };
     log(JSON.stringify(receipt, null, 2));
+    if (receipt.refused === true) {
+      // Still leave the operator with a plan rather than a stack trace.
+      log("probe was refused; the world state above is what the worker reported.");
+    }
     return receipt as unknown as ProvisionResult;
   }
 
