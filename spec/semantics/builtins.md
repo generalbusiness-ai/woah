@@ -220,6 +220,15 @@ allocation survives only when the write-set-selected commit authority owns
 that space; off-room routing follows coherence.md §CO2.3 and consumes no room
 sequence.
 
+At the original direct ingress, a retained terminal-transfer outcome is bound
+to the live session, actor, correlation/idempotency key, and the canonical
+wrapper request (target, verb, arguments, and force-direct options). An exact
+retry returns a detached copy of that target outcome before the wrapper runs.
+Reusing the same key for a different wrapper request is refused with
+`E_INVARG`, naming `id`, before wrapper dispatch, sequence allocation, or log
+append. Implementations bound this ingress cache by age and count; durable
+transport idempotency remains the outer retry guarantee.
+
 The compatibility wrapper does not resume after transfer. It MUST transfer
 only when its current behavior transaction contains proof reads and dispatch
 metadata but no behavior-domain effect. If the transfer cannot be terminal or
@@ -227,6 +236,11 @@ an effect has already been produced, it refuses with `E_SCOPE_SPLIT` before any
 sequence is allocated. A call already executing as a sequenced turn may inline
 a compatible same-space dispatch; it refuses incompatible sequenced nesting
 rather than accepting a second turn.
+
+The terminal transfer is an opaque core control signal, not a Woo value or
+Woo error. Woo `try`/`except` cannot intercept it, and a native-thrown object or
+`Proxy` with lookalike fields cannot impersonate it; implementations recognize
+only identities minted by the trusted transfer factory.
 
 This builtin is for inherited command-surface verbs such as
 `$conversational:command(text)`; browser clients should normally use v2 command

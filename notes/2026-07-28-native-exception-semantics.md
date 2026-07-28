@@ -2,12 +2,98 @@
 
 Date: 2026-07-28
 
-Status: implementation handoff; no code change or deployment is authorized by
-this note
+Status: implemented on isolated branch `worktree-native-exception-integration`;
+validation in progress; not merged to main and not deployed
 
 Audited base: main `fb8bfe85`
 
+Implementation base: main `6cbeb490`
+
 Deployed worker reported during the audit: `02bbc479`
+
+## Implementation disposition
+
+The audit's five findings are implemented in the isolated integration branch.
+The phased text below is retained as the design and rollout rationale; this
+table records the actual disposition.
+
+| Finding | Disposition |
+|---|---|
+| F1 — failed transcript retains behavior effects | Recorder behavior scopes now commit or abort with the behavior journal. Fresh execution and deterministic replay stamp hash-covered `failureEffectsGeneration: 1`; generic/imported recordings remain unmarked. Both Net authorities observe legacy/unknown generations and terminally reject an invalid complete generation-1 shape. |
+| F2 — direct rollback is incomplete | Direct and sequenced behavior use the same lazy inverse-operation journal. Authoritative objects, nested values, sessions, logs, tombstones, guest allocation, snapshots, counters, presence bookkeeping, and persistence-dirty state restore together. Repository acceptance runs while the outer journal is still live. |
+| F3 — programmer transition validates after mutation | Feature-list shape and surface composition are preflighted. A shared object-flag plan computes the lineage, features, counters, and audit result before applying them. |
+| F4 — programmer-agent creation allocates too early | Prospective inherited surface composition is validated before allocation. Create, registration, counters, and credentials then run in one behavior transaction. |
+| F5 — session callback rewrites accepted success | Session-ended delivery is a typed post-accept effect. Synchronous throws and promise rejections become bounded metrics and cannot change the accepted domain result. |
+
+The bounded historical repair is implemented for local SQLite and Net account
+authorities. It walks only account-owned evidence, supports dry-run, refuses
+ambiguous or oversized candidates, runs apply in a real savepoint, never
+rewrites coherence versions for appearance, and converges to `empty` on retry.
+
+The principled close is implemented at the mutation boundary:
+
+- authoritative containers are guarded proxies and can mutate only under an
+  explicit mutation permit;
+- the first mutation records an inverse operation in the current nested
+  behavior scope, so cost scales with touched state rather than world size;
+- the recorder has matching nested behavior scopes, retaining proof/envelope
+  events while discarding every aborted domain effect;
+- persistence acceptance and nested sequenced-log acceptance occur before the
+  outer journal is released, so storage refusal restores memory and storage;
+- public values, cached outcomes, bytecode, seeds, and replies cross detached,
+  immutable boundaries rather than retaining aliases into authority;
+- the declarative native contract registry requires every tracked mutating
+  primitive to name its rollback, saga, or live-only failure discipline.
+
+Authority validation remains the independent trust-boundary backstop. This is
+important even with the by-construction producer close: stale, imported, or
+defective producers must not be trusted merely because they claim generation
+1.
+
+### Findings widened during implementation
+
+Adversarial tests exposed and closed additional members of the same class:
+
+- shrinking an array by assigning `length` must journal every truncated
+  element, not only the length field;
+- deep-freeze branding must happen only after the whole graph succeeds, and
+  cyclic or hostile `Proxy` inputs must fail without poisoning later checks;
+- `ErrorValue` and reply/cache boundaries must detach nested aliases;
+- JSON-folder persistence must write an immutable generation and publish it
+  with one atomic manifest rename, leaving prior generations readable by
+  concurrent readers after a partial save;
+- presence `Set`/`Map` views must not escape as mutable authority aliases;
+- subscriber-scrub throttling is rollback state, and scrub decisions must read
+  the durable subscriber projection rather than a stale helper view;
+- synchronous repository refusal during savepoint commit must abort the
+  behavior journal once and preserve the original error rather than masking it
+  with a second abort;
+- terminal command transfer needs one top-level turn, an unforgeable
+  proof-only control signal, and retry binding at the original direct ingress.
+  Exact retries return the retained target outcome before rerunning the
+  wrapper; a different request under the same live session/actor/frame id is
+  refused before wrapper dispatch or sequence allocation.
+
+### Measured bridge cost
+
+The rejected eager full-world snapshot grew with untouched state and was
+measured at roughly 16.8 times the warm-world baseline. The implemented lazy
+journal removed that scaling:
+
+- at 100, 1,000, and 5,000 objects, median no-op direct calls were about
+  `0.011 ms`, writes `0.015–0.016 ms`, and post-write failures
+  `0.027–0.029 ms`;
+- a 100-row accept/abort measured `0.353/0.382 ms` with exactly 100 undo
+  categories;
+- a compound abort measured `2.182 ms`, and SQLite abort `0.303 ms`;
+- on the exact 5,000-object comparison base, candidate no-op/write/failure
+  measured `0.010/0.014/0.026 ms` versus the former eager path's
+  `1.792/1.665/2.159 ms`.
+
+These microbenchmarks establish the local algorithmic boundary. The load and
+workerd lanes below remain required before this branch is ready for a main
+merge, and deployed NC8/Analytics Engine evidence still requires separate
+deployment authorization.
 
 ## Executive decision
 

@@ -522,7 +522,10 @@ payloads. During rolling deployment, an absent or unknown generation is
 observe-only. A complete generation-1 violation rejects terminally as
 `invalid_error_effects`; it is neither retried nor applied. Producers MUST NOT
 stamp generation 1 until their failed-turn recorder rollback satisfies this
-grammar.
+grammar. The reference fresh-execution and deterministic-replay producers have
+that rollback and stamp generation 1. The generic `RecordedTurn` converter does
+not stamp: imported and legacy recordings remain observe-only unless their
+actual producer establishes the capability.
 
 ## CO4. Commit validation
 
