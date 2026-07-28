@@ -44,10 +44,11 @@ async function humanAgentCall(
   world: WooWorld,
   human: string,
   verb: string,
-  agent: string
+  agent: string,
+  invocation = "first"
 ): Promise<CallResult> {
   return await world.directCall(
-    `${verb}-${agent}`,
+    `${verb}-${agent}-${invocation}`,
     human,
     human,
     verb,
@@ -62,8 +63,9 @@ describe("native handler prepare/apply failure boundaries", () => {
     const agent = await createAgent(world, human, "native-promote", false);
     world.setProp(agent, "features", "malformed" as never);
     const counterVersion = world.object(account).propertyVersions.get("programmer_agent_count");
+    const before = world.exportWorld();
 
-    const frame = await humanAgentCall(world, human, "promote_agent_to_programmer", agent);
+    const frame = await humanAgentCall(world, human, "promote_agent_to_programmer", agent, "first");
 
     expect(frame.op).toBe("error");
     expect((frame as any).error.code).toBe("E_TYPE");
@@ -71,6 +73,11 @@ describe("native handler prepare/apply failure boundaries", () => {
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
     expect(world.object(account).propertyVersions.get("programmer_agent_count")).toBe(counterVersion);
     expect(world.propOrNull(agent, "features")).toBe("malformed");
+    expect(world.exportWorld()).toEqual(before);
+
+    const retry = await humanAgentCall(world, human, "promote_agent_to_programmer", agent, "second");
+    expect(retry).toMatchObject({ op: "error", error: { code: "E_TYPE" } });
+    expect(world.exportWorld()).toEqual(before);
   });
 
   it("rejects malformed features before programmer demotion mutates lineage or quota", async () => {
@@ -79,8 +86,9 @@ describe("native handler prepare/apply failure boundaries", () => {
     const agent = await createAgent(world, human, "native-demote", true);
     world.setProp(agent, "features", "malformed" as never);
     const counterVersion = world.object(account).propertyVersions.get("programmer_agent_count");
+    const before = world.exportWorld();
 
-    const frame = await humanAgentCall(world, human, "demote_agent_from_programmer", agent);
+    const frame = await humanAgentCall(world, human, "demote_agent_from_programmer", agent, "first");
 
     expect(frame.op).toBe("error");
     expect((frame as any).error.code).toBe("E_TYPE");
@@ -88,6 +96,11 @@ describe("native handler prepare/apply failure boundaries", () => {
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
     expect(world.object(account).propertyVersions.get("programmer_agent_count")).toBe(counterVersion);
     expect(world.propOrNull(agent, "features")).toBe("malformed");
+    expect(world.exportWorld()).toEqual(before);
+
+    const retry = await humanAgentCall(world, human, "demote_agent_from_programmer", agent, "second");
+    expect(retry).toMatchObject({ op: "error", error: { code: "E_TYPE" } });
+    expect(world.exportWorld()).toEqual(before);
   });
 
   it("rejects malformed features before retirement changes any lifecycle fact", async () => {
@@ -99,8 +112,9 @@ describe("native handler prepare/apply failure boundaries", () => {
     const keyBefore = structuredClone(
       (world.propOrNull(agent, "api_keys") as Record<string, unknown>)[keyId]
     );
+    const before = world.exportWorld();
 
-    const frame = await humanAgentCall(world, human, "revoke_agent", agent);
+    const frame = await humanAgentCall(world, human, "revoke_agent", agent, "first");
 
     expect(frame.op).toBe("error");
     expect((frame as any).error.code).toBe("E_TYPE");
@@ -111,6 +125,11 @@ describe("native handler prepare/apply failure boundaries", () => {
     expect(world.propOrNull(agent, "retired_at")).toBe(null);
     expect((world.propOrNull(agent, "api_keys") as Record<string, unknown>)[keyId])
       .toEqual(keyBefore);
+    expect(world.exportWorld()).toEqual(before);
+
+    const retry = await humanAgentCall(world, human, "revoke_agent", agent, "second");
+    expect(retry).toMatchObject({ op: "error", error: { code: "E_TYPE" } });
+    expect(world.exportWorld()).toEqual(before);
   });
 
   it("preflights set_actor_flag before its separate programmer counter write", async () => {
@@ -131,6 +150,42 @@ describe("native handler prepare/apply failure boundaries", () => {
     expect((frame as any).error.code).toBe("E_TYPE");
     expect(world.object(agent).flags.programmer ?? false).toBe(false);
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+  });
+
+  it("routes set_actor_flag programmer accounting through the shared transition", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "native-flag-shared@woo.dev");
+    const agent = await createAgent(world, human, "native-flag-shared", false);
+
+    const promote = await world.directCall(
+      "native-set-flag-shared-up",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", true]
+    ) as CallResult;
+    expect(promote.op).toBe("result");
+    expect(world.object(agent).flags.programmer).toBe(true);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+
+    const demote = await world.directCall(
+      "native-set-flag-shared-down",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", false]
+    ) as CallResult;
+    expect(demote.op).toBe("result");
+    expect(world.object(agent).flags.programmer).toBe(false);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+
+    const audits = world.propOrNull("$system", "wizard_actions") as Array<Record<string, unknown>>;
+    expect(audits.filter((entry) => entry.action === "actor_flag_changed")).toEqual([
+      expect.objectContaining({ actor: "$wiz", target: agent, flag: "programmer", old: false, new: true }),
+      expect.objectContaining({ actor: "$wiz", target: agent, flag: "programmer", old: true, new: false })
+    ]);
   });
 
   it("preflights the prospective $agent surface before consuming an object id", async () => {
