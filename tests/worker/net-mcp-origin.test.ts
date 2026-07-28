@@ -41,6 +41,7 @@ function netState(name: string) {
   };
   return {
     state,
+    pending: () => deferred.length,
     settle: async () => {
       while (deferred.length > 0) await deferred.shift();
     },
@@ -134,7 +135,13 @@ async function fixture(options: { allowedOrigins?: string } = {}) {
     };
   };
 
-  const close = () => {
+  const close = async () => {
+    // Session creation can enqueue relation/fanout work after the HTTP reply.
+    // Drain every fake DO to a fixed point before closing SQLite so a failure
+    // belongs to this test instead of leaking into the next Origin case.
+    while (states.some((state) => state.pending() > 0)) {
+      for (const st of states) await st.settle();
+    }
     for (const st of states) st.close();
   };
   return { edge, close };
@@ -184,7 +191,7 @@ describe("MCP Origin admission through the Worker edge", () => {
         headers: { "mcp-token": TOKEN }
       }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -210,7 +217,7 @@ describe("MCP Origin admission through the Worker edge", () => {
       // rather than treated as absent.
       expectForeignOriginRefusal(await edge({ origin: "null", headers: { "mcp-token": TOKEN } }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -234,7 +241,7 @@ describe("MCP Origin admission through the Worker edge", () => {
         headers: { "mcp-token": TOKEN, [PUBLIC_ORIGIN_HEADER]: "https://evil.example" }
       }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -249,7 +256,7 @@ describe("MCP Origin admission through the Worker edge", () => {
       // browsers, which cannot lie about it.
       expectInitialized(await edge({ headers: { "mcp-token": TOKEN } }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -273,7 +280,7 @@ describe("MCP Origin admission through the Worker edge", () => {
         headers: { "mcp-token": TOKEN }
       }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -290,7 +297,7 @@ describe("MCP Origin admission through the Worker edge", () => {
         headers: { "mcp-token": TOKEN }
       }));
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -308,7 +315,7 @@ describe("MCP Origin admission through the Worker edge", () => {
         headers: { "mcp-token": TOKEN }
       }));
     } finally {
-      close();
+      await close();
     }
   });
 });
