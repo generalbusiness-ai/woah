@@ -2,8 +2,8 @@
 
 Date: 2026-07-28
 
-Status: implemented on isolated branch `worktree-native-exception-integration`;
-validation in progress; not merged to main and not deployed
+Status: implemented and locally validated on isolated branch
+`worktree-native-exception-integration`; not merged to main and not deployed
 
 Audited base: main `fb8bfe85`
 
@@ -73,6 +73,24 @@ Adversarial tests exposed and closed additional members of the same class:
   Exact retries return the retained target outcome before rerunning the
   wrapper; a different request under the same live session/actor/frame id is
   refused before wrapper dispatch or sequence allocation.
+- a failed scope may retain durable pre-state proofs, but it cannot retain
+  reads or exact-definer dispatch proofs for an object created and rolled back
+  in that same scope. Such proofs have no surviving authority that can attest
+  them and otherwise turn an ordinary failed behavior into `rider_unattested`;
+- the first post-fix legibility failure was not another rollback defect:
+  cross-log Acts genuinely cross incompatible semantic spaces. The Acts
+  catalog now reports the specific `E_SCOPE_SPLIT` refusal rather than
+  misclassifying it as `E_INVARG`;
+- detached public world views made several fixture mutations into silent
+  no-ops. Fixtures now use the supported flag/verb-metadata seams, and the
+  shared workerd fixture asserts the serialized partition cell that the
+  authority actually receives;
+- fake-DO fixture teardown is part of the correctness boundary. Deferred
+  tasks are drained to quiescence before SQLite closes, and deferred rejection
+  is propagated into the test result rather than printed after a green run;
+- the data-path analyzer now classifies all native-atomicity and post-accept
+  metric kinds. Its test derives the current `MetricEvent` vocabulary so a new
+  unclassified smoke-tail event fails the reporting gate.
 
 ### Measured bridge cost
 
@@ -91,9 +109,37 @@ journal removed that scaling:
   `1.792/1.665/2.159 ms`.
 
 These microbenchmarks establish the local algorithmic boundary. The load and
-workerd lanes below remain required before this branch is ready for a main
-merge, and deployed NC8/Analytics Engine evidence still requires separate
-deployment authorization.
+workerd lanes below are also green. Deployed NC8/Analytics Engine evidence
+still requires separate deployment authorization.
+
+### Local validation evidence
+
+The final isolated branch passed the complete local ladder:
+
+| Lane | Result |
+|---|---|
+| Focused native rollback and Net legibility | 68/68 |
+| Smoke-fixture and metric-vocabulary regressions | 11/11 |
+| `npm run typecheck` | passed |
+| `npm test` | 87 files, 1,058/1,058 |
+| `npm run test:worker` | 48 files, 373/373 |
+| `npm run test:full` | 166 files, 2,072/2,072 |
+| `npm run load:net-dev` | 3/3 |
+| `npm run load:net-skew` | 6/6 |
+| `npm run smoke:net-dev` | 44/44 |
+| `npm run smoke:net-mcp` | 17/17 |
+
+Adversarial reversion also proved two late integration tests are causal:
+reinstating the detached public-view metadata write makes the serialized
+workerd-fixture test fail, and reverting transient-proof pruning makes the
+native rollback suite fail while exposing the erased object's reads and
+dispatch proof.
+
+`npm run load:net-canary`, `npm run metrics:net-ae`, and the deployed
+walkthrough were not run: they require deployment/external acceptance state,
+and this task did not authorize a deployment. Therefore the local branch is
+implementation-complete, while production rollout and the deployed NC8 gate
+remain open release steps.
 
 ## Executive decision
 
