@@ -345,6 +345,25 @@ describe("clean failed-transcript producers", () => {
       ownsSequencingSpace: false
     })).toMatchObject({ policy: "enforce", valid: true, reasons: [] });
 
+    // Submit the producer's exact numeric-version proof to the shadow
+    // authority. This is the reviewer repro boundary: retaining the transient
+    // version-2 read made this otherwise legitimate failed turn retry forever.
+    const commitScope = createShadowCommitScope({
+      node: "scope:failed-clean-commit",
+      scope: fresh.transcript.scope,
+      serialized: serializedBefore
+    });
+    const commitReply = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "failed-clean-producer",
+      scope: fresh.transcript.scope,
+      expected: commitScope.head,
+      transcript: fresh.transcript
+    });
+    expect(commitReply, JSON.stringify(commitReply)).toMatchObject({
+      kind: "woo.commit.accepted.shadow.v1"
+    });
+
     const key = shadowTurnKeyFromTranscript(fresh.transcript);
     const replay = await executeShadowRecordedTurnOrNeedState(
       createShadowExecutionNode({
