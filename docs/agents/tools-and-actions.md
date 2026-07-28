@@ -26,8 +26,19 @@ the_cockatoo__squawk()
 ```
 
 Input schemas come from the verb's declared arguments, explicit type hints,
-and command-parser argument sources. The server may add a numeric suffix if
-two names collide.
+and command-parser argument sources.
+
+Object ids are sanitized into tool names — anything outside letters, digits,
+and `_` becomes `_` — so two different objects can want the same name (`a-b`
+and `a_b` both give `a_b`). When that happens the server adds a numeric suffix
+(`a_b__ping`, `a_b__ping_2`). The suffix is assigned across everything you can
+reach, so **filtering or paging never changes a name**: the same verb on the
+same object is always advertised under the same name, whether you saw it in
+`tools/list`, in `woo_list_reachable_tools` with a `scope` or `query`, or on
+page three. Calling the name you were given always reaches the object you were
+shown. Names can be re-ranked when your context changes (you move, something
+arrives) — that is what `notifications/tools/list_changed` tells you about, so
+re-list when you get one.
 
 ## Compact discovery
 

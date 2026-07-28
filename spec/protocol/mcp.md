@@ -36,6 +36,28 @@ an idempotent success.
 One MCP session binds to one actor. MCP never changes `actor`, `progr`, verb
 permissions, or the normal Net turn authority rules.
 
+### M1.1 Notifications
+
+A JSON-RPC **notification** — any message with no `id`, whether or not the
+server recognizes its method — is a non-initialize method and is therefore
+subject to the same session validation and per-actor rate limiting as
+`tools/call`. It is authenticated *before* it is acted on and before it is
+acknowledged. This includes `notifications/initialized`, includes
+`notifications/cancelled` (which acts on session-scoped state and must not
+trust a raw `Mcp-Session-Id` header whose expiry was never consulted), and
+includes methods this version does not know: an evolving protocol's
+notifications must not be an unauthenticated door into the gateway.
+
+A notification carries no `id` to correlate a JSON-RPC error against, so the
+HTTP status is the whole answer. An accepted notification is `202` with an
+empty body — including for an unrecognized method, which is then ignored. A
+rejected session is the standard client refusal envelope (`401`,
+`E_NOSESSION`); an exhausted rate bucket is `429`, `E_RATE`. `202` means
+*authenticated and accepted*, never merely *received*.
+
+`initialize` keeps its own path: it is a request, it carries the `Mcp-Token`
+credential rather than a session id, and it mints the session this rule reads.
+
 The `initialize` result's `instructions` string is an agent's entire
 orientation — many MCP clients read nothing else unprompted — so it must name
 the actor, state that the dynamic tool list tracks structural context and must
@@ -204,7 +226,7 @@ The supported scopes change presentation, never authority:
 | `active` | Actor, active space, active-space contents, and inventory. This is the default. |
 | `here` | Active space and its direct contents. |
 | `object` | One named object, only if it is already in structural context. |
-| `space` | One contextual space (or the active space) and its direct contents. |
+| `space` | One contextual space (or the active space) and its direct contents that are themselves in structural context. |
 
 There is deliberately no `all` scope. `active` already returns the complete
 structural context; a separate `all` had no distinct selection (it resolved to
@@ -242,22 +264,6 @@ to 500 characters on a word boundary with a trailing ellipsis. Taking the first
 *line* instead truncates wrapped doc-comments mid-sentence, which is what an
 agent then reads as the verb's whole contract.
 
-Names are deterministic within a listing. The base form is
-`<sanitized-object>__<sanitized-verb>`; a numeric suffix resolves collisions.
-Tools are sorted by canonical object then verb before collision assignment,
-except that **the session actor's own object sorts ahead of the alphabetical
-remainder**. The actor's own verbs are how it acts at all, so they must never be
-displaced past the page cap by objects that merely happen to share its space:
-the actor's tools occupy the first dynamic slots of the first page, after the
-stable controls.
-
-This is a guarantee of **precedence, not completeness**. Nothing bounds how many
-verbs a class chain and its features can contribute, so a suit larger than one
-page still spans pages; what the ordering guarantees is that the overflow is the
-actor's own tail rather than an arbitrary subset displaced by unrelated objects.
-A client that pages only once therefore sees the actor's tools first and, while
-the suit fits, all of them. This ordering is the only privileged position in the
-listing; it changes rank, not membership or authority.
 `inputSchema` is derived from `arg_spec.args`/`params` and optional type
 hints. When explicit hints are absent, the gateway preserves the stable JSON
 shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
@@ -266,6 +272,62 @@ string, resolved object slots are object-id strings, and `cmd` is an object.
 Named invocation maps JSON object properties to positional verb arguments in
 the declared order. Missing properties become `null`. `woo_call` accepts the
 positional list directly.
+
+### M2.3 Tool naming
+
+The base form is `<sanitized-object>__<sanitized-verb>`, where sanitizing
+strips one leading `$` and replaces every character outside `[A-Za-z0-9_]`
+with `_`; a numeric suffix (`_2`, `_3`, …) resolves collisions. Tools are
+sorted by canonical object then verb before collision assignment, except that
+**the session actor's own object sorts ahead of the alphabetical remainder**.
+The actor's own verbs are how it acts at all, so they must never be displaced
+past the page cap by objects that merely happen to share its space: the
+actor's tools occupy the first dynamic slots of the first page, after the
+stable controls.
+
+That ordering is a guarantee of **precedence, not completeness**. Nothing
+bounds how many verbs a class chain and its features can contribute, so a suit
+larger than one page still spans pages; what the ordering guarantees is that
+the overflow is the actor's own tail rather than an arbitrary subset displaced
+by unrelated objects. A client that pages only once therefore sees the actor's
+tools first and, while the suit fits, all of them. This is the only privileged
+position in the listing; it changes rank, not membership or authority.
+
+**Names are assigned canonically, over the session's complete reachable
+context, and neither filtering nor paging ever changes one.** Whatever a
+client asks for — standard `tools/list`, any `woo_list_reachable_tools`
+`scope`, an `object` or `query` filter, any page of any of them — a given
+`(object, verb)` pair in that session's context is advertised under one and
+only one name, and invoking that name reaches that object. This is the
+property an agent relies on when it calls what it was told to call, so it is a
+protocol guarantee rather than an implementation detail.
+
+The reason it needs stating is that sanitizing is **lossy**: `$a-b`, `a+b`,
+`a b`, and `$a_b` all render `a_b`, so distinct objects genuinely do compete
+for one base name and the numeric suffix is the only thing separating them. A
+suffix is meaningful only relative to the set it was computed over, so a name
+computed over a *subset* is not the same name — a filtered view that
+disambiguated among only the objects it kept would hand out the unsuffixed
+name for one of them while invocation, resolving over the whole context, bound
+that name to another. Discovery therefore computes one canonical descriptor
+set, names included, and every scope, filter, and page is a projection of it.
+
+A corollary: presentation scopes select from that canonical set by object and
+can never widen it. `space` names one *contextual* space and its direct
+contents; contents that are not themselves in structural context (M3) are not
+advertised, because a descriptor neither dynamic-name invocation nor
+`woo_call` would accept is not an advertisement.
+
+Prose that names a tool — refusal remediations, `instructions` — must read the
+name from the canonical assignment for the same reason. Re-deriving one by
+sanitizing an id ignores the suffix and can name a different object's tool.
+The single exception is the session actor's own tools: the actor sorts first,
+so its descriptors are never the ones that carry a suffix.
+
+Names are stable for as long as the context is. Context changes (moving,
+taking, an object arriving) can re-rank a collision, which is exactly what
+`notifications/tools/list_changed` (M6) exists to announce; a client that
+re-lists on the hint never observes a shifted name.
 
 ## M3. Structural context and navigation
 
@@ -603,6 +665,14 @@ request id is not an error — and can only ever release a wait parked under the
 same session. Without honouring it, a bounded waiter set would let a client's
 own abandoned polls refuse its next legitimate one until they timed out.
 
+A parked request is identified by its JSON-RPC id **including that id's type**.
+JSON-RPC 2.0 ids may be strings or numbers, and `1` and `"1"` are different
+ids naming different requests; a client may legitimately have both in flight.
+A cancellation matches only the request whose id is equal *and* of the same
+class, so cancelling `"1"` never releases a wait parked under `1`. Collapsing
+the two would silently return an empty, non-draining reply to a request the
+client never cancelled.
+
 **Eviction is not rare, and a silent client goes deaf.** The queue lives in
 the gateway shard's memory, and on Cloudflare an idle shard is evicted within
 roughly ten seconds. A session that stops asking therefore stops hearing:
@@ -734,6 +804,32 @@ At most one open stream receives a given hint. A disconnect before delivery
 leaves the hint pending, while delivery is live and not resumable. Missing,
 expired, or malformed sessions are rejected before a stream is opened.
 
+**Listens are bounded per session, by eviction rather than refusal.** Each
+open listen holds a stream controller and a live 25-second timer, so the count
+per session is capped (currently 2 — Streamable HTTP gives a client one
+standalone stream, with slack for a reconnect that overlaps the stream it
+replaces). Opening a listen beyond the cap **closes the oldest one** and
+admits the new one; a GET is never refused for this reason, and there is no
+status code for it. Refusal was the wrong choice here because the excess this
+must survive is usually not abuse: an ungracefully dropped connection leaves a
+phantom listen behind — cancellation is not guaranteed to be observed
+promptly — and refusing would lock a legitimately reconnecting client out for
+up to a full listen window. A client cannot provoke more than the cap in live
+listens however many GETs it sends, and their arrival *rate* is bounded by the
+ordinary per-actor limit.
+
+What an evicted client observes is a **normal end of stream**: the response
+ends cleanly, exactly as it would at the 25-second bound, with no error event
+and no trailing data. That is deliberately indistinguishable from the bounded
+close a conforming client already handles, and the correct response to both is
+the same — reconnect after the advertised `retry` interval. It *is*
+distinguishable from a network drop, which surfaces as a transport error
+rather than an orderly EOF. A client that never opens a second listen never
+sees an eviction at all.
+
+Eviction loses nothing: a pending hint is cleared only by a delivery a stream
+actually accepted, so it survives to the next listen.
+
 The notification is a freshness hint only. Clients re-run `tools/list`; the
 current structural resolver remains the authorization boundary. No temporary
 tool-result field substitutes for the standard notification, and a client may
@@ -744,7 +840,10 @@ re-list at any time even if it missed a live hint.
 - API-key authentication happens before session creation.
 - A present Streamable HTTP `Origin` must be admitted by §M7.1; headless
   clients may omit the header.
-- Every non-initialize method validates `Mcp-Session-Id` and its expiry.
+- Every non-initialize method validates `Mcp-Session-Id` and its expiry, and
+  spends a token from the actor's rate bucket, before it is acted on. A
+  notification is a method (M1.1): "it has no `id`" is not an exemption, and
+  neither is "the server does not recognize the method".
 - Other actors' session bearers never appear in tools, relation results, or
   observations.
 - Dynamic listing and dynamic invocation use one authoritative resolver.
