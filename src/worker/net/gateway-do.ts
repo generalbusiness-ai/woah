@@ -7741,7 +7741,7 @@ export class NetGatewayDO {
   }
 
   /** M5.1: the SCOPE NAME whose delivery counters govern this session's
-   * continuity — `room:the_chatroom`, not the bare object `the_chatroom`.
+   * continuity — the `room:<id>` scope name, not the bare object id.
    *
    * `mcpActiveScope` answers in object ids; `deliverySeen`/`liveSeen` are
    * keyed by scope names, because that is what a fanout body carries. Getting

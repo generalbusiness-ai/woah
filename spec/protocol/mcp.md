@@ -397,6 +397,23 @@ It is intentionally live and at-most-once: Durable Object eviction or session
 close drops undelivered observations. Durable observation recovery is a
 separate protocol feature and must not be implied by this queue.
 
+**Eviction is not rare, and a silent client goes deaf.** The queue lives in
+the gateway shard's memory, and on Cloudflare an idle shard is evicted within
+roughly ten seconds. A session that stops asking therefore stops hearing:
+measured against the deployed worker, a co-present peer that slept 15s missed
+its partner's room line entirely (and its next reply carried `gap:true`),
+while the same peer holding a parked `woo_wait` across the same window
+received it. An in-flight request is what keeps the shard — and the queue —
+alive.
+
+A client that wants to hear everything MUST keep a wait in flight rather than
+poll on a duty cycle longer than the eviction window. This is a real limit on
+the current design, not an incidental one: it is the direct consequence of a
+live, gateway-local, at-most-once queue, and the `gap` marker below exists to
+make its consequences legible rather than to remove them. Removing the limit
+means durable observation recovery, which this section explicitly does not
+promise.
+
 Multiple parked waits may wake together, but draining uses prefix removal so
 an observation is returned to at most one waiter.
 

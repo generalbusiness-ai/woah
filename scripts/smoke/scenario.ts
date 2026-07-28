@@ -435,7 +435,7 @@ export async function runSmokeWalkthrough(
     let terminalReached = false;
     try {
       orderAttempted = true;
-      const reply = await orderWithAdmissionRetry(alice, request, admissionWaitMs, ctx.signal, cfg);
+      const reply = await orderWithAdmissionRetry(alice, [bob], request, admissionWaitMs, ctx.signal, cfg);
       if (!isRecord(reply) || reply.queued !== true || typeof reply.order_id !== "string" || !reply.order_id) {
         throw new Error(`dispenser order should return {order_id, queued:true}; got ${JSON.stringify(reply).slice(0, 300)}`);
       }
@@ -1068,8 +1068,51 @@ const DEFAULT_ADMISSION_WAIT_MS = 66_000;
 // lane's ceiling means either an operator widened the block's config or the
 // lane has no room to wait; the walkthrough says so rather than stalling into
 // its watchdog.
+/** Sleep while keeping the given sessions' observation queues alive.
+ *
+ * `woo_wait` delivery is at-most-once and the queue is gateway-LOCAL live
+ * state (spec/protocol/mcp.md §M5), so a session that stops asking stops
+ * hearing: measured against the deployed worker, a gateway shard idle for
+ * ~10s is evicted and every observation fanned out to a session it held is
+ * dropped on the floor. A conforming polling client therefore keeps a wait
+ * in flight; an in-flight request is what holds the shard up (verified: a
+ * session parked across a 15s window heard the peer's line, the same session
+ * merely sleeping 15s did not, and its next reply carried `gap:true`).
+ *
+ * The walkthrough's admission window is the one place it goes quiet for tens
+ * of seconds, and it is the PEER — not the sleeping caller — whose ear has to
+ * stay open for the assertions that follow. Anything these polls collect goes
+ * into the session's retention buffer, so keeping the ear open cannot cost an
+ * observation the step is about to assert on.
+ */
+async function sleepWithOpenEars(
+  totalMs: number,
+  sessions: readonly SmokeSession[],
+  signal: AbortSignal | undefined
+): Promise<void> {
+  const deadline = Date.now() + totalMs;
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const slice = Math.min(2000, deadline - Date.now());
+    // One short parked wait per session per slice, in parallel: the request
+    // itself is the keep-alive, and the reply's rows are retained, not lost.
+    await Promise.all(sessions.map(async (session) => {
+      try {
+        const result = await session.callTool("woo_wait", { timeout_ms: slice, limit: 100 }, { signal });
+        const observations = waitObservationsOf(result).filter(isRecord);
+        session.retainObservations(observations);
+      } catch {
+        // A keep-alive poll is best-effort; the assertions below own the
+        // real failure reporting.
+      }
+    }));
+    if (sessions.length === 0) await abortableDelay(slice, signal);
+  }
+}
+
 async function orderWithAdmissionRetry(
   session: SmokeSession,
+  peers: readonly SmokeSession[],
   request: string,
   ceilingMs: number,
   signal: AbortSignal | undefined,
@@ -1086,26 +1129,16 @@ async function orderWithAdmissionRetry(
       throw new Error(`dispenser admission window (${retrySeconds}s) exceeds this lane's ${Math.floor(ceilingMs / 1000)}s wait ceiling: ${message.slice(0, 200)}`);
     }
     cfg.log?.(`    [${session.label}] dispenser admission window active; waiting ${retrySeconds + 1}s for the one retry`);
-    await sleepUnlessAborted(waitMs, signal);
+    // The peers keep polling through the window. Going silent here used to
+    // cost their gateway shard (and with it their queue), so the order's
+    // fanout landed on a shard holding nothing for them and the terminal-fact
+    // assertion below failed with "saw no observations" — a transport
+    // eviction misreported as a dispenser fanout failure.
+    await sleepWithOpenEars(waitMs, [session, ...peers], signal);
     return await session.call("the_horoscope", "order", [request], signal);
   }
 }
 
-function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    throwIfAborted(signal);
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      const reason = signal?.reason;
-      reject(reason instanceof Error ? reason : new Error("operation aborted"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
 
 // Drain pending observations from a session's wait queue so the next assertion
 // only sees events emitted after this point. The deployed fan-out can take 1–2s
