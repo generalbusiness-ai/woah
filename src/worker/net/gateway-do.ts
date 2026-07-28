@@ -821,41 +821,59 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 const RECENT_CLIENT_TURN_CAP = 512;
 
 /**
- * H2c: selection-pin retention, PER SCOPE (see pinScope).
+ * H2c: selection-pin retention — the gateway half of a SHARED retention
+ * boundary with the authority's recorded replies (scope.ts
+ * IDEMPOTENCY_LEASE_MS).
  *
- * The pin must outlive the recorded reply it protects, in the scope-sized
- * units the scope prunes in. A scope retains at most
- * `max(REPLY_CACHE_CAP, tailLimit) + RECEIPT_CACHE_CAP` = 1280 replies
- * (scope.ts pruneReplies); this is that number with headroom, counted per
- * scope rather than across the whole shard.
+ * The property that has to hold is an ORDERING between two independent stores:
+ * a recorded outcome must never outlive the pin that routes its retry back to
+ * it. Otherwise the retry re-plans, may select a second scope, and commits
+ * there — the cross-scope double execution, reached through the routing door
+ * instead of the commit door.
  *
- * Counting across the shard — the previous rule — meant a gateway serving
- * several busy scopes evicted a pin while its receipt was still live at the
- * scope. A retry then re-planned freely, and if selection landed on a
- * DIFFERENT scope it executed a second time: the same double execution
- * idempotency exists to prevent, reached through the routing door instead of
- * the commit door.
+ * Counting rows cannot establish that ordering, and two successive attempts to
+ * size it were both disproved by direct probes: a shard-wide row ceiling
+ * deletes by global rowid and ignores scope, so many scopes each individually
+ * under a per-scope cap still evict live-receipt pins; and a per-scope cap
+ * counts PINS rather than pins with a live outcome, so keys that were pinned
+ * and abandoned before any reply push out an older live one. No choice of
+ * limits fixes either: the two stores prune on different, unrelated triggers.
  *
- * Headroom (2048 vs 1280) covers pins with no reply behind them. The pin is
- * necessarily written BEFORE the submit — the whole point is to survive a
- * submit whose outcome the gateway never learned — so keys that were pinned
- * and then abandoned (a retryable rejection the client gave up on, a lost
- * response) consume pin budget without ever recording a reply.
+ * So retention is by CLOCK, shared with the authority, and eviction of an
+ * unexpired guarantee is not permitted at all:
+ *
+ * - a pin for a client-supplied operation id is GUARANTEED. It is removed only
+ *   when its lease expires. At capacity the gateway REFUSES a new guaranteed
+ *   admission (`E_RETRY_CAPACITY`) rather than evict one that is still live —
+ *   a visible refusal is strictly better than a silent double execution;
+ * - a pin for a gateway-MINTED key is TRANSIENT. No client can reuse such a
+ *   key, so it only has to survive the current request's repair loop, and it
+ *   is evicted by count so it can never crowd out a guarantee.
+ *
+ * The gateway lease is deliberately LONGER than the authority's, so clock skew
+ * between two Durable Objects cannot invert the ordering the invariant rests
+ * on. Slack is the whole difference: 20 minutes here against 10 there.
  */
-const GATEWAY_PIN_LIMIT = 2048;
+const GATEWAY_PIN_LEASE_MS = 20 * 60_000;
 /**
- * Table-level ceiling across all scopes, so per-scope retention does not make
- * the table unbounded in the number of scopes a shard touches. At ~200 bytes a
- * row this is a few MiB of DO SQL, and it holds 32 scopes at their full
- * per-scope window. Past it the OLDEST pins shard-wide are dropped and those
- * keys fall back to the documented window-expiry posture (a retry re-plans and
- * is a new turn by every observable measure).
+ * Guaranteed pins held per shard. At ~200 bytes a row this is a few MiB of DO
+ * SQL. Combined with the lease it is also a rate: sustaining more than
+ * `GATEWAY_GUARANTEED_PIN_CAPACITY / GATEWAY_PIN_LEASE_MS` ≈ 55 client-keyed
+ * operations per second on ONE shard for a full lease is what it takes to
+ * reach the refusal, and the refusal names itself when it happens.
  */
-const GATEWAY_PIN_TABLE_LIMIT = 65536;
+const GATEWAY_GUARANTEED_PIN_CAPACITY = 65536;
+/** Minted-key pins kept before the oldest are dropped. They only need to
+ * outlive one request's repair loop, so this is generous already. */
+const GATEWAY_TRANSIENT_PIN_CAPACITY = 4096;
 /** Drain-watermark writes between retention sweeps. A sweep costs one COUNT
- * over a table bounded by GATEWAY_PIN_TABLE_LIMIT; the interval keeps that off
+ * over a bounded table; the interval keeps that off
  * the per-poll path while still bounding growth (one row per new session). */
 const MCP_WATERMARK_SWEEP_INTERVAL = 256;
+/** Drain watermarks retained per shard. One row per live session, so this is a
+ * session-count bound; it previously borrowed the selection-pin constant,
+ * which coupled two unrelated tables through one number. */
+const GATEWAY_WATERMARK_LIMIT = 2048;
 /** A session bearer destroys its own credential when close commits. Keep a
  * bounded gateway-local receipt so a lost close reply can still replay as
  * success after the session cell is expired/reaped. Same bounded-idempotency
@@ -1108,20 +1126,41 @@ export class NetGatewayDO {
     // submit for that key targeted. A re-plan (same key, refreshed view)
     // must never migrate the commit to a different scope — the pinned
     // scope may already hold the recorded reply, and a second scope would
-    // double-commit the turn. Bounded (H2c): pinScope prunes to the most
-    // recent GATEWAY_PIN_LIMIT rows PER SCOPE, sized to outlive that scope's
-    // reply/receipt retention, under a shard-wide table ceiling (see
-    // pinScope).
+    // double-commit the turn. Retention is lease-based and shared with the
+    // authority's reply cache (H2c: see pinScope).
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
     );
-    // Per-scope retention needs a per-scope index, or every pinned turn pays
-    // a full-table COUNT. Idempotent, and cheap to add to an existing table.
-    // Indexed on `scope` alone: every SQLite index carries the rowid as its
-    // payload already, so `WHERE scope = ? ORDER BY rowid` is served by this
-    // one — and naming rowid in the index columns is a syntax error.
+    // Lease columns, added in place so an already-deployed shard keeps its
+    // pins across the upgrade — dropping the table instead would blank every
+    // in-flight route at exactly the moment the invariant is being repaired.
+    // Legacy rows are backfilled with a full lease and treated as guaranteed:
+    // conservative in the direction that matters, since it can only retain a
+    // route that is no longer needed, never discard one that is.
+    const pinColumns = new Set(
+      sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
+    );
+    if (!pinColumns.has("expires_at")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
+      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
+    }
+    // Backfill unconditionally, not only when the columns are first added: any
+    // row that reaches this table without a lease is undateable, and an
+    // undateable row must not become an ageless one. Indexed on expires_at and
+    // a no-op once clean, so the steady-state cost is a lookup.
     state.storage.sql.exec(
-      "CREATE INDEX IF NOT EXISTS net_gateway_pin_scope ON net_gateway_pin (scope)"
+      "UPDATE net_gateway_pin SET expires_at = ?, guaranteed = 1 WHERE expires_at IS NULL",
+      Date.now() + GATEWAY_PIN_LEASE_MS
+    );
+    // Retention sweeps read by expiry and by class; both stay off a full-table
+    // scan. Every SQLite index carries the rowid as its payload already, so
+    // "oldest first within a class" is served by the class index — and naming
+    // rowid in the index columns is a syntax error.
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_pin_expiry ON net_gateway_pin (expires_at)"
+    );
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_pin_class ON net_gateway_pin (guaranteed)"
     );
     // AU1.2 durable edge-event lane: refusal records buffered here and
     // drained to the audit shards (see recordEdgeAudit).
@@ -2008,7 +2047,29 @@ export class NetGatewayDO {
       const pinned = this.pinnedScope(request.idempotency_key);
       const targetScope = pinned ?? planned.selection.scope;
       if (pinned === null) {
-        this.pinScope(request.idempotency_key, planned.selection.scope);
+        // `retry_receipt` is precisely "the client chose this key and will
+        // reuse it" (an MCP operation_id, or retry_safe on /net-api/turn), so
+        // it is also precisely the set of keys a retry can ever look up. Those
+        // pins carry the retention guarantee; a gateway-minted key only has to
+        // survive this request's own repair loop.
+        const guaranteed = request.retry_receipt === true;
+        if (this.pinScope(request.idempotency_key, planned.selection.scope, guaranteed) === "capacity") {
+          // Refuse BEFORE the submit leaves. Issuing a retry guarantee this
+          // shard cannot keep would mean a lost response re-executes silently;
+          // a named refusal lets the client wait, or drop the operation id and
+          // accept ordinary at-least-once semantics knowingly.
+          throw new NetError(
+            "E_RETRY_CAPACITY",
+            "this gateway shard cannot currently guarantee retry safety for a new operation id",
+            {
+              reason: "pin_capacity",
+              retry_after_ms: 60_000,
+              remediation:
+                "retry this call unchanged in a moment; the guarantee is refused, not the operation"
+            },
+            trace
+          );
+        }
       } else if (pinned !== planned.selection.scope) {
         this.metric({
           kind: "net_turn_selection_pin_override",
@@ -5440,6 +5501,11 @@ export class NetGatewayDO {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
 
     if (name === "woo_wait") {
+      // M4.3: the advertised schema is enforced before anything else happens.
+      // Silently defaulting a wrong-typed `timeout_ms` made a client that
+      // passed "5000" park for one second and believe it had parked for five.
+      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (refusal) return this.mcpToolError(id, refusal);
       const timeout = typeof args.timeout_ms === "number" ? Math.min(Math.max(args.timeout_ms, 0), 25_000) : 1000;
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
@@ -5453,6 +5519,12 @@ export class NetGatewayDO {
     // invocation so the advertised set and the accepted set remain equal.
     await this.warmMcpContext(actor, session);
     if (name === "woo_list_reachable_tools") {
+      // M4.3. The `scope` enum is now refused by the same validator every
+      // other tool uses, so the refusal names the field and the allowed set
+      // instead of arriving as a bare thrown message. mcpToolScope still
+      // guards the internal contract for non-transport callers.
+      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (refusal) return this.mcpToolError(id, refusal);
       try {
         const page = this.mcpToolPage(actor, session, args);
         // Re-baseline from the canonical set the page was projected from —
@@ -5477,9 +5549,27 @@ export class NetGatewayDO {
       }
     }
     if (name === "woo_call") {
-      const requested = typeof args.object === "string" ? args.object : "";
-      const verb = typeof args.verb === "string" ? args.verb : "";
-      if (!requested || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
+      // M4.3, gate 1: woo_call's OWN schema — `object`/`verb` required
+      // strings, `args` an array. This replaced a coercing presence check
+      // that reported a non-string `object` as "missing" and silently turned
+      // a non-array `args` into an empty list, dispatching the verb with no
+      // arguments instead of saying the payload was malformed.
+      const controlRefusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (controlRefusal) return this.mcpToolError(id, controlRefusal);
+      const requested = args.object as string;
+      const verb = args.verb as string;
+      if (!requested || !verb) {
+        return this.mcpToolError(id, {
+          code: "E_INVARG",
+          message: "woo_call: \"object\" and \"verb\" must be non-empty",
+          detail: {
+            reason: "empty_required_argument",
+            tool: name,
+            field: requested ? "verb" : "object",
+            remediation: "name a reachable object id (or $me/$here) and a verb on its dispatch chain"
+          }
+        });
+      }
       // `$me`/`$here` are the forms every user doc uses for "the session
       // actor" and "the space I am in". They resolved nowhere, so each of
       // those documented examples refused. They are transport-level session
@@ -5502,6 +5592,18 @@ export class NetGatewayDO {
       }
       const resolved = this.mcpResolveCall(actor, session, object, verb);
       if ("error" in resolved) return this.mcpToolError(id, resolved.error);
+      // M4.3, gate 2: the resolved verb's own declared parameters. `woo_call`
+      // cannot advertise them — its schema describes a free-form list — but
+      // once the verb is resolved its `arg_spec` is in hand, and it is the
+      // SAME input the advertised dynamic `inputSchema` is derived from.
+      const positional = Array.isArray(args.args) ? args.args : [];
+      const argRefusal = mcpValidatePositionalArguments(
+        resolved.tool.object,
+        resolved.tool.verb,
+        resolved.tool.argSpec,
+        positional
+      );
+      if (argRefusal) return this.mcpToolError(id, argRefusal);
       // `woo_call` carries verb arguments positionally inside `args`, so its
       // own argument namespace never collides with the reserved name.
       const operation = mcpOperationId(params, args, []);
@@ -5512,7 +5614,7 @@ export class NetGatewayDO {
         session,
         resolved.tool.object,
         resolved.tool.verb,
-        Array.isArray(args.args) ? args.args : [],
+        positional,
         resolved.tool.route,
         this.mcpTraceOf(request),
         operation.value
@@ -5520,6 +5622,11 @@ export class NetGatewayDO {
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
     if (dynamic) {
+      // M4.3: validate against `mcpProtocolTool`'s schema — the exact object
+      // `tools/list` advertised for this tool, reserved `operation_id`
+      // included — so the accepted set and the advertised set are one thing.
+      const refusal = mcpValidateNamedArguments(name, mcpProtocolTool(dynamic).inputSchema, args);
+      if (refusal) return this.mcpToolError(id, refusal);
       const operation = mcpOperationId(params, args, dynamic.argNames);
       if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
@@ -8365,64 +8472,74 @@ export class NetGatewayDO {
     return this.callReadsVerbFlag(view, call, "reads_ordered_children");
   }
 
-  /** The scope pinned to an idempotency key, or null (fix 5c). */
+  /** The scope pinned to an idempotency key, or null (fix 5c). An EXPIRED pin
+   * is not a pin: its lease is the same boundary the authority prunes its
+   * recorded reply on, so past it there is nothing left to route back to. */
   private pinnedScope(idempotencyKey: string): string | null {
     const rows = sqlRows<{ scope: string }>(
-      this.state.storage.sql.exec("SELECT scope FROM net_gateway_pin WHERE idempotency_key = ?", idempotencyKey)
+      this.state.storage.sql.exec(
+        // A NULL lease is a legacy row, and legacy reads as LIVE: honouring a
+        // route we can no longer date is the harmless direction (a pin
+        // outliving its reply costs nothing), while treating it as expired
+        // would silently drop exactly the routes this change exists to keep.
+        // The constructor backfill retires them on the next boot.
+        "SELECT scope FROM net_gateway_pin WHERE idempotency_key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        idempotencyKey,
+        Date.now()
+      )
     );
     return rows.length > 0 ? rows[0].scope : null;
   }
 
-  /** Persist the key → scope pin; first writer wins (fix 5c).
+  /**
+   * Persist the key → scope pin; first writer wins (fix 5c).
    *
-   * H2c boundedness, aligned with the authority's reply retention:
+   * Retention is by lease, never by eviction of a live guarantee — see
+   * GATEWAY_PIN_LEASE_MS for why counting rows cannot establish the ordering
+   * this rests on. On each admission:
    *
-   * - **per scope**, the table keeps the most recent GATEWAY_PIN_LIMIT rows
-   *   (rowid order — SQLite's insertion order). That number strictly exceeds
-   *   what one scope can retain in recorded replies and receipts (scope.ts
-   *   pruneReplies), so while a receipt is live its pin is live, and a retry
-   *   is routed back to the scope that holds the answer instead of being free
-   *   to execute at a second one;
-   * - **shard-wide**, a GATEWAY_PIN_TABLE_LIMIT ceiling keeps the table
-   *   bounded in the number of scopes.
+   * 1. expired rows go, whatever their class;
+   * 2. TRANSIENT rows (gateway-minted keys) are trimmed to their own capacity,
+   *    oldest first, so they can never crowd out a guarantee;
+   * 3. a GUARANTEED admission at capacity is REFUSED — reported to the caller,
+   *    which turns it into `E_RETRY_CAPACITY` before anything is submitted.
    *
-   * The reverse containment — a live pin always having a live receipt — is
-   * deliberately NOT an invariant. The pin is written before the submit (that
-   * is what makes it survive a lost response), so at write time there is no
-   * outcome to condition on, and a pin whose reply has pruned is harmless: the
-   * retry reaches the right scope, finds nothing recorded, and validates fresh.
-   *
-   * Consequence, documented (the reply-cache posture, scope.ts pruneReplies):
-   * a replay arriving after BOTH have pruned is a NEW turn by every observable
-   * measure — it validates fresh against the current head and read versions.
-   * Idempotency is a bounded-window guarantee, not an eternal one. */
-  private pinScope(idempotencyKey: string, scope: string): void {
-    this.state.storage.sql.exec(
-      "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
-      idempotencyKey,
-      scope
-    );
-    // Per-scope prune, on the (scope, rowid) index — the count and the delete
-    // both stay off a full-table scan.
-    const scoped = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE scope = ?", scope)
+   * Returns `"capacity"` for that refusal and `"pinned"` otherwise. The
+   * refusal is a real cost of the design and is stated plainly in mcp.md
+   * §M4.2: a client is told its retry guarantee cannot be issued right now,
+   * which is strictly better than issuing one that silently does not hold.
+   */
+  private pinScope(idempotencyKey: string, scope: string, guaranteed: boolean): "pinned" | "capacity" {
+    const now = Date.now();
+    this.state.storage.sql.exec("DELETE FROM net_gateway_pin WHERE expires_at <= ?", now);
+    const transient = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 0")
     )[0];
-    if (scoped && Number(scoped.n) > GATEWAY_PIN_LIMIT) {
+    if (transient && Number(transient.n) > GATEWAY_TRANSIENT_PIN_CAPACITY) {
       this.state.storage.sql.exec(
-        "DELETE FROM net_gateway_pin WHERE scope = ? AND rowid NOT IN " +
-          "(SELECT rowid FROM net_gateway_pin WHERE scope = ? ORDER BY rowid DESC LIMIT ?)",
-        scope,
-        scope,
-        GATEWAY_PIN_LIMIT
+        "DELETE FROM net_gateway_pin WHERE guaranteed = 0 AND rowid NOT IN " +
+          "(SELECT rowid FROM net_gateway_pin WHERE guaranteed = 0 ORDER BY rowid DESC LIMIT ?)",
+        GATEWAY_TRANSIENT_PIN_CAPACITY
       );
     }
-    const total = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
-    if (total && Number(total.n) > GATEWAY_PIN_TABLE_LIMIT) {
-      this.state.storage.sql.exec(
-        "DELETE FROM net_gateway_pin WHERE rowid NOT IN (SELECT rowid FROM net_gateway_pin ORDER BY rowid DESC LIMIT ?)",
-        GATEWAY_PIN_TABLE_LIMIT
-      );
+    if (guaranteed) {
+      const held = sqlRows<{ n: number }>(
+        this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 1")
+      )[0];
+      if (held && Number(held.n) >= GATEWAY_GUARANTEED_PIN_CAPACITY) {
+        this.metric({ kind: "net_turn_pin_capacity_refusal", scope, held: Number(held.n) });
+        return "capacity";
+      }
     }
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) VALUES (?, ?, ?, ?) " +
+        "ON CONFLICT(idempotency_key) DO NOTHING",
+      idempotencyKey,
+      scope,
+      now + GATEWAY_PIN_LEASE_MS,
+      guaranteed ? 1 : 0
+    );
+    return "pinned";
   }
 
   /** Scopes that carry at least one durable MCP drain watermark, loaded once
@@ -8485,9 +8602,9 @@ export class NetGatewayDO {
    *
    * Written on every reply that hands observations back to the client (and on
    * an empty one — an empty drain is just as much a "you are caught up to
-   * here" statement). Bounded like the selection pins: only the most recent
-   * GATEWAY_PIN_LIMIT rows are kept, and a pruned row degrades to the old
-   * conservative `gap:true`, never to a false continuity claim. */
+   * here" statement). Bounded: only the most recent GATEWAY_WATERMARK_LIMIT
+   * rows are kept, and a pruned row degrades to the old conservative
+   * `gap:true`, never to a false continuity claim. */
   private recordMcpDrainWatermark(session: string, actor: string): void {
     const scope = this.mcpDeliveryScope(actor, session);
     if (scope === null) return; // placeless / unclassifiable: nothing to vouch for
@@ -8511,11 +8628,11 @@ export class NetGatewayDO {
     const count = sqlRows<{ n: number }>(
       this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_mcp_watermark")
     )[0];
-    if (count && Number(count.n) > GATEWAY_PIN_LIMIT) {
+    if (count && Number(count.n) > GATEWAY_WATERMARK_LIMIT) {
       this.state.storage.sql.exec(
         "DELETE FROM net_gateway_mcp_watermark WHERE rowid NOT IN "
         + "(SELECT rowid FROM net_gateway_mcp_watermark ORDER BY ts DESC LIMIT ?)",
-        GATEWAY_PIN_LIMIT
+        GATEWAY_WATERMARK_LIMIT
       );
     }
   }
@@ -10500,6 +10617,261 @@ function mcpSchemaForHint(raw: string): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Argument validation for `tools/call` (mcp.md §M4.3).
+ *
+ * We advertise an `inputSchema` for every tool and, until this landed,
+ * checked nothing against it: a missing property silently became `null` and a
+ * wrong-typed one reached verb dispatch unchanged, so the schema a model
+ * reads was decorative. Everything below runs BEFORE the turn is planned —
+ * a refused call emits no observation and writes no cell.
+ *
+ * This is deliberately NOT a JSON Schema engine. It implements exactly the
+ * vocabulary our own advertisements can contain — `type`, `enum`, `anyOf`,
+ * and `required` — which covers everything `mcpInputSchema` derives from an
+ * `arg_spec` (type hints, `command.args_from` shapes) plus the hand-written
+ * stable-control schemas. Deliberately NOT supported, because no
+ * advertisement can express them: nested object/array element schemas
+ * (`items` is always `{}`), `additionalProperties`, `format`, numeric or
+ * length bounds, `pattern`, `oneOf`/`allOf`/`not`, and schema references. A
+ * schema fragment this validator does not understand constrains NOTHING rather than
+ * refusing, so a richer future advertisement can never start rejecting calls
+ * that were valid before the validator learned about it.
+ */
+type McpArgRefusal = { code: string; message: string; detail: Record<string, unknown> };
+
+/** True when `value` satisfies the shallow schema fragment. An empty or
+ * unrecognized fragment accepts everything — see the fail-open rule above. */
+function mcpSchemaAccepts(schema: Record<string, unknown>, value: unknown): boolean {
+  if (Array.isArray(schema.anyOf)) {
+    return schema.anyOf.some((branch) => mcpSchemaAccepts(mcpRecord(branch), value));
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => allowed === value)) return false;
+  const type = typeof schema.type === "string" ? schema.type : "";
+  switch (type) {
+    case "string": return typeof value === "string";
+    case "boolean": return typeof value === "boolean";
+    // JSON has one number type; `integer` is the narrower assertion. Both
+    // reject the non-finite values JSON cannot carry anyway.
+    case "integer": return typeof value === "number" && Number.isInteger(value);
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "object": return typeof value === "object" && value !== null && !Array.isArray(value);
+    case "array": return Array.isArray(value);
+    case "null": return value === null;
+    default: return true;
+  }
+}
+
+/** What a refusal should say the parameter had to be. */
+function mcpSchemaExpectation(schema: Record<string, unknown>): string {
+  if (Array.isArray(schema.anyOf)) {
+    const branches = schema.anyOf
+      .map((branch) => mcpSchemaExpectation(mcpRecord(branch)))
+      .filter((text) => text !== "any");
+    if (branches.length > 0) return branches.join(" or ");
+    return "any";
+  }
+  if (Array.isArray(schema.enum)) return `one of ${schema.enum.map((value) => JSON.stringify(value)).join(", ")}`;
+  return typeof schema.type === "string" && schema.type ? schema.type : "any";
+}
+
+/** The JSON type name to report back for a rejected value. */
+function mcpJsonTypeOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  return typeof value;
+}
+
+/**
+ * Validate a named-argument object against the schema that was advertised
+ * for it. Used for the stable controls (schema straight out of
+ * `MCP_TOOL_DEFS`) and for dynamic `<object>__<verb>` tools (schema straight
+ * out of `mcpProtocolTool`), so the validator and the advertisement are the
+ * same object and cannot drift.
+ *
+ * STRICTNESS: required-presence and type agreement are enforced; **unknown
+ * properties are ignored, not rejected.** Our advertised schemas do not set
+ * `additionalProperties: false`, so JSON Schema's own reading of them permits
+ * extras — rejecting what we advertise as permitted would be a fresh
+ * disagreement, and real MCP clients do decorate `arguments`. The failure
+ * mode that matters, a misspelled parameter name, is still caught: the
+ * correctly spelled parameter is then missing, and the refusal lists the
+ * unrecognized properties so the typo is diagnosable.
+ */
+function mcpValidateNamedArguments(
+  tool: string,
+  schema: Record<string, unknown>,
+  values: Record<string, unknown>
+): McpArgRefusal | null {
+  const properties = mcpRecord(schema.properties);
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((value): value is string => typeof value === "string")
+    : [];
+  const requiredSet = new Set(required);
+  // `undefined` is not a JSON value, but a hand-built client object can carry
+  // it; treat it as absent rather than as a value that fails every type.
+  const supplied = (name: string) =>
+    Object.prototype.hasOwnProperty.call(values, name) && values[name] !== undefined;
+  const missing = required.filter((name) => !supplied(name));
+  if (missing.length > 0) {
+    const field = missing[0];
+    const expected = mcpSchemaExpectation(mcpRecord(properties[field]));
+    // Only computed on the refusal path: an accepted call must not pay for it.
+    const unknown = Object.keys(values).filter((name) => !(name in properties));
+    return {
+      code: "E_INVARG",
+      message: `${tool}: missing required argument "${field}" (${expected})`,
+      detail: {
+        reason: "missing_required_argument",
+        tool,
+        field,
+        missing,
+        expected,
+        required,
+        ...(unknown.length > 0 ? { unknown_properties: unknown } : {}),
+        remediation: unknown.length > 0
+          ? `supply "${field}" as ${expected}; these supplied properties are not parameters of this tool and were ignored: `
+            + `${unknown.map((name) => `"${name}"`).join(", ")} — check for a misspelling`
+          : `supply "${field}" as ${expected}; this tool requires ${required.map((name) => `"${name}"`).join(", ")}`
+      }
+    };
+  }
+  // Advertisement order, not client order: the refusal a client sees for a
+  // given bad payload must not depend on JSON key ordering.
+  for (const [name, declared] of Object.entries(properties)) {
+    if (!supplied(name)) continue;
+    const value = values[name];
+    // `null` on an OPTIONAL parameter means "not supplied". It is exactly
+    // what mcpNamedArgs substitutes for an absent property, so refusing the
+    // transport's own encoding of absence would be incoherent.
+    if (value === null && !requiredSet.has(name)) continue;
+    const declaredSchema = mcpRecord(declared);
+    if (mcpSchemaAccepts(declaredSchema, value)) continue;
+    const expected = mcpSchemaExpectation(declaredSchema);
+    return {
+      code: "E_INVARG",
+      message: `${tool}: argument "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      detail: {
+        reason: "argument_type_mismatch",
+        tool,
+        field: name,
+        expected,
+        received: mcpJsonTypeOf(value),
+        remediation: `pass "${name}" as ${expected}`
+      }
+    };
+  }
+  return null;
+}
+
+/**
+ * Validate `woo_call`'s positional `args` list against the resolved verb's
+ * own `arg_spec` — the same input `mcpInputSchema` turns into the advertised
+ * `inputSchema`, so a verb that is also advertised is checked identically
+ * through both doors.
+ *
+ * RESIDUAL, stated in mcp.md §M4.3: a page whose `arg_spec` carries no
+ * declaration list at all declares no arity this gateway could check. That is
+ * the `(dobj, prep, iobj)` command-header form, whose parameters are bound
+ * from parsed command tokens rather than declared positionally, and any aged
+ * page written before `arg_spec` carried one. Those calls pass through
+ * unexamined; the alternative — assuming zero parameters — would refuse every
+ * legitimate command-shaped call.
+ */
+function mcpValidatePositionalArguments(
+  object: string,
+  verb: string,
+  argSpec: Record<string, unknown>,
+  values: unknown[]
+): McpArgRefusal | null {
+  if (!Array.isArray(argSpec.args) && !Array.isArray(argSpec.params)) return null;
+  const derived = mcpInputSchema(argSpec);
+  const properties = mcpRecord(derived.schema.properties);
+  const required = Array.isArray(derived.schema.required)
+    ? (derived.schema.required as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+  const requiredSet = new Set(required);
+  const target = `${object}:${verb}`;
+  // Optional markers are not guaranteed to be trailing (`["a?", "b"]` is
+  // expressible), so the minimum arity is one past the LAST required
+  // position, not the count of required names.
+  let minimum = 0;
+  derived.args.forEach((name, index) => {
+    if (requiredSet.has(name)) minimum = index + 1;
+  });
+  if (values.length < minimum) {
+    const field = derived.args[values.length] ?? derived.args[derived.args.length - 1] ?? "";
+    const expected = mcpSchemaExpectation(mcpRecord(properties[field]));
+    return {
+      code: "E_INVARG",
+      message:
+        `${target}: missing required argument #${values.length + 1} "${field}" (${expected}) — `
+        + `the verb takes at least ${minimum} argument${minimum === 1 ? "" : "s"}, received ${values.length}`,
+      detail: {
+        reason: "missing_required_argument",
+        obj: object,
+        name: verb,
+        field,
+        position: values.length,
+        expected,
+        declared: derived.args,
+        minimum_arity: minimum,
+        received_arity: values.length,
+        remediation: `pass args in the declared order (${derived.args.join(", ")})`
+      }
+    };
+  }
+  if (values.length > derived.args.length) {
+    return {
+      code: "E_INVARG",
+      message:
+        `${target}: too many arguments — the verb declares ${derived.args.length} `
+        + `(${derived.args.join(", ") || "none"}), received ${values.length}`,
+      detail: {
+        reason: "too_many_arguments",
+        obj: object,
+        name: verb,
+        declared: derived.args,
+        maximum_arity: derived.args.length,
+        received_arity: values.length,
+        remediation: derived.args.length > 0
+          ? `pass at most ${derived.args.length} args, in the declared order (${derived.args.join(", ")})`
+          : "this verb takes no arguments; pass an empty args list"
+      }
+    };
+  }
+  for (const [index, name] of derived.args.entries()) {
+    if (index >= values.length) break;
+    const value = values[index];
+    // Same absence rule as the named path: `null` in an optional slot is how
+    // "not supplied" is spelled positionally.
+    if (value === null && !requiredSet.has(name)) continue;
+    const declaredSchema = mcpRecord(properties[name]);
+    if (mcpSchemaAccepts(declaredSchema, value)) continue;
+    const expected = mcpSchemaExpectation(declaredSchema);
+    return {
+      code: "E_INVARG",
+      message: `${target}: argument #${index + 1} "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      detail: {
+        reason: "argument_type_mismatch",
+        obj: object,
+        name: verb,
+        field: name,
+        position: index,
+        expected,
+        received: mcpJsonTypeOf(value),
+        declared: derived.args,
+        remediation: `pass args[${index}] ("${name}") as ${expected}`
+      }
+    };
+  }
+  return null;
+}
+
+/** Map the validated named-argument object onto the verb's positional list.
+ * An absent OPTIONAL parameter becomes `null` here; an absent REQUIRED one
+ * can no longer reach this point (mcpValidateNamedArguments refused it). */
 function mcpNamedArgs(tool: NetMcpDynamicTool, values: Record<string, unknown>): unknown[] {
   return tool.argNames.map((name) => values[name] ?? null);
 }
@@ -10598,3 +10970,15 @@ const MCP_TOOL_DEFS = [
     }
   }
 ] as const;
+
+/**
+ * The advertised input schema of each stable control, keyed by tool name.
+ *
+ * Projected from `MCP_TOOL_DEFS` itself rather than restated, so the object
+ * `tools/call` validates against IS the object `tools/list` published. A
+ * second, hand-maintained copy would be a new drift surface — exactly the bug
+ * this validation exists to close for dynamic tools.
+ */
+const MCP_CONTROL_SCHEMAS: Record<string, Record<string, unknown>> = Object.fromEntries(
+  MCP_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema as unknown as Record<string, unknown>])
+);

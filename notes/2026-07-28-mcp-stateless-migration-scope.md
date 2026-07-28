@@ -252,12 +252,41 @@ correctness exposure*, not future conformance work, and the honest consequence
 is that it should not wait for the codec if the codec slips. Tracked
 separately from this note's deferral.
 
-**Do not describe MCP mutation retries — or this migration — as exactly-once
-safe until the routing-pin invariant is resolved.** A 2026-07-28 review
-disproved the pin ⊇ receipt claim with two persistence probes (a shard-wide
-ceiling that deletes by global rowid ignoring scope, and same-scope abandoned
-submissions evicting a live-receipt pin). The guarantee is real only within a
-window whose boundary the two stores do not currently share.
+**LANDED EARLY, 2026-07-28 — argument validation is no longer deferred.** It
+was taken out of this bundle and shipped ahead of the codec, for the reason
+above: malformed input reaching the VM is a correctness matter independent of
+which protocol revision we speak, and the fix does not depend on any
+2026-07-28 wire change. It is specified in
+[spec/protocol/mcp.md §M4.3](../spec/protocol/mcp.md) and covered by
+`tests/worker/net-mcp-arg-validation.test.ts`. Both doors are validated
+against the object that was advertised — dynamic tools against the published
+protocol schema, `woo_call`'s positional list against the resolved verb's own
+`arg_spec` — so there is no second derivation for the codec to reconcile
+later.
+
+The **other four** §5b items remain deferred to the versioned codec exactly as
+described above: ignored `initialize` parameters, unvalidated protocol-version
+headers, a malformed `tools/list` cursor silently becoming page zero, and
+protocol faults answering at HTTP 200. When the codec lands it should ABSORB
+the argument validator rather than reimplement it — a second implementation
+would recreate the advertisement/validator drift this fix exists to prevent.
+
+**The routing-pin invariant is resolved, and the resolution bounds what may be
+claimed.** A 2026-07-28 review disproved the original pin ⊇ receipt claim with
+two persistence probes (a shard-wide ceiling that deletes by global rowid
+ignoring scope, and same-scope abandoned submissions evicting a live-receipt
+pin). Both are now regression tests. The two stores share a wall-clock lease
+instead of trying to size row counts against each other: outcomes expire at 10
+minutes, pins at 20, and an unexpired pin is never evicted — at capacity the
+shard refuses a new retry-safe admission (`E_RETRY_CAPACITY`) instead.
+
+Retry safety is therefore exactly-once **within that lease, on the shard that
+admitted the operation**, and mcp.md §M4.2 lists the exclusions (cross-shard
+retries under a different credential, storage loss, gateway-minted keys). Do
+not describe it as unconditionally exactly-once. Note for this migration: the
+durable-handle direction it is heading toward would remove the two-store split,
+but not the ordering requirement — the pin is written before the submit, so no
+placement makes routing and outcome one atomic record at admission.
 
 ## 6. Tool-list policy [revised]
 

@@ -171,6 +171,9 @@ remediation. `detail.reason` carries the machine-readable form:
 | Verb fails the execute prefilter | `E_PERM` | `verb_not_executable` |
 | `direct` route, verb lacks `direct_callable` | `E_DIRECT_DENIED` | `not_direct_callable` |
 
+An argument that does not satisfy the advertised schema is refused before any
+of the above are reached, with its own `detail.reason` (§M4.3).
+
 `E_VERBNF` uses the engine's `{obj, name}` detail shape. Each refusal also
 carries a `remediation` string naming the action that would change the answer.
 A world-level refusal from the turn itself carries no gateway `reason` — that
@@ -232,7 +235,8 @@ There is deliberately no `all` scope. `active` already returns the complete
 structural context; a separate `all` had no distinct selection (it resolved to
 the same local closure) and wrongly implied a global tool enumeration, which
 Big-World forbids ([distribution.md](../semantics/distribution.md)). A request
-for `scope: "all"` is rejected.
+for `scope: "all"` is rejected — by the schema's own `enum` (§M4.3), so the
+refusal names the field and the four allowed values.
 
 ### M2.2 Verb mapping
 
@@ -270,8 +274,9 @@ shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
 string, resolved object slots are object-id strings, and `cmd` is an object.
 
 Named invocation maps JSON object properties to positional verb arguments in
-the declared order. Missing properties become `null`. `woo_call` accepts the
-positional list directly.
+the declared order. `woo_call` accepts the positional list directly. Both are
+validated against the advertised schema first (§M4.3): a missing REQUIRED
+property is refused, and only an absent OPTIONAL one becomes `null`.
 
 ### M2.3 Tool naming
 
@@ -621,14 +626,52 @@ most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
 of insertion, in memory and in durable storage together: a prune that can lag
 its insert is the unbounded cache it was meant to prevent.
 
-**The gateway's scope pin is retained to cover that window**, counted PER SCOPE
-(2048 keys, above the 1280 a scope can retain) rather than shard-wide. The pin
-decides where a retry is routed and the recorded reply decides whether it
-executes, so a pin that expires while its reply is live would let a retry
-re-plan into a second scope and commit there — the same double execution, by a
-different door. The converse is not required: the pin is necessarily written
-before its submit (that is what makes it survive a lost response), so pins with
-no reply behind them are expected, and a pin outliving its reply is harmless.
+**The retention boundary is a LEASE, and it is shared.** Two stores decide
+whether a retry is safe: the gateway's selection pin decides where the retry is
+routed, and the authority's recorded reply decides whether it executes when it
+gets there. If the pin expires while the reply is live, the retry re-plans, may
+select a second scope, and commits there — the same double execution, by a
+different door.
+
+Row counts cannot establish that ordering and MUST NOT be used to try. The two
+stores prune on unrelated triggers, so a limit in one says nothing about age in
+the other; two successive attempts to size this were both disproved by direct
+probes (a shard-wide ceiling deleting by global row order regardless of scope,
+and a per-scope cap counting pins rather than pins with a live outcome). The
+boundary is therefore a clock both sides share:
+
+- a recorded outcome expires **10 minutes** after it is recorded, whatever the
+  count quotas above would allow;
+- a pin for a client-supplied operation id expires after **20 minutes**. The
+  gap is slack: the two stores are different Durable Objects with independent
+  clocks, and the pin must outlive the reply even under skew;
+- an unexpired pin is **never evicted**. At capacity the gateway REFUSES a new
+  retry-safe admission with `E_RETRY_CAPACITY` rather than drop a live one.
+  Nothing is planned or submitted; the client is told that the retry
+  *guarantee* was refused, not the operation, and MAY retry shortly or re-issue
+  without an operation id and accept at-least-once semantics knowingly. A
+  visible refusal is the intended cost — the alternative is a guarantee that
+  silently does not hold.
+
+**The guarantee, exactly.** A recorded outcome younger than the 10-minute
+authority lease has a live pin routing its retry back to the scope that holds
+it. It does NOT hold, and MUST NOT be relied on, when:
+
+- the retry reaches a **different gateway shard** than the one that admitted
+  the operation. Shard routing follows the session, then the API key, so
+  retries on one credential are shard-stable; a retry presenting a *different*
+  credential for the same actor may land on a shard that never held the pin;
+- the admitting shard **lost its durable storage**;
+- the operation id was **gateway-minted** rather than client-supplied. Minted
+  keys are never reusable by a client, so they carry no retained-route promise
+  and their pins are evicted freely;
+- either lease has **expired** — see the paragraph below, which is the ordinary
+  case and not a failure.
+
+The converse containment is deliberately not claimed: a pin outliving its reply
+is expected and harmless. The pin is necessarily written BEFORE its submit —
+that is what makes it survive a lost response — so at write time there is no
+outcome to condition on.
 
 A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read
@@ -637,11 +680,94 @@ durable receipt. Operations needing a durable, long-lived outcome record are
 domain state (an order id, a task) and belong in the world, not in this
 cache.
 
+### M4.3 Argument validation
+
+**Arguments are validated against the advertised `inputSchema` before
+dispatch.** A refused call runs no verb: it emits no observation, writes no
+cell, and consumes no sequence number. This is a correctness rule, not a
+conformance one — an unvalidated argument otherwise reaches the VM, which
+makes the schema published to a model decorative.
+
+The validator reads the **same object that was advertised**, never a second
+derivation of it. A dynamic tool is checked against the protocol schema
+`tools/list` published for it (the derived `arg_spec` schema plus the reserved
+`operation_id`, §M4.2); a stable control is checked against its own published
+schema. A validator built from an independent restatement of `arg_spec` would
+be free to disagree with the advertisement, which is the defect this rule
+closes.
+
+**What is checked.** Exactly the vocabulary an advertisement can contain:
+
+| Keyword | Meaning enforced |
+|---|---|
+| `required` | The property must be present and not `undefined`. |
+| `type` | `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`. `integer` is the narrower assertion over JSON's single number type. |
+| `enum` | The value must be one of the listed values. |
+| `anyOf` | At least one branch must accept (the form a `a\|b` type hint derives). |
+
+**What is deliberately NOT checked**, because no advertisement can express
+it: nested object properties, array element schemas (`items` is always `{}`),
+`additionalProperties`, `format`, numeric or length bounds, `pattern`,
+`oneOf`/`allOf`/`not`, and `$ref`. A schema fragment the validator does not
+recognize **constrains nothing** rather than refusing, so a future
+advertisement can never begin rejecting calls that were valid before the
+validator learned about it.
+
+**Unknown properties are ignored, not rejected.** Advertised schemas do not
+set `additionalProperties:false`, so JSON Schema's own reading of them permits
+extras, and clients legitimately decorate `arguments`. Rejecting what the
+advertisement permits would be a fresh disagreement between the two. The
+failure this leniency could hide — a misspelled parameter name — is still
+caught, because the correctly spelled parameter is then *missing*: that
+refusal lists the unrecognized properties under `detail.unknown_properties` so
+the typo is diagnosable.
+
+**`null` in an optional slot means "not supplied."** It is precisely what the
+transport substitutes for an absent property when mapping named arguments onto
+positional ones (§M2.2), so refusing it would refuse the protocol's own
+encoding of absence. A `null` supplied for a *required*, type-declared
+parameter is a type mismatch.
+
+**Refusal shape.** `E_INVARG` with a `detail.reason`, the offending parameter,
+what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
+
+| Condition | `detail.reason` | Key detail fields |
+|---|---|---|
+| A required parameter is absent | `missing_required_argument` | `field`, `expected`, `missing`, `required`, `unknown_properties?` |
+| A supplied value has the wrong type | `argument_type_mismatch` | `field`, `expected`, `received` |
+| More positional args than the verb declares | `too_many_arguments` | `declared`, `maximum_arity`, `received_arity` |
+| `woo_call` `object`/`verb` supplied but empty | `empty_required_argument` | `field` |
+
+**`woo_call` is validated in two stages, and carries a residual.** Its own
+schema (`object` and `verb` required strings, `args` an array) is checked
+first. Its `args` list is free-form by construction — the tool cannot
+advertise the parameters of a verb chosen at call time — so the second stage
+runs *after* verb resolution, against the resolved page's own `arg_spec`,
+which is the same input the dynamic `inputSchema` is derived from. That stage
+checks positional arity (minimum from the last required position, maximum from
+the declared count) and the per-position type.
+
+The residual: **a page whose `arg_spec` carries no parameter declaration list
+at all is not arity-checked.** That is the `(dobj prep iobj)` command-header
+form, whose parameters are bound from parsed command tokens rather than
+declared positionally, and any aged page written before `arg_spec` carried a
+list. Such a call passes through unexamined. Assuming "zero parameters"
+instead would refuse every legitimate command-shaped call, and the gateway has
+no other source for the arity. A client cannot rely on a refusal for a
+malformed call to such a verb; the verb body remains its own guard.
+
+Beyond that residual, argument *meaning* is never checked here: that a string
+names a real object, that a number is in range, that a list has the right
+members. Those are the verb's own business and are enforced inside the
+authoritative turn.
+
 ## M5. Observation queue
 
 `woo_wait` drains a gateway-local, per-session FIFO fed by the same
 presence-routed fanout as WebSocket clients. It accepts `timeout_ms` from 0 to
-25,000 and `limit` from 1 to 256 (default 64). It returns
+25,000 and `limit` from 1 to 256 (default 64); values of the declared type are
+clamped into those ranges, while a value of the wrong type is refused (§M4.3)
+rather than silently replaced by the default. It returns
 `{observations:[...], gap:<bool>}`.
 
 The queue holds at most 256 observations and drops the oldest on overflow.
