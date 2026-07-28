@@ -196,6 +196,37 @@ describe("net-only Worker entry", () => {
     })), env);
     expect(unknown.status).toBe(404);
     expect(forwarded).toHaveLength(1);
+
+    // AP11.9: the identity-anchor op is the sibling that DOES exist, and is
+    // gated identically.
+    const anchorBody = { anchor_id: "ops-anchor" };
+    const anchorUnsigned = await worker.fetch(new Request("https://woo.test/net-operator/identity/anchor", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(anchorBody)
+    }), env);
+    expect(anchorUnsigned.status).toBe(401);
+    expect(forwarded).toHaveLength(1);
+
+    const anchorSigned = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/identity/anchor", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(anchorBody)
+    })), env);
+    expect(anchorSigned.status, await anchorSigned.clone().text()).toBe(200);
+    expect(forwarded).toHaveLength(2);
+    expect(forwarded[1]!.url).toBe("https://do/net/provision-anchor");
+    expect(forwarded[1]!.body).toEqual(anchorBody);
+    expect(forwarded[1]!.signedForGateway).toBe(true);
+
+    // A body without a token never reaches a DO.
+    const anchorMalformed = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/identity/anchor", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    })), env);
+    expect(anchorMalformed.status).toBe(400);
+    expect(forwarded).toHaveLength(2);
     scopeState.close();
   });
 

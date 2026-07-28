@@ -125,10 +125,10 @@
     "$account": 1
   },
   "src/worker/net/gateway-do.ts": {
-    "$account": 4,
+    "$account": 5,
     "$agent": 3,
     "$guest": 1,
-    "$human": 3,
+    "$human": 6,
     "$room": 1,
     "$space": 2
   }

@@ -308,7 +308,32 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
     return json({ error: { code: "E_NOSESSION", message: `net-operator requires a signed internal request: ${errorMessage(error)}` } }, 401);
   }
   if (request.method !== "POST") {
-    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure or /net-operator/wizard/provision" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor}" } }, 404);
+  }
+  // AP11.9. Like wizard provisioning this is gateway-shaped (it builds a
+  // genesis submit and then self-subscribes), so it is routed to a shard by its
+  // own token rather than to a scope authority.
+  if (url.pathname === "/net-operator/identity/anchor") {
+    try {
+      const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);
+      const text = new TextDecoder().decode(bytes);
+      const body = JSON.parse(text) as { anchor_id?: unknown };
+      if (typeof body.anchor_id !== "string" || !body.anchor_id) {
+        return json({ error: { code: "E_INVARG", message: "identity anchor requires anchor_id" } }, 400);
+      }
+      const shard = netGatewayShardForKey(
+        `operator-anchor:${body.anchor_id}`,
+        parseNetGatewayShardCount(env.NET_API_GATEWAY_SHARDS)
+      );
+      const stub = resolveNetDestination(env, `gateway:${shard}`);
+      return await stub.fetch(await signInternalRequest(env, new Request("https://do/net/provision-anchor", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: text
+      })));
+    } catch (error) {
+      return publicError(error);
+    }
   }
   // AP11 wizard provisioning runs a TURN, so it is addressed to a gateway shard
   // rather than a scope authority. The edge still only forwards, freshly
@@ -339,7 +364,7 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
     }
   }
   if (url.pathname !== "/net-operator/credentials/ensure") {
-    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/credentials/ensure or /net-operator/wizard/provision" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor}" } }, 404);
   }
   try {
     const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);

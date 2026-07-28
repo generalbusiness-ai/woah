@@ -1,7 +1,7 @@
 // AP11 operator CLI (scripts/net-provision-wizard.ts). The driver composes three
 // independently idempotent signed calls; these cases pin the composition, the
 // ordering constraint that forces it, and the argument refusals.
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,6 +29,11 @@ function harness(credentialFile: string) {
     await verifyInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, request.clone());
     const body = await request.json() as Record<string, unknown>;
     calls.push({ url: request.url, body });
+    if (request.url.endsWith("/net-operator/identity/anchor")) {
+      return new Response(JSON.stringify({ ok: true, created: true, human: "human_op_abc", account: "account_op_abc", scope: "cluster:human_op_abc" }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
     if (request.url.endsWith("/net-operator/wizard/provision")) {
       const first = calls.filter((call) => call.url.endsWith("/net-operator/wizard/provision")).length === 1;
       return new Response(JSON.stringify({
@@ -134,6 +139,57 @@ describe("AP11 operator wizard provisioning CLI", () => {
     expect(ensures[1]!.body).toEqual(ensures[0]!.body);
   });
 
+  it("seeds the anchor first when given a token instead of an existing human", async () => {
+    // A fresh net world seeds NO $human, so the anchor step is the normal
+    // opening move of the runbook, not an edge case.
+    const home = mkdtempSync(join(tmpdir(), "woo-provision-wizard-"));
+    temporaryDirectories.push(home);
+    const credentialFile = join(home, ".config", "generalbusiness", "woo_net_credentials.env");
+    const { calls, fetchImpl } = harness(credentialFile);
+    process.env.WOO_INTERNAL_SECRET = SECRET;
+
+    await provisionNetWizard([
+      "--base-url", "https://woo.test",
+      "--anchor-id", "ops-anchor",
+      "--provision-id", "ops-wizard-1",
+      "--credential-name", "OPS_WIZARD_WOO_APIKEY",
+      "--credential-file", credentialFile
+    ], { homeDir: home, fetch: fetchImpl, log: () => {} });
+
+    expect(calls.map((call) => call.url)).toEqual([
+      "https://woo.test/net-operator/identity/anchor",
+      "https://woo.test/net-operator/wizard/provision",
+      "https://woo.test/net-operator/credentials/ensure",
+      "https://woo.test/net-operator/wizard/provision"
+    ]);
+    expect(calls[0]!.body).toEqual({ anchor_id: "ops-anchor", label: "operator anchor ops-anchor" });
+    // The human the anchor returned is what provisioning then targets.
+    expect(calls[1]!.body.human).toBe("human_op_abc");
+  });
+
+  it("probes without mutating, and reports what to run next", async () => {
+    const home = mkdtempSync(join(tmpdir(), "woo-provision-wizard-"));
+    temporaryDirectories.push(home);
+    const credentialFile = join(home, ".config", "generalbusiness", "woo_net_credentials.env");
+    const { calls, fetchImpl } = harness(credentialFile);
+    process.env.WOO_INTERNAL_SECRET = SECRET;
+
+    await provisionNetWizard([
+      "--base-url", "https://woo.test",
+      "--human", "human_2",
+      "--provision-id", "ops-wizard-1",
+      "--probe",
+      "--credential-file", credentialFile
+    ], { homeDir: home, fetch: fetchImpl, log: () => {} });
+
+    // Exactly one call, flagged as a probe, and no credential was generated.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://woo.test/net-operator/wizard/provision");
+    expect(calls[0]!.body).toEqual({ human: "human_2", provision_id: "ops-wizard-1", probe: true });
+    // No credential was generated at all — probe does not even create the file.
+    expect(existsSync(credentialFile)).toBe(false);
+  });
+
   it("refuses arguments that cannot describe a valid provisioning", async () => {
     const home = mkdtempSync(join(tmpdir(), "woo-provision-wizard-"));
     temporaryDirectories.push(home);
@@ -146,6 +202,10 @@ describe("AP11 operator wizard provisioning CLI", () => {
     // `$wiz` is precisely the identity this op replaces; naming it is a refusal,
     // not a fallback.
     await expect(provisionNetWizard([...base, "--human", "$wiz", "--provision-id", "a"], deps)).rejects.toThrow(/non-\$/);
+    // --human and --anchor-id are alternatives, and one is required.
+    await expect(provisionNetWizard([...base, "--provision-id", "a"], deps)).rejects.toThrow(/--human .* or --anchor-id/);
+    await expect(provisionNetWizard([...base, "--human", "human_2", "--anchor-id", "x", "--provision-id", "a"], deps)).rejects.toThrow(/alternatives/);
+    await expect(provisionNetWizard([...base, "--anchor-id", "bad token", "--provision-id", "a"], deps)).rejects.toThrow(/anchor-id/);
     await expect(provisionNetWizard([...base, "--human", "human_2"], deps)).rejects.toThrow(/provision-id/);
     await expect(provisionNetWizard([...base, "--human", "human_2", "--provision-id", "bad id"], deps)).rejects.toThrow(/provision-id/);
     await expect(provisionNetWizard([

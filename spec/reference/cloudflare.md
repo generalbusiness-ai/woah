@@ -1458,33 +1458,69 @@ arguments, or repository files. Operator tooling generates the secret
 locally and writes the one-time full token to an owner-only (`0600`) file
 before sending the verifier or installing it as a Worker secret.
 
-The entry exposes one further internal-signed operator operation:
-`POST /net-operator/wizard/provision`
+The entry exposes two further internal-signed operator operations,
+`POST /net-operator/wizard/provision` and `POST /net-operator/identity/anchor`
 ([provisioning.md §AP11](../identity/provisioning.md#ap11-operator-wizard-provisioning-implemented)).
-Unlike the credential and repair operations it runs a **turn**, so it is
-addressed to a gateway shard (keyed by the target human) rather than to a scope
-authority. It mints a non-catalog, wizard-flagged, programmer-surfaced agent
-anchored under an existing human account — the only way to obtain a usable
-wizard on a deployed world, because the seeded `$wiz` cannot plan a client turn
-at all. It is idempotent on an operator-supplied `provision_id` and mints no
-credential material.
+Unlike the credential and repair operations these are gateway-shaped rather than
+scope-shaped: the first runs a turn, the second builds a genesis submit for a
+new authority cluster. Together they are the only way to obtain a usable wizard
+on a deployed world, because the seeded `$wiz` cannot plan a client turn at all.
 
-Deploy-day runbook (the two operator commands are separate steps; code landing
-is not a healed world):
+**A freshly cut-over world needs THREE steps, in this order.** The provisioning
+command alone is not enough, and skipping either prerequisite fails with a
+named refusal that says which one is missing:
+
+1. **Seed an identity anchor.** A fresh install seeds NO `$human` and no
+   `$account` (verified against the install plan), and the net stack exposes no
+   signup route — so there is nothing for provisioning to anchor to. The anchor
+   is a credential-less identity: no password, no OAuth, no key, so nothing can
+   authenticate as it (§AP11.9).
+2. **Install the AP11 primitive** if the world predates it. A runtime never
+   rewrites durable cells, so `$human:provision_wizard_agent` reaches an aged
+   world only through the definition repair (§AP11.11).
+3. **Provision**, then bind the credential.
+
+`npm run provision:net-wizard -- --anchor-id <token> …` performs steps 1 and 3
+in one command. Step 2 is a separate, explicit operator action because it
+changes catalog definitions.
+
+Probe first — this reports the world's state without mutating anything, and
+names the command to run next:
 
 ```bash
 npm run provision:net-wizard -- \
   --base-url https://woah1.generalbusiness.ai \
-  --human <human actor id> \
+  --anchor-id ops-wizard \
+  --provision-id ops-wizard-1 \
+  --probe
+```
+
+Then, if the probe reports `primitive_installed: false`:
+
+```bash
+npm run repair:net-definitions -- \
+  https://woah1.generalbusiness.ai '$human:provision_wizard_agent'
+```
+
+Then the provisioning run itself:
+
+```bash
+npm run provision:net-wizard -- \
+  --base-url https://woah1.generalbusiness.ai \
+  --anchor-id ops-wizard \
   --provision-id ops-wizard-1 \
   --name OpsWizard \
   --credential-name OPS_WIZARD_WOO_APIKEY
 ```
 
-The driver provisions, then installs a locally generated verifier through
-`/net-operator/credentials/ensure`, then re-runs provisioning to record the key
-pointer. The replayable token lands only in the owner-only credential file.
-Re-running the whole command is a no-op.
+The driver seeds (or reuses) the anchor, provisions, installs a locally
+generated verifier through `/net-operator/credentials/ensure`, then re-runs
+provisioning to record the key pointer. The replayable token lands only in the
+owner-only credential file. Every step is idempotent, so re-running the whole
+sequence is a no-op.
+
+Use `--human <actor id>` instead of `--anchor-id` when anchoring to a human
+that already exists (a signup-created account on a world that has one).
 
 For a Net world installed before `$actor.api_keys` existed, deploy the runtime
 and then run the explicit, idempotent bootstrap-definition migration before

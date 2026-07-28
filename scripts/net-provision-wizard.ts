@@ -40,6 +40,8 @@ import { ensureNetCredential } from "./net-ensure-credential";
 type Args = {
   baseUrl: string;
   human: string;
+  anchorId: string;
+  probe: boolean;
   provisionId: string;
   name: string;
   purpose: string;
@@ -62,23 +64,38 @@ function parseArgs(argv: string[], homeDir = homedir()): Args {
     values.set(flag.slice(2), value);
     index += 1;
   }
+  const anchorId = values.get("anchor-id") ?? "";
+  const probe = flags.has("probe");
+  // --human and --anchor-id are alternatives: name an EXISTING human, or name
+  // an operator anchor token and let the driver seed/reuse the identity it
+  // derives. A fresh net world has no human at all (the install plan seeds
+  // none), so --anchor-id is the normal case there.
   const human = values.get("human") ?? "";
   const provisionId = values.get("provision-id") ?? "";
   const name = values.get("name") ?? provisionId;
   const credentialName = values.get("credential-name") ?? "";
   const skipCredential = flags.has("skip-credential");
-  if (!human || human.startsWith("$")) {
+  if (!human && !anchorId) {
+    throw new Error("one of --human (an existing human actor) or --anchor-id (seed/reuse an operator anchor) is required");
+  }
+  if (human && anchorId) throw new Error("--human and --anchor-id are alternatives; pass exactly one");
+  if (human && human.startsWith("$")) {
     throw new Error("--human must name a concrete (non-$) human actor; $wiz is exactly the identity this op exists to replace");
+  }
+  if (anchorId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(anchorId)) {
+    throw new Error("--anchor-id must be 1..128 chars of [A-Za-z0-9._:-]");
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(provisionId)) {
     throw new Error("--provision-id is required: 1..128 chars of [A-Za-z0-9._:-]");
   }
-  if (!skipCredential && !/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
+  if (!probe && !skipCredential && !/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
     throw new Error("--credential-name must be an uppercase shell-safe env name (or pass --skip-credential)");
   }
   return {
     baseUrl: (values.get("base-url") ?? "https://woah1.generalbusiness.ai").replace(/\/+$/, ""),
     human,
+    anchorId,
+    probe,
     provisionId,
     name,
     purpose: values.get("purpose") ?? "operator-provisioned wizard",
@@ -121,29 +138,47 @@ type ProvisionResult = {
   programmer_agent_count: number;
 };
 
+async function postSigned(url: string, secret: string, payload: unknown, doFetch: typeof fetch): Promise<Record<string, unknown>> {
+  const request = new Request(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const response = await doFetch(await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, request));
+  const body = await response.text();
+  if (!response.ok) throw new Error(`${url} failed: ${response.status} ${body}`);
+  return JSON.parse(body) as Record<string, unknown>;
+}
+
+/** Seed (or find) the operator anchor identity this provisioning will hang
+ * from. A fresh net world seeds no `$human` at all, so without this the whole
+ * runbook has nothing to anchor to. Idempotent on the token. */
+async function ensureAnchor(args: Args, secret: string, doFetch: typeof fetch, log: (m: string) => void): Promise<string> {
+  const receipt = await postSigned(`${args.baseUrl}/net-operator/identity/anchor`, secret, {
+    anchor_id: args.anchorId,
+    label: `operator anchor ${args.anchorId}`
+  }, doFetch);
+  const human = typeof receipt.human === "string" ? receipt.human : "";
+  if (receipt.ok !== true || !human) throw new Error(`identity anchor returned an invalid receipt: ${JSON.stringify(receipt)}`);
+  log(`anchor ${human} (account ${String(receipt.account)}) ${receipt.created === true ? "created" : "already present"}`);
+  return human;
+}
+
 async function postProvision(
   args: Args,
   secret: string,
   apiKeyId: string | null,
   doFetch: typeof fetch
 ): Promise<ProvisionResult> {
-  const request = new Request(`${args.baseUrl}/net-operator/wizard/provision`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      human: args.human,
-      provision_id: args.provisionId,
-      name: args.name,
-      purpose: args.purpose,
-      ...(apiKeyId ? { api_key_id: apiKeyId } : {})
-    })
-  });
-  const response = await doFetch(await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, request));
-  const body = await response.text();
-  if (!response.ok) throw new Error(`wizard provision failed: ${response.status} ${body}`);
-  const parsed = JSON.parse(body) as { ok?: unknown; result?: ProvisionResult };
+  const parsed = await postSigned(`${args.baseUrl}/net-operator/wizard/provision`, secret, {
+    human: args.human,
+    provision_id: args.provisionId,
+    name: args.name,
+    purpose: args.purpose,
+    ...(apiKeyId ? { api_key_id: apiKeyId } : {})
+  }, doFetch) as { ok?: unknown; result?: ProvisionResult };
   if (parsed.ok !== true || !parsed.result || typeof parsed.result.actor_id !== "string") {
-    throw new Error(`wizard provision returned an invalid receipt: ${body}`);
+    throw new Error(`wizard provision returned an invalid receipt: ${JSON.stringify(parsed)}`);
   }
   return parsed.result;
 }
@@ -157,6 +192,22 @@ export async function provisionNetWizard(
   const doFetch = deps.fetch ?? fetch;
   const log = deps.log ?? console.log;
   const secret = internalSecret(homeDir, args.credentialFile);
+
+  // Step 0 — the anchor. A fresh net world seeds no `$human`, so when the
+  // operator names a token instead of an existing actor, seed/reuse it first.
+  if (args.anchorId) args.human = await ensureAnchor(args, secret, doFetch, log);
+
+  // A read-only report: what does the world hold, and what should run next?
+  // The only way to tell "no human" from "no primitive" without mutating.
+  if (args.probe) {
+    const receipt = await postSigned(`${args.baseUrl}/net-operator/wizard/provision`, secret, {
+      human: args.human,
+      provision_id: args.provisionId,
+      probe: true
+    }, doFetch);
+    log(JSON.stringify(receipt, null, 2));
+    return receipt as unknown as ProvisionResult;
+  }
 
   // Step 1 — mint (or converge on) the agent.
   const provisioned = await postProvision(args, secret, null, doFetch);

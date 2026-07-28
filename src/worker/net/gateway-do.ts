@@ -117,6 +117,7 @@ import { turnEchoId } from "../../net/turn-echo";
 import { observationReachesActor, type Observation } from "../../core/types";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
+import { identityAnchorIds, provisionAnchorSubmit } from "../../net/identity-anchor";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import {
@@ -347,6 +348,25 @@ type OperatorProvisionWizardRequest = {
   /** Routed api-key id the operator generated locally; recorded on the agent so
    * rotate/revoke find the credential the operator holds. */
   api_key_id?: string;
+  /** Report what the world holds without mutating anything. The operator's
+   * only way to tell "no human" from "no primitive" before running for real. */
+  probe?: boolean;
+};
+
+/** The seed identity classes an operator anchor instantiates. Named once, here,
+ * rather than inside the genesis builder: the builder stays world-agnostic and
+ * this is the single place the net layer states which bootstrap classes carry
+ * the account/human contract. */
+const ANCHOR_HUMAN_CLASS = "$human";
+const ANCHOR_ACCOUNT_CLASS = "$account";
+
+/** /net/provision-anchor body (AP11.9; see operatorProvisionAnchor). */
+type OperatorProvisionAnchorRequest = {
+  /** Opaque operator-chosen token; the anchor's object ids derive from it, so
+   * a re-run names the same identity rather than minting a second. */
+  anchor_id: string;
+  label?: string;
+  agent_quota?: number;
 };
 
 /** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
@@ -713,7 +733,16 @@ function guestClaim(raw: unknown, now: number, ttlMs: number): GuestClaim | null
 }
 
 async function guestClaimHex(claim: GuestClaim, purpose: string): Promise<string> {
-  const bytes = new TextEncoder().encode(`${purpose}\0${claim.id}`);
+  return derivedIdHex(claim.id, purpose);
+}
+
+/** Deterministic 16-byte hex derived from an opaque seed and a purpose label.
+ * Object ids that must be REPRODUCIBLE from a caller's token — an elastic guest
+ * claim, an operator anchor — derive here rather than allocating from a
+ * counter: a never-before-seen cluster has no counter, and reproducibility is
+ * what makes a lost reply replayable as the same submit. */
+async function derivedIdHex(seed: string, purpose: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${purpose}\0${seed}`);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return Array.from(digest.slice(0, 16), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -1062,6 +1091,9 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/provision-anchor") {
+        return await this.operatorProvisionAnchor((await request.json()) as OperatorProvisionAnchorRequest);
       }
       if (request.method === "POST" && url.pathname === "/net/provision-wizard") {
         return await this.operatorProvisionWizard((await request.json()) as OperatorProvisionWizardRequest);
@@ -2394,6 +2426,81 @@ export class NetGatewayDO {
   }
 
   /**
+   * /net/provision-anchor — AP11.9 operator identity anchor.
+   *
+   * A fresh net install seeds no human and no account instance (verified: the
+   * install plan's partitions contain zero of either), and the net stack
+   * exposes no signup route, so a freshly cut-over world has nothing for AP11
+   * to anchor to. This mints that anchor.
+   *
+   * It is a GENESIS SUBMIT, not a turn — see identity-anchor.ts for why a turn
+   * cannot express "bring a new authority cluster into existence" and why the
+   * minted identity is inert (no password, no OAuth, no key, no session).
+   *
+   * Idempotent on `anchor_id`: the object ids derive from it, so a replay is a
+   * byte-identical submit that the sequencer collapses. A re-run against an
+   * anchor that already exists reports it without a second commit.
+   */
+  private async operatorProvisionAnchor(body: OperatorProvisionAnchorRequest): Promise<Response> {
+    const anchorId = typeof body.anchor_id === "string" ? body.anchor_id.trim() : "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(anchorId)) {
+      return json({ error: { code: "E_INVARG", message: "anchor_id must be 1..128 chars of [A-Za-z0-9._:-]" } }, 400);
+    }
+    const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 128) : `operator anchor ${anchorId}`;
+    const agentQuota = Number.isSafeInteger(body.agent_quota) && Number(body.agent_quota) > 0
+      ? Math.min(Number(body.agent_quota), 64)
+      : 5;
+    let epoch: string;
+    try {
+      epoch = (await this.catalogIdentity()).epoch;
+    } catch (err) {
+      if (err instanceof ClientAuthError) {
+        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
+      }
+      throw err;
+    }
+    // Object ids are derived from the token, not allocated: a genesis cluster
+    // has no counter, and derivation is what makes a lost reply replayable.
+    const anchorHex = await derivedIdHex(anchorId, "operator-anchor");
+    const { human, account } = identityAnchorIds(anchorHex);
+    const clusterScope = `cluster:${human}`;
+
+    // An anchor that already exists is reported, not re-committed. The submit
+    // below would also collapse idempotently, but answering from the authority
+    // read keeps a re-run free of a write attempt entirely.
+    await this.warmScopes([{ scope: clusterScope, objects: [human] }], "net_provision_anchor_pull_miss_failed");
+    if (this.ensureView().has(cellKey("object_lineage", human))) {
+      return json({ ok: true, created: false, human, account, scope: clusterScope, catalog_epoch: epoch });
+    }
+
+    const planned = provisionAnchorSubmit({
+      human,
+      account,
+      label,
+      now: this.host.now(),
+      epoch,
+      agentQuota,
+      humanClass: ANCHOR_HUMAN_CLASS,
+      accountClass: ANCHOR_ACCOUNT_CLASS
+    });
+    const reply = await this.idempotentSubmit(`scope:${planned.clusterScope}`, planned.submit);
+    if (reply.status !== "accepted") {
+      this.metric({ kind: "net_provision_anchor", scope: planned.clusterScope, status: "error", error: JSON.stringify(reply) });
+      return json({ error: { code: "E_RETRY", message: "anchor provisioning did not commit; retry", detail: reply } }, 503);
+    }
+    try {
+      await this.installTouched(this.ensureView(), `scope:${planned.clusterScope}`, reply.touched);
+    } catch (err) {
+      // Acceptance is durable; only this gateway's own view is behind, and the
+      // next pull refreshes it. Named rather than silently swallowed.
+      this.metric({ kind: "net_provision_anchor_install_degraded", scope: planned.clusterScope, status: "error", error: String(err) });
+    }
+    await this.selfSubscribe(planned.clusterScope);
+    this.metric({ kind: "net_provision_anchor", scope: planned.clusterScope, status: "ok" });
+    return json({ ok: true, created: true, human, account, scope: planned.clusterScope, catalog_epoch: epoch });
+  }
+
+  /**
    * /net/provision-wizard — AP11 signed-operator wizard provisioning.
    *
    * Why this is a TURN and not a cell write like the repair family: every other
@@ -2431,6 +2538,7 @@ export class NetGatewayDO {
       return json({ error: { code: "E_INVARG", message: "provision_id must be 1..128 chars of [A-Za-z0-9._:-]" } }, 400);
     }
     const apiKeyId = typeof body.api_key_id === "string" ? body.api_key_id.trim() : "";
+    const probe = body.probe === true;
     // Named world-state verdicts (not installed / not active) rather than the
     // generic 500 the outer handler would give a ClientAuthError: an operator
     // running this against a half-installed namespace must be able to tell
@@ -2467,6 +2575,7 @@ export class NetGatewayDO {
     // class defaults (quota 0, provision_id null) and would then either refuse
     // confusingly or grant the wrong headroom. Failing the operator's request
     // is the correct outcome.
+    let recordedAgent: string | null = null;
     const account = this.netObjectProperty(human, "account");
     if (typeof account === "string" && account) {
       const prefetch = async (object: string, role: string): Promise<void> => {
@@ -2491,7 +2600,10 @@ export class NetGatewayDO {
         && Object.hasOwn(ledger as Record<string, unknown>, provisionId)
         ? (ledger as Record<string, unknown>)[provisionId]
         : undefined;
-      if (typeof recorded === "string" && recorded) await prefetch(recorded, "recorded agent");
+      if (typeof recorded === "string" && recorded) {
+        recordedAgent = recorded;
+        await prefetch(recorded, "recorded agent");
+      }
     }
     // Each invocation is its OWN turn. The durable idempotency handle is the
     // operator's `provision_id`, enforced inside the primitive: a re-run
@@ -2518,12 +2630,54 @@ export class NetGatewayDO {
       args: []
     });
     const principal = typeof page?.owner === "string" && page.owner ? page.owner : null;
+
+    // "No such human" and "no such primitive" both make callVerbPage return
+    // null — it resolves through the TARGET'S lineage chain, so an absent
+    // target has no chain to walk. Reporting both as E_VERBNF sent an operator
+    // hunting for a missing verb when the real answer was a missing identity,
+    // and those are opposite remedies (repair the definition vs seed an
+    // anchor). Separate them explicitly from the view.
+    const humanPresent = this.ensureView().has(cellKey("object_lineage", human));
+    if (probe) {
+      return json({
+        ok: true,
+        probe: true,
+        scope: planningScope,
+        catalog_epoch: epoch,
+        human,
+        human_present: humanPresent,
+        human_class: humanPresent ? this.netAncestry(human, 6) : [],
+        account: typeof account === "string" ? account : null,
+        primitive_installed: principal !== null,
+        recorded_agent: recordedAgent,
+        // The remedy the operator should run next, so the probe is actionable
+        // rather than merely descriptive.
+        next: !humanPresent
+          ? "seed an operator anchor (POST /net-operator/identity/anchor)"
+          : principal === null
+            ? "install the primitive (npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent')"
+            : "ready: run the provisioning op"
+      });
+    }
+    if (!humanPresent) {
+      return json({
+        error: {
+          code: "E_OBJNF",
+          message: "provision human does not exist at its authority scope; seed an operator anchor first",
+          detail: { human, scope: planningScope, remedy: "POST /net-operator/identity/anchor" }
+        }
+      }, 409);
+    }
     if (!principal) {
       return json({
         error: {
           code: "E_VERBNF",
           message: "this world does not install the provision_wizard_agent primitive",
-          detail: { human, verb: "provision_wizard_agent" }
+          detail: {
+            human,
+            verb: "provision_wizard_agent",
+            remedy: "npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent'"
+          }
         }
       }, 409);
     }
@@ -7573,6 +7727,24 @@ export class NetGatewayDO {
     if (typeof arg !== "number" || !Number.isInteger(arg) || arg < 0) return null;
     const value = call.args[arg];
     return typeof value === "string" ? value.trim() : null;
+  }
+
+  /** The first `limit` entries of an object's parent chain as this gateway's
+   * view holds it. Used only by the AP11 probe, to let an operator SEE that the
+   * id they named is (or is not) a human actor rather than infer it from a
+   * refusal. Bounded and view-only: no warm, no cross-DO hop. */
+  private netAncestry(object: string, limit: number): string[] {
+    const view = this.ensureView();
+    const chain: string[] = [];
+    let current: string | null = object;
+    const seen = new Set<string>();
+    while (current && chain.length < limit && !seen.has(current)) {
+      seen.add(current);
+      const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
+      current = typeof lineage?.parent === "string" ? lineage.parent : null;
+      if (current) chain.push(current);
+    }
+    return chain;
   }
 
   /** Read an effective property from the derived view, walking inherited
