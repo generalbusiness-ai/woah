@@ -113,6 +113,19 @@ async function fixture() {
         "verb :hits_now() rxd { return this.hits; }",
         null
       ).ok).toBe(true);
+      // Same effect as `bump`, but it DECLARES a parameter. The key-reuse
+      // tests need two calls that differ only in their arguments and are
+      // both well-formed: argument validation (mcp.md §M4.3) runs before the
+      // fingerprint check, so a surplus argument on the zero-parameter
+      // `bump` is now refused as malformed and never reaches the key at all.
+      expect(installVerb(
+        fresh,
+        "the_mug",
+        "bump_by",
+        "verb :bump_by(amount) rxd { this.hits = this.hits + amount; return this.hits; }",
+        null,
+        { argSpec: { args: ["amount"], types: { amount: "int" } } }
+      ).ok).toBe(true);
     }
   });
 
@@ -483,15 +496,15 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
         await f.settleAll();
         return response;
       };
-      // Changed ARGUMENTS.
-      const changedArgs = await conflict({ object: "the_mug", verb: "bump", args: ["extra"] });
-      expect(changedArgs.result).toMatchObject({
+      // Changed VERB. (Changed ARGUMENTS has its own test below: it needs a
+      // verb that declares a parameter, so that both calls are well-formed.)
+      const changedVerb = await conflict({ object: "the_mug", verb: "complain", args: [] });
+      expect(changedVerb.result).toMatchObject({
         isError: true,
         structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT", detail: { reason: "operation_id_reused" } } }
       });
       // The refusal must not leak the original call it collided with.
-      expect(JSON.stringify(changedArgs.result)).not.toContain("hits");
-      // Changed VERB.
+      expect(JSON.stringify(changedVerb.result)).not.toContain("hits");
       expect((await conflict({ object: "the_mug", verb: "hits_now", args: [] })).result).toMatchObject({
         isError: true,
         structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
@@ -511,6 +524,42 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(await f.hits()).toBe(1);
     } finally {
       await f.close();
+    }
+  });
+
+  it("refuses key reuse when only the ARGUMENTS differ", async () => {
+    const f = await fixture();
+    try {
+      // Both calls are well-formed against `bump_by`'s declared parameter, so
+      // this isolates the fingerprint's sensitivity to argument VALUES —
+      // argument validation has nothing to say about either one.
+      const first = await f.call(f.aliceSession, "woo_call", {
+        object: "the_mug", verb: "bump_by", args: [5], operation_id: "reuse-args"
+      });
+      expect(first.result?.isError, JSON.stringify(first).slice(0, 300)).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(5);
+
+      const changedArgs = await f.call(f.aliceSession, "woo_call", {
+        object: "the_mug", verb: "bump_by", args: [7], operation_id: "reuse-args"
+      });
+      await f.settleAll();
+      expect(changedArgs.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT", detail: { reason: "operation_id_reused" } } }
+      });
+      // The refusal must not leak the original call it collided with.
+      expect(JSON.stringify(changedArgs.result)).not.toContain("hits");
+      // The conflict committed nothing, and the original still replays.
+      expect(await f.hits()).toBe(5);
+      const replay = await f.call(f.aliceSession, "woo_call", {
+        object: "the_mug", verb: "bump_by", args: [5], operation_id: "reuse-args"
+      });
+      expect(replay.result?.structuredContent?.replayed).toBe(true);
+      expect(replay.result?.structuredContent?.result).toBe(5);
+      expect(await f.hits()).toBe(5);
+    } finally {
+      f.close();
     }
   });
 
@@ -570,7 +619,12 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
           method: "tools/call",
           params: {
             name: "woo_call",
-            arguments: { object: "the_mug", verb: "bump", args: ["different"], operation_id: "cold-conflict" }
+            // A DIFFERENT but well-formed call: `bump_by` declares its
+            // parameter, so this reaches the fingerprint check rather than
+            // being refused earlier as a malformed payload (§M4.3). It also
+            // mutates, so a fingerprint that failed to fire would show up in
+            // the `hits` assertion below rather than passing silently.
+            arguments: { object: "the_mug", verb: "bump_by", args: [1], operation_id: "cold-conflict" }
           }
         })
       }));

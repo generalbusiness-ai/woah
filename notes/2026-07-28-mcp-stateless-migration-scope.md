@@ -252,6 +252,25 @@ correctness exposure*, not future conformance work, and the honest consequence
 is that it should not wait for the codec if the codec slips. Tracked
 separately from this note's deferral.
 
+**LANDED EARLY, 2026-07-28 — argument validation is no longer deferred.** It
+was taken out of this bundle and shipped ahead of the codec, for the reason
+above: malformed input reaching the VM is a correctness matter independent of
+which protocol revision we speak, and the fix does not depend on any
+2026-07-28 wire change. It is specified in
+[spec/protocol/mcp.md §M4.3](../spec/protocol/mcp.md) and covered by
+`tests/worker/net-mcp-arg-validation.test.ts`. Both doors are validated
+against the object that was advertised — dynamic tools against the published
+protocol schema, `woo_call`'s positional list against the resolved verb's own
+`arg_spec` — so there is no second derivation for the codec to reconcile
+later.
+
+The **other four** §5b items remain deferred to the versioned codec exactly as
+described above: ignored `initialize` parameters, unvalidated protocol-version
+headers, a malformed `tools/list` cursor silently becoming page zero, and
+protocol faults answering at HTTP 200. When the codec lands it should ABSORB
+the argument validator rather than reimplement it — a second implementation
+would recreate the advertisement/validator drift this fix exists to prevent.
+
 **The routing-pin invariant is resolved, and the resolution bounds what may be
 claimed.** A 2026-07-28 review disproved the original pin ⊇ receipt claim with
 two persistence probes (a shard-wide ceiling that deletes by global rowid
