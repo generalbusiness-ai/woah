@@ -1131,6 +1131,66 @@ describe("native exception rollback", () => {
     expect(transcript.observations).toEqual([]);
   });
 
+  it("finishes every inverse, preserves the original error, and poisons a world after restore failure", async () => {
+    const world = createWorld();
+    world.createObject({ id: "poison_subject", name: "Poison subject", parent: "$thing", owner: "$wiz" });
+    world.defineProperty("poison_subject", { name: "first", defaultValue: 0, owner: "$wiz", perms: "rw", typeHint: "int" });
+    world.defineProperty("poison_subject", { name: "second", defaultValue: 0, owner: "$wiz", perms: "rw", typeHint: "int" });
+    const internals = world as unknown as {
+      behaviorUndoScopes: Array<{ undos: Array<() => void> }>;
+    };
+    addDirectNative(world, "poison_controller", "fail_restore", () => {
+      world.setProp("poison_subject", "first", 1);
+      // Place a hostile inverse between two real writes. LIFO abort must still
+      // restore the later and earlier rows around this failure.
+      internals.behaviorUndoScopes.at(-1)?.undos.push(() => {
+        throw wooError("E_TEST_UNDO", "injected inverse failure");
+      });
+      world.setProp("poison_subject", "second", 2);
+      throw wooError("E_TEST_ORIGINAL", "preserve this behavior error");
+    });
+    addDirectNative(world, "poison_controller", "after", () => "must not run");
+
+    const failed = await world.directCall("poison-fail", "$wiz", "poison_controller", "fail_restore", []);
+
+    expect(failed).toMatchObject({ op: "error", error: { code: "E_TEST_ORIGINAL" } });
+    expect(world.getProp("poison_subject", "first")).toBe(0);
+    expect(world.getProp("poison_subject", "second")).toBe(0);
+    const refused = await world.directCall("poison-after", "$wiz", "poison_controller", "after", []);
+    expect(refused).toMatchObject({
+      op: "error",
+      error: {
+        code: "E_WORLD_POISONED",
+        value: { restore_error: "E_TEST_UNDO" }
+      }
+    });
+    expect(() => world.setProp("poison_subject", "first", 3)).toThrow(
+      expect.objectContaining({ code: "E_WORLD_POISONED" })
+    );
+  });
+
+  it("refuses to discard staged durable acceptance under persistence deferral", () => {
+    const world = createWorld();
+    const internals = world as unknown as {
+      withBehaviorSavepoint<T>(fn: () => T): T;
+      acceptNowOrWithOuterBehavior(accept: () => void): void;
+    };
+    let accepted = false;
+
+    expect(() => world.withPersistenceDeferred(() =>
+      internals.withBehaviorSavepoint(() => {
+        internals.acceptNowOrWithOuterBehavior(() => {
+          accepted = true;
+        });
+        return true;
+      })
+    )).toThrow(expect.objectContaining({
+      code: "E_INTERNAL",
+      message: "durable behavior acceptance cannot commit inside persistence deferral"
+    }));
+    expect(accepted).toBe(false);
+  });
+
   it.each(["result enrichment", "live audience resolution"] as const)(
     "keeps %s inside the direct acceptance boundary",
     async (faultAt) => {
@@ -1968,5 +2028,43 @@ describe("native exception rollback", () => {
     expect(transcript.observations).toEqual([
       expect.objectContaining({ type: "$error", code: "E_TEST_SEQUENCED_ROLLBACK" })
     ]);
+  });
+
+  it("keeps meSnapshot restore metadata outside a failed turn's effects", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:failed-overlay");
+    const actor = session.actor;
+    await world.moveObjectChecked(actor, "the_dubspace");
+    // Model a recoverable focus overlay: the session addresses the actor while
+    // the actor's physical room remains the durable `here` projection.
+    expect(world.migrationSetSessionState(session.id, { activeScope: actor })).toBe(true);
+    addDirectNative(world, "overlay_controller", "move_then_fail", async (ctx) => {
+      const internals = ctx.world as unknown as {
+        movetoActorChecked(call: typeof ctx, movingActor: string, target: string): Promise<unknown>;
+      };
+      await internals.movetoActorChecked(ctx, actor, "the_chatroom");
+      throw wooError("E_TEST_OVERLAY_ROLLBACK", "restore the session focus");
+    });
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const failed = await world.directCall(
+      "failed-overlay",
+      actor,
+      "overlay_controller",
+      "move_then_fail",
+      [],
+      { sessionId: session.id }
+    );
+
+    expect(failed).toMatchObject({ op: "error", error: { code: "E_TEST_OVERLAY_ROLLBACK" } });
+    expect(world.activeScopeForSession(session.id)).toBe(actor);
+    const me = await world.meSnapshot(world.sessions.get(session.id)!);
+    expect(me.overlays).toEqual({
+      active_scope: { subject: actor, surface: "default", restore: true }
+    });
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.sessionScopeTransition).toBeUndefined();
+    expect(transcript.moves).toEqual([]);
   });
 });

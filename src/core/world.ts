@@ -1298,6 +1298,12 @@ export class WooWorld {
   // repository transaction open. While its surrounding call has persistence
   // paused, even persist(true) remains deferred until behavior acceptance.
   private behaviorSavepointDepth = 0;
+  // An inverse operation should be total, but a corrupt/hostile value can
+  // still make restoration throw. Such a world can no longer prove that its
+  // in-memory authority matches durable state. Finish every remaining undo,
+  // preserve the original call error, then refuse all later behavior/mutation
+  // until the host discards this instance and reloads from persistence.
+  private behaviorJournalPoison: ErrorValue | null = null;
   private persistenceDirty = false;
   private dirtyObjects = new Set<ObjRef>();
   private deletedObjects = new Set<ObjRef>();
@@ -6620,6 +6626,9 @@ export class WooWorld {
     message: Message,
     appliedOptions: AppliedCallOptions = {}
   ): Promise<AppliedFrame | ErrorFrame> {
+    if (this.behaviorJournalPoison) {
+      return { op: "error", id: frameId, error: this.behaviorJournalPoisonError() };
+    }
     const session = this.sessions.get(sessionId);
     if (!session || !this.sessionAlive(sessionId)) {
       return { op: "error", id: frameId, error: wooError("E_NOSESSION", "session token is expired or unknown") };
@@ -6907,6 +6916,7 @@ export class WooWorld {
     const startedAt = Date.now();
     let transferCacheBinding: string | null = null;
     try {
+      this.assertBehaviorJournalHealthy();
       assertObj(actor);
       assertObj(target);
       assertString(verbName);
@@ -13210,6 +13220,7 @@ export class WooWorld {
   private withBehaviorSavepoint<T>(fn: () => Promise<T>): Promise<T>;
   private withBehaviorSavepoint<T>(fn: () => T): T;
   private withBehaviorSavepoint<T>(fn: () => T | Promise<T>): T | Promise<T> {
+    this.assertBehaviorJournalHealthy();
     const recorder = this.activeTurnRecorder;
     recorder?.beginBehaviorScope();
     this.behaviorUndoScopes.push({
@@ -13234,12 +13245,27 @@ export class WooWorld {
     this.persistencePaused += 1;
     const commit = (value: T): T => {
       try {
-        if (this.behaviorSavepointDepth === 1 && this.persistenceDeferred === 0) {
+        const scope = this.behaviorUndoScopes.at(-1);
+        if (
+          this.behaviorSavepointDepth === 1
+          && this.persistenceDeferred > 0
+          && (scope?.acceptance.length ?? 0) > 0
+        ) {
+          // A deferred outer commit would pop this scope without executing its
+          // staged log/storage callbacks. Refuse loudly: accepted-in-memory
+          // with absent durable acceptance is never a legal intermediate.
+          throw wooError(
+            "E_INTERNAL",
+            "durable behavior acceptance cannot commit inside persistence deferral",
+            { acceptance: scope?.acceptance.length ?? 0 }
+          );
+        }
+        if (this.behaviorSavepointDepth === 1) {
           // Nested sequenced calls can stage durable log acceptance beneath a
           // direct command-plan turn. Execute those commits only while the
           // outer rollback journal is still live; any repository refusal then
           // aborts both the nested turn and its outer behavior atomically.
-          this.runBehaviorAcceptance(this.behaviorUndoScopes.at(-1)?.acceptance ?? []);
+          this.runBehaviorAcceptance(scope?.acceptance ?? []);
         }
         this.commitBehaviorUndoScope();
         recorder?.commitBehaviorScope();
@@ -13381,6 +13407,7 @@ export class WooWorld {
   }
 
   private withBehaviorMutationPermit<T>(fn: () => T): T {
+    this.assertBehaviorJournalHealthy();
     this.behaviorMutationPermit += 1;
     try {
       return fn();
@@ -13457,9 +13484,19 @@ export class WooWorld {
   private abortBehaviorUndoScope(): void {
     const aborted = this.behaviorUndoScopes.pop();
     if (!aborted) throw new Error("behavior undo-scope abort without begin");
+    let restoreFailure: ErrorValue | null = null;
     this.behaviorJournalRestoring += 1;
     try {
-      for (let index = aborted.undos.length - 1; index >= 0; index -= 1) aborted.undos[index]();
+      for (let index = aborted.undos.length - 1; index >= 0; index -= 1) {
+        try {
+          aborted.undos[index]();
+        } catch (err) {
+          // Continue LIFO restoration so one broken inverse cannot strand all
+          // earlier rows. The original behavior/acceptance error remains the
+          // result of this turn; this failure poisons only future use.
+          restoreFailure ??= normalizeError(err);
+        }
+      }
     } finally {
       this.behaviorJournalRestoring -= 1;
     }
@@ -13479,6 +13516,23 @@ export class WooWorld {
     this.invalidatePresenceIndex();
     this.invalidateSessionActiveScopeIndex();
     if (this.behaviorUndoScopes.length === 0) this.lastBehaviorUndoStats = this.behaviorUndoStats(aborted);
+    if (restoreFailure && !this.behaviorJournalPoison) {
+      this.behaviorJournalPoison = deepFreezePlainValue(wooError(
+        "E_WORLD_POISONED",
+        "authority rollback failed; reload this world before further use",
+        { restore_error: restoreFailure.code }
+      ));
+    }
+  }
+
+  private behaviorJournalPoisonError(): ErrorValue {
+    return this.behaviorJournalPoison
+      ?? wooError("E_WORLD_POISONED", "authority rollback failed; reload this world before further use");
+  }
+
+  private assertBehaviorJournalHealthy(): void {
+    if (this.behaviorJournalRestoring > 0 || !this.behaviorJournalPoison) return;
+    throw this.behaviorJournalPoisonError();
   }
 
   private behaviorUndoStats(scope: BehaviorUndoScope): NonNullable<WooWorld["lastBehaviorUndoStats"]> {
