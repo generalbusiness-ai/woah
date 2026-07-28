@@ -551,6 +551,16 @@ For programmer state:
 5. Share this transition planner with `setObjectFlags` and `set_actor_flag` so
    their ordering cannot drift.
 
+The implemented planner is now genuinely shared: `setProgrammerAgentState`
+calls `prepareObjectFlagPlan` and `applyObjectFlagPlan`, computes the account
+counter before apply, and suppresses only the raw wizard audit so it can emit
+the profile-aware transition audit afterward. `$system:set_actor_flag` routes
+account-bound programmer changes through that same method; the generic
+`setObjectFlags` path uses the same plan/apply pair without quota accounting.
+Malformed-feature promote, demote, and revoke tests invoke each operation twice
+under distinct request ids and prove the complete serialized state, including
+cell versions, is identical after both refusals.
+
 For programmer-agent creation:
 
 1. Validate the requested name, quotas, credential inputs, inherited `$agent`

@@ -528,6 +528,15 @@ type ObjectFlagPlan = {
   target: ObjRef;
   changes: Record<string, { from: boolean; to: boolean }>;
   reconcileAuthorSurface: boolean;
+  authorSurfaceBefore: boolean;
+  authorSurfaceDesired: boolean;
+};
+
+type ObjectFlagApplyOptions = {
+  audit?: false | {
+    action: string;
+    detail: Record<string, WooValue>;
+  };
 };
 
 type PostAcceptEffect = {
@@ -5995,41 +6004,62 @@ export class WooWorld {
      * touched, and quota before a promote transition, so a refusal happens with
      * nothing mutated rather than half-applied across a host boundary.
      */
-    private async setProgrammerAgentState(caller: ObjRef, actor: ObjRef, account: ObjRef, programmer: boolean, auditAction: string): Promise<void> {
-      const currently = this.objectLive(actor).flags.programmer === true;
-      const transition = currently !== programmer;
-      const surface = this.programmerSurface();
-      // Surface reconciliation reads the existing feature list in both
-      // directions. Validate its shape before lineage or quota mutation, then
-      // retain the independent collision preflight for promotion. The
-      // reconciliation reads it again during apply, but no ordinary validation
-      // failure remains reachable after the first write.
-      const featuresBefore = surface && this.canCarryFeatures(actor) ? this.featureList(actor) : [];
-      if (programmer && surface) this.assertSurfaceComposable(actor, surface);
+    private async setProgrammerAgentState(
+      caller: ObjRef,
+      actor: ObjRef,
+      account: ObjRef,
+      programmer: boolean,
+      auditAction: string,
+      auditDetail: Record<string, WooValue> = {}
+    ): Promise<void> {
+      // The shared flag planner validates feature shape and surface
+      // composability without mutation. Forced reconciliation preserves the
+      // AP6 self-healing behavior even when the lineage flag is already right.
+      const flagPlan = this.prepareObjectFlagPlan(
+        actor,
+        { programmer },
+        { reconcileAuthorSurface: true }
+      );
+      const transition = flagPlan.changes.programmer !== undefined;
+      let nextProgrammerCount: number | null = null;
       if (transition) {
         if (programmer) this.assertProgrammerAgentQuota(account);
         // The transition writes the account counter; refuse across a host
         // boundary before mutating anything.
         await this.assertProgrammerProvisioningColocated(actor, account);
-        // Flag write through the lineage seam so it commits over Net.
-        this.mutateLineage(actor, () => { this.objectLive(actor).flags.programmer = programmer; });
-        this.markObjectDirty(actor);
         const delta = programmer ? 1 : -1;
-        const next = Math.max(0, Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + delta);
-        this.setProp(account, "programmer_agent_count", next);
+        nextProgrammerCount = Math.max(
+          0,
+          Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + delta
+        );
+      }
+
+      // Apply only after every ordinary validation and cross-host check has
+      // succeeded. Lineage and surface mutation now use the exact same
+      // implementation as setObjectFlags and set_actor_flag.
+      this.applyObjectFlagPlan(caller, flagPlan, { audit: false });
+      if (transition) {
+        this.setProp(account, "programmer_agent_count", nextProgrammerCount!);
         // The caller (the human/wizard) is the acting principal; the agent is
         // the subject (§8.10). Routed through the profile audit adapter so the
         // Net transition writes no catalog $system cell (its audit is the
         // commit record); local materializes into wizard_actions.
-        this.recordProvisioningAudit(caller, auditAction, { target: actor, account, programmer, transition: true });
+        this.recordProvisioningAudit(caller, auditAction, {
+          target: actor,
+          account,
+          programmer,
+          transition: true,
+          ...auditDetail
+        });
       }
       // Surface reconciliation is unconditional so partial legacy state heals.
       // A repair without a flag transition is itself auditable.
-      const hadSurface = surface ? featuresBefore.includes(surface) : false;
-      this.reconcileProgrammerSurface(actor, programmer);
-      const hasSurface = surface ? this.featureList(actor).includes(surface) : false;
-      if (!transition && hadSurface !== hasSurface) {
-        this.recordProvisioningAudit(caller, "programmer_surface_repaired", { target: actor, attached: hasSurface, transition: false });
+      if (!transition && flagPlan.authorSurfaceBefore !== flagPlan.authorSurfaceDesired) {
+        this.recordProvisioningAudit(caller, "programmer_surface_repaired", {
+          target: actor,
+          attached: flagPlan.authorSurfaceDesired,
+          transition: false
+        });
       }
     }
 
@@ -12605,7 +12635,11 @@ export class WooWorld {
    * quota checks before applying this plan, keeping the shared flag path from
    * drifting back into validate-after-write ordering.
    */
-  private prepareObjectFlagPlan(target: ObjRef, flags: Record<string, unknown>): ObjectFlagPlan {
+  private prepareObjectFlagPlan(
+    target: ObjRef,
+    flags: Record<string, unknown>,
+    options: { reconcileAuthorSurface?: boolean } = {}
+  ): ObjectFlagPlan {
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
     const allowed = new Set(["wizard", "programmer", "fertile"]);
     const obj = this.objectLive(target);
@@ -12621,31 +12655,47 @@ export class WooWorld {
       if (prev === raw) continue;
       changes[key] = { from: prev, to: raw };
     }
-    const reconcileAuthorSurface = Boolean(changes.programmer || changes.wizard);
+    const reconcileAuthorSurface =
+      options.reconcileAuthorSurface === true ||
+      Boolean(changes.programmer || changes.wizard);
+    let authorSurfaceBefore = false;
+    const authorSurfaceDesired = reconcileAuthorSurface && (
+      (changes.programmer?.to ?? (before.programmer === true)) ||
+      (changes.wizard?.to ?? (before.wizard === true))
+    );
     if (reconcileAuthorSurface && this.canCarryFeatures(target)) {
       const surface = this.programmerSurface();
       if (surface) {
         // Both attach and remove consume this list. Shape validation belongs in
         // prepare even when the desired state is false.
-        this.featureList(target);
-        const willAuthor =
-          (changes.programmer?.to ?? (before.programmer === true)) ||
-          (changes.wizard?.to ?? (before.wizard === true));
-        if (willAuthor && (changes.programmer?.to === true || changes.wizard?.to === true)) {
-          this.assertSurfaceComposable(target, surface);
-        }
+        const features = this.featureList(target);
+        authorSurfaceBefore = features.includes(surface);
+        // Forced reconciliation may attach a missing surface even when the
+        // flag itself does not change, so composability is a precondition
+        // whenever the desired state is author-capable.
+        if (authorSurfaceDesired) this.assertSurfaceComposable(target, surface);
       }
     }
-    return { target, changes, reconcileAuthorSurface };
+    return {
+      target,
+      changes,
+      reconcileAuthorSurface,
+      authorSurfaceBefore,
+      authorSurfaceDesired
+    };
   }
 
-  private applyObjectFlagPlan(actor: ObjRef, plan: ObjectFlagPlan): WooObject["flags"] {
+  private applyObjectFlagPlan(
+    actor: ObjRef,
+    plan: ObjectFlagPlan,
+    options: ObjectFlagApplyOptions = {}
+  ): WooObject["flags"] {
     // This is the apply half of a validated authority mutation. `object()` is
     // deliberately detached at the public boundary; mutate the guarded live
     // row so the journal records and can reverse the lineage change.
     const obj = this.objectLive(plan.target);
     const { target, changes } = plan;
-    if (Object.keys(changes).length === 0) return { ...obj.flags };
+    const changed = Object.keys(changes).length > 0;
     // The authoring surface must resolve on any actor that can author — a
     // programmer OR a wizard (a wizard bypasses the surface CHECK but still
     // needs the verbs to RESOLVE on itself). Preflight composability before
@@ -12658,23 +12708,28 @@ export class WooWorld {
     // set_object_flags is the deliberate quota-bypassing wizard primitive.
     // The flag write goes through the lineage seam so it is recorded in the net
     // transcript (flags live in the object_lineage cell).
-    this.mutateLineage(target, () => {
-      for (const [key, change] of Object.entries(changes)) {
-        (obj.flags as Record<string, boolean>)[key] = change.to;
-      }
-    });
-    if (plan.reconcileAuthorSurface) {
-      this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
+    if (changed) {
+      this.mutateLineage(target, () => {
+        for (const [key, change] of Object.entries(changes)) {
+          (obj.flags as Record<string, boolean>)[key] = change.to;
+        }
+      });
     }
-    // Deliberately still recordWizardAction. `$system:set_actor_flag`, the only
-    // caller, is an UNTRACKED native and is therefore refused over Net before
-    // this line can run (incomplete_transcript) — routing the audit through the
-    // AU1 sink would be inert while implying Net support that does not exist.
-    // On Net, wizard authority is granted by the AP11 provisioning op
-    // (spec/identity/provisioning.md §AP11), which writes the flag through the
-    // lineage seam and audits through the sink.
-    this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
-    this.markObjectDirty(target);
+    if (plan.reconcileAuthorSurface) {
+      this.reconcileProgrammerSurface(target, plan.authorSurfaceDesired);
+    }
+    // Raw wizard flag changes keep the local wizard-action audit. Account-bound
+    // programmer transitions suppress it here and let setProgrammerAgentState
+    // emit the profile-aware audit after the shared flag/surface apply.
+    const audit = options.audit;
+    if (changed && audit !== false) {
+      this.recordWizardAction(
+        actor,
+        audit?.action ?? "set_object_flags",
+        audit?.detail ?? { target, changes: changes as unknown as WooValue }
+      );
+    }
+    if (changed) this.markObjectDirty(target);
     return { ...obj.flags };
   }
 
@@ -13867,34 +13922,35 @@ export class WooWorld {
       this.recordWizardAction(ctx.actor, "gc_pending_credentials", { changed });
       return changed;
     });
-    this.registerBuiltinNativeHandler("set_actor_flag", "authoritative", (ctx, args) => {
+    this.registerBuiltinNativeHandler("set_actor_flag", "authoritative", async (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set actor flags", { actor: ctx.actor });
       const target = assertObj(args[0]);
       const flag = String(args[1] ?? "");
       const value = args[2];
       if (typeof value !== "boolean") throw wooError("E_TYPE", "flag value must be boolean", value);
-      // Prepare the shared lineage/surface transition before touching the
-      // account counter. In particular, malformed feature state must reject
-      // here rather than after set_actor_flag has consumed or returned quota.
+      const before = Boolean((this.objectLive(target).flags as Record<string, boolean>)[flag]);
+      if (flag === "programmer" && this.inheritsFrom(target, "$agent")) {
+        const owner = this.propOrNullLive(target, "owner");
+        if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
+          const account = assertObj(this.propOrNullLive(owner, "account"));
+          await this.setProgrammerAgentState(
+            ctx.actor,
+            target,
+            account,
+            value,
+            "actor_flag_changed",
+            { flag, old: before, new: value }
+          );
+          return { ...this.objectLive(target).flags } as unknown as WooValue;
+        }
+      }
       const flagPlan = this.prepareObjectFlagPlan(target, { [flag]: value });
-      if (flag === "programmer" && value === true && this.inheritsFrom(target, "$agent")) {
-        const owner = this.propOrNullLive(target, "owner");
-        if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
-          const account = assertObj(this.propOrNullLive(owner, "account"));
-          if (!this.objectLive(target).flags.programmer) {
-            this.assertProgrammerAgentQuota(account);
-            this.setProp(account, "programmer_agent_count", Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + 1);
-          }
+      return this.applyObjectFlagPlan(ctx.actor, flagPlan, {
+        audit: {
+          action: "actor_flag_changed",
+          detail: { target, flag, old: before, new: value }
         }
-      }
-      if (flag === "programmer" && value === false && this.inheritsFrom(target, "$agent") && this.objectLive(target).flags.programmer) {
-        const owner = this.propOrNullLive(target, "owner");
-        if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
-          const account = assertObj(this.propOrNullLive(owner, "account"));
-          this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) - 1));
-        }
-      }
-      return this.applyObjectFlagPlan(ctx.actor, flagPlan) as unknown as WooValue;
+      }) as unknown as WooValue;
     });
     this.registerBuiltinNativeHandler("set_quota", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set quotas", { actor: ctx.actor });
