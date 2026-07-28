@@ -53,6 +53,12 @@ refuse unless all of these hold:
 3. the caller is the receiver; and
 4. the receiver resolves a schema for `(type, version)` and the payload validates.
 
+An otherwise valid sequenced call whose receiver is bound to a different log
+MUST refuse with `E_SCOPE_SPLIT`, not `E_INVARG`. The call names two
+incompatible semantic spaces; its Act data is not malformed. This remains true
+when failure rollback removes every provisional domain write before Net selects
+the error transcript's commit scope.
+
 The anchored-actor form exists for catalog authorities such as a Dispenser
 block: the block's typed domain verbs compose the fact, while the containing
 space remains the sequenced log authority. Moving the actor to another space

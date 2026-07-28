@@ -174,7 +174,23 @@ export class InMemoryTurnRecorder implements TurnRecorder {
       abortBehaviorScope: () => {
         const aborted = behaviorScopes.pop();
         if (!aborted) throw new Error("turn recorder behavior-scope abort without begin");
-        destination().push(...aborted.filter(recorderEventSurvivesBehaviorAbort));
+        // Reads normally survive a failed behavior because they are the
+        // optimistic proof for the canonical error outcome. A read whose
+        // SUBJECT was created inside this same aborted scope is different:
+        // rollback erased that subject, so no authority can attest it and it
+        // cannot conflict with durable state. Drop those orphan proofs along
+        // with the create. This is computed over the complete aborted scope,
+        // including committed nested scopes, so an outer abort also cleans up
+        // reads of objects created before a nested call.
+        const rolledBackCreates = new Set(
+          aborted
+            .filter((event): event is Extract<TurnRecorderEvent, { kind: "object_create" }> => event.kind === "object_create")
+            .map((event) => event.object)
+        );
+        destination().push(...aborted.filter((event) =>
+          recorderEventSurvivesBehaviorAbort(event) &&
+          !recorderEventReadsRolledBackObject(event, rolledBackCreates)
+        ));
       },
       currentBehaviorEvents: () => behaviorScopes.at(-1) ?? [],
       discardTurn: () => {
@@ -211,4 +227,23 @@ function recorderEventSurvivesBehaviorAbort(event: TurnRecorderEvent): boolean {
     event.kind === "logical_input" ||
     event.kind === "untracked_effect"
   );
+}
+
+function recorderEventReadsRolledBackObject(event: TurnRecorderEvent, rolledBackCreates: ReadonlySet<ObjRef>): boolean {
+  if (rolledBackCreates.size === 0) return false;
+  switch (event.kind) {
+    case "cell_read":
+    case "state_probe":
+      return rolledBackCreates.has(event.cell.object);
+    case "prop_read":
+      return rolledBackCreates.has(event.object);
+    case "dispatch":
+      // The transcript turns a dispatch into a verb-page read on its definer.
+      // An inherited dispatch on a transient target still proves a durable
+      // class page, while a verb defined on the transient object has no
+      // surviving authority row.
+      return rolledBackCreates.has(event.definer);
+    default:
+      return false;
+  }
 }

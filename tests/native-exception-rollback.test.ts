@@ -918,6 +918,72 @@ describe("native exception rollback", () => {
     ]);
   });
 
+  it("discards orphan proofs for objects created and rolled back in the same behavior scope", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "sequenced",
+      scope: "room",
+      seq: 7,
+      actor: "$wiz",
+      target: "controller",
+      verb: "test",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({ kind: "prop_read", object: "durable", name: "counter", value: 1, version: 2 });
+    active.event({
+      kind: "object_create",
+      object: "transient",
+      name: "Transient",
+      parent: "$thing",
+      owner: "$wiz",
+      anchor: "room",
+      location: "room",
+      flags: {}
+    });
+    active.event({ kind: "prop_read", object: "transient", name: "owner", value: "$wiz", version: 1 });
+    active.event({ kind: "cell_read", cell: { kind: "lifecycle", object: "transient" }, value: "created", version: "1" });
+    active.event({ kind: "state_probe", cell: { kind: "prop", object: "transient", name: "text" } });
+    active.event({
+      kind: "dispatch",
+      target: "transient",
+      verb: "local",
+      definer: "transient",
+      implementation: "bytecode",
+      owner: "$wiz"
+    });
+    // An inherited dispatch still proves a durable class verb page even
+    // though its receiver disappears.
+    active.event({
+      kind: "dispatch",
+      target: "transient",
+      verb: "inherited",
+      definer: "$thing",
+      implementation: "bytecode",
+      owner: "$wiz"
+    });
+    active.beginBehaviorScope();
+    active.event({ kind: "prop_read", object: "transient", name: "text", value: "", version: 1 });
+    active.commitBehaviorScope();
+    active.event({ kind: "logical_input", name: "now", value: 123 });
+    active.abortBehaviorScope();
+
+    expect(recorder.turns[0].events).toEqual([
+      expect.objectContaining({ kind: "turn_start" }),
+      { kind: "prop_read", object: "durable", name: "counter", value: 1, version: 2 },
+      {
+        kind: "dispatch",
+        target: "transient",
+        verb: "inherited",
+        definer: "$thing",
+        implementation: "bytecode",
+        owner: "$wiz"
+      },
+      { kind: "logical_input", name: "now", value: 123 }
+    ]);
+  });
+
   it("does not retain a failed create as a same-run ordered parent", async () => {
     const world = createWorld();
     world.setRequireOrderedChildrenProjection(true);
