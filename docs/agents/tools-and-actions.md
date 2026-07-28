@@ -28,6 +28,22 @@ the_cockatoo__squawk()
 Input schemas come from the verb's declared arguments, explicit type hints,
 and command-parser argument sources.
 
+**The schema is enforced, not decorative.** Your arguments are checked against
+it before anything runs: a missing required argument or one of the wrong type
+is refused with an `E_INVARG` naming the parameter, what was expected, and
+what to do about it — and nothing happens in the world, so a refusal is always
+safe to fix and retry. Extra properties the tool does not declare are ignored
+rather than refused, so you can decorate a call with your own bookkeeping
+fields; but that also means a *misspelled* argument name reads as "missing",
+and the refusal lists the unrecognized names so you can spot the typo. An
+optional argument may be omitted or passed as `null`.
+
+`woo_call` is checked the same way once its target verb resolves: too few or
+too many positional arguments, or one of the wrong type, are refused before
+the call runs. The exception is a verb declared in the command form
+(`verb :look(any any any)`), which declares no argument list for the server to
+check against — those calls are passed through, and the verb itself decides.
+
 Object ids are sanitized into tool names — anything outside letters, digits,
 and `_` becomes `_` — so two different objects can want the same name (`a-b`
 and `a_b` both give `a_b`). When that happens the server adds a numeric suffix
@@ -117,6 +133,9 @@ Refusals name one condition each, with a `detail.reason` and a
 | `native_verb` | Engine-native; there is no Net execution body to call. |
 | `verb_not_executable` | The verb's owner has not granted execute permission. |
 | `not_direct_callable` | The verb is not exposed to outside direct calls. |
+| `missing_required_argument` | Supply the named argument; `detail.expected` gives its type. |
+| `argument_type_mismatch` | Re-send the named argument as `detail.expected`. |
+| `too_many_arguments` | `detail.declared` lists the arguments the verb actually takes. |
 
 An `E_SCOPE_SPLIT` means the target is a mounted space with its own shared
 scope — an outliner or board sitting in your room. One turn cannot write both
