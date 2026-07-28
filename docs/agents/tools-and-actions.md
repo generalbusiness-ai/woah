@@ -102,6 +102,7 @@ Refusals name one condition each, with a `detail.reason` and a
 | --- | --- |
 | `target_not_reachable` | Move to the object's space, or take it into inventory. |
 | `verb_not_defined` (`E_VERBNF`) | The object is reachable but has no such verb. |
+| `verb_order_unavailable` | Several verbs answer to that abbreviation and their order is undecidable — name one exactly. |
 | `native_verb` | Engine-native; there is no Net execution body to call. |
 | `verb_not_executable` | The verb's owner has not granted execute permission. |
 | `not_direct_callable` | The verb is not exposed to outside direct calls. |

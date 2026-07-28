@@ -79,14 +79,37 @@ is deliberately **wider than the listing**. Its gates are exactly two:
    the actor passes the generic execute prefilter for.
 
 Name resolution is **the world dispatcher's rule, unmodified**. Aliases are
-patterns, not literals — `l@ook` and `@exam*ine` mark an abbreviation point,
-a trailing `*` is a prefix wildcard, and `|` separates alternatives within one
-alias — and precedence is per definer: walking the chain, each definer is
-searched for an exact verb-name match before any alias pattern is tried there.
-A transport must share this rule with the dispatcher rather than restate it;
-exact-comparing alias strings refuses names `resolveVerb` accepts, and
-flattening the per-definer precedence dispatches a different verb than the
-world would.
+patterns, not literals: `l@ook` and `@exam*ine` mark an abbreviation point, a
+trailing `*` is a prefix wildcard, and `|` separates alternatives within one
+alias.
+
+Precedence is a **total order with two keys**, and both are normative:
+
+1. **Definer order.** Walking the chain (instance, ancestors, then each
+   declared feature chain), the first definer that answers wins.
+2. **Slot order within a definer.** A definer's verbs are scanned in
+   definition order — the slot array — for an exact name match, and then
+   scanned again in that same order for an alias-pattern match. The first hit
+   of each scan wins.
+
+Neither key may be substituted. Both select a *different verb* rather than a
+refusal, so getting either wrong silently runs code the caller did not ask
+for: flattening key 1 runs an ancestor's exactly-named verb where the world
+runs a nearer class's aliased one, and ordering a definer's verbs
+alphabetically instead of by slot resolves an overlapping alias to the wrong
+one of two sibling verbs. A transport must therefore share this rule with the
+dispatcher rather than restate it. (Exact names cannot collide within one
+definer — the authoring door refuses a duplicate — so key 2 only ever breaks
+alias ties, but it is ordered for both scans because the ordering is the rule.)
+
+**Unorderable candidates are refused, never guessed.** A gateway resolving
+from a sparse view can only apply key 2 when the tied candidates carry
+distinct, known slots. When two or more candidates at one definer match and
+that condition does not hold, the call is refused with `E_MISSING_STATE` and
+`detail.reason: "verb_order_unavailable"`, listing the candidate verb names;
+naming a verb exactly remains unambiguous and still resolves. Falling back to
+any other ordering would reintroduce the wrong-verb bug in the one case where
+it cannot be detected.
 
 `tool_exposed` is a **listing** flag (§M2.2) and has no bearing on `woo_call`.
 Gating the escape hatch on an advertising flag made an author unable to invoke
@@ -121,6 +144,7 @@ remediation. `detail.reason` carries the machine-readable form:
 | Target is not in structural context | `E_PERM` | `target_not_reachable` |
 | `$here` used with no active space | `E_PERM` | `no_active_scope` |
 | Verb resolves nowhere on the chain | `E_VERBNF` | `verb_not_defined` |
+| Several verbs match and their order is undecidable | `E_MISSING_STATE` | `verb_order_unavailable` |
 | Verb resolves to a native page | `E_PERM` | `native_verb` |
 | Verb fails the execute prefilter | `E_PERM` | `verb_not_executable` |
 | `direct` route, verb lacks `direct_callable` | `E_DIRECT_DENIED` | `not_direct_callable` |

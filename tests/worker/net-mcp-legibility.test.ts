@@ -141,6 +141,43 @@ describe("mcpFirstParagraph", () => {
   });
 });
 
+// The ORACLE for the MCP resolution test below: what the world's own
+// dispatcher does when two verbs on ONE definer both answer to a name.
+// LambdaMOO semantics, and world.ts ownVerbNamed's implementation, scan
+// `obj.verbs` — the SLOT array, i.e. definition order — so the lower slot
+// wins regardless of how the names sort. If this ever changes, this test
+// fails first and the MCP expectation below is known to need revisiting.
+describe("world verb dispatch: same-definer alias collisions", () => {
+  const authorProbe = (world: ReturnType<typeof createWorld>, object: string, names: string[]): void => {
+    world.createObject({ id: object, name: object, parent: "$thing", owner: "$wiz" });
+    for (const name of names) {
+      // Appended in call order, so slot == position in `names`.
+      world.addVerbForActor("$wiz", object, { name, owner: "$wiz", perms: "rxd", aliases: ["x*"] });
+      world.setVerbCodeForActor("$wiz", object, name, `verb :${name}() rxd { return "${name}"; }`);
+    }
+  };
+
+  it("resolves an overlapping alias to the LOWEST SLOT, not the alphabetically first name", () => {
+    const world = createWorld();
+    // Slot 1 sorts alphabetically LAST. Alphabetical resolution answers
+    // `a_second`; the dispatcher answers `z_first`.
+    authorProbe(world, "slot_probe_za", ["z_first", "a_second"]);
+    expect(world.ownVerbExact("slot_probe_za", "z_first")?.slot).toBe(1);
+    expect(world.ownVerbExact("slot_probe_za", "a_second")?.slot).toBe(2);
+    expect(world.resolveVerb("slot_probe_za", "x").verb.name).toBe("z_first");
+
+    // The reverse arrangement, so the expectation cannot be satisfied by any
+    // fixed alphabetical rule: here the lowest slot IS the first name.
+    authorProbe(world, "slot_probe_az", ["a_first", "z_second"]);
+    expect(world.resolveVerb("slot_probe_az", "x").verb.name).toBe("a_first");
+
+    // Exact names cannot collide on one definer at all — the authoring door
+    // refuses a duplicate — so slot order is the only tie to break.
+    expect(() => world.addVerbForActor("$wiz", "slot_probe_za", { name: "z_first", owner: "$wiz", perms: "rxd" }))
+      .toThrow(/already exists/);
+  });
+});
+
 describe("Net MCP surface legibility (fake-DO lane)", () => {
   it("widens woo_call to reachability, names each refusal, marks observation gaps, and reconciles its counts", async () => {
     const progAgent = "prog_agent";
@@ -291,6 +328,64 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     // Pattern matching must not decay into "starts with".
     const tooShort = await call(prog.session, "woo_call", { object: progAgent, verb: "@con", args: [widget] });
     expect(errorOf(tooShort).code, JSON.stringify(tooShort).slice(0, 300)).toBe("E_VERBNF");
+
+    // ---- Net-authored collisions fail CLOSED, not arbitrarily -----------
+    // Two verbs authored over Net on one object, both carrying the same alias
+    // pattern. Verb slots authored over Net are all `1` (the sparse planning
+    // world materializes only the page being written, so every append lands
+    // in an empty verb array), so the object's own dispatch order is
+    // undefined — there is no right verb to pick. Refusing is the answer;
+    // picking whichever name sorted first is how this class of bug hides.
+    const authorCollision = async (label: string, names: [string, string]): Promise<string> => {
+      const made = await call(prog.session, "woo_call", { object: progAgent, verb: "create", args: ["$thing", { name: label }] });
+      await settleAll();
+      expect(made.result?.isError, JSON.stringify(made).slice(0, 300)).not.toBe(true);
+      const id = (made.result?.structuredContent?.result ?? {}).id as string;
+      expect(id).toBeTruthy();
+      for (const name of names) {
+        const put = await call(prog.session, "woo_call", {
+          object: progAgent,
+          verb: "install_verb",
+          args: [id, name, `verb :${name}() rxd { return "${name}"; }`, {}]
+        });
+        await settleAll();
+        expect(put.result?.isError, `${label}/${name}: ${JSON.stringify(put).slice(0, 300)}`).not.toBe(true);
+        // Aliases are metadata, so they ride set_verb_info, not the source header.
+        const aliased = await call(prog.session, "woo_call", {
+          object: progAgent,
+          verb: "set_verb_info",
+          args: [id, name, { aliases: ["x*"] }]
+        });
+        await settleAll();
+        expect(aliased.result?.isError, `${label}/${name} alias: ${JSON.stringify(aliased).slice(0, 300)}`).not.toBe(true);
+      }
+      return id;
+    };
+
+    const collided = await authorCollision("SlotProbeZA", ["z_first", "a_second"]);
+    // Documents the underlying substrate defect this refusal is protecting
+    // against: if Net authoring ever assigns real slots, this expectation
+    // fails and the ordered branch becomes reachable for authored verbs.
+    const authoredSlots = (gateway as any).ensureView()
+      .cellsForObject(collided)
+      .filter((cell: { kind: string }) => cell.kind === "verb_bytecode")
+      .map((cell: { value: { slot?: number } }) => cell.value?.slot);
+    expect(authoredSlots.length).toBe(2);
+    expect(new Set(authoredSlots).size, "Net authoring now assigns distinct verb slots").toBe(1);
+
+    const ambiguous = await call(prog.session, "woo_call", { object: collided, verb: "x", args: [] });
+    await settleAll();
+    expect(ambiguous.result?.isError, JSON.stringify(ambiguous).slice(0, 400)).toBe(true);
+    expect(errorOf(ambiguous).detail?.reason).toBe("verb_order_unavailable");
+    expect(errorOf(ambiguous).detail?.candidates).toEqual(["a_second", "z_first"]);
+
+    // Naming either verb exactly is unambiguous and still runs it.
+    const exactSecond = await call(prog.session, "woo_call", { object: collided, verb: "a_second", args: [] });
+    await settleAll();
+    expect(exactSecond.result?.structuredContent?.result).toBe("a_second");
+    const exactFirst = await call(prog.session, "woo_call", { object: collided, verb: "z_first", args: [] });
+    await settleAll();
+    expect(exactFirst.result?.structuredContent?.result).toBe("z_first");
 
     // ---- Fix 4 (mixed styles): the FIRST doc comment wins -----------------
     // $builder:create_command opens with `//` docs and contains a bracketed
@@ -464,6 +559,129 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     expect(settledWait.result?.structuredContent?.result?.gap).toBe(false);
 
     await settleAll();
+    for (const st of states) st.close();
+  });
+
+  // Same-definer alias collisions resolve in SLOT order over MCP, exactly as
+  // world.ts ownVerbNamed resolves them. The gateway used to order a definer's
+  // pages ALPHABETICALLY, so `x` ran `a_second` here and `z_first` in the
+  // world — a different verb, not a refusal, so nothing surfaced but the wrong
+  // answer. The expected names are pinned independently by the world-dispatch
+  // oracle above; this asserts MCP agrees with it.
+  //
+  // Authored in the PRE-INSTALL world so the slots are real (1 and 2). Verbs
+  // authored over Net all land on slot 1 — see the fail-closed case in the
+  // main test — which is a different situation with a different right answer.
+  it("resolves a same-definer alias collision to the same verb the world dispatcher runs", async () => {
+    const old = createWorld();
+    const caller = "guest_1"; // a seeded guest from the demo catalogs
+    old.ensureApiKey("$wiz", caller, "slot-key", "slot-secret", "slot");
+    // Raw createWorld() leaves the guest pool placeless — planNetInstall is
+    // what seats it — so place the caller and the probe objects together.
+    const room = old.propOrNull("$system", "guest_initial_room") as string;
+    expect(room, "the catalogs no longer declare a start room").toBeTruthy();
+    old.moveObject(caller, room);
+
+    const authorProbe = (object: string, names: [string, string]): void => {
+      old.createObject({ id: object, name: object, parent: "$thing", owner: "$wiz" });
+      old.moveObject(object, room); // reachable as room contents (M3)
+      for (const name of names) {
+        old.addVerbForActor("$wiz", object, { name, owner: "$wiz", perms: "rxd", aliases: ["x*"] });
+        old.setVerbCodeForActor("$wiz", object, name, `verb :${name}() rxd { return "${name}"; }`);
+      }
+    };
+    // Slot 1 sorts alphabetically LAST, and the reverse arrangement, so no
+    // fixed alphabetical rule can satisfy both.
+    authorProbe("slot_probe_za", ["z_first", "a_second"]);
+    authorProbe("slot_probe_az", ["a_first", "z_second"]);
+    expect(old.ownVerbExact("slot_probe_za", "a_second")?.slot).toBe(2);
+    // The oracle, read from the same world the cells are about to come from.
+    expect(old.resolveVerb("slot_probe_za", "x").verb.name).toBe("z_first");
+    expect(old.resolveVerb("slot_probe_az", "x").verb.name).toBe("a_first");
+
+    const cells = cellsFromSerialized(old.exportWorld());
+    const partitions = partitionCells(cells);
+    const relations = partitionInstallRelations(cells);
+    const epoch = "cat-net-mcp-legibility-slots";
+    partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
+
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    let gateway: NetGatewayDO;
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable destination ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, scopeCells] of partitions) {
+      const st = netState(`slots-scope-${scope}`);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: epoch, cells: scopeCells, relations: relations.get(scope) ?? [] })
+      });
+      expect((await instance.fetch(await signInternalRequest(scopeEnv, request))).ok, `seed ${scope}`).toBe(true);
+      states.push(st);
+      scopeDOs.set(scope, instance);
+    }
+    const gatewayState = netState("slots-gateway");
+    states.push(gatewayState);
+    gateway = new NetGatewayDO(gatewayState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: resolve,
+      NET_GATEWAY_SELF: "gateway:net-api"
+    } as NetGatewayEnv);
+    const settleAll = async () => {
+      for (const st of states) await st.settle();
+      for (const scope of scopeDOs.values()) await scope.alarm();
+      for (const st of states) await st.settle();
+    };
+
+    let nextId = 200;
+    const mcp = async (body: Rpc, headers: Record<string, string> = {}) => {
+      const response = await gateway.fetch(new Request("https://do/net-api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body)
+      }));
+      const text = await response.text();
+      return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) as Record<string, any> : null };
+    };
+    const init = await mcp(
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { "mcp-token": "apikey:slot-key:slot-secret" }
+    );
+    expect(init.status, JSON.stringify(init.body)).toBe(200);
+    const session = init.headers.get("mcp-session-id") as string;
+    await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": session });
+    const call = async (object: string, verb: string) =>
+      (await mcp(
+        { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "woo_call", arguments: { object, verb, args: [] } } },
+        { "mcp-session-id": session }
+      )).body as Record<string, any>;
+
+    const za = await call("slot_probe_za", "x");
+    await settleAll();
+    expect(za.result?.isError, JSON.stringify(za).slice(0, 400)).not.toBe(true);
+    expect(
+      za.result?.structuredContent?.result,
+      "woo_call ran a different verb than the world dispatcher would"
+    ).toBe("z_first");
+
+    const az = await call("slot_probe_az", "x");
+    await settleAll();
+    expect(az.result?.isError, JSON.stringify(az).slice(0, 400)).not.toBe(true);
+    expect(az.result?.structuredContent?.result).toBe("a_first");
+
+    // Exact names still reach exactly their own verb.
+    expect((await call("slot_probe_za", "a_second")).result?.structuredContent?.result).toBe("a_second");
+
+    for (const st of states) await st.settle();
     for (const st of states) st.close();
   });
 

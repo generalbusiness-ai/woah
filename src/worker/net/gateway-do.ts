@@ -5621,8 +5621,8 @@ export class NetGatewayDO {
       };
     }
     const drafts = this.mcpObjectToolDrafts(actor, object, this.mcpActiveCommandContext(actor, session).has(object));
-    const tool = mcpMatchVerb(drafts, verb);
-    if (!tool) {
+    const match = mcpMatchVerb(drafts, verb);
+    if ("miss" in match) {
       // Same shape the engine raises for a missing verb (world.ts): a client
       // that already special-cases E_VERBNF keeps working.
       return {
@@ -5638,6 +5638,25 @@ export class NetGatewayDO {
         }
       };
     }
+    if ("ambiguous" in match) {
+      // Several verbs on one definer answer to this name and the view cannot
+      // order them, so the gateway cannot know which one the world would run.
+      // Refuse: running the wrong verb is worse than declining to guess.
+      return {
+        error: {
+          code: "E_MISSING_STATE",
+          message: `${object}:${verb} matches several verbs whose definition order this gateway cannot determine`,
+          detail: {
+            reason: "verb_order_unavailable",
+            obj: object,
+            name: verb,
+            candidates: match.ambiguous.map((draft) => draft.verb).sort(),
+            remediation: "name one of the candidate verbs exactly instead of an alias"
+          }
+        }
+      };
+    }
+    const tool = match.tool;
     if (!tool.bytecode) {
       return {
         error: {
@@ -5903,9 +5922,27 @@ export class NetGatewayDO {
       const walked = new Set<string>();
       while (current && !walked.has(current)) {
         walked.add(current);
+        // SLOT ORDER, not alphabetical. Drafts are the resolution order (see
+        // mcpMatchVerb), and the world dispatcher walks a definer's verbs in
+        // definition order — `obj.verbs` is the slot array. Sorting by name
+        // here made two same-definer verbs with overlapping alias patterns
+        // resolve to whichever name sorted first, which is not the verb the
+        // world would have run. Any presentation ordering the LISTING wants is
+        // applied separately, downstream, in mcpToolsForObjects.
+        //
+        // The name is a deterministic tiebreak only for pages whose slot the
+        // view does not carry; ambiguity that actually changes an answer is
+        // refused rather than guessed (mcpMatchVerb).
         const pages = view.cellsForObject(current)
           .filter((cell) => cell.kind === "verb_bytecode" && typeof cell.name === "string")
-          .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+          .sort((a, b) => {
+            const left = mcpVerbSlot(a.value);
+            const right = mcpVerbSlot(b.value);
+            if (left !== right) {
+              return (left ?? Number.MAX_SAFE_INTEGER) - (right ?? Number.MAX_SAFE_INTEGER);
+            }
+            return String(a.name).localeCompare(String(b.name));
+          });
         for (const cell of pages) {
           const verb = cell.name as string;
           if (seenVerbs.has(verb)) continue;
@@ -5928,6 +5965,9 @@ export class NetGatewayDO {
             // Verb-name resolution is per-definer (see mcpMatchVerb), so the
             // draft has to remember where it came from.
             definer: current,
+            // Definition order within that definer. `null` when the view's
+            // page does not carry one — see mcpMatchVerb's fail-closed rule.
+            slot: mcpVerbSlot(cell.value),
             verb,
             route,
             aliases,
@@ -9148,6 +9188,10 @@ type NetMcpToolDraft = {
   /** The class or feature ancestor holding the page. Verb-name resolution is
    * per-definer, so this is load-bearing for mcpMatchVerb, not decoration. */
   definer: string;
+  /** Definition order within `definer` — the dispatcher's second ordering
+   * key. `null` when the view's page carries none; mcpMatchVerb refuses
+   * rather than guessing when that absence could change the answer. */
+  slot: number | null;
   verb: string;
   /** Transport route derived from catalog command persistence. This stays
    * internal: clients invoke one capability; the gateway preserves its
@@ -9234,28 +9278,79 @@ function mcpSanitizeId(value: string): string {
  * The gateway used to exact-compare `aliases.includes(verb)`, so `woo_call`
  * answered E_VERBNF for names `world.resolveVerb` accepts.
  *
- * Precedence matters as much as matching, and is reproduced exactly: the world
- * walks the chain definer by definer and, at EACH definer, tries every exact
- * name before any alias pattern (world.ts ownVerbNamed). Flattening that into
- * one global exact pass followed by one global alias pass would silently
- * dispatch an ancestor's exactly-named verb where the world would have run a
- * nearer class's aliased one — a wrong verb, which is worse than a refusal.
- * `drafts` arrives in chain order and is contiguous per definer, so walking
- * the groups in order preserves it.
+ * Precedence matters as much as matching, and the dispatcher's order is a
+ * TOTAL order with two levels. Reproducing only one of them is not enough:
+ *
+ *   1. chain order across definers — `resolveVerbFrom` walks the parent chain
+ *      and stops at the first definer that answers. Flattening this into one
+ *      global exact pass and then one global alias pass dispatches an
+ *      ancestor's exactly-named verb where the world runs a nearer class's
+ *      aliased one.
+ *   2. SLOT order within one definer — `ownVerbNamed` scans `obj.verbs`, the
+ *      slot array, exact names first and then alias patterns, taking the
+ *      first hit of each scan. Ordering a definer's pages alphabetically
+ *      instead means two verbs with overlapping alias patterns (slot 1
+ *      `z_first` and slot 2 `a_second`, both aliased `x*`) resolve `x` to
+ *      `a_second` here and `z_first` in the world.
+ *
+ * Both levels select a DIFFERENT verb, not a refusal, so getting either wrong
+ * silently runs code the caller did not ask for. `drafts` therefore arrives in
+ * chain order, contiguous per definer, slot-ordered within each — walking it
+ * as-is is the dispatcher's walk.
+ *
+ * Fail-closed on unknown order. Order is only decidable when the tied
+ * candidates carry DISTINCT, KNOWN slots, and neither half of that is
+ * guaranteed:
+ *
+ *   - a page whose view record has no `slot` has no position at all; and
+ *   - verbs authored over Net currently all land on `slot: 1`, because the
+ *     sparse planning world materializes only the page being written, so the
+ *     append lands in an empty verb array every time. Two such pages are not
+ *     merely unordered here — the authoritative object reconstructed from
+ *     those cells has no defined order either, so there is no right answer to
+ *     pick.
+ *
+ * So a multi-candidate tie without distinct known slots is refused rather than
+ * guessed. Silently falling back to alphabetical would be the very bug above,
+ * dressed up as an answer. A single candidate needs no order and resolves
+ * normally, which is every ordinary call.
  */
-function mcpMatchVerb(drafts: NetMcpToolDraft[], name: string): NetMcpToolDraft | undefined {
+type McpVerbMatch =
+  | { tool: NetMcpToolDraft }
+  | { ambiguous: NetMcpToolDraft[] }
+  | { miss: true };
+
+function mcpMatchVerb(drafts: NetMcpToolDraft[], name: string): McpVerbMatch {
   for (let index = 0; index < drafts.length; ) {
     const definer = drafts[index].definer;
     let end = index;
     while (end < drafts.length && drafts[end].definer === definer) end += 1;
     const group = drafts.slice(index, end);
+    // Exact names first, in slot order. The world's own installer refuses a
+    // duplicate name on one object, so this scan cannot tie — but it is
+    // ordered anyway, because the ordering is the rule, not an optimization.
     const exact = group.find((draft) => draft.verb === name);
-    if (exact) return exact;
-    const aliased = group.find((draft) => draft.aliases.some((alias) => verbAliasMatches(alias, name)));
-    if (aliased) return aliased;
+    if (exact) return { tool: exact };
+    const aliased = group.filter((draft) => draft.aliases.some((alias) => verbAliasMatches(alias, name)));
+    if (aliased.length === 1) return { tool: aliased[0] };
+    if (aliased.length > 1) {
+      const slots = aliased.map((draft) => draft.slot);
+      const orderable = slots.every((slot) => slot !== null) && new Set(slots).size === slots.length;
+      // `aliased` preserves the group's slot ordering, so the head IS the
+      // lowest slot once the order is known to be real.
+      return orderable ? { tool: aliased[0] } : { ambiguous: aliased };
+    }
     index = end;
   }
-  return undefined;
+  return { miss: true };
+}
+
+/** Definition order for a verb page as the net view carries it. Verb cells are
+ * the serialized VerbDef minus line_map, so `slot` rides along; `null` records
+ * an aged or hand-built page that predates it rather than inventing a position. */
+function mcpVerbSlot(value: unknown): number | null {
+  const slot = (value as { slot?: unknown } | null)?.slot;
+  return typeof slot === "number" && Number.isFinite(slot) ? slot : null;
 }
 
 /**
