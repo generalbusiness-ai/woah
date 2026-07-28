@@ -8,6 +8,7 @@
  * execution stack with different session, reachability, or observation rules.
  */
 import { JSONRPCMessageSchema, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { withDeadline } from "./deadline";
 
 export type NetMcpStdioProxyOptions = {
   endpoint: string;
@@ -20,6 +21,9 @@ export type NetMcpStdioProxyOptions = {
   onError?: (error: unknown) => void;
 };
 
+/** Default wall-clock bound for each step of {@link NetMcpStdioProxy.close}. */
+export const NET_MCP_STDIO_CLOSE_MS = 500;
+
 export class NetMcpStdioProxy {
   private readonly endpoint: string;
   private readonly token: string;
@@ -29,6 +33,10 @@ export class NetMcpStdioProxy {
   private sessionId: string | null = null;
   private protocolVersion: string | null = null;
   private readonly notificationAbort = new AbortController();
+  /** Cancels forwarded request POSTs. Deliberately separate from
+   * `notificationAbort`: shutdown must be able to cut a hung request without
+   * that being confused with the notification carrier's normal retry cycle. */
+  private readonly requestAbort = new AbortController();
   private notificationTask: Promise<void> | null = null;
   private closed = false;
 
@@ -59,10 +67,15 @@ export class NetMcpStdioProxy {
         headers.set("mcp-protocol-version", this.protocolVersion);
       }
 
+      // No per-request deadline: `woo_wait` legitimately blocks for tens of
+      // seconds, so a blanket transport timeout would break it. The bound that
+      // matters is shutdown, and `requestAbort` supplies it — otherwise a hung
+      // POST outlives stdin and the process ignores SIGTERM.
       const response = await this.fetchImpl(this.endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify(message)
+        body: JSON.stringify(message),
+        signal: this.requestAbort.signal
       });
       if (response.status === 202 || response.status === 204) {
         if (isInitialized(message)) this.startNotifications();
@@ -90,32 +103,62 @@ export class NetMcpStdioProxy {
       }
       return decoded;
     } catch (error) {
-      if (!hasRequestId(message)) throw error;
+      const aborted = isAbortError(error) || this.requestAbort.signal.aborted;
+      if (!hasRequestId(message)) {
+        // A notification has no reply slot. Abort during shutdown is expected,
+        // so it must not be reported as a bridge error on stderr.
+        if (aborted) return null;
+        throw error;
+      }
       return {
         jsonrpc: "2.0",
         id: message.id,
-        error: { code: -32000, message: `Net MCP transport failed: ${errorMessage(error)}` }
+        error: {
+          code: -32000,
+          message: aborted
+            ? "Net MCP stdio bridge shut down before the request completed"
+            : `Net MCP transport failed: ${errorMessage(error)}`
+        }
       };
     }
   }
 
+  /** Cancel every in-flight forwarded request.
+   *
+   * Shutdown calls this after its bounded drain: a request the Net endpoint
+   * never answers must not be able to hold stdin EOF or SIGTERM hostage.
+   * Each cancelled `forward` resolves with a correlated JSON-RPC error, so
+   * the client sees a reply rather than a truncated stream. */
+  abortRequests(): void {
+    this.requestAbort.abort();
+  }
+
   /** Close the underlying Net session exactly once. Stdio EOF is transport
    * shutdown, so it maps to Streamable HTTP DELETE rather than merely exiting
-   * and waiting for the session TTL. */
-  async close(): Promise<void> {
+   * and waiting for the session TTL.
+   *
+   * The DELETE is a courtesy — the server expires the session on its own TTL —
+   * so every step here is bounded by `timeoutMs`. A hung endpoint must not
+   * turn session hygiene back into the hang this method exists to avoid. */
+  async close(timeoutMs = NET_MCP_STDIO_CLOSE_MS): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.notificationAbort.abort();
-    await this.notificationTask?.catch(() => undefined);
+    this.requestAbort.abort();
+    await withDeadline(this.notificationTask?.catch(() => undefined), timeoutMs);
     const session = this.sessionId;
     this.sessionId = null;
     if (!session) return;
     const headers = new Headers({ "mcp-session-id": session });
     if (this.protocolVersion) headers.set("mcp-protocol-version", this.protocolVersion);
-    await this.fetchImpl(this.endpoint, {
+    // Both bounds are needed: the signal frees the socket, and the race frees
+    // this method even from a `fetch` implementation that ignores the signal.
+    const deleted = this.fetchImpl(this.endpoint, {
       method: "DELETE",
-      headers
+      headers,
+      signal: AbortSignal.timeout(timeoutMs)
     }).then((response) => response.body?.cancel()).catch(() => undefined);
+    await withDeadline(deleted, timeoutMs);
   }
 
   private startNotifications(): void {
@@ -185,9 +228,13 @@ function isInitialized(message: JSONRPCMessage): boolean {
   return "method" in message && message.method === "notifications/initialized";
 }
 
-function hasRequestId(message: JSONRPCMessage): message is JSONRPCMessage & { id: string | number } {
+/** JSON-RPC requests carry an id and therefore owe the client exactly one
+ * reply; notifications do not. Shared with the dispatcher so both sides agree
+ * on which messages must be answered when the bridge is tearing down. */
+export function hasRequestId(message: JSONRPCMessage): message is JSONRPCMessage & { id: string | number } {
   return "id" in message && (typeof message.id === "string" || typeof message.id === "number");
 }
+
 
 function parseMcpBody(text: string, contentType: string | null): unknown {
   if (!contentType?.includes("text/event-stream")) return JSON.parse(text);
