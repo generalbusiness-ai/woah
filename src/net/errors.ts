@@ -40,6 +40,11 @@ export type NetErrorCode =
                         // re-seed there would silently reset authoritative state
                         // under an unchanged head (invisible to every version
                         // check) — terminal; a committed scope is never reseeded
+  | "E_RETRY_CAPACITY" // this gateway shard holds its full complement of UNEXPIRED
+                       // retry guarantees, so it cannot issue another one. Refusing
+                       // is deliberate: the alternative is evicting a live guarantee,
+                       // which turns a lost response into a silent second execution.
+                       // The operation is untouched — nothing was planned or submitted
   | "E_INVARG";        // a malformed internal request field (wrong type/shape) —
                        // refused with the offending field named, never silently
                        // coerced into a different-but-valid request (Adv-a)
@@ -61,7 +66,8 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_SEED_LAG: "informational; consumer proceeds via head-check",
   E_INVARG: "terminal for this request; fix the malformed field the detail names",
   E_EPOCH_MISMATCH: "terminal; catalog install/migration must reconcile the epochs (operator concern)",
-  E_SEED_COMMITTED: "terminal; a committed scope is never reseeded — a fresh namespace is the recovery (operator concern)"
+  E_SEED_COMMITTED: "terminal; a committed scope is never reseeded — a fresh namespace is the recovery (operator concern)",
+  E_RETRY_CAPACITY: "retry the same call unchanged shortly; the retry GUARANTEE was refused, not the operation, and nothing was submitted"
 };
 
 const RETRYABLE: ReadonlySet<NetErrorCode> = new Set([

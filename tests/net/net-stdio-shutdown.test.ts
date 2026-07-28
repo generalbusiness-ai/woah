@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
@@ -265,6 +267,15 @@ async function startHangingNetEndpoint(): Promise<{ url: string; deletes: () => 
 
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
+/** The installed `tsx` CLI, resolved rather than assumed to sit under this
+ * file's own tree. Under a git worktree `node_modules` lives at the primary
+ * checkout, so a path built relative to this file resolves to something that
+ * does not exist and the child dies with ENOENT before it can be driven —
+ * reported as "child never reached tools/call", which reads like a bridge
+ * defect rather than a missing binary. Node's own resolution is what knows how
+ * to walk up to the real install. */
+const TSX_CLI = join(dirname(createRequire(import.meta.url).resolve("tsx/package.json")), "dist", "cli.mjs");
+
 describe("net MCP stdio bridge process", () => {
   /** Drive a real child bridge into a request the endpoint never answers, then
    * end it the way `stop` says and report how long the child took to leave. */
@@ -272,7 +283,7 @@ describe("net MCP stdio bridge process", () => {
     stop: (child: ReturnType<typeof spawn>) => void
   ): Promise<{ code: number | null; signal: NodeJS.Signals | null; elapsedMs: number; deletes: number; stderr: string }> {
     const endpoint = await startHangingNetEndpoint();
-    const child = spawn(fileURLToPath(new URL("../../node_modules/.bin/tsx", import.meta.url)), ["src/mcp/net-stdio.ts"], {
+    const child = spawn(process.execPath, [TSX_CLI, "src/mcp/net-stdio.ts"], {
       cwd: REPO_ROOT,
       env: { ...process.env, WOO_MCP_URL: endpoint.url, WOO_MCP_TOKEN: "apikey:local-dev:secret" },
       stdio: ["pipe", "pipe", "pipe"]
