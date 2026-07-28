@@ -73,6 +73,10 @@ import { verbCellSlot } from "./verb-slots";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
+import {
+  classifyFailedTranscriptEffects,
+  type FailedTranscriptEffectsReport
+} from "../core/failed-transcript-effects";
 
 export type ScopeHead = {
   seq: number;
@@ -167,6 +171,7 @@ export type RejectReason =
   | "read_version_mismatch" // step 7
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
   | "catalog_mutation"    // step 5 — epoch-immutable definition write without an epoch transition
+  | "invalid_error_effects" // failed clean-generation transcript carried behavior effects; terminal
   | "write_unauthorized"  // step 9
   | "schedule_unauthorized" // CO16.2 — schedule/cancel effect failed provenance, namespace, authority, or quota; terminal
   | "post_state_mismatch"; // step 10
@@ -310,6 +315,10 @@ export type ScopeSequencerOptions = {
    * copy #1). Without it, behavior is identical to the in-memory Phase-2
    * sequencer. Type-only import: no runtime cycle with scope-store. */
   durable?: ScopeStore;
+  /** Observe every failed-transcript shape before rollout enforcement. The
+   * report is fixed-vocabulary counts/reasons only and contains no world
+   * values, object ids, observation bodies, or error text. */
+  failedTranscriptEffects?: (report: FailedTranscriptEffectsReport) => void;
 };
 
 /** H2a default: the TOTAL reply-cache cap. Sized so a busy scope's recent
@@ -879,9 +888,41 @@ export class ScopeSequencer {
       return this.reject(submit, "stale_epoch", { submitted: submit.stamp.catalog_epoch, current: this.catalogEpoch });
     }
 
-    // Step 4: completeness — never short-circuited or relabelled.
+    // Failed-turn effect admission is generation-gated for rolling safety:
+    // legacy/unmarked producers are observed but retain their historical
+    // behavior; only a producer claiming the clean recorder generation is
+    // terminally refused when it violates that capability.
+    const failureEffects = classifyFailedTranscriptEffects(submit.transcript, {
+      ownsSequencingSpace:
+        submit.transcript.route === "sequenced"
+          ? (this.options.owns ? this.options.owns(submit.transcript.space ?? submit.transcript.scope) : true)
+          : false
+    });
+    if (failureEffects.policy !== "not_failed") {
+      // Observability is not authority. A broken metrics sink must never turn
+      // an otherwise valid commit into a semantic failure.
+      try {
+        this.options.failedTranscriptEffects?.(failureEffects);
+      } catch {
+        // Best effort by contract.
+      }
+    }
+
+    // Step 4: completeness — never short-circuited or relabelled. Classify
+    // first so observe mode also captures failed transcripts whose untracked
+    // effect makes them incomplete; enforcement remains below this historical
+    // higher-priority verdict.
     if (!submit.transcript.complete) {
       return this.reject(submit, "incomplete_transcript", { reasons: submit.transcript.incompleteReasons });
+    }
+    if (failureEffects.policy === "enforce" && !failureEffects.valid) {
+      return this.reject(submit, "invalid_error_effects", {
+        failure_effects: {
+          generation: failureEffects.generation,
+          counts: failureEffects.counts,
+          reasons: failureEffects.reasons
+        }
+      });
     }
 
     // SL1/CO2.3: new net-planned sequenced transcripts preserve their

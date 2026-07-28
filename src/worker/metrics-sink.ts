@@ -111,6 +111,7 @@ function primaryCount(event: AnalyticsMetric): number {
           : typeof e.records === "number" ? e.records
             : 0;
     case "shadow_transcript_anomaly":
+    case "failed_transcript_effects":
       return 1;
     case "state_path_divergence":
       return typeof e.missing_object_count === "number" && e.missing_object_count > 0 ? e.missing_object_count : 1;

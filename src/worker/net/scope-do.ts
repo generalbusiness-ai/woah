@@ -2695,6 +2695,17 @@ export class NetScopeDO {
       // Committed-log acceptance timestamps (CO2.5) come from the host
       // clock, so tests with a fixture clock and workerd agree.
       now: () => this.host.now(),
+      failedTranscriptEffects: (report) => this.metric({
+        kind: "failed_transcript_effects",
+        scope: resolvedScope,
+        route: report.route,
+        policy: report.policy,
+        generation: report.generation,
+        valid: report.valid,
+        reason: report.reasons[0] ?? "valid",
+        reasons: report.reasons,
+        counts: report.counts
+      }),
       // CO4 step 1 (CO14): validate the submit's session story — every
       // session read plus the transcript's session field — from this
       // authority's own cells when owned, else via the CO2.3 attestation
