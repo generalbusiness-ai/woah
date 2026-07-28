@@ -243,6 +243,29 @@ frame is a no-op by scope head. Accepted frames carry the authority's
 acceptance timestamp so retried deliveries never mint fresh wall-clock
 values.
 
+The recorded reply also carries the OUTCOME of the execution that committed
+under that key — the verb's return value, its transcript error, and its
+observations — so a client whose response was lost learns what happened
+instead of only that something did. The retry's own re-planned transcript is
+never presented as that outcome: it describes an execution that committed
+nothing, which for a turn consuming `now()` or `random()` would be a
+plausible wrong answer. A commit reply therefore distinguishes a fresh accept
+(the caller already holds its planned transcript) from a replay (the caller
+holds nothing, and receives the recorded output).
+
+The retained outcome is bound to the actor that committed it. Idempotency
+keys are client-chosen on `/net-api/turn`, on the WebSocket turn frame, and —
+via the operation id — on MCP, so two clients may name the same key. A submit
+from a different actor still learns that it committed nothing; it never
+receives the first actor's return value or directed lines.
+
+Retention is bounded and therefore so is the guarantee: replies within the
+scope's recovery-tail window are never pruned, and the cache holds a bounded
+total beyond it. A replay arriving after its reply pruned re-enters
+validation as a new turn. Per-surface client contract, including the retained
+byte ceiling and what a client is promised on retry:
+[mcp.md §M4.2](mcp.md#m42-retry-safety-the-operation-id).
+
 Fanout carries two distinct monotonic positions. The authority `seq` gates
 derived state application and may skip at one subscriber when an authority
 event produces no row for that destination. A per-subscriber `delivery_seq`
@@ -1242,8 +1265,12 @@ One write path per fact (CO9), concretized:
     transcript; `error` matters because an errored verb still commits
     its complete transcript — without the field an accepted no-op is
     indistinguishable from success). A scope-confirmed replay of a durable
-    commit omits them and marks `replayed:true`; a pure direct read is not
-    cached and safely returns a newly validated result at the unchanged head.
+    commit marks `replayed:true` and returns the RECORDED outcome of the
+    execution that committed rather than the replay's own re-plan, with
+    `replay_outcome` (`full`/`partial`/`none`) and `replay_omitted` naming
+    anything the authority did not retain (CO2.5, mcp.md §M4.2); a pure
+    direct read is not cached and safely returns a newly validated result at
+    the unchanged head.
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
     client reads over the CO13 roster mirror and the view cell probe. Session
     ids are bearer credentials: relation reads expose only actor-level

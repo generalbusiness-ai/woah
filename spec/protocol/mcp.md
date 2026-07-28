@@ -331,8 +331,10 @@ object is refused for both. A canonical target must also pass the concrete
 runtime-object-id validator before it can consume turn planning or repair
 budget.
 
-Every accepted invocation enters the normal Net client-turn path with a fresh
-idempotency key; MCP never runs a private VM. Routing comes from the descriptor's
+Every accepted invocation enters the normal Net client-turn path; MCP never
+runs a private VM. The turn's idempotency key comes from the client's
+operation id when one is supplied (§M4.2) and is otherwise freshly minted.
+Routing comes from the descriptor's
 command contract: `persistence:"live"` selects `direct` (and therefore still
 requires `direct_callable:true` at ingress), while `persistence:"durable"`
 selects `sequenced`. A tool-exposed verb without either declaration defaults to
@@ -381,9 +383,106 @@ Exactly one seat. `observations` on the reply and the queue's echo dedupe are
 two halves of one rule, so a client that reads both never receives an event
 twice, and delivery to every other session is unaffected.
 
-A detected idempotent replay (§CO2.5) commits nothing this round and therefore
-carries no observations. MCP mints a fresh idempotency key per `tools/call`, so
-that case is unreachable on this transport.
+A detected idempotent replay (§M4.2) commits nothing this round. It carries
+the observations RECORDED with the committed execution, never the retry's own
+re-planned ones.
+
+### M4.2 Retry safety: the operation id
+
+A `tools/call` that changes the world MUST be safe to retry. HTTP responses
+are lost — network drops, Durable Object eviction, client timeouts — and a
+client that cannot distinguish "never committed" from "committed, reply lost"
+has only two options, both wrong: retry and risk a second execution, or give
+up and risk none.
+
+**The id.** A client MAY supply a client-chosen, client-stable `operation_id`
+for a `tools/call`, in either of two carriers:
+
+- `params._meta["woo.net/operation_id"]` — the protocol carrier. It cannot
+  collide with a verb's argument names and it survives the stateless protocol
+  revision, in which sessions are removed but `_meta` is required on every
+  request. It takes precedence when both are present.
+- `arguments.operation_id` — the advertised carrier, present in the input
+  schema of `woo_call` and of every dynamic tool. It is what makes the
+  mechanism visible to a model, which will never populate an unadvertised
+  `_meta` field. It is NOT advertised, and NOT read, for a verb that declares
+  its own parameter of that name: that verb owns the name, and its callers
+  use `_meta`.
+
+The value MUST match `[A-Za-z0-9._:-]{1,128}`. A malformed value is refused
+with `E_INVARG` (`detail.reason:"invalid_operation_id"`) and commits nothing;
+it is never silently downgraded to a minted key, which would leave the client
+believing it was protected.
+
+**Who mints it.** The client, never the server. The server namespaces it per
+authenticated actor before it becomes the turn's idempotency key, so two
+agents that independently choose the same string do not collide.
+
+**Optionality and the read/write split.** The id is OPTIONAL everywhere, and
+absence preserves the prior behaviour exactly: a fresh key per call. It is
+not required for mutating verbs either. Requiring it would break every
+existing client on a live surface, and the server cannot decide reliably in
+advance which calls mutate — the descriptor's `persistence` contract declares
+a durability intent, not a write set, and a `sequenced` verb may write
+nothing. So the server accepts the id universally and lets the authority's
+keyed reply cache decide, and the tool schema tells clients where it matters:
+**supply one for any call that changes the world; omit it for reads, which
+are safe to re-issue.**
+
+**What a retry is promised.** A retry under the same operation id, from the
+same actor, within the retention window (below):
+
+1. does not execute a second time — the authority returns the reply recorded
+   for that key (§CO2.5); and
+2. learns the outcome of the execution that DID commit. The reply carries
+   `structuredContent.replayed:true`, `replay_outcome`, the recorded
+   `result`, the recorded `observations`, and — if the verb threw — the
+   recorded error as a normal `isError` result. A verb that threw still
+   commits its transcript, so replaying that as an empty success would be
+   worse than the double execution this mechanism prevents.
+
+The retry's own re-plan is NEVER presented as the outcome. It describes an
+execution that committed nothing, and for a turn reading `now()` or `random()`
+it would be a plausible wrong answer.
+
+`replay_outcome` names how much survived:
+
+| value | meaning |
+|---|---|
+| `full` | result, error, and observations are the recorded ones |
+| `partial` | some part existed and was not retained; `replay_omitted` lists which of `result`, `error`, `observations` |
+| `none` | no outcome was retained for this key |
+
+When the result was not retained, `structuredContent.result` is ABSENT rather
+than `null`: a client must be able to tell "the verb returned nothing" from
+"the verb returned something I cannot show you". Every non-`full` replay also
+carries a prose content block stating that the operation ran exactly once and
+that the client must re-read state rather than retry under a new id.
+
+An outcome is retained up to 4 KiB serialized. Over that, observations are
+dropped first (the client can re-orient with a read) and the loss is named.
+Return values are retained for MUTATING turns only — a turn that wrote
+nothing is safe to re-issue under a fresh id, and read results are the large
+ones, which must not grow the CO7 commit envelope.
+
+**Binding.** The retained outcome belongs to the actor whose turn committed
+it. A submit from a different actor under the same key still learns that its
+own submit committed nothing — that is the safety property — but receives
+`replay_outcome:"none"`, never the first actor's return value or directed
+lines. Idempotency keys are client-chosen on `/net-api/turn` and the
+WebSocket turn frame too, so identical strings from different clients are
+possible and must never become a read channel.
+
+**Past the retention window.** Idempotency is a bounded-window guarantee, not
+an eternal one. The committing scope retains recorded replies for **at least
+its most recent 256 commits** (the recovery-tail window, never pruned) and at
+most 1024 total; the gateway's scope pin has the same posture. A retry
+arriving after its reply has pruned is a NEW turn by every observable
+measure: it validates fresh against the current head and current read
+versions, and it will execute. Clients MUST NOT treat an operation id as a
+durable receipt. Operations needing a durable, long-lived outcome record are
+domain state (an order id, a task) and belong in the world, not in this
+cache.
 
 ## M5. Observation queue
 
