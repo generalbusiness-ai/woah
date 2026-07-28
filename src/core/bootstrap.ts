@@ -451,8 +451,23 @@ const PLAYER_HELP_SOURCE = `verb :help(topic) rxd {
     }
   }
   if (!found) {
-    if (length(dbs) > 0) { try { dispatch(dbs[1], "record_miss", [t]); } except err5 { } }
-    result = { ok: false, status: "not_found", topic: t, lines: ["No help available for " + str_char(34) + t + str_char(34) + "."] };
+    /* An unknown topic must stay a *reply*, not a failure. This used to also
+       record the miss as a property write on the first help db. A help db is
+       ordinarily installed catalog state, so on a Net world CO15 refuses that
+       write with E_CATALOG_MUTATION — and the refusal is a turn verdict
+       settled at commit, which no try/except in here can catch, so the whole
+       help call failed with an invariant dump. The reply now carries the
+       topic list instead, which is what the asker actually needs. */
+    let topics = [];
+    for db5 in dbs {
+      try {
+        let names = dispatch(db5, "find_topics", [""]);
+        if (typeof(names) == "list") { for nm in names { if (!(nm in topics)) { topics = topics + [nm]; } } }
+      } except err5 { }
+    }
+    let miss_lines = ["No help available for " + str_char(34) + t + str_char(34) + "."];
+    if (length(topics) > 0) { miss_lines = miss_lines + ["Topics: " + str_join(topics, ", ")]; }
+    result = { ok: false, status: "not_found", topic: t, topics: topics, lines: miss_lines };
   }
   if (typeof(result) == "map" && has(result, "lines")) { this:tell_lines(result["lines"]); }
   else { this:tell(to_string(result)); }

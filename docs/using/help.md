@@ -22,7 +22,17 @@ databases:
 
 Each database is a `$generic_help_db` instance. The first one that
 recognizes the topic (exact match, then prefix-abbreviation match)
-returns. If nothing matches, you get a "no such topic" message.
+returns. If nothing matches, you get a "no such topic" reply that
+lists every topic the search path does know, so you can pick one
+without a second round trip:
+
+```
+No help available for "programmer".
+Topics: index, help, commands, movement, ways, look, say, ...
+```
+
+A lookup never writes to the help database, so a miss is an ordinary
+answer rather than something that can fail.
 
 This means a chatroom can ship its own help (e.g., a tutorial room
 with topics specific to its objects), and falling through to the
@@ -72,11 +82,12 @@ human-readable narrative or a topic that doesn't map to one object.
 
 ## Adding help topics
 
-If you own a `$generic_help_db` instance, you can add topics by
-calling its writer verbs (the exact shape varies by deployment;
-typically `:add_topic(name, body)`). Help authors usually start by
-copying an existing `:get_topic` body and editing it — the directive
-shape is straightforward once you've seen one.
+A database's topics live in its `topics` property — a map from topic
+name to topic value. `$generic_help_db` ships no writer verb, so an
+owner adds or edits a topic by writing that map (for the bundled
+`$help`, a catalog `merge_map` seed hook does it; see the catalog's
+`DESIGN.md`). Topic values are plain strings, lists of strings, or one
+of the directives above.
 
 The catalog source for the help database lives at
 [`../../catalogs/help/`](../../catalogs/help/) with design rationale

@@ -935,12 +935,31 @@ export function updateCatalogManifest(world: WooWorld, manifest: CatalogManifest
     ref_requested: tap === "@local" ? "@local" : "unversioned",
     ref_resolved_sha: "unversioned"
   };
+  // §CT14: a RECORDED VERSION MEANS "THIS EDGE FULLY APPLIED". A migration that
+  // stopped part-way must leave the pre-migration version in place.
+  //
+  // Recording the target anyway is not merely inaccurate, it is terminal. The
+  // next attempt validates the migration's `from_version` against the recorded
+  // version, so a prematurely-advanced version makes the ONLY migration that
+  // could finish the job refuse to match — the world claims v2.0.0, still holds
+  // v1 data, and answers a retry with "migration version range does not match
+  // 2.0.0 -> 2.0.0". There is no path forward from there, which contradicts the
+  // rerun-recovery contract §CT14.4 rests on.
+  //
+  // Holding the version back is the honest record of what applied. The
+  // definitions repaired above may now be AHEAD of it; that is deliberate and
+  // safe — repairCatalogManifest is idempotent (the boot schema sync re-runs it
+  // every cold init), and migration_state names exactly which step stopped the
+  // edge. A rerun re-repairs the definitions as a no-op and retries the steps,
+  // which §CT14.4 already requires publishers to make idempotent.
+  const migrationHeld = migrationState.status === "failed";
+  const recordedVersion = migrationHeld ? current.version : manifest.version;
   const record: InstalledCatalogRecord = {
     ...current,
     tap,
     catalog: manifest.name,
     alias,
-    version: manifest.version,
+    version: recordedVersion,
     updated_at: Date.now(),
     owner: actor,
     objects: { ...current.objects, ...manifestObjectRefs(manifest) },

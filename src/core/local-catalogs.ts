@@ -1499,7 +1499,7 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
       continue;
     }
     try {
-      updateCatalogManifest(world, manifest, {
+      const updated = updateCatalogManifest(world, manifest, {
         tap: "@local",
         alias: name,
         actor: "$wiz",
@@ -1507,6 +1507,28 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
         acceptMajor: true,
         migration
       });
+      // A migration that stopped part-way does NOT throw: §CT14.3 has the
+      // migration body catch step failures on purpose, so partial progress is
+      // recorded instead of rolled back wholesale. It returns a `failed`
+      // migration_state instead — and that is the same hazard as a thrown
+      // failure, so it gets the same treatment. Reading only the throw let a
+      // half-migrated catalog ride on into the schema sync with nothing
+      // reported: definitions flipped forward without their data rewrites,
+      // silently. The recorded version stays at the pre-migration value
+      // (updateCatalogManifest holds it back), so the next boot re-attempts
+      // this same edge rather than skipping it as already applied.
+      const state = updated.migration_state;
+      if (state && state.status === "failed") {
+        report("woo.local_catalog_version_migration_failed", {
+          catalog: name,
+          from: currentVersion,
+          to: manifest.version,
+          failed_step: state.failed_step,
+          completed_steps: state.completed_steps.length,
+          error: state.error?.message ?? "migration step failed"
+        });
+        blocked.add(name);
+      }
     } catch (err) {
       report("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
       // A failed major migration leaves the same hazard as a missing one:

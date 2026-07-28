@@ -412,6 +412,67 @@ describe("local catalogs", () => {
     world.setProp("$help", "topics", topics as never);
   }
 
+  // The other half of a genuine v0.x world, and the half that makes the §CT14
+  // version edge actually run. Rewinding topic VALUES alone leaves the registry
+  // at the bundled version, so runLocalCatalogVersionMigrations finds no drift
+  // and migration-v0-to-v1.json never executes — a test that ages only the
+  // values proves nothing about the migration. This restores the definitions
+  // help v1.0.0 drops (the miss-telemetry surface) AND rewinds the recorded
+  // version, so the next cold init sees a real 0.1.1 -> 1.0.0 major edge.
+  //
+  // A deployed v0.1.1 world differs from a current one in three ways and all
+  // three have to be rewound or the scenario is not the one being claimed:
+  // leaving the CURRENT schema-plan completion record in place makes the sync
+  // short-circuit on it, and the version only appears to stay at 0.1.1 — an
+  // artifact of the fixture rather than behavior.
+  function rewindHelpDefinitionsToV0(world: ReturnType<typeof createWorld>): void {
+    const owner = world.object("$generic_help_db").owner;
+    world.defineProperty("$generic_help_db", {
+      name: "missed_topics",
+      defaultValue: [],
+      typeHint: "list<map>",
+      owner,
+      perms: "r"
+    });
+    world.addVerb("$generic_help_db", {
+      kind: "native",
+      name: "record_miss",
+      aliases: [],
+      owner,
+      perms: "rxd",
+      arg_spec: { args: ["topic"] },
+      source: "verb :record_miss(topic) rxd { return null; /* native: see help_db_record_miss */ }",
+      source_hash: "aged-record-miss",
+      version: 1,
+      line_map: {},
+      native: "help_db_record_miss",
+      direct_callable: true
+    });
+    const installed = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .map((record) => (record.alias === "help" ? { ...record, version: "0.1.1" } : record));
+    world.setProp("$catalog_registry", "installed_catalogs", installed as never);
+    world.setProp("$system", "catalog_migration_records", [] as never);
+  }
+
+  /** Both halves: an aged world is aged in its data AND its definitions. */
+  function ageHelpWorldToV0(world: ReturnType<typeof createWorld>): void {
+    rewindHelpToV011(world);
+    rewindHelpDefinitionsToV0(world);
+  }
+
+  /** The definitions help v1.0.0 retires, as a world actually stores them. */
+  function helpTelemetrySurface(world: ReturnType<typeof createWorld>): { verb: boolean; property: boolean } {
+    return {
+      verb: world.object("$generic_help_db").verbs.some((verb) => verb.name === "record_miss"),
+      property: world.object("$generic_help_db").propertyDefs.has("missed_topics")
+    };
+  }
+
+  function installedHelpVersion(world: ReturnType<typeof createWorld>): string | undefined {
+    return (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+      .find((record) => record.alias === "help")?.version as string | undefined;
+  }
+
   it("rewrites help v0.1.1 topics that named nonexistent MCP tools, and adds the orientation topics", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["help"]);
@@ -481,32 +542,30 @@ describe("local catalogs", () => {
   it("repairs a world whose registry still records help v0.1.1, and advances the recorded version", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["help"]);
-    rewindHelpToV011(world);
-    // A deployed v0.1.1 world differs from a current one in three ways, and all
-    // three have to be rewound or the scenario is not the one being claimed.
-    // Rewinding only the topics and the registry version leaves the CURRENT
-    // schema-plan completion record in place; the sync then short-circuits on
-    // that record and the version appears to stay at 0.1.1 — an artifact of the
-    // fixture, not behavior. Dropping the records models the real thing.
-    const installed = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
-      .map((record) => (record.alias === "help" ? { ...record, version: "0.1.1" } : record));
-    world.setProp("$catalog_registry", "installed_catalogs", installed as never);
-    world.setProp("$system", "catalog_migration_records", [] as never);
+    ageHelpWorldToV0(world);
+    // The fixture really is aged, or the assertions below prove nothing.
+    expect(helpTelemetrySurface(world)).toEqual({ verb: true, property: true });
+    expect(installedHelpVersion(world)).toBe("0.1.1");
 
     installLocalCatalogs(world, ["help"]);
 
     const topics = world.getProp("$help", "topics") as Record<string, string[]>;
     expect(topics.focus.join(" ")).toContain("no woo_focus");
     expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
-    // Minor drift needs no §CT14 migration file: runLocalCatalogVersionMigrations
-    // routes only MAJOR edges through updateCatalogManifest, and the auto schema
-    // sync covers the rest — including writing manifest.version back onto the
-    // registry record. So the recorded version DOES advance on a minor bump.
-    // The merge repair must still not depend on that; its gate is the stored
-    // value itself, which is what makes it correct either way.
-    const after = (world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
-      .find((record) => record.alias === "help");
-    expect(after?.version).toBe("0.2.0");
+    // 0.1.1 → 1.0.0 is a MAJOR edge, so runLocalCatalogVersionMigrations routes
+    // it through updateCatalogManifest with the bundled §CT14 file. That file
+    // carries the destructive half of the fix: an aged world keeps the
+    // record_miss verb and the missed_topics property until the drop steps run
+    // (the schema sync alone never removes definitions the manifest stopped
+    // declaring). Both must be gone afterwards.
+    expect(helpTelemetrySurface(world)).toEqual({ verb: false, property: false });
+    expect(installedHelpVersion(world)).toBe("1.0.0");
+
+    // Migration rule: reruns must be safe. A second cold init finds nothing to
+    // drop and leaves the repaired state alone.
+    installLocalCatalogs(world, ["help"]);
+    expect(helpTelemetrySurface(world)).toEqual({ verb: false, property: false });
+    expect(installedHelpVersion(world)).toBe("1.0.0");
   });
 
   // The help topics name builder/programmer verbs in prose ("$programmer adds
@@ -589,11 +648,89 @@ describe("local catalogs", () => {
     }
   });
 
+  // Boot must treat a RETURNED failure exactly like a THROWN one. §CT14.3 has
+  // the migration body catch step failures on purpose, so a stopped edge comes
+  // back as `migration_state.status === "failed"` rather than as an exception.
+  // The boot path read only the throw, so a half-migrated catalog rode on into
+  // the schema sync — new definitions installed without the major's data
+  // rewrites — with nothing reported. Injecting the step failure at the world
+  // writer keeps this about the boot path's HANDLING rather than about any
+  // particular way a step can fail.
+  it("blocks and reports a bundled catalog whose version migration returns failed, then retries it next boot", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    ageHelpWorldToV0(world);
+
+    const warnings: Array<[string, Record<string, unknown>]> = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((event: unknown, detail: unknown) => {
+      warnings.push([String(event), (detail ?? {}) as Record<string, unknown>]);
+    });
+    const removeVerb = vi.spyOn(world, "removeVerb").mockImplementationOnce(() => {
+      throw new Error("injected step failure");
+    });
+    try {
+      installLocalCatalogs(world, ["help"]);
+    } finally {
+      removeVerb.mockRestore();
+      warn.mockRestore();
+    }
+
+    // Reported, naming the step that stopped the edge.
+    const reported = warnings.find(([event]) => event === "woo.local_catalog_version_migration_failed");
+    expect(reported, `expected a migration failure warning, saw ${JSON.stringify(warnings.map(([e]) => e))}`).toBeTruthy();
+    expect(reported?.[1]).toMatchObject({
+      catalog: "help",
+      from: "0.1.1",
+      to: "1.0.0",
+      failed_step: "1:drop_verb:$generic_help_db:record_miss"
+    });
+
+    // The version is held back, so the next boot re-attempts this same edge
+    // instead of skipping it as already applied.
+    expect(installedHelpVersion(world)).toBe("0.1.1");
+    // Blocked: the drift schema sync was skipped, so the retired surface is
+    // still there for operator attention rather than half-repaired.
+    expect(helpTelemetrySurface(world)).toEqual({ verb: true, property: true });
+
+    // Next boot, cause gone: the edge runs to completion with no operator
+    // intervention beyond fixing what broke it.
+    installLocalCatalogs(world, ["help"]);
+    expect(installedHelpVersion(world)).toBe("1.0.0");
+    expect(helpTelemetrySurface(world)).toEqual({ verb: false, property: false });
+  });
+
+  // Same failure under the fail-closed rule the net install planner uses: an
+  // install plan must never be built from a world it already knows it could
+  // not migrate.
+  it("aborts a fail-closed install when a version migration returns failed", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    ageHelpWorldToV0(world);
+
+    const removeVerb = vi.spyOn(world, "removeVerb").mockImplementationOnce(() => {
+      throw new Error("injected step failure");
+    });
+    try {
+      expect(() => installLocalCatalogs(world, ["help"], { failClosed: true }))
+        .toThrow("catalog install failed closed");
+    } finally {
+      removeVerb.mockRestore();
+    }
+    expect(installedHelpVersion(world)).toBe("0.1.1");
+  });
+
   // AGENTS.md migration discipline: a migration must be test-run on a local
   // SQLite woo. Seed an aged world, close it, reopen, migrate, close, reopen —
   // so the repair is proven to survive the storage round trip rather than only
   // existing in the in-memory object graph.
-  it("repairs the help topics through a real SQLite round trip", async () => {
+  //
+  // Both aged-world repairs run here, and they are different mechanisms that
+  // an earlier version of this test conflated: the topic VALUES heal through
+  // the merge_map seed drift pass, while the retired record_miss verb and
+  // missed_topics property are dropped by the §CT14 version edge. Aging only
+  // the values left the registry at the bundled version, so the edge never ran
+  // and migration-v0-to-v1.json had no coverage on the SQLite profile at all.
+  it("repairs the help topics and runs the v0->v1 migration through a real SQLite round trip", async () => {
     const { mkdtempSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { LocalSQLiteRepository } = await import("../src/server/sqlite-repository");
@@ -603,15 +740,19 @@ describe("local catalogs", () => {
       const seedRepo = new LocalSQLiteRepository(path);
       const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
       installLocalCatalogs(seedWorld, ["help"]);
-      rewindHelpToV011(seedWorld);
+      ageHelpWorldToV0(seedWorld);
       seedRepo.close();
 
       const upgradeRepo = new LocalSQLiteRepository(path);
       const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
       // The aged state really did persist — otherwise the migration below
-      // would be repairing a world that was never broken.
+      // would be repairing a world that was never broken. Both halves matter:
+      // the stale values AND the retired definitions with the old version.
       expect((upgradeWorld.getProp("$help", "topics") as Record<string, string[]>).focus.join(" "))
         .toContain("Use woo_focus(");
+      expect(helpTelemetrySurface(upgradeWorld)).toEqual({ verb: true, property: true });
+      expect(installedHelpVersion(upgradeWorld)).toBe("0.1.1");
+
       installLocalCatalogs(upgradeWorld, ["help"]);
       upgradeRepo.close();
 
@@ -621,12 +762,37 @@ describe("local catalogs", () => {
       expect(topics.focus.join(" ")).toContain("no woo_focus");
       expect(topics.wait.join(" ")).toContain("woo_wait(timeout_ms, limit)");
       expect(topics.tools.join(" ")).toContain("woo_list_reachable_tools");
+      // The migration edge ran and its drops survived the storage round trip:
+      // the definitions are gone from the REOPENED world, not merely from the
+      // object graph the migration mutated.
+      expect(helpTelemetrySurface(verifyWorld)).toEqual({ verb: false, property: false });
+      expect(installedHelpVersion(verifyWorld)).toBe("1.0.0");
+
+      // ...and the migrated world answers an unknown topic instead of trying
+      // to write the retired property. This is the user-visible behavior the
+      // whole change exists for, asserted on the SQLite profile.
+      const miss = await verifyWorld.directCall("sqlite-help-miss", "$wiz", "$wiz", "help", ["programmer"]);
+      expect(miss.op).toBe("result");
+      if (miss.op === "result") {
+        expect(miss.result).toMatchObject({ ok: false, status: "not_found", topic: "programmer" });
+        expect((miss.result as { topics: string[] }).topics).toEqual(expect.arrayContaining(["commands", "movement"]));
+      }
 
       // Rerunning against the already-repaired persisted world is a no-op.
       const before = JSON.stringify(topics);
       installLocalCatalogs(verifyWorld, ["help"]);
       expect(JSON.stringify(verifyWorld.getProp("$help", "topics"))).toBe(before);
+      expect(helpTelemetrySurface(verifyWorld)).toEqual({ verb: false, property: false });
+      expect(installedHelpVersion(verifyWorld)).toBe("1.0.0");
       verifyRepo.close();
+
+      // The no-op really is durable: a fourth open sees the same repaired
+      // world rather than a re-migration on every boot.
+      const replayRepo = new LocalSQLiteRepository(path);
+      const replayWorld = createWorld({ repository: replayRepo, catalogs: false });
+      expect(helpTelemetrySurface(replayWorld)).toEqual({ verb: false, property: false });
+      expect(installedHelpVersion(replayWorld)).toBe("1.0.0");
+      replayRepo.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -832,9 +998,50 @@ describe("local catalogs", () => {
       expect(plan.result).toMatchObject({ route: "direct", target: "$wiz", verb: "help", args: ["movement"] });
     }
 
+    // An unknown topic is a *reply*, never a failure, and it hands back the
+    // topic list so the asker can recover in one step.
+    //
+    // This path used to also record the miss as a `missed_topics` property
+    // write on the first help db. On a Net world $help is installed catalog
+    // state, so that write is refused at commit with E_CATALOG_MUTATION — a
+    // turn verdict, decided after the verb has run, which the `try`/`except`
+    // around the dispatch could not catch. `guest:help("programmer")` returned
+    // a raw invariant dump on the deployed world instead of an answer, and the
+    // telemetry recorded nothing there anyway (nothing ever read the list
+    // back). help v1.0.0 drops the verb and the property.
+    //
+    // Local worlds do not enforce the catalog-write rule, so the local proof
+    // is the second half: the whole help turn must leave $help byte-identical.
+    // If it writes anything, Net refuses the turn. The Net lane itself is
+    // proven in tests/worker/net-mcp-agent-surface.test.ts.
+    const helpBefore = JSON.stringify(world.exportObjects(["$help"]));
     const miss = await world.directCall("help-miss", "$wiz", "$wiz", "help", ["definitely-missing"]);
     expect(miss.op).toBe("result");
-    expect(world.getProp("$help", "missed_topics")).toContainEqual(expect.objectContaining({ topic: "definitely-missing", actor: "$wiz" }));
+    if (miss.op === "result") {
+      expect(miss.result).toMatchObject({ ok: false, status: "not_found", topic: "definitely-missing" });
+      const reply = miss.result as { topics?: unknown; lines?: unknown };
+      expect(Array.isArray(reply.topics)).toBe(true);
+      // The same list `help()` with no topic renders in its index.
+      const indexTopics = Object.keys(world.getProp("$help", "topics") as Record<string, WooValue>);
+      expect(reply.topics as string[]).toEqual(expect.arrayContaining(indexTopics));
+      expect(reply.lines as string[]).toEqual([
+        'No help available for "definitely-missing".',
+        `Topics: ${(reply.topics as string[]).join(", ")}`
+      ]);
+      // The asker is told, not just the return value: both lines reach them.
+      expect(miss.observations).toContainEqual(
+        expect.objectContaining({ type: "text", target: "$wiz", text: expect.stringContaining("No help available") })
+      );
+      expect(miss.observations).toContainEqual(
+        expect.objectContaining({ type: "text", target: "$wiz", text: expect.stringContaining("Topics: ") })
+      );
+    }
+    expect(JSON.stringify(world.exportObjects(["$help"])), "a help miss must not write to the help db").toBe(helpBefore);
+
+    // The dead telemetry surface is gone from the class, not merely unused.
+    const helpDbVerbs = world.object("$generic_help_db").verbs.map((verb) => verb.name);
+    expect(helpDbVerbs).not.toContain("record_miss");
+    expect(world.object("$generic_help_db").propertyDefs.has("missed_topics")).toBe(false);
 
     // Regression for notes/2026-05-16-online-walkthrough.md Inconsistency 1.
     // The minimum first-light topic set must include look, say, focus, wait,
