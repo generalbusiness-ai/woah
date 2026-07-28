@@ -320,6 +320,75 @@ describe("native exception rollback", () => {
     expect(recorder.turns[0].start.route).toBe("direct");
   });
 
+  it("refuses terminal transfer when a wrapper wrote before nested programmer eval", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:nested-eval-transfer");
+    const actor = session.actor;
+    world.migrationSetObjectOwner(actor, actor);
+    world.setCatalogObjectFlags(actor, { programmer: true });
+    world.chparentAuthoredObject("$wiz", actor, "$programmer");
+    world.createObject({
+      id: "nested_eval_transfer_wrapper",
+      name: "Nested eval transfer wrapper",
+      parent: "$thing",
+      owner: actor
+    });
+    world.defineProperty("nested_eval_transfer_wrapper", {
+      name: "marker",
+      defaultValue: 0,
+      owner: actor,
+      perms: "rw",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "the_dubspace",
+      "nested_eval_transfer_target",
+      `verb :nested_eval_transfer_target() rx { return 42; }`,
+      null
+    ).ok).toBe(true);
+    const plan = {
+      ok: true,
+      route: "sequenced",
+      space: "the_dubspace",
+      target: "the_dubspace",
+      verb: "nested_eval_transfer_target",
+      args: []
+    };
+    const evalSource = `execute_command_plan(${JSON.stringify(plan)})`;
+    addDirectNative(world, "nested_eval_transfer_wrapper", "run", async (ctx) => {
+      world.setProp("nested_eval_transfer_wrapper", "marker", 1);
+      return await world.dispatch(
+        { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
+        actor,
+        "eval",
+        [evalSource, {}]
+      );
+    });
+    const beforeSeq = Number(world.getProp("the_dubspace", "next_seq"));
+
+    const frame = await world.directCall(
+      "nested-eval-transfer-refusal",
+      actor,
+      "nested_eval_transfer_wrapper",
+      "run",
+      [],
+      { sessionId: session.id }
+    );
+
+    expect(frame).toMatchObject({
+      op: "error",
+      error: {
+        code: "E_SCOPE_SPLIT"
+      }
+    });
+    if (frame.op === "error") {
+      expect(Number((frame.error.value as { mutations?: number } | undefined)?.mutations ?? 0)).toBeGreaterThan(0);
+    }
+    expect(world.getProp("nested_eval_transfer_wrapper", "marker")).toBe(0);
+    expect(world.getProp("the_dubspace", "next_seq")).toBe(beforeSeq);
+  });
+
   it("answers an exact terminal-transfer retry before rerunning its wrapper", async () => {
     const world = createWorld();
     const session = world.auth("guest:terminal-transfer-retry");

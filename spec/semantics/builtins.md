@@ -233,9 +233,11 @@ The compatibility wrapper does not resume after transfer. It MUST transfer
 only when its current behavior transaction contains proof reads and dispatch
 metadata but no behavior-domain effect. If the transfer cannot be terminal or
 an effect has already been produced, it refuses with `E_SCOPE_SPLIT` before any
-sequence is allocated. A call already executing as a sequenced turn may inline
-a compatible same-space dispatch; it refuses incompatible sequenced nesting
-rather than accepting a second turn.
+sequence is allocated. "Current behavior transaction" includes the complete
+active savepoint stack: an outer wrapper write cannot be hidden by entering a
+fresh inner helper savepoint such as `$programmer:eval`. A call already
+executing as a sequenced turn may inline a compatible same-space dispatch; it
+refuses incompatible sequenced nesting rather than accepting a second turn.
 
 The terminal transfer is an opaque core control signal, not a Woo value or
 Woo error. Woo `try`/`except` cannot intercept it, and a native-thrown object or

@@ -443,8 +443,11 @@ no room sequence.
 
 Planning before transfer is read-only. If the wrapper has already produced a
 behavior-domain effect or the transfer cannot be terminal, the call refuses
-`E_SCOPE_SPLIT` before sequence allocation. Incompatible nesting inside an
-already-sequenced turn is refused rather than accepted as a second turn.
+`E_SCOPE_SPLIT` before sequence allocation. This proof-only check covers every
+active nested behavior savepoint, so entering an empty helper savepoint cannot
+hide a write made by the outer compatibility wrapper. Incompatible nesting
+inside an already-sequenced turn is refused rather than accepted as a second
+turn.
 Browser clients use the v2 command-intent path to avoid the compatibility
 transfer entirely.
 
