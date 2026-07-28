@@ -239,14 +239,15 @@ function shadowScopeHeadForAcceptedCommit(
 
 // Reasons whose verdict cannot be superseded by the post-apply
 // `post_state_mismatch` check, so a submission carrying one can be rejected
-// before paying commit-apply. stale_head/scope_mismatch/permission_denied
-// outrank post_state_mismatch; read_version_mismatch is convergence-safe to
-// short-circuit (the repair transfer refreshes the cells, the next attempt runs
-// the full path). incomplete_transcript / nondeterministic are intentionally
-// absent — see the gate in `submitShadowCommit`.
+// before paying commit-apply. stale_head/scope_mismatch/incomplete_transcript/
+// permission_denied outrank post_state_mismatch; read_version_mismatch is
+// convergence-safe to short-circuit (the repair transfer refreshes the cells,
+// the next attempt runs the full path). nondeterministic remains absent — see
+// the gate in `submitShadowCommit`.
 const PRE_APPLY_REJECT_REASONS: ReadonlySet<ShadowCommitConflict["reason"]> = new Set([
   "stale_head",
   "scope_mismatch",
+  "incomplete_transcript",
   "permission_denied",
   "read_version_mismatch",
   "invalid_error_effects"
@@ -352,14 +353,17 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   );
   const preApplyErrors = [...envelopeErrors, ...writeAuthorityErrors];
   const preApplyReason = preApplyErrors.length > 0 ? shadowConflictReason(preApplyErrors) : null;
-  // stale_head / scope_mismatch / permission_denied outrank post_state_mismatch
-  // (priority 4), so their reason is identical with or without apply.
+  // stale_head / scope_mismatch / incomplete_transcript / permission_denied
+  // outrank post_state_mismatch, so their reason is identical with or without
+  // apply. This follows the same validation order as Net: completeness is a
+  // terminal envelope verdict and therefore also outranks generation-1 failed
+  // effect admission.
   // read_version_mismatch is lower priority, but short-circuiting it is
   // convergence-safe: the DESIGN A repair transfer refreshes exactly the
   // mismatched cells, and the next attempt — reads no longer stale — runs the
   // full apply+post-state path and surfaces any genuine post_state_mismatch.
-  // incomplete_transcript / nondeterministic are deliberately NOT short-circuited
-  // so a post_state_mismatch verdict can never be silently downgraded.
+  // nondeterministic is deliberately NOT short-circuited so a
+  // post_state_mismatch verdict can never be silently downgraded.
   if (preApplyReason && PRE_APPLY_REJECT_REASONS.has(preApplyReason)) {
     // Nothing is applied, so the touched cells' post image equals their pre
     // image: reuse preStateHash for both receipt hashes.
@@ -2079,10 +2083,13 @@ function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): { obje
 function shadowConflictReason(errors: string[]): ShadowCommitConflict["reason"] {
   if (errors.some((error) => error.startsWith("stale_head"))) return "stale_head";
   if (errors.some((error) => error.startsWith("scope_mismatch"))) return "scope_mismatch";
+  // Net performs its terminal completeness check before failed-effect
+  // admission. Keep the shadow authority on the same reason vocabulary and
+  // priority when a generation-1 transcript violates both constraints.
+  if (errors.some((error) => error.startsWith("incomplete"))) return "incomplete_transcript";
   if (errors.some((error) => error.startsWith("invalid_error_effects"))) return "invalid_error_effects";
   if (errors.some((error) => error.startsWith("permission_denied"))) return "permission_denied";
   if (errors.some((error) => error.startsWith("post_state_mismatch"))) return "post_state_mismatch";
-  if (errors.some((error) => error.startsWith("incomplete"))) return "incomplete_transcript";
   if (errors.some((error) => error.includes("version mismatch") || error.includes("value mismatch"))) return "read_version_mismatch";
   return "nondeterministic";
 }
