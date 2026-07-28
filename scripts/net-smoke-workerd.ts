@@ -359,6 +359,44 @@ async function main(): Promise<number> {
     });
     step("authenticated roster read over /net-api shows the room contents", clientRoster !== null);
 
+    // ---- MCP Origin admission (mcp.md §M7.1) over REAL workerd. The fake-DO
+    // lane already drives these through the Worker entry, but with undici's
+    // Headers; this lane proves the edge assertion survives workerd's own
+    // header handling and the real DO stub boundary — which is the exact seam
+    // the original defect lived in (the edge rewrites the URL to `https://do`,
+    // so the DO cannot see the public origin unless the edge states it).
+    //
+    // `base` here is loopback, so §M7.1's loopback clause is what admits the
+    // browser case; a non-loopback foreign origin is still refused.
+    const mcpOrigin = async (headers: Record<string, string>): Promise<Response> => fetch(`${base}/net-api/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
+    });
+    const browserOrigin = new URL(base).origin;
+    const admitted = await mcpOrigin({ origin: browserOrigin, "mcp-token": "apikey:lane-key:lane-secret" });
+    const admittedSid = admitted.headers.get("mcp-session-id") ?? "";
+    step(
+      "browser Origin from the endpoint's own public origin is ADMITTED (the production 403 regression)",
+      admitted.status === 200 && admittedSid !== "",
+      `status=${admitted.status} session=${admittedSid ? "yes" : "no"}`
+    );
+    // Close it again so this probe leaves no session behind for later steps.
+    if (admittedSid) {
+      await fetch(`${base}/net-api/mcp`, { method: "DELETE", headers: { "mcp-session-id": admittedSid } });
+    }
+    const foreign = await mcpOrigin({ origin: "https://hostile.example", "mcp-token": "apikey:lane-key:lane-secret" });
+    step("foreign browser Origin is REFUSED 403", foreign.status === 403, `status=${foreign.status}`);
+    // The attacker model: a client asserting the trusted header itself. The
+    // edge strips it by `x-woo-internal-` prefix and overwrites it, so this
+    // must land exactly where the plain foreign origin did.
+    const forged = await mcpOrigin({
+      origin: "https://hostile.example",
+      "x-woo-internal-public-origin": "https://hostile.example",
+      "mcp-token": "apikey:lane-key:lane-secret"
+    });
+    step("a FORGED x-woo-internal-public-origin does not admit a foreign Origin", forged.status === 403, `status=${forged.status}`);
+
     // ---- Programmer lifecycle over REAL workerd (P1/P2): a fully anchored
     // programmer family promotes over /net-api/turn, authors + invokes through
     // the real MCP surface, and demotes — the same shape as the fake-DO
