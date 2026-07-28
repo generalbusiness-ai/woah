@@ -219,6 +219,36 @@ Required test: **fault injection where the commit succeeds, the response is
 dropped, and the retry produces the outcome exactly once.** This is being fixed
 now, ahead of the migration.
 
+## 5b. The current wire profile is only partially enforced — fold into the migration
+
+A review of the shipped MCP surface found the claimed `2025-06-18` profile
+enforced only in part: `initialize` parameters are ignored; protocol-version
+headers are not validated; a malformed pagination cursor silently becomes page
+zero; a missing or expired session answers with a JSON-RPC error at HTTP 200;
+and dynamic tool arguments are not validated against their advertised schema
+before invocation. Each diverges from the 2025-06-18 lifecycle, transport,
+pagination, and tools requirements.
+
+**Deliberate decision: do not harden the existing parser.** The 2026-07-28
+revision changes every one of those surfaces — the handshake disappears, the
+version moves into `_meta` plus a matching header, results gain `resultType`,
+and list results gain `ttlMs`/`cacheScope`. Hardening a parser we are about to
+retire spends the work twice and leaves two divergent code paths during the
+dual-era window.
+
+Instead this becomes a **first-class requirement of the migration**: a shared
+**versioned codec / state-machine layer** that owns wire validation for both
+profiles — one place that knows which fields are required in which revision,
+validates headers against body and `_meta`, rejects malformed cursors, maps
+protocol faults to correct HTTP status and error codes, and validates tool
+arguments against the advertised schema before dispatch. Dual-era conformance
+(§8 step 4) is then a property of that layer rather than of two parsers.
+
+Argument validation deserves its own note: it is the one item on that list that
+is not merely conformance. An unvalidated argument reaches verb dispatch, so
+the schema we advertise to models is currently decorative. That should land with
+the codec layer, not before it.
+
 ## 6. Tool-list policy [revised]
 
 SEP-2567 requires list endpoints to depend on *deployment and authenticated
