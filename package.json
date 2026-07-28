@@ -32,6 +32,7 @@
     "repair:net-contents": "tsx scripts/net-repair-contents.ts",
     "repair:net-definitions": "tsx scripts/net-repair-definitions.ts",
     "repair:net-seed-properties": "tsx scripts/net-repair-seed-properties.ts",
+    "repair:net-verb-slots": "tsx scripts/net-repair-verb-slots.ts",
     "credential:net-ensure": "tsx scripts/net-ensure-credential.ts",
     "provision:net-wizard": "tsx scripts/net-provision-wizard.ts",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",

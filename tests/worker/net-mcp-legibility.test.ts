@@ -804,6 +804,31 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     expect((await call("aged_probe", "z_first")).result?.structuredContent?.result).toBe("z_first");
     expect((await call("aged_probe", "a_second")).result?.structuredContent?.result).toBe("a_second");
 
+    // ---- and the deploy-day cure: repair:net-verb-slots -----------------
+    // The operator op renumbers the duplicated pages into the order every node
+    // already resolves — slot, then name — so the refusal lifts and the
+    // answer is the one the WORLD dispatcher was already giving. For a world
+    // whose pages all collapsed onto slot 1 that is the alphabetical one:
+    // `a_second`, NOT the verb authored first. The authoring order is not
+    // recorded anywhere and the repair does not invent it
+    // (src/net/verb-slots.ts).
+    const owning = scopeDOs.get(CATALOG_SCOPE) as NetScopeDO;
+    const repaired = await owning.fetch(await signInternalRequest(scopeEnv, new Request("https://do/net/repair-verb-slots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objects: ["aged_probe"] })
+    })));
+    expect(repaired.ok, await repaired.clone().text()).toBe(true);
+    expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", objects: ["aged_probe"] });
+    for (const st of states) await st.settle();
+    for (const scope of scopeDOs.values()) await scope.alarm();
+    for (const st of states) await st.settle();
+
+    const resolved = await call("aged_probe", "x");
+    for (const st of states) await st.settle();
+    expect(resolved.result?.isError, JSON.stringify(resolved).slice(0, 400)).not.toBe(true);
+    expect(resolved.result?.structuredContent?.result, "the repair did not lift the refusal").toBe("a_second");
+
     for (const st of states) await st.settle();
     for (const st of states) st.close();
   });

@@ -143,6 +143,7 @@ describe("the /net-install doorway (route level)", () => {
     const h = buildHarness();
     // Wrong verb on a valid path shape.
     expect((await h.signedRequest("/net-install/scope/room%3Ax/subscribe", seedBody("room:x"))).status).toBe(404);
+    expect((await h.signedRequest("/net-install/scope/room%3Ax/repair-verb-slot", seedBody("room:x"))).status).toBe(404);
     // Wrong method for the verb.
     expect((await h.signedRequest("/net-install/scope/room%3Ax/seed")).status).toBe(404);
     expect((await h.signedRequest("/net-install/scope/room%3Ax/head", seedBody("room:x"))).status).toBe(404);
@@ -436,6 +437,81 @@ describe("the /net-install doorway (route level)", () => {
     await reject({ entries: [{ ...entries[0], supersedes: { stale: "not-a-list" } }] });
     await reject({ entries: [] });
     await reject({ entries: Array.from({ length: 33 }, () => entries[0]) });
+    h.close();
+  });
+
+  // Aged-world verb-slot repair (CO4.7). Worlds authored before 2026-07-27 hold
+  // objects whose verb pages share an ordinal, because the Net authoring path
+  // could not see an object's other pages. This op renumbers them into the
+  // order the system already resolves — slot then name — which is
+  // behaviour-preserving; it does not try to recover an insertion order nothing
+  // recorded.
+  it("renumbers aged duplicate verb slots, leaves healthy gaps alone, and replays empty", async () => {
+    const h = buildHarness();
+    const verb = (object: string, name: string, slot: number | undefined) => ({
+      kind: "verb_bytecode",
+      object,
+      name,
+      value: { kind: "bytecode", name, aliases: ["x*"], owner: "$wiz", perms: "rx", version: 1, ...(slot === undefined ? {} : { slot }) }
+    });
+    const cells = [
+      { kind: "object_lineage", object: "aged_box", value: { parent: "$thing", owner: "$wiz" } },
+      // The aged shape: three pages, all claiming slot 1.
+      verb("aged_box", "zulu", 1), verb("aged_box", "alpha", 1), verb("aged_box", "mike", 1),
+      // A HEALTHY object with a legitimate gap (its slot-2 verb was deleted).
+      // Renumbering it would invalidate live slot descriptors for no gain.
+      { kind: "object_lineage", object: "gapped_box", value: { parent: "$thing", owner: "$wiz" } },
+      verb("gapped_box", "one", 1), verb("gapped_box", "three", 3)
+    ];
+    expect((await h.signedRequest("/net-install/scope/room%3Aaged/seed", seedBody("room:aged", EPOCH, cells))).status).toBe(200);
+
+    const body = { method: "POST" as const, headers: { "content-type": "application/json" }, body: JSON.stringify({}) };
+    expect((await h.request("/net-install/scope/room%3Aaged/repair-verb-slots", body)).status).toBe(401);
+
+    const dry = await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", {
+      ...body, body: JSON.stringify({ dry_run: true })
+    });
+    expect(dry.status, await dry.clone().text()).toBe(200);
+    expect(await dry.json()).toMatchObject({
+      ok: true, status: "would_apply", dry_run: true, objects: ["aged_box"], remaining: 0
+    });
+
+    const repaired = await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", body);
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    expect(await repaired.json()).toMatchObject({
+      ok: true, scope: "room:aged", status: "applied", objects: ["aged_box"],
+      // Only the two pages whose ordinal actually moves are rewritten; `alpha`
+      // already sorts first and keeps slot 1.
+      changed: ["verb_bytecode:aged_box:mike", "verb_bytecode:aged_box:zulu"]
+    });
+
+    const durable = h.scopeStates.get("room:aged")!.storage.sql;
+    const slotOf = (key: string) => {
+      const rows = durable.exec(`SELECT body FROM net_scope_cell WHERE key = '${key}'`).toArray();
+      return (JSON.parse(String(rows[0]!.body)) as { value: { slot?: number } }).value.slot;
+    };
+    // The order (slot, then name) the unrepaired object already resolved in —
+    // alpha, mike, zulu — made explicit. No name resolves differently.
+    expect([slotOf("verb_bytecode:aged_box:alpha"), slotOf("verb_bytecode:aged_box:mike"), slotOf("verb_bytecode:aged_box:zulu")])
+      .toEqual([1, 2, 3]);
+    // The healthy gap is untouched.
+    expect(slotOf("verb_bytecode:gapped_box:three")).toBe(3);
+
+    // Idempotent: a second run finds a distinct ascending set and does nothing.
+    expect(await (await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", body)).json())
+      .toMatchObject({ ok: true, status: "empty", changed: [], objects: [] });
+
+    // Bounds and ownership.
+    const reject = async (payload: unknown) =>
+      expect((await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", {
+        ...body, body: JSON.stringify(payload)
+      })).status).toBe(400);
+    await reject({ objects: [] });
+    await reject({ objects: Array.from({ length: 33 }, () => "aged_box") });
+    // An object this scope does not own is reported, never repaired here.
+    expect(await (await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", {
+      ...body, body: JSON.stringify({ objects: ["elsewhere_box"] })
+    })).json()).toMatchObject({ ok: true, status: "empty", skipped: ["elsewhere_box"] });
     h.close();
   });
 

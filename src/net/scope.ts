@@ -595,6 +595,17 @@ export class ScopeSequencer {
     return this.orderedOperatorRepair("operator_seed_property_repair", cells, []);
   }
 
+  /** Signed operator repair for aged verb-slot data (CO4.7). The Worker shell
+   * derives each replacement page from this scope's OWN verb cells — assigning
+   * the ordinals implied by the resolution order every node already computes
+   * (src/net/verb-slots.ts) — so nothing an operator sends chooses a slot.
+   * Same ordered-event contract as the rest of the family. */
+  operatorRepairVerbSlots(
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>
+  ): OperatorDefinitionRepair {
+    return this.orderedOperatorRepair("operator_verb_slot_repair", cells, []);
+  }
+
   /** Shared ordered-commit body for the signed operator repair family:
    * idempotency marker from the change set, one head advance, authoritative
    * stamps, one tail entry, one durable transaction. Unchanged replay returns
