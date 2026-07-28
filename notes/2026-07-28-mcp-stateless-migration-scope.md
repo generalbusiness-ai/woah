@@ -244,10 +244,20 @@ protocol faults to correct HTTP status and error codes, and validates tool
 arguments against the advertised schema before dispatch. Dual-era conformance
 (§8 step 4) is then a property of that layer rather than of two parsers.
 
-Argument validation deserves its own note: it is the one item on that list that
-is not merely conformance. An unvalidated argument reaches verb dispatch, so
-the schema we advertise to models is currently decorative. That should land with
-the codec layer, not before it.
+Argument validation deserves its own note, and a second reviewer independently
+reached the same conclusion: it is the one item on that list that is **not
+merely conformance**. An unvalidated argument reaches verb dispatch, so the
+`inputSchema` we advertise to models is decorative. That is a *current
+correctness exposure*, not future conformance work, and the honest consequence
+is that it should not wait for the codec if the codec slips. Tracked
+separately from this note's deferral.
+
+**Do not describe MCP mutation retries — or this migration — as exactly-once
+safe until the routing-pin invariant is resolved.** A 2026-07-28 review
+disproved the pin ⊇ receipt claim with two persistence probes (a shard-wide
+ceiling that deletes by global rowid ignoring scope, and same-scope abandoned
+submissions evicting a live-receipt pin). The guarantee is real only within a
+window whose boundary the two stores do not currently share.
 
 ## 6. Tool-list policy [revised]
 
