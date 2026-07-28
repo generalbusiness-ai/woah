@@ -1877,6 +1877,79 @@ describe("woo core", () => {
     ]);
   });
 
+  // Slots are a DURABLE per-object ordinal, not an array index
+  // (spec/semantics/objects.md §9.1). The distinction was invisible on a full
+  // world and catastrophic on a sliced one: hydrating from array position made
+  // every verb a Net turn touched claim slot 1, which is the object's whole
+  // dispatch order (notes/2026-07-27-net-verb-slots.md).
+  it("keeps verb slots stable across removal, and addresses them by value", async () => {
+    const world = createWorld({ catalogs: false });
+    world.createObject({ id: "slot_probe", name: "Slot Probe", parent: "$root", owner: "$wiz" });
+    for (const name of ["alpha", "bravo", "charlie"]) {
+      world.addVerbForActor("$wiz", "slot_probe", { name, owner: "$wiz", perms: "rxd" });
+    }
+    expect(world.object("slot_probe").verbs.map((verb) => [verb.name, verb.slot])).toEqual([
+      ["alpha", 1], ["bravo", 2], ["charlie", 3]
+    ]);
+
+    // Deleting the MIDDLE verb leaves a gap. Renumbering would silently change
+    // charlie's ordinal — a value agents read back and pass as a descriptor,
+    // and one that other nodes hold in their own copy of the page.
+    world.deleteVerbForActor("$wiz", "slot_probe", "bravo");
+    expect(world.object("slot_probe").verbs.map((verb) => [verb.name, verb.slot])).toEqual([
+      ["alpha", 1], ["charlie", 3]
+    ]);
+
+    // A numeric descriptor names the slot, not the position: charlie is at
+    // ARRAY index 1 and SLOT 3, and 3 is the number the object reports.
+    expect(world.verbInfoForActor("$wiz", "slot_probe", 3).name).toBe("charlie");
+    expect(() => world.verbInfoForActor("$wiz", "slot_probe", 2)).toThrow(/slot out of range/);
+
+    // The next append allocates ABOVE the highest live slot; it does not
+    // refill the gap, so no ordinal is ever reused.
+    world.addVerbForActor("$wiz", "slot_probe", { name: "delta", owner: "$wiz", perms: "rxd" });
+    expect(world.ownVerbExact("slot_probe", "delta")?.slot).toBe(4);
+
+    // A metadata edit keeps the page where it is.
+    world.setVerbInfoForActor("$wiz", "slot_probe", "charlie", { aliases: ["ch*"] });
+    expect(world.ownVerbExact("slot_probe", "charlie")?.slot).toBe(3);
+
+    const reloaded = createWorldFromSerialized(world.exportWorld(), { persist: false });
+    expect(reloaded.object("slot_probe").verbs.map((verb) => [verb.name, verb.slot])).toEqual([
+      ["alpha", 1], ["charlie", 3], ["delta", 4]
+    ]);
+  });
+
+  // The hydration rule, isolated: a world image carrying only SOME of an
+  // object's verbs (which is every Net planning slice) must not renumber the
+  // pages it holds. Legacy pages with no stored slot still number by position,
+  // so a pre-slot persisted world hydrates exactly as it used to.
+  it("preserves stored verb slots when hydrating a partial verb list", async () => {
+    const world = createWorld({ catalogs: false });
+    world.createObject({ id: "partial_probe", name: "Partial Probe", parent: "$root", owner: "$wiz" });
+    for (const name of ["alpha", "bravo", "charlie"]) {
+      world.addVerbForActor("$wiz", "partial_probe", { name, owner: "$wiz", perms: "rxd" });
+    }
+    const serialized = world.exportWorld();
+    const probe = serialized.objects.find((obj) => obj.id === "partial_probe");
+    expect(probe).toBeTruthy();
+    // Keep only the LAST page, as a slice grown by a single verb-name miss does.
+    probe!.verbs = probe!.verbs.filter((verb) => verb.name === "charlie");
+
+    const sliced = createWorldFromSerialized(serialized, { persist: false });
+    expect(sliced.ownVerbExact("partial_probe", "charlie")?.slot, "a one-page slice renumbered the page it holds").toBe(3);
+    expect(sliced.verbInfoForActor("$wiz", "partial_probe", 3).name).toBe("charlie");
+
+    // A slotless (pre-slot-persistence) page still numbers by position.
+    const legacy = world.exportWorld();
+    const legacyProbe = legacy.objects.find((obj) => obj.id === "partial_probe");
+    for (const verb of legacyProbe!.verbs) delete (verb as { slot?: number }).slot;
+    const hydrated = createWorldFromSerialized(legacy, { persist: false });
+    expect(hydrated.object("partial_probe").verbs.map((verb) => [verb.name, verb.slot])).toEqual([
+      ["alpha", 1], ["bravo", 2], ["charlie", 3]
+    ]);
+  });
+
   it("sequences calls and emits observations", async () => {
     const { world, session, actor } = authedWorld();
     const first = await callInDubspace(world, session.id, "1", message(actor, "the_dubspace", "set_control", ["delay_1", "feedback", 0.77]));

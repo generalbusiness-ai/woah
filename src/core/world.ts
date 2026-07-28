@@ -2369,23 +2369,52 @@ export class WooWorld {
     return value;
   }
 
+  /**
+   * Write one verb page on `objRef`, choosing its SLOT (spec/semantics/core.md
+   * §C7.4). A slot is a durable per-object ordinal, never an array index:
+   *
+   *  - `options.slot` — bind that exact slot value. Replaces whatever page
+   *    currently holds it, or introduces the slot if it is vacant. (Used by
+   *    set_verb_info / set_verb_code / install-over-existing, which must
+   *    NEVER move a verb.)
+   *  - `options.append` — allocate `max(existing slots) + 1`.
+   *  - neither — bind the same-named own page's existing slot; append when
+   *    there is no such page.
+   *
+   * Slots are allocated monotonically and are NOT re-densified: removeVerb
+   * leaves a gap, and every other page keeps the slot it was given. That is
+   * what makes a slot meaningful on a node that holds only part of the
+   * object — under Net planning `obj.verbs` is the turn's SLICE, so any rule
+   * derived from array position (the pre-2026-07-27 behavior) silently
+   * renumbered live verbs down to 1. See notes/2026-07-27-net-verb-slots.md.
+   */
   addVerb(objRef: ObjRef, verb: VerbDef, options: { append?: boolean; slot?: number } = {}): VerbDef {
     const obj = this.object(objRef);
     const parsedPerms = normalizeVerbPerms(verb.perms, verb.direct_callable === true);
-    const index =
+    const existingIndex = this.findOwnVerbIndex(obj, verb.name);
+    const slot =
       options.slot !== undefined
-        ? options.slot - 1
+        ? options.slot
+        : options.append === true
+          ? this.nextVerbSlot(obj)
+          : existingIndex >= 0
+            ? obj.verbs[existingIndex].slot ?? this.nextVerbSlot(obj)
+            : this.nextVerbSlot(obj);
+    const normalized = { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable, slot } as VerbDef;
+    // The page being replaced is the one that holds this slot (an explicit
+    // slot rebinds that position) or, by default, the same-named own page.
+    // `append` never replaces: it is how the substrate installs an additional
+    // page, including a second page under a name that already exists (which
+    // LambdaMOO permits and `addVerbForActor` separately refuses).
+    const targetIndex =
+      options.slot !== undefined
+        ? obj.verbs.findIndex((entry) => entry.slot === options.slot)
         : options.append === true
           ? -1
-          : this.findOwnVerbIndex(obj, verb.name);
-    const normalized = { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable };
-    const writtenIndex = index >= 0 && index < obj.verbs.length ? index : obj.verbs.length;
-    if (index >= 0 && index < obj.verbs.length) {
-      obj.verbs[index] = this.withVerbSlot(normalized, index);
-    } else {
-      obj.verbs.push(this.withVerbSlot(normalized, obj.verbs.length));
-    }
-    this.reindexVerbs(obj);
+          : existingIndex;
+    if (targetIndex >= 0) obj.verbs[targetIndex] = normalized;
+    else obj.verbs.push(normalized);
+    this.orderVerbs(obj);
     // Verb writes are part of the host-seed body delivered to satellites; a
     // verb edit that does not bump mutationCounter would let the gateway's
     // hostSeedCache serve a stale seed to the next satellite that asks for
@@ -2395,15 +2424,21 @@ export class WooWorld {
     this.bumpMutationVersion();
     this.persistObject(objRef);
     this.persist();
-    return obj.verbs[writtenIndex];
+    return normalized;
   }
 
+  /** Removing a verb LEAVES ITS SLOT VACANT. Renumbering the survivors would
+   * change the durable ordinal of pages this write never touched — over Net
+   * those pages are not even in the turn's slice, so the renumber could not be
+   * committed anyway, and locally it would silently invalidate every slot
+   * descriptor an agent already holds. Gaps are the honest primitive; only
+   * relative ORDER is load-bearing (spec/semantics/core.md §C7.4). */
   removeVerb(objRef: ObjRef, name: string): boolean {
     const obj = this.object(objRef);
     const before = obj.verbs.length;
     obj.verbs = obj.verbs.filter((verb) => verb.name !== name);
     if (obj.verbs.length === before) return false;
-    this.reindexVerbs(obj);
+    this.orderVerbs(obj);
     this.bumpMutationVersion();
     this.persistObject(objRef);
     this.persist();
@@ -2519,12 +2554,25 @@ export class WooWorld {
     return obj.verbs.findIndex((verb) => verb.name === name);
   }
 
-  private withVerbSlot(verb: VerbDef, index: number): VerbDef {
-    return { ...verb, slot: index + 1 } as VerbDef;
+  /** The next free ordinal for an appended verb: one past the highest slot
+   * this world holds for the object. On a full world that is exact. Under Net
+   * sparse planning it is a HINT computed from the turn's slice — the owning
+   * scope re-derives the floor at commit and rejects a page that does not
+   * match (spec/protocol/coherence.md §CO4 verb-slot allocation), so an
+   * under-estimate becomes a retryable replan, never a silent collision. */
+  private nextVerbSlot(obj: WooObject): number {
+    let high = 0;
+    for (const verb of obj.verbs) high = Math.max(high, verb.slot ?? 0);
+    return high + 1;
   }
 
-  private reindexVerbs(obj: WooObject): void {
-    obj.verbs = obj.verbs.map((verb, index) => this.withVerbSlot(verb, index));
+  /** Keep `obj.verbs` in resolution order: slot ascending, name ascending for
+   * pages that (in an unrepaired aged world) still share a slot. This is the
+   * SAME total order the net bridge and the shadow page normalizer produce, so
+   * every node that holds the same page set resolves the same verb. It does
+   * NOT renumber — see removeVerb. */
+  private orderVerbs(obj: WooObject): void {
+    obj.verbs.sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0) || a.name.localeCompare(b.name));
     obj.modified = Date.now();
   }
 
@@ -2835,16 +2883,23 @@ export class WooWorld {
     return this.objects.has(objRef);
   }
 
-  // Resolve a verb by name (with optional `*`/`@` aliases) or 1-based slot
-  // index, restricted to verbs defined directly on `objRef`. Raises
-  // E_VERBNF when not found. LambdaMOO `verb_info(obj, desc)`.
+  // Resolve a verb by name (with optional `*`/`@` aliases) or by SLOT VALUE,
+  // restricted to verbs defined directly on `objRef`. Raises E_VERBNF when not
+  // found. LambdaMOO `verb_info(obj, desc)`.
+  //
+  // A numeric descriptor names the slot the object REPORTS (verb_info.slot,
+  // list_verb.slot), not a position in the array: slots are monotonic with
+  // gaps after removeVerb, so index-addressing would silently answer with a
+  // neighbour once anything had been deleted (spec/semantics/core.md §C7.4).
   ownVerbResolve(objRef: ObjRef, descriptor: WooValue): VerbDef {
     const obj = this.object(objRef);
     if (typeof descriptor === "number") {
-      if (!Number.isInteger(descriptor) || descriptor < 1 || descriptor > obj.verbs.length) {
+      if (!Number.isInteger(descriptor) || descriptor < 1) {
         throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
       }
-      return obj.verbs[descriptor - 1];
+      const bySlot = obj.verbs.find((verb) => verb.slot === descriptor);
+      if (!bySlot) throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
+      return bySlot;
     }
     if (typeof descriptor !== "string") {
       throw wooError("E_TYPE", "verb descriptor must be a name string or 1-based slot integer", descriptor);
@@ -7252,7 +7307,8 @@ export class WooWorld {
   private resolveVerbSlotWithWalk(actor: ObjRef, objRef: ObjRef, slot: number, walk: Record<string, WooValue>[]): ResolvedVerb {
     if (!Number.isInteger(slot) || slot < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", slot);
     const obj = this.object(objRef);
-    const verb = obj.verbs[slot - 1];
+    // By slot VALUE, not array index — see ownVerbResolve.
+    const verb = obj.verbs.find((entry) => entry.slot === slot);
     walk.push({ id: objRef, kind: "slot", slot, matched: verb !== undefined });
     if (!verb) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${slot}`, { obj: objRef, slot, actor });
     return { definer: objRef, verb };
@@ -7266,7 +7322,8 @@ export class WooWorld {
     const obj = this.object(objRef);
     if (typeof descriptor === "number") {
       if (!Number.isInteger(descriptor) || descriptor < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", descriptor);
-      const current = obj.verbs[descriptor - 1] ?? null;
+      // By slot VALUE, not array index — see ownVerbResolve.
+      const current = obj.verbs.find((verb) => verb.slot === descriptor) ?? null;
       if (!current) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${descriptor}`, { obj: objRef, slot: descriptor });
       if (options.mode === "define") throw wooError("E_INVARG", "define mode requires a name descriptor, not an existing slot", descriptor);
       return { current, slot: descriptor, name: current.name, append: false };
@@ -7282,7 +7339,10 @@ export class WooWorld {
     if (options.mode === "set_code" && !current) throw wooError("E_VERBNF", `verb not found for set_code: ${objRef}:${descriptorName}`, { obj: objRef, name: descriptorName });
     return {
       current,
-      slot: current ? (current.slot ?? existingIndex + 1) : obj.verbs.length + 1,
+      // An update keeps the page's own slot; a new verb reports the ordinal the
+      // append will allocate. `obj.verbs.length + 1` was the same array-index
+      // guess addVerb made, and under Net planning both were 1 for every verb.
+      slot: current ? (current.slot ?? this.nextVerbSlot(obj)) : this.nextVerbSlot(obj),
       name,
       append: options.append || !current
     };
@@ -8665,7 +8725,7 @@ export class WooWorld {
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
           properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
           propertyVersions: new Map(item.propertyVersions),
-          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          verbs: importedVerbs(item.verbs),
           children: new Set(item.children),
           contents: new Set(item.contents),
           eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -8719,7 +8779,7 @@ export class WooWorld {
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
           properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
           propertyVersions: new Map(item.propertyVersions),
-          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          verbs: importedVerbs(item.verbs),
           children: new Set(item.children),
           contents: new Set(item.contents),
           eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -9339,7 +9399,7 @@ export class WooWorld {
       propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
       properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
       propertyVersions: new Map(item.propertyVersions),
-      verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+      verbs: importedVerbs(item.verbs),
       children: new Set(item.children),
       contents: new Set(item.contents),
       eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -13656,6 +13716,30 @@ function appendQuery(base: string, params: Record<string, string>): string {
 const STORAGE_FLUSH_TOP_N = 5;
 
 type BytecodeVerbDef = Extract<VerbDef, { kind: "bytecode" }>;
+
+/**
+ * Hydrate one object's verb list, PRESERVING each page's stored slot.
+ *
+ * This used to stamp `index + 1`, which made `slot` a property of the array
+ * a node happened to be holding rather than of the verb. Under Net sparse
+ * planning the array is the turn's slice, so a verb whose real slot was 3
+ * hydrated as slot 1 and — because every authoring write re-serializes the
+ * page it touched — that lie was committed back as authority. See
+ * notes/2026-07-27-net-verb-slots.md.
+ *
+ * A page with no stored slot is legacy (pre-slot persistence, or a
+ * hand-written fixture); those are numbered by position, which reproduces the
+ * old behavior exactly for worlds that never recorded slots. Ties are broken
+ * by name, matching the net bridge and the shadow page normalizer, so the
+ * hydrated array is already in resolution order.
+ */
+function importedVerbs(verbs: readonly VerbDef[]): VerbDef[] {
+  let fallback = 0;
+  for (const verb of verbs) fallback = Math.max(fallback, verb.slot ?? 0);
+  return verbs
+    .map((verb) => cloneImportedVerb(verb, verb.slot ?? ++fallback))
+    .sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0) || a.name.localeCompare(b.name));
+}
 
 function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
   // importWorld may hydrate directly from cached boot snapshots. Copy every
