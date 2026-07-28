@@ -9,8 +9,16 @@ export type NativePrimitiveContract = {
   reads: string[];
   writes: string[];
   emits: string[];
+  /** Required for every contract whose writes list is non-empty. */
+  failure?: NativePrimitiveFailureContract;
   open_seed?: NativePrimitiveOpenSeedContract;
   note: string;
+};
+
+export type NativePrimitiveFailureContract = {
+  mutation_scope: "single_authority" | "cross_authority_saga" | "live_only";
+  on_error: "rollback" | "idempotent_progress" | "best_effort";
+  post_commit?: string[];
 };
 
 export type NativePrimitiveOpenSeedVerbLookup = {
@@ -25,6 +33,11 @@ export type NativePrimitiveOpenSeedContract = {
   object_verb_lookup_names?: string[];
   catalog_property_names?: string[];
   dispatch_verb_names?: string[];
+};
+
+const SINGLE_AUTHORITY_ROLLBACK: NativePrimitiveFailureContract = {
+  mutation_scope: "single_authority",
+  on_error: "rollback"
 };
 
 const CONTRACTS: Record<string, NativePrimitiveContract> = {
@@ -51,6 +64,10 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "session_scope",
       "cell_write"
     ],
+    failure: {
+      ...SINGLE_AUTHORITY_ROLLBACK,
+      post_commit: ["remote presence-mirror notification"]
+    },
     open_seed: {
       dispatch_verb_names: ["moveto"],
       verb_lookups: [
@@ -95,6 +112,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "guest.features_version"
     ],
     emits: ["object_move", "cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Guest reset is transcript-safe because inventory ejection and actor placement use recorded movement, while every durable reset field uses recorded property writes. The optional destination is a trusted cleanup override; omitted calls retain home/$nowhere behavior. returnGuest only updates the classic runtime's in-memory allocator and is a no-op while a live exclusive session owns the actor."
   },
   thing_moveto: {
@@ -117,6 +135,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "object_move",
       "cell_write"
     ],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       dispatch_verb_names: ["moveto"],
       verb_lookups: [
@@ -223,6 +242,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "actor wizard authority"],
     writes: ["target actor api_keys"],
     emits: [],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Wizard-authority minting: the target actor cluster owns the verifier record; the accepted authenticated transcript is the issuance audit. Cleartext is returned once and never stored."
   },
   create_api_key_for_owner: {
@@ -234,6 +254,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target actor api_keys", "target actor existence", "target actor ancestry", "target actor authority anchor", "target actor ownership", "actor wizard authority"],
     writes: ["target actor api_keys"],
     emits: [],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Owner-mint path used by block mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
   },
   list_api_keys: {
@@ -267,7 +288,11 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["routed actor api_keys or legacy $system.api_keys", "actor ownership", "local sessions"],
     writes: ["routed actor api_keys.revoked_at or legacy $system.api_keys.revoked_at", "local sessions"],
     emits: [],
-    note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
+    failure: {
+      ...SINGLE_AUTHORITY_ROLLBACK,
+      post_commit: ["session-ended transport notification"]
+    },
+    note: "Revocation records the credential and local-session mutations in the transcript. The session-ended transport notification is host-only post-commit work: its rejection is measured and cannot rewrite the accepted result."
   },
   human_promote_agent_to_programmer: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -291,6 +316,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.programmer_agent_count"
     ],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       object_property_names: [
         "account",
@@ -323,6 +349,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.programmer_agent_count"
     ],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       object_property_names: [
         "account",
@@ -343,6 +370,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["actor wizard authority", "account.<kind> prior value"],
     writes: ["account.agent_quota or account.programmer_grant_quota"],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       object_property_names: ["agent_quota", "programmer_grant_quota"]
     },
@@ -381,6 +409,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "agent.features_version"
     ],
     emits: ["object_create", "cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       object_property_names: [
         "account",
@@ -426,6 +455,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.agent_count"
     ],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     open_seed: {
       object_property_names: [
         "account",
@@ -440,7 +470,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       ],
       catalog_property_names: ["programmer_surface"]
     },
-    note: "Human self-service revoke: strips programmer state through the shared transition, marks the actor-owned api-key record revoked, sets deactivated_at and retired_at, and decrements the account agent count EXACTLY ONCE. `retired_at` — not `deactivated_at` — is the slot-returned marker: deactivation is a reversible auth fact that never touches the counter, so reading it as an accounting fact leaks the slot in one order and double-returns it in the other (provisioning.md AP11.7). The retirement work itself is idempotent and re-runs on a repeat call, repairing an actor another path left half-retired — every effect a recorded lineage/property write co-resident in the human authority cluster. Session teardown is a live-runtime action, not a durable effect, so it runs only after an accepted commit (same posture as revoke_api_key). The audit is the commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1). Legacy catalog-owned api-key ids remain outside this contract: revoking one still writes $system and is refused on Net."
+    note: "Human self-service revoke: strips programmer state through the shared transition, marks the actor-owned api-key record revoked, sets deactivated_at and retired_at, and decrements the account agent count EXACTLY ONCE. `retired_at` — not `deactivated_at` — is the slot-returned marker: deactivation is a reversible auth fact that never touches the counter, so reading it as an accounting fact leaks the slot in one order and double-returns it in the other (provisioning.md AP11.7). The retirement work itself is idempotent and re-runs on a repeat call, repairing an actor another path left half-retired — every effect, including local session invalidation, belongs to the same rollback-scoped human authority transaction. External transports discover the invalidated session on their next operation; this primitive has no failure-propagating notification callback. The audit is the commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1). Legacy catalog-owned api-key ids remain outside this contract: revoking one still writes $system and is refused on Net."
   },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",
@@ -451,6 +481,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object existence", "actor wizard authority"],
     writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "world event schemas", "feature attachments"],
     emits: ["catalog_install"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Catalog install runs as a sequenced $catalog_registry call. All authoritative mutations (class creation, seed_hook instance creation, feature attachment) flow through the recorded transcript; recovery from a partial install is operator-driven (CT14.3)."
   },
   catalog_registry_update: {
@@ -462,6 +493,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object state", "actor wizard authority"],
     writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "migration_state"],
     emits: ["catalog_update", "migration_failed"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Catalog update reuses the install pipeline plus any optional migration steps; same transcript-completeness contract."
   },
   help_db_find_topics: {
@@ -506,6 +538,10 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target player name", "target player location", "actor location"],
     writes: ["actor location", "room contents", "presence mirrors through movement hooks"],
     emits: ["text observations", "left observation", "entered observation", "object_move", "cell_write", "logical_input"],
+    failure: {
+      ...SINGLE_AUTHORITY_ROLLBACK,
+      post_commit: ["remote presence-mirror notification"]
+    },
     note: "Join is transcript-safe through movetoChecked plus logical timestamps for emitted movement observations."
   },
   actor_focus: {
@@ -517,6 +553,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["target existence", "target actor ancestry", "target name visibility", "actor focus_list"],
     writes: ["actor focus_list"],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Focus is transcript-safe because it only appends a validated object ref to the bounded actor-owned focus_list property."
   },
   actor_unfocus: {
@@ -528,6 +565,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["actor focus_list"],
     writes: ["actor focus_list"],
     emits: ["cell_write"],
+    failure: SINGLE_AUTHORITY_ROLLBACK,
     note: "Unfocus is transcript-safe because it only removes an object ref from the actor-owned focus_list property."
   },
   actor_focus_list: {
@@ -566,6 +604,45 @@ export function nativePrimitiveIsTranscriptTracked(handler: string | undefined):
 export function nativePrimitiveContractValue(handler: string | undefined): WooValue {
   const contract = nativePrimitiveContract(handler);
   return contract ? structuredClone(contract) as unknown as WooValue : null;
+}
+
+/**
+ * Mechanical failure-discipline guard for the tracked-native registry.
+ *
+ * The writes list is the registry's claim that a primitive mutates
+ * authoritative state. Adding such a contract without choosing its failure
+ * boundary must fail tests rather than silently inheriting an ambiguous
+ * partial-commit policy.
+ */
+export function nativePrimitiveContractDisciplineErrors(): string[] {
+  const errors: string[] = [];
+  for (const [name, contract] of Object.entries(CONTRACTS)) {
+    if (contract.handler !== name) errors.push(`${name}: handler field is ${contract.handler}`);
+    if (contract.writes.length > 0 && !contract.failure) {
+      errors.push(`${name}: mutating contract has no failure discipline`);
+      continue;
+    }
+    const failure = contract.failure;
+    if (!failure) continue;
+    if (failure.mutation_scope === "single_authority" && failure.on_error !== "rollback") {
+      errors.push(`${name}: single-authority mutation must roll back on error`);
+    }
+    if (failure.mutation_scope === "cross_authority_saga" && failure.on_error !== "idempotent_progress") {
+      errors.push(`${name}: cross-authority saga must retain only idempotent progress`);
+    }
+    if (failure.mutation_scope === "live_only") {
+      if (contract.writes.length > 0) errors.push(`${name}: live-only primitive declares authoritative writes`);
+      if (failure.on_error !== "best_effort") errors.push(`${name}: live-only primitive must be best-effort`);
+    }
+    const postCommit = failure.post_commit ?? [];
+    if (postCommit.some((item) => item.trim().length === 0)) {
+      errors.push(`${name}: post-commit effect names must be non-empty`);
+    }
+    if (new Set(postCommit).size !== postCommit.length) {
+      errors.push(`${name}: post-commit effect names must be unique`);
+    }
+  }
+  return errors;
 }
 
 export function nativePrimitiveOpenSeedVerbLookups(): NativePrimitiveOpenSeedVerbLookup[] {

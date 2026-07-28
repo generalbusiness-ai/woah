@@ -584,6 +584,16 @@ bytecode-to-bytecode calls so write-frame validation can prove which verb frame
 performed each mutation. Production transcripts fold that data into both the
 read set and the `vm` block.
 
+A tracked native contract with a non-empty `writes` list MUST declare its
+failure discipline. A `single_authority` primitive uses `rollback`. A
+`cross_authority_saga` primitive uses `idempotent_progress` and names its
+durable protocol; declaring this category does not create a saga runner.
+`live_only` work uses `best_effort` and cannot declare authoritative writes.
+Failure-prone transport callbacks are listed as `post_commit` work: they run
+after acceptance, are absent from domain effects, and cannot change the turn
+outcome. The contract registry is guarded so adding a mutating tracked native
+without this declaration fails validation.
+
 Transcript values MAY be omitted when the receiver already has the matching
 content-addressed state page. Validation still needs either the value or a
 trusted way to retrieve it by `value_hash`.
@@ -2621,10 +2631,11 @@ is validated against transcript create/write facts rather than the pre-turn
 world. Deterministic native helpers are admitted only when a
 `woo.native_primitive_contract.v1` contract declares the handler
 transcript-tracked and deterministic, including the state families it reads,
-writes, and emits. Native dispatches without such a contract make the
-transcript incomplete. Runtime cross-host bridge boundaries are also explicitly
-incomplete in the v2 protocol; mergeable remote sub-transcripts are deferred
-until the execution plane exists.
+writes, and emits and, for a mutating handler, its failure discipline. Native
+dispatches without such a contract make the transcript incomplete. Runtime
+cross-host bridge boundaries are also explicitly incomplete in the v2
+protocol; mergeable remote sub-transcripts are deferred until the execution
+plane exists.
 
 ### Dubspace
 

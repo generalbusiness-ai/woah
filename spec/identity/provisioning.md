@@ -821,15 +821,22 @@ that is not true. A published surface is now a **precondition**, refused with
 surface actually attached. A world that predates the published reference is
 repaired by the scalar seed-property repair (§AP11.12).
 
-**Atomicity — with a correction.** All four steps commit in one turn, so a
-turn-level rejection (a scope refusal, a read-version mismatch) applies none of
-them. **A verb that THROWS part way through is different: the writes it already
-made are still committed.** Verified — refusing after the create left
-`account.agent_count` incremented. Every precondition this op can check must
-therefore be checked BEFORE the first write, not next to the step it guards.
-The published-surface precondition below is checked at the top for exactly this
-reason. Preconditions that are only knowable mid-sequence must be expressed as
-idempotent, re-runnable state rather than as a mid-flight throw.
+**Atomicity.** All four steps are one single-authority behavior transaction.
+A turn-level rejection (a scope refusal or read-version mismatch) applies none
+of them. A throw after behavior begins likewise rolls back its lineage,
+property, creation, credential, counter, audit, and observation effects. On the
+sequenced route the assigned sequence and one canonical `$error` outcome still
+commit; they are envelope facts, not effects of the failed behavior.
+
+The production observation that a refusal after create left
+`account.agent_count` incremented exposed a runtime rollback defect; it was
+never a separate AP11 partial-commit rule. AP11 still checks every knowable
+precondition before its first write. That makes refusals precise, avoids
+allocating identities for invalid requests, and keeps each apply phase free of
+ordinary validation errors. Its idempotent ledger remains required for crash
+recovery and retries. A future operation that truly crosses authorities must
+either refuse before mutation, as AP11's colocation checks do, or define a
+named durable saga; it cannot claim this transaction's rollback boundary.
 
 **Audit.** As in AP6, the audit is profile-materialized. On Net the accepted
 commit record IS the audit; the `$system.wizard_actions` catalog write is
