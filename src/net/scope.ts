@@ -293,6 +293,13 @@ export type CommitReply =
        * it is stripped from the replayed copy, since a hash of another
        * client's request is not this caller's business. */
       replay_request?: string;
+      /** H2a retention class: this recorded reply is a RECEIPT — an accepted
+       * turn that advanced nothing (`recordDirectReceipt`). Receipts share
+       * whatever head was current when they were taken, so the seq-ordered
+       * recovery-tail rule cannot age them out; they are bounded by their own
+       * insertion-ordered quota instead (see pruneReplies). Stored only, never
+       * returned: it is retention bookkeeping, not a client fact. */
+      replay_receipt?: true;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -301,6 +308,13 @@ export type CommitReply =
       reason: RejectReason;
       retryable: boolean;
       head: ScopeHead;
+      /** CO2.5: the request fingerprint this recorded REJECTION answers.
+       * Terminal rejections are recorded under the key exactly like accepts,
+       * so they need the same "one key answers one request" proof — without
+       * it, reusing a key with a different payload silently returns the first
+       * request's refusal instead of `idempotency_conflict`. Stored only;
+       * stripped from the replayed copy like its accepted sibling. */
+      replay_request?: string;
       /** Structured repair input: the cells whose reads mismatched, so the
        * gateway refreshes exactly those instead of grinding the budget. */
       mismatched_reads?: TranscriptCell[];
@@ -395,12 +409,19 @@ export type ScopeSequencerOptions = {
    * frames carry the authority's acceptance time). Default Date.now; the
    * DO shell injects host.now so tests and workerd agree on the source. */
   now?: () => number;
-  /** H2a: reply-cache bound — the TOTAL number of recorded replies the
-   * cache holds (default REPLY_CACHE_CAP). Within-window replies (still
-   * covered by the recovery tail) are never pruned but DO count toward
-   * this cap, so the number retained beyond the window is this cap minus
-   * the in-window count, not this cap itself. See pruneReplies. */
+  /** H2a: reply-cache bound for ADVANCING replies — accepted commits that
+   * consumed a seq. Within-window replies (still covered by the recovery
+   * tail) are never pruned but DO count toward this cap, so the number
+   * retained beyond the window is this cap minus the in-window count, not
+   * this cap itself. Default REPLY_CACHE_CAP. See pruneReplies. */
   replyLimit?: number;
+  /** H2a: reply-cache bound for NON-ADVANCING outcomes — direct receipts and
+   * terminal rejections. They are recorded at whatever head is current and
+   * never consume a seq, so the seq-ordered tail rule above can never age
+   * them out; they get their own insertion-ordered FIFO quota instead.
+   * Defaults to `min(RECEIPT_CACHE_CAP, replyLimit)` — a deployment that
+   * shrinks the reply cache shrinks its receipts with it. See pruneReplies. */
+  receiptLimit?: number;
   /** Durability (Phase 3): when provided, the sequencer hydrates from the
    * store at construction and writes through on every state change (CO5
    * copy #1). Without it, behavior is identical to the in-memory Phase-2
@@ -408,19 +429,55 @@ export type ScopeSequencerOptions = {
   durable?: ScopeStore;
 };
 
-/** H2a default: the TOTAL reply-cache cap. Sized so a busy scope's recent
- * idempotent retries always replay, while the table stops growing one row
- * per turn forever. The recovery-tail window is never pruned, so the count
- * retained BEYOND the window is this cap minus the in-window replies. */
+/** H2a default: the ADVANCING reply cap — accepted commits. Sized so a busy
+ * scope's recent idempotent retries always replay, while the table stops
+ * growing one row per turn forever. The recovery-tail window is never pruned,
+ * so the count retained BEYOND the window is this cap minus the in-window
+ * replies, and the hard bound on this class is `max(cap, tailLimit)`.
+ * Non-advancing outcomes are bounded separately (RECEIPT_CACHE_CAP). */
 export const REPLY_CACHE_CAP = 1024;
+
+/**
+ * H2a default: the NON-ADVANCING quota — direct receipts (CO2.5) plus
+ * terminal rejections.
+ *
+ * These are the rows an actor can mint cheaply and repeatedly: a receipt
+ * costs one keyed speech act, a terminal rejection costs one malformed
+ * submit, and NEITHER consumes a sequence number. The advancing cap above is
+ * self-limiting because the sequencer hands out one seq per accepted commit;
+ * this one has to be enforced by count, or authenticated storage grows one
+ * row per cheap request forever.
+ *
+ * Sized well under the advancing cap: a client's retry window for effect-free
+ * speech is measured in seconds, not in thousands of turns, and every row here
+ * can carry up to REPLAY_OUTPUT_BYTE_CAP of retained output.
+ */
+export const RECEIPT_CACHE_CAP = 256;
+
+/**
+ * H2a: which retention quota a recorded reply belongs to.
+ *
+ * Terminal rejections are self-describing. Receipts are marked at record time
+ * (`replay_receipt`) because nothing else about a receipt distinguishes it
+ * from the accept that shared its head.
+ *
+ * Aged rows written before the mark existed therefore read as ADVANCING. That
+ * is the conservative direction: they land in a cap that is already bounded
+ * (`max(replyLimit, tailLimit)`), they are the oldest rows in it, and they
+ * drain as the head moves past them. Guessing the other way would let a
+ * genuine accepted reply be evicted by receipt pressure.
+ */
+function isNonAdvancingReply(reply: CommitReply): boolean {
+  return reply.status === "rejected" || reply.replay_receipt === true;
+}
 
 /**
  * CO2.5: the serialized byte ceiling for ONE recorded reply's ReplayOutput.
  *
  * The reply cache is bounded by COUNT, so an unbounded per-entry payload
  * would be an unbounded cache. With this cap the whole cache is bounded at
- * REPLY_CACHE_CAP * REPLAY_OUTPUT_BYTE_CAP ≈ 4 MiB of retained output, on
- * top of the replies themselves. It is also well inside the CO7 warm
+ * (REPLY_CACHE_CAP + RECEIPT_CACHE_CAP) * REPLAY_OUTPUT_BYTE_CAP ≈ 5 MiB of
+ * retained output, on top of the replies themselves. It is also well inside the CO7 warm
  * envelope ceiling (64 KiB), so attaching a result never turns a committing
  * turn into an E_ENVELOPE refusal.
  */
@@ -908,7 +965,6 @@ export class ScopeSequencer {
     // unset, so replay-of-a-replay remains stable.
     const recorded = this.replies.get(submit.idempotency_key);
     if (recorded) {
-      if (recorded.status !== "accepted") return recorded;
       // An idempotency key answers ONE request. Reusing it for a different
       // call must never hand back the first call's reply — a confidently
       // wrong answer is worse than the double execution keys prevent. The
@@ -917,7 +973,12 @@ export class ScopeSequencer {
       // does not. Both sides must carry one: a submit or a recorded reply
       // from before this field existed is not evidence of agreement, and
       // guessing either way would be worse than the pre-existing behaviour.
-      const { replay_request: recordedRequest, ...replayable } = recorded;
+      //
+      // This runs BEFORE the accepted/rejected split. A terminal rejection is
+      // recorded under the key exactly like an accept, so serving one to a
+      // DIFFERENT request is the same wrong answer — and it is the cheaper
+      // one to provoke, since any client can bank a rejection under a key.
+      const { replay_request: recordedRequest, ...replayableAll } = recorded;
       if (
         recordedRequest !== undefined &&
         submit.request_fingerprint !== undefined &&
@@ -933,6 +994,12 @@ export class ScopeSequencer {
             "retry the original call unchanged, or use a new key for this one"
         });
       }
+      // A recorded rejection replays as itself. It carries no output and no
+      // actor binding, so the only thing to strip is the stored fingerprint.
+      if (replayableAll.status !== "accepted") return replayableAll;
+      // `replay_receipt` is retention bookkeeping (which quota this row sits
+      // in), not something the caller is owed — strip it with the fingerprint.
+      const { replay_receipt: _class, ...replayable } = replayableAll;
       // The retained outcome is bound to the actor that committed it. A
       // mismatch still replays the VERDICT (this submit committed nothing —
       // that is the whole safety property) but never the other actor's
@@ -1548,10 +1615,10 @@ export class ScopeSequencer {
       replay_output: this.recordedOutput(submit),
       ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {})
     };
-    this.replies.set(submit.idempotency_key, recordedReply);
-    // H2a: bound the reply cache on each accepted commit (memory and the
-    // durable rows prune in lockstep inside the transaction below).
-    const prunedReplies = this.pruneReplies();
+    // H2a: bound the reply cache on each accepted commit. `transact:false`
+    // because this path has more durable work to keep atomic with the reply
+    // (cells, head, tail, log) — the pruned keys join that transaction below.
+    const prunedReplies = this.recordReply(submit.idempotency_key, recordedReply, false);
 
     // Write-through (CO5 copy #1): one atomic transaction covering cells,
     // head, reply, and tail — a crash between the reply and the fanout
@@ -2690,20 +2757,36 @@ export class ScopeSequencer {
   }
 
   /**
-   * H2a: bound the reply cache. Every recorded reply carries the head it
-   * was recorded AT (`reply.head.seq` — accepted replies advance to it,
-   * terminal rejections record the head they rejected against), so age
-   * is derivable from content with no schema change. Two retention
-   * guarantees, both honored:
+   * H2a: bound the reply cache. TWO quotas, because the cache holds two
+   * kinds of row whose growth is limited by different things.
    *
-   * - **never prune within the tail window** — a reply whose seq is
-   *   still covered by the retained recovery tail (seq > head - tail
-   *   limit) is never a candidate, so recovery-tail replay always finds
-   *   its replies;
-   * - **a bounded TOTAL cache** — outside the window, the OLDEST replies
-   *   prune until the whole cache is back within `replyLimit` (default
-   *   REPLY_CACHE_CAP); in-window replies are never candidates but do
-   *   count toward the cap.
+   * **Advancing replies** — accepted commits. Each consumed a sequence
+   * number, so their count is rate-limited by the sequencer itself, and their
+   * age is derivable from `reply.head.seq` with no schema change:
+   *
+   * - *never prune within the tail window* — a reply whose seq is still
+   *   covered by the retained recovery tail (seq > head - tailLimit) is never
+   *   a candidate, so recovery-tail replay always finds its replies;
+   * - outside the window the OLDEST prune until the advancing set is back
+   *   within `replyLimit` (default REPLY_CACHE_CAP); in-window replies are
+   *   never candidates but do count toward the cap.
+   *
+   * The window carve-out is safe HERE because at most `tailLimit` distinct
+   * seqs can be in the window, so the advancing set is hard-bounded by
+   * `max(replyLimit, tailLimit)`.
+   *
+   * **Non-advancing outcomes** — direct receipts (CO2.5) and terminal
+   * rejections. These advance nothing, so they are recorded at whatever head
+   * is current and the rule above can NEVER reach them: the cutoff trails the
+   * head by tailLimit, and a row sitting AT the head is always inside the
+   * window. Before this split that made them unbounded — a reviewer's probe
+   * put 10 same-head receipts into a scope configured to hold 3 replies and
+   * got all 10 back, i.e. any actor could mint storage forever out of cheap
+   * repeated keyed speech. They get a flat insertion-ordered FIFO quota
+   * (`receiptLimit`, default `min(RECEIPT_CACHE_CAP, replyLimit)`) instead.
+   *
+   * Resulting per-scope bound: `max(replyLimit, tailLimit) + receiptLimit`
+   * rows — with the shipped defaults, `max(1024, 256) + 256 = 1280`.
    *
    * Consequence, documented: a replay arriving AFTER its reply pruned
    * (a client retrying a turn from thousands of commits ago) re-enters
@@ -2712,7 +2795,9 @@ export class ScopeSequencer {
    * re-plan) rejects it; the one thing it can never do is silently
    * re-commit, because committing requires the current head and fresh
    * read versions, at which point it IS a new turn by any observable
-   * measure.
+   * measure. A pruned RECEIPT is the same bargain at the receipt quota's
+   * depth, and the gateway's selection pin is sized to outlive it
+   * (gateway-do.ts pinScope) so the retry cannot land at a second scope.
    *
    * Returns the pruned keys so the caller deletes the durable rows in
    * the same transaction (memory-follows-durable in lockstep).
@@ -2746,16 +2831,42 @@ export class ScopeSequencer {
     const recorded: CommitReply = {
       ...reply,
       replay_output: this.recordedOutput(submit),
-      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {})
+      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {}),
+      // H2a: mark the retention class at the point of record. A receipt takes
+      // the CURRENT head, so nothing about its stored shape distinguishes it
+      // from an accept later on — and an unclassified receipt is exactly the
+      // row the seq-ordered rule can never reach.
+      replay_receipt: true
     };
-    this.replies.set(submit.idempotency_key, recorded);
+    this.recordReply(submit.idempotency_key, recorded);
+  }
+
+  /**
+   * H2a: insert a recorded reply and enforce the retention bounds in the same
+   * step — memory and durable rows in lockstep, one transaction.
+   *
+   * Insertion and prune must not be separable. A cache that inserts now and
+   * prunes "soon" is an unbounded cache for as long as the lag lasts, and the
+   * lag is exactly what an attacker controls: the cheapest rows to mint are
+   * the ones a deferred prune has not looked at yet.
+   *
+   * Callers that have OTHER durable work to make atomic with the reply (the
+   * accept path: cells, head, tail, log) pass `transact:false` and fold the
+   * returned pruned keys into their own transaction instead.
+   */
+  private recordReply(key: string, reply: CommitReply, transact = true): string[] {
+    this.replies.set(key, reply);
     const pruned = this.pruneReplies();
     const durable = this.options.durable;
-    if (!durable) return;
+    if (!durable || !transact) return pruned;
     durable.transaction(() => {
-      durable.writeReply(submit.idempotency_key, recorded);
-      for (const key of pruned) durable.deleteReply(key);
+      durable.writeReply(key, reply);
+      // A quota of zero can prune the row just written. Writing then deleting
+      // it inside one transaction leaves durable and memory agreeing (both
+      // absent), which is the only property that matters here.
+      for (const pruneKey of pruned) durable.deleteReply(pruneKey);
     });
+    return pruned;
   }
 
   private recordedOutput(submit: CommitSubmit): ReplayOutput {
@@ -2791,17 +2902,75 @@ export class ScopeSequencer {
 
   private pruneReplies(): string[] {
     const limit = this.options.replyLimit ?? REPLY_CACHE_CAP;
-    if (this.replies.size <= limit) return [];
-    const cutoff = this.headState.seq - this.options.tailLimit;
-    const candidates = [...this.replies.entries()]
-      .map(([key, reply]) => ({ key, seq: reply.head.seq }))
-      .filter((entry) => entry.seq <= cutoff)
-      .sort((a, b) => a.seq - b.seq);
+    const receiptLimit = this.options.receiptLimit ?? Math.min(RECEIPT_CACHE_CAP, limit);
     const pruned: string[] = [];
-    for (const entry of candidates) {
-      if (this.replies.size <= limit) break;
-      this.replies.delete(entry.key);
-      pruned.push(entry.key);
+
+    // Two quotas, because the two kinds of row are bounded by different
+    // things. Map iteration is insertion order, which for advancing replies is
+    // also seq order (one accepted commit, one seq) — so a single pass in
+    // insertion order gives "oldest first" for both classes.
+    const advancing: Array<{ key: string; seq: number }> = [];
+    const nonAdvancing: string[] = [];
+    const claimedSeq = new Set<number>();
+    for (const [key, reply] of this.replies) {
+      if (isNonAdvancingReply(reply)) {
+        nonAdvancing.push(key);
+        continue;
+      }
+      // AGED-ROW REPAIR, and the reason the marker is not load-bearing on its
+      // own. At most ONE reply per scope can be advancing at a given seq: the
+      // commit that consumed seq N is the only thing that could have produced
+      // head N. So a SECOND unmarked row carrying that seq is necessarily a
+      // receipt written before `replay_receipt` was recorded — the rows a
+      // deployed world is already holding.
+      //
+      // First-wins is the correct tiebreak, not an arbitrary one: a receipt
+      // takes the head an accept had ALREADY set, so in insertion order (which
+      // rehydration preserves — scope-do reads ORDER BY rowid) the genuine
+      // accept always precedes the receipts that share its seq. Without this,
+      // an aged pile at a QUIET scope would be permanent: unmarked receipts sit
+      // at the current head, the seq-ordered cutoff never reaches them, and no
+      // new commit ever moves it.
+      if (claimedSeq.has(reply.head.seq)) {
+        nonAdvancing.push(key);
+        continue;
+      }
+      claimedSeq.add(reply.head.seq);
+      advancing.push({ key, seq: reply.head.seq });
+    }
+
+    // Quota 1 — NON-ADVANCING (direct receipts, terminal rejections). Pure
+    // FIFO, no window immunity: these rows are recorded at whatever head is
+    // current and never consume a seq, so "still inside the recovery-tail
+    // window" is true of every one of them forever. That is precisely the
+    // hole an actor exploits by repeating cheap keyed speech.
+    let overflow = nonAdvancing.length - receiptLimit;
+    for (let i = 0; i < nonAdvancing.length && overflow > 0; i += 1, overflow -= 1) {
+      this.replies.delete(nonAdvancing[i]);
+      pruned.push(nonAdvancing[i]);
+    }
+
+    // Quota 2 — ADVANCING replies, unchanged rule. A reply whose seq is still
+    // covered by the retained recovery tail is never a candidate, so
+    // recovery-tail replay always finds its replies; outside the window the
+    // oldest prune until the advancing set is back within `limit`. This one is
+    // safe to leave soft-capped because seq is scarce: at most `tailLimit`
+    // distinct seqs can be in the window, so the retained total is bounded by
+    // `max(limit, tailLimit)` — a hard bound, not a hope.
+    if (advancing.length > limit) {
+      const cutoff = this.headState.seq - this.options.tailLimit;
+      // Ordered by seq explicitly rather than trusting insertion order: after
+      // a rehydration the map is filled from durable rows, and an aged row
+      // predating the retention class (below) can land among the advancing set
+      // out of seq order. Oldest-first must stay true of what is actually held.
+      const candidates = advancing.filter((entry) => entry.seq <= cutoff).sort((a, b) => a.seq - b.seq);
+      let remaining = advancing.length;
+      for (const entry of candidates) {
+        if (remaining <= limit) break;
+        this.replies.delete(entry.key);
+        pruned.push(entry.key);
+        remaining -= 1;
+      }
     }
     return pruned;
   }
@@ -2862,8 +3031,18 @@ export class ScopeSequencer {
     // would destroy the original caller's proof and let ITS retry execute a
     // second time. The refusal is returned; the receipt stands.
     if (!RETRYABLE_VERDICTS.has(reason) && !this.replies.has(submit.idempotency_key)) {
-      this.replies.set(submit.idempotency_key, reply);
-      this.options.durable?.writeReply(submit.idempotency_key, reply);
+      // CO2.5: the RECORDED rejection carries the fingerprint of the request
+      // it refused, so a later submit reusing this key for a DIFFERENT call is
+      // met with `idempotency_conflict` instead of this refusal. The RETURNED
+      // reply does not carry it — a stored request hash is never wire output.
+      const recorded: CommitReply =
+        submit.request_fingerprint !== undefined
+          ? { ...reply, replay_request: submit.request_fingerprint }
+          : reply;
+      // H2a: recorded rejections are bounded like receipts. Before this they
+      // were inserted with no prune at all, which made "submit something
+      // terminally invalid under a fresh key" an unbounded storage write.
+      this.recordReply(submit.idempotency_key, recorded);
     }
     return reply;
   }

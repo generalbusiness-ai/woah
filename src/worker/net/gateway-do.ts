@@ -814,13 +814,41 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 /** Echo-dedupe LRU bound (see recentClientTurns). */
 const RECENT_CLIENT_TURN_CAP = 512;
 
-/** H2c: selection-pin retention (see pinScope) — matches the scopes'
- * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
- * outlives the reply it protects by more than the window. */
-const GATEWAY_PIN_LIMIT = 1024;
+/**
+ * H2c: selection-pin retention, PER SCOPE (see pinScope).
+ *
+ * The pin must outlive the recorded reply it protects, in the scope-sized
+ * units the scope prunes in. A scope retains at most
+ * `max(REPLY_CACHE_CAP, tailLimit) + RECEIPT_CACHE_CAP` = 1280 replies
+ * (scope.ts pruneReplies); this is that number with headroom, counted per
+ * scope rather than across the whole shard.
+ *
+ * Counting across the shard — the previous rule — meant a gateway serving
+ * several busy scopes evicted a pin while its receipt was still live at the
+ * scope. A retry then re-planned freely, and if selection landed on a
+ * DIFFERENT scope it executed a second time: the same double execution
+ * idempotency exists to prevent, reached through the routing door instead of
+ * the commit door.
+ *
+ * Headroom (2048 vs 1280) covers pins with no reply behind them. The pin is
+ * necessarily written BEFORE the submit — the whole point is to survive a
+ * submit whose outcome the gateway never learned — so keys that were pinned
+ * and then abandoned (a retryable rejection the client gave up on, a lost
+ * response) consume pin budget without ever recording a reply.
+ */
+const GATEWAY_PIN_LIMIT = 2048;
+/**
+ * Table-level ceiling across all scopes, so per-scope retention does not make
+ * the table unbounded in the number of scopes a shard touches. At ~200 bytes a
+ * row this is a few MiB of DO SQL, and it holds 32 scopes at their full
+ * per-scope window. Past it the OLDEST pins shard-wide are dropped and those
+ * keys fall back to the documented window-expiry posture (a retry re-plans and
+ * is a new turn by every observable measure).
+ */
+const GATEWAY_PIN_TABLE_LIMIT = 65536;
 /** Drain-watermark writes between retention sweeps. A sweep costs one COUNT
- * over a table bounded by GATEWAY_PIN_LIMIT; the interval keeps that off the
- * per-poll path while still bounding growth (one row per new session). */
+ * over a table bounded by GATEWAY_PIN_TABLE_LIMIT; the interval keeps that off
+ * the per-poll path while still bounding growth (one row per new session). */
 const MCP_WATERMARK_SWEEP_INTERVAL = 256;
 /** A session bearer destroys its own credential when close commits. Keep a
  * bounded gateway-local receipt so a lost close reply can still replay as
@@ -1075,11 +1103,19 @@ export class NetGatewayDO {
     // must never migrate the commit to a different scope — the pinned
     // scope may already hold the recorded reply, and a second scope would
     // double-commit the turn. Bounded (H2c): pinScope prunes to the most
-    // recent GATEWAY_PIN_LIMIT rows — the same retention posture as the
-    // scopes' reply cache, and the same documented consequence (see
+    // recent GATEWAY_PIN_LIMIT rows PER SCOPE, sized to outlive that scope's
+    // reply/receipt retention, under a shard-wide table ceiling (see
     // pinScope).
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+    );
+    // Per-scope retention needs a per-scope index, or every pinned turn pays
+    // a full-table COUNT. Idempotent, and cheap to add to an existing table.
+    // Indexed on `scope` alone: every SQLite index carries the rowid as its
+    // payload already, so `WHERE scope = ? ORDER BY rowid` is served by this
+    // one — and naming rowid in the index columns is a syntax error.
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_pin_scope ON net_gateway_pin (scope)"
     );
     // AU1.2 durable edge-event lane: refusal records buffered here and
     // drained to the audit shards (see recordEdgeAudit).
@@ -8208,26 +8244,52 @@ export class NetGatewayDO {
 
   /** Persist the key → scope pin; first writer wins (fix 5c).
    *
-   * H2c boundedness: the table keeps only the most recent
-   * GATEWAY_PIN_LIMIT rows (rowid order — SQLite's insertion order),
-   * pruned on insert. Consequence, documented (the reply-cache posture,
-   * scope.ts pruneReplies): a replay arriving after its pin pruned may
-   * re-plan to a different scope — but by the same retention window its
-   * recorded reply at the original scope has pruned too, so the request
-   * is a NEW turn by every observable measure: it validates fresh
-   * against the current head and read versions. Idempotency is a
-   * bounded-window guarantee, not an eternal one. */
+   * H2c boundedness, aligned with the authority's reply retention:
+   *
+   * - **per scope**, the table keeps the most recent GATEWAY_PIN_LIMIT rows
+   *   (rowid order — SQLite's insertion order). That number strictly exceeds
+   *   what one scope can retain in recorded replies and receipts (scope.ts
+   *   pruneReplies), so while a receipt is live its pin is live, and a retry
+   *   is routed back to the scope that holds the answer instead of being free
+   *   to execute at a second one;
+   * - **shard-wide**, a GATEWAY_PIN_TABLE_LIMIT ceiling keeps the table
+   *   bounded in the number of scopes.
+   *
+   * The reverse containment — a live pin always having a live receipt — is
+   * deliberately NOT an invariant. The pin is written before the submit (that
+   * is what makes it survive a lost response), so at write time there is no
+   * outcome to condition on, and a pin whose reply has pruned is harmless: the
+   * retry reaches the right scope, finds nothing recorded, and validates fresh.
+   *
+   * Consequence, documented (the reply-cache posture, scope.ts pruneReplies):
+   * a replay arriving after BOTH have pruned is a NEW turn by every observable
+   * measure — it validates fresh against the current head and read versions.
+   * Idempotency is a bounded-window guarantee, not an eternal one. */
   private pinScope(idempotencyKey: string, scope: string): void {
     this.state.storage.sql.exec(
       "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
       idempotencyKey,
       scope
     );
-    const count = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
-    if (count && Number(count.n) > GATEWAY_PIN_LIMIT) {
+    // Per-scope prune, on the (scope, rowid) index — the count and the delete
+    // both stay off a full-table scan.
+    const scoped = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE scope = ?", scope)
+    )[0];
+    if (scoped && Number(scoped.n) > GATEWAY_PIN_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_pin WHERE scope = ? AND rowid NOT IN " +
+          "(SELECT rowid FROM net_gateway_pin WHERE scope = ? ORDER BY rowid DESC LIMIT ?)",
+        scope,
+        scope,
+        GATEWAY_PIN_LIMIT
+      );
+    }
+    const total = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
+    if (total && Number(total.n) > GATEWAY_PIN_TABLE_LIMIT) {
       this.state.storage.sql.exec(
         "DELETE FROM net_gateway_pin WHERE rowid NOT IN (SELECT rowid FROM net_gateway_pin ORDER BY rowid DESC LIMIT ?)",
-        GATEWAY_PIN_LIMIT
+        GATEWAY_PIN_TABLE_LIMIT
       );
     }
   }
