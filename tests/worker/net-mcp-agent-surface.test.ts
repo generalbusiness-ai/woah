@@ -172,6 +172,21 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     // test would actually have failed under plain alphabetical ordering.
     expect(allNames.some((name) => name.startsWith("the_"))).toBe(true);
 
+    // The walkthrough's "128 vs 142" count mismatch, stated as an invariant.
+    // tools/list pages at MCP_PAGE INCLUDING the woo_* controls;
+    // woo_list_reachable_tools `total` counts dynamic descriptors with no cap.
+    // Nothing is filtered differently — a reader comparing page 1 against the
+    // pager total is comparing a page to a total.
+    expect(firstPageNames.length, "the first page is no longer capped").toBe(MCP_PAGE);
+    const pager = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "woo_list_reachable_tools", arguments: { scope: "active", limit: 1 } } },
+      { "mcp-session-id": session }
+    );
+    const pagerTotal = pager.body?.result?.structuredContent?.result?.total as number;
+    expect(allNames.length - MCP_STATIC_TOOLS, `pager total ${pagerTotal} does not reconcile with the full listing`)
+      .toBe(pagerTotal);
+    expect(pagerTotal, "the fixture no longer reproduces the page-vs-total gap").toBeGreaterThan(MCP_PAGE - MCP_STATIC_TOOLS);
+
     // PRECEDENCE is the actual guarantee (spec M2.2): the actor's tools are a
     // contiguous block at the head of the dynamic listing, directly after the
     // stable woo_* controls. Completeness on page 1 is a *consequence* that

@@ -32,8 +32,8 @@ compact discovery, stale-metadata recovery, and observation polling:
 | Tool | Purpose |
 | --- | --- |
 | `woo_list_reachable_tools(scope?, object?, query?, limit?, cursor?, include_schema?)` | Page and filter canonical descriptors in structural context. |
-| `woo_call(object, verb, args?)` | Invoke one reachable verb through the Net turn path. |
-| `woo_wait(timeout_ms?, limit?)` | Long-poll live observations queued for this session. |
+| `woo_call(object, verb, args?)` | Invoke any verb on a reachable object through the Net turn path, listed or not. |
+| `woo_wait(timeout_ms?, limit?)` | Long-poll live observations queued for this session; returns `{observations, gap}`. |
 
 Net publishes schema-backed dynamic named tools. It deliberately does not use
 MCP focus/unfocus wrappers. It advertises `listChanged:true` and sends the
