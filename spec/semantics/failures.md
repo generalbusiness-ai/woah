@@ -75,6 +75,14 @@ parent's earlier work. An inner success merges provisionally into its parent;
 if the parent later fails, the inner effects are also rolled back and cannot be
 persisted or submitted to another authority.
 
+Every inverse in an aborted savepoint MUST be attempted even if an earlier
+inverse raises. The behavior's original failure remains the result of that
+turn. A restore failure means the in-memory authority can no longer prove that
+it matches its durable state, so the world instance becomes poisoned: all
+subsequent behavior and mutation MUST refuse with `E_WORLD_POISONED` until the
+host discards the instance and reloads it from persistence. A poisoned instance
+MUST NOT continue serving writes from partially restored state.
+
 Failure-prone transport work belongs after acceptance. A session-ended
 notification, socket closure, or other host callback runs only after the
 authoritative behavior result and persistence are ready. It is best-effort:

@@ -93,6 +93,13 @@ it too. Ordinary in-VM `CALL_VERB` dispatch shares the current behavior scope;
 it does not create a savepoint for every frame. Neither form can leak a write,
 observation, schedule, or other transcript effect from an aborted parent.
 
+Durable acceptance callbacks staged by a nested sequenced call remain part of
+the outermost behavior savepoint. The runtime MUST execute them before that
+savepoint commits, while rollback is still possible. It MUST refuse rather than
+pop an outer scope whose staged acceptance has been suppressed by a persistence
+deferral; accepted in-memory state with no corresponding durable acceptance is
+not a valid intermediate state.
+
 ---
 
 ## S4. Determinism and replay

@@ -159,6 +159,9 @@ CREATE TABLE ancestor_chain (
 -- v2 write-through may also call saveCommittedLogEntry for an already accepted
 -- transcript; that path upserts the final row by (space_id, seq) and does not
 -- allocate a new seq or mutate next_seq.
+-- Runtime behavior acceptance remains staged inside the outer behavior
+-- savepoint until these writes succeed. A persistence-deferral scope must not
+-- discard staged acceptance; the runtime refuses that composition instead.
 -- See semantics/space.md.
 CREATE TABLE space_message (
   space_id    TEXT NOT NULL,
