@@ -150,22 +150,37 @@ The final isolated branch passed the complete local ladder:
 
 | Lane | Result |
 |---|---|
-| Focused native rollback and Net legibility | 68/68 |
-| Smoke-fixture and metric-vocabulary regressions | 11/11 |
+| Adversarial remediation focus (10 files) | 237/237 |
 | `npm run typecheck` | passed |
-| `npm test` | 87 files, 1,058/1,058 |
-| `npm run test:worker` | 48 files, 373/373 |
-| `npm run test:full` | 166 files, 2,072/2,072 |
+| `npm test` | 88 files, 1,061/1,061 |
+| `npm run test:worker` | 48 files, 374/374 |
+| `npm run test:full` | 167 files, 2,090/2,090 |
 | `npm run load:net-dev` | 3/3 |
 | `npm run load:net-skew` | 6/6 |
 | `npm run smoke:net-dev` | 44/44 |
 | `npm run smoke:net-mcp` | 17/17 |
 
-Adversarial reversion also proved two late integration tests are causal:
-reinstating the detached public-view metadata write makes the serialized
-workerd-fixture test fail, and reverting transient-proof pruning makes the
-native rollback suite fail while exposing the erased object's reads and
-dispatch proof.
+Adversarial reversion proved the late integration tests are causal:
+
+- restoring permissive proof retention leaves the transient
+  `{ counter: 2, version: 2 }` read in the failed transcript and fails the
+  authority-acceptance test;
+- checking only the innermost behavior scope lets the outer-write command
+  transfer evade `E_SCOPE_SPLIT` and fails the nested-transfer test;
+- omitting a native classification or its failure contract fails the
+  registry-exhaustiveness guard;
+- removing the AP11 explicit-demotion conflict re-promotes the deliberately
+  demoted agent and fails the local and Net repair tests;
+- removing the exclusive repair lease lets a repair overlap a live local
+  repository and fails the live-server refusal test;
+- allowing deferred staged acceptance to fall out of scope makes the
+  persistence-deferral test return instead of throwing;
+- restoring fail-fast inverse replay lets `E_TEST_UNDO` mask
+  `E_TEST_ORIGINAL` and fails the poisoned-rollback test;
+- reinstating the detached public-view metadata write makes the serialized
+  workerd-fixture test fail; and
+- reverting created-object proof pruning exposes reads and dispatch proof for
+  an identity erased by rollback and fails the native rollback suite.
 
 `npm run load:net-canary`, `npm run metrics:net-ae`, and the deployed
 walkthrough were not run: they require deployment/external acceptance state,
