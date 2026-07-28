@@ -400,6 +400,17 @@ separate protocol feature and must not be implied by this queue.
 Multiple parked waits may wake together, but draining uses prefix removal so
 an observation is returned to at most one waiter.
 
+**Client obligation.** A reply is the client's only copy: the rows it carries
+are already removed from the queue, and no later `woo_wait` will return them.
+A client that filters a reply — waiting for one kind of observation and
+keeping only the match — therefore *destroys* every other row in that batch.
+Batch composition is a server-side timing artifact and carries no meaning: the
+same two facts arrive in one reply or two depending only on how close together
+they committed and how warm the gateway is. Clients that assert over a
+sequence of observations MUST buffer the rows they did not consume, or they
+will fail intermittently, on exactly the fast paths where the server is
+working best.
+
 ### M5.1 Continuity marker
 
 Every `woo_wait` reply carries `gap`. It is a **continuity claim about the
@@ -416,14 +427,37 @@ is its only ear, cannot.
 
 `gap` is set when:
 
+- a bounded-buffer overflow discards undelivered rows; or
 - the gateway reconstructs live session state for a session whose durable cell
-  already exists — a Durable Object restart or a capacity eviction; or
-- a bounded-buffer overflow discards undelivered rows.
+  already exists — a Durable Object restart or a capacity eviction — **and
+  cannot prove that nothing was delivered to the session's scope while that
+  state was missing**.
 
-It is **conservative**: a restart sets it whether or not anything was actually
-queued at the time. A session whose state was installed by its own
-`initialize` and never lost starts gap-free, so an ordinary first wait does not
-report a false gap.
+Losing the live queue is not by itself a continuity break. Losing it *across a
+delivery* is. The gateway keeps two durable per-scope delivery counters — the
+committed-fanout lane position and a count of applied live-fanout bodies — and
+records both, together with the session's scope, on every `woo_wait` reply.
+A reconstruction compares them: unchanged counters prove the session missed
+nothing and the reply is gap-free; either counter advanced (or no watermark
+survives, or the session's scope changed) means it cannot prove continuity and
+the reply carries `gap:true`.
+
+This distinction is load-bearing rather than cosmetic. On Cloudflare an idle
+gateway shard is evicted within roughly ten seconds — measured against the
+deployed worker, far inside a turn-based agent's think time — so an
+unconditional gap-on-reconstruction fires on essentially every poll and teaches
+agents to ignore the marker, which is the one outcome that makes it useless.
+
+It remains **conservative** in the safe direction: an advanced counter reports
+a gap even when the delivery in question would not have reached this session
+(a peer-directed line, or the session's own echo). It reports what the gateway
+can prove, never what it merely hopes. A session whose state was installed by
+its own `initialize` and never lost starts gap-free without consulting a
+watermark, so an ordinary first wait does not report a false gap.
+
+The watermarks are derived gateway state, bounded like the selection pins: a
+pruned or missing row degrades to `gap:true`, never to a false continuity
+claim.
 
 The marker is one-shot. It describes a discontinuity, not a state, and is
 cleared by the reply that carries it. A pending gap also short-circuits the
