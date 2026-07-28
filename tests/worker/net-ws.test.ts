@@ -471,7 +471,17 @@ async function buildHarness(
     pauseNextGatewayFanout,
     rehydrateGateway,
     rehydrateWithoutPeerCells,
-    close: () => states.forEach((st) => st.close())
+    close: async () => {
+      let deferredFailure: unknown;
+      try {
+        await settle();
+      } catch (err) {
+        deferredFailure = err;
+      } finally {
+        states.forEach((st) => st.close());
+      }
+      if (deferredFailure !== undefined) throw deferredFailure;
+    }
   };
 }
 
@@ -523,7 +533,7 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     expect(stolenMint.status).toBe(401);
     expect(stolenMint.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "actor_mismatch" } });
 
-    h.close();
+    await h.close();
   });
 
   it("accepts a ticket upgrade tagged by session and serves turn/ping frames", async () => {
@@ -615,7 +625,7 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     expect(frames(server).at(-1)).toMatchObject({ type: "error", error: { code: "E_INVARG" } });
     expect(server.readyState).toBe(1);
 
-    h.close();
+    await h.close();
   });
 
   it("rate-limits inbound turn frames on the socket's actor bucket (H4)", async () => {
@@ -641,7 +651,7 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     // The socket survives the refusal (a throttle is not a protocol error).
     expect(server.readyState).toBe(1);
 
-    h.close();
+    await h.close();
   });
 });
 
@@ -658,7 +668,7 @@ describe("gateway self-subscribe (H1)", () => {
       active_scope: "ws_room",
       relation_expedite_degraded: true
     });
-    h.close();
+    await h.close();
   });
 
   it("returns an accepted turn when post-accept presence expedite fails", async () => {
@@ -674,7 +684,7 @@ describe("gateway self-subscribe (H1)", () => {
       reply: { status: "accepted" },
       relation_expedite_degraded: true
     });
-    h.close();
+    await h.close();
   });
 
   it("plans who_all from owner-anchored presence when the shard lacks a peer's cluster cells", async () => {
@@ -706,7 +716,7 @@ describe("gateway self-subscribe (H1)", () => {
       expect.objectContaining({ player: h.actor }),
       expect.objectContaining({ player: h.other })
     ]));
-    h.close();
+    await h.close();
   });
 
   it("auto-subscribes the gateway to the scopes a session touches, so peer push works with NO manual subscribe", async () => {
@@ -770,7 +780,7 @@ describe("gateway self-subscribe (H1)", () => {
       expect(Object.keys(peerObservations[0] as Record<string, unknown>), `observations.${key}`).toContain(key);
     }
 
-    h.close();
+    await h.close();
   });
 });
 
@@ -838,7 +848,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
         observations: [expect.objectContaining({ type: "spoke", text: "service-visible" })]
       })
     ]);
-    h.close();
+    await h.close();
   });
 
   it("relays a validated effect-free direct observation without minting a scope sequence", async () => {
@@ -911,7 +921,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     const second = frames(socketA).at(-1) as { reply?: { head?: { seq?: number } } };
     expect(second.reply?.head?.seq).toBe(stableSeq);
     await h.settle();
-    h.close();
+    await h.close();
   });
 
   it("labels a redundant submitter frame after gateway hibernation loses the echo LRU", async () => {
@@ -965,7 +975,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
       })
     ]);
 
-    h.close();
+    await h.close();
   });
 
   it("pushes a turn's observations to present peers, skipping the submitter and absent sessions", async () => {
@@ -1113,7 +1123,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // fake SQLite stores so the test cannot hide a post-assertion delivery
     // failure behind waitUntil teardown.
     await h.settle();
-    h.close();
+    await h.close();
   });
 
   it("keeps a sequenced turn's directed text echo off bystander carriers and still delivers it to the recipient's other session", async () => {
@@ -1184,7 +1194,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     expect(bystanderObservations.map((obs) => obs.type)).toEqual(["spoke"]);
     expect(JSON.stringify(bystanderObservations)).not.toContain("private line");
 
-    h.close();
+    await h.close();
   });
 
   it("resolves a presence-derived live audience on the destination shard instead of trusting a partial planner enumeration", async () => {
@@ -1231,6 +1241,6 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
       })
     ]);
 
-    h.close();
+    await h.close();
   });
 });

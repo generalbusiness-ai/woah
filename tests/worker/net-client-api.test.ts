@@ -45,6 +45,7 @@ const KEY_SECRET = "capi-secret";
 function netState(name: string): {
   state: NetScopeDurableState & NetGatewayDurableState;
   settle: () => Promise<void>;
+  pending: () => number;
   close: () => void;
 } {
   const fake = new FakeDurableObjectState(name);
@@ -66,6 +67,7 @@ function netState(name: string): {
     settle: async () => {
       while (deferred.length > 0) await deferred.shift();
     },
+    pending: () => deferred.length,
     close: () => fake.close()
   };
 }
@@ -259,6 +261,15 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   states.push(gatewayState);
 
   states.push(auditState);
+  const settleAll = async (): Promise<void> => {
+    // A scope delivery may enqueue work on a gateway or audit DO that was
+    // already visited in this pass. Repeat until every shared fixture queue is
+    // empty so teardown is a real quiescence boundary.
+    for (;;) {
+      for (const state of states) await state.settle();
+      if (states.every((state) => state.pending() === 0)) return;
+    }
+  };
   return {
     gateway,
     actor,
@@ -275,7 +286,17 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
       if (!instance) throw new Error(`missing credential authority ${scope}`);
       return signedTo(instance, "/net/ensure-credential", { actor: target, id, record });
     },
-    close: () => states.forEach((st) => st.close())
+    close: async () => {
+      let deferredFailure: unknown;
+      try {
+        await settleAll();
+      } catch (err) {
+        deferredFailure = err;
+      } finally {
+        states.forEach((state) => state.close());
+      }
+      if (deferredFailure !== undefined) throw deferredFailure;
+    }
   };
 }
 
@@ -320,7 +341,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       expect(legacy.status).toBe(200);
       expect(legacy.body).toMatchObject({ actor: h.actor });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -358,7 +379,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       );
       expect(foreign.status).toBe(403);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -408,7 +429,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       );
       expect(own.status, JSON.stringify(own.body)).toBe(200);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -482,7 +503,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
         }
       });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -593,7 +614,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
         error: { code: "E_NOSESSION", detail: { reason: "session_apikey_revoked" } }
       });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -656,7 +677,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(viaHeader.status).toBe(401);
     expect(viaHeader.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "session_required" } });
 
-    h.close();
+    await h.close();
   });
 
   it("authorizes reads by presence and denies credential/foreign cells (B1)", async () => {
@@ -709,7 +730,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(noSession.status).toBe(401);
     expect(noSession.body.error).toMatchObject({ detail: { reason: "session_required" } });
 
-    h.close();
+    await h.close();
   });
 
   it("accepts bounded browser diagnostics on the net namespace without trusting payload identity", async () => {
@@ -735,7 +756,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       body: { metrics: [] }
     });
     expect(missingSession.status).toBe(401);
-    h.close();
+    await h.close();
   });
 
   it("mints a session, requires sessions on turns (CO14), and returns result/observations on the sessioned turn", async () => {
@@ -853,7 +874,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(roster.status).toBe(200);
     expect(Array.isArray(roster.body.members)).toBe(true);
 
-    h.close();
+    await h.close();
   });
 
   it("rejects a catalog-qualified target before target-scope pull or repair", async () => {
@@ -903,7 +924,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       detail: { field: "args[0]", reason: "invalid_object_id" }
     });
 
-    h.close();
+    await h.close();
   });
 
   it("v1 client-surface field names are pinned (Phase 5 contract freeze: add-only, never rename)", async () => {
@@ -941,7 +962,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(roster.status).toBe(200);
     for (const key of ["relation", "owner", "members"]) expect(Object.keys(roster.body), `relation.${key}`).toContain(key);
 
-    h.close();
+    await h.close();
   });
 
   it("rate-limits /net-api per authenticated actor: burst 100, named 429 E_RATE, refills (H4)", async () => {
@@ -975,7 +996,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     } finally {
       nowSpy.mockRestore();
     }
-    h.close();
+    await h.close();
   });
 
   it("gives session mint + ws-ticket a tighter shared bucket (H4 amplifier rule)", async () => {
@@ -1007,7 +1028,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const read = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
     expect(read.status).toBe(401);
 
-    h.close();
+    await h.close();
   });
 });
 
@@ -1058,7 +1079,7 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
     expect(theirs.status).toBe(200);
     expect(theirs.body.partition).toBe("acct_other");
     expect(theirs.body.records).toEqual([]);
-    h.close();
+    await h.close();
   });
 
   it("a refused credential lands as a gateway edge record in the operator partition (AU1.2)", async () => {
@@ -1083,7 +1104,7 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
     };
     expect(res.records.length).toBeGreaterThan(0);
     expect(res.records[0]?.principal).toMatchObject({ attribution: "credentialed", credential: "no-such-key" });
-    h.close();
+    await h.close();
   });
 });
 
@@ -1162,6 +1183,6 @@ describe("AU10.3 join gate: one trace id across gateway span, scope span, and au
       expect(child.start_ms as number).toBeGreaterThanOrEqual(rootSpan.start_ms as number);
       expect(child.end_ms as number).toBeLessThanOrEqual(rootSpan.end_ms as number);
     }
-    h.close();
+    await h.close();
   });
 });
