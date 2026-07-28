@@ -51,7 +51,7 @@ describe("Net legacy split family: promote refuses without partial mutation", ()
     // Simulate a LEGACY family: the account predates authority-root anchoring, so
     // it is anchorless (catalog-scoped). Signup anchored it; strip that to model
     // an already-deployed pre-anchoring account.
-    old.object(account).anchor = null;
+    old.migrationSetObjectAnchor(account, null);
     // Now mint a NEW agent under this legacy family — the "re-provision" remedy.
     const prov = (await old.directCall("prov", human, human, "create_agent", ["NewBot", "", false])) as unknown as { result: { actor_id: string } };
     const agent = prov.result.actor_id;

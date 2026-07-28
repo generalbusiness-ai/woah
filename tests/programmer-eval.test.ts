@@ -6,9 +6,8 @@ import type { WooValue } from "../src/core/types";
 function programmerActor(world: ReturnType<typeof createWorld>, id = "guest:eval") {
   const session = world.auth(id);
   const actor = session.actor;
-  const obj = world.object(actor);
-  obj.owner = actor;
-  obj.flags.programmer = true;
+  world.migrationSetObjectOwner(actor, actor);
+  world.setCatalogObjectFlags(actor, { programmer: true });
   world.chparentAuthoredObject("$wiz", actor, "$programmer");
   return { session, actor };
 }
@@ -16,7 +15,7 @@ function programmerActor(world: ReturnType<typeof createWorld>, id = "guest:eval
 function plainActor(world: ReturnType<typeof createWorld>, id = "guest:eval-plain") {
   const session = world.auth(id);
   const actor = session.actor;
-  world.object(actor).owner = actor;
+  world.migrationSetObjectOwner(actor, actor);
   return { session, actor };
 }
 
@@ -212,7 +211,7 @@ describe("$programmer:eval", () => {
     const world = createWorld();
     const session = world.auth("guest:eval-no-progbit");
     const actor = session.actor;
-    world.object(actor).owner = actor;
+    world.migrationSetObjectOwner(actor, actor);
     world.chparentAuthoredObject("$wiz", actor, "$programmer");
     // Note: no `flags.programmer = true`.
     const frame = await world.directCall(undefined, actor, actor, "eval", ["1 + 1", {}]);

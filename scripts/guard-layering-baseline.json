@@ -28,7 +28,7 @@
     "$root": 17,
     "$sequenced_log": 6,
     "$space": 16,
-    "$thing": 13
+    "$thing": 12
   },
   "src/core/dsl-compiler.ts": {
     "$root": 1
@@ -89,7 +89,7 @@
     "$root": 6,
     "$sequenced_log": 1,
     "$space": 20,
-    "$thing": 2,
+    "$thing": 1,
     "$transparent": 1,
     "$xxx": 1
   },

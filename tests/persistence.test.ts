@@ -487,7 +487,12 @@ describe("json folder persistence", () => {
       expect(secondWorld.getProp("the_dubspace", "next_seq")).toBe(2);
       expect(secondWorld.replay("the_dubspace", 1, 10)).toHaveLength(1);
       expect(secondWorld.latestSnapshot("the_dubspace")?.seq).toBe(1);
-      expect(existsSync(join(path, "objects", "delay_1.json"))).toBe(true);
+      const manifest = JSON.parse(readFileSync(join(path, "manifest.json"), "utf8")) as {
+        objects: Array<{ id: string; file: string }>;
+      };
+      const delayFile = manifest.objects.find((item) => item.id === "delay_1")?.file;
+      expect(delayFile).toMatch(/^generations\/gen-[^/]+\/objects\/delay_1\.json$/);
+      expect(delayFile && existsSync(join(path, delayFile))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -644,7 +644,7 @@ describe("plan-time session effects (CO14 fold; chunk 2)", () => {
     const world = createWorld();
     const session = world.auth("guest:sessions-fold");
     const actor = session.actor;
-    world.object(actor).flags.programmer = true;
+    world.setCatalogObjectFlags(actor, { programmer: true });
     world.createObject({ id: "sess_room", name: "Session Room", parent: "$space", owner: actor });
     const installed = installVerb(
       world,
@@ -660,9 +660,9 @@ describe("plan-time session effects (CO14 fold; chunk 2)", () => {
     // Entry verbs skip the presence gate (the catalog `enter` idiom —
     // catalogs/chat `skip_presence_check: true`): a sequenced call into a
     // room the actor has not entered yet IS the entering.
-    const welcome = world.object("sess_room").verbs.find((verb) => verb.name === "welcome");
-    expect(welcome).toBeDefined();
-    if (welcome) welcome.skip_presence_check = true;
+    expect(world.migrationSetVerbExecutionMetadata("sess_room", "welcome", {
+      skipPresenceCheck: true
+    })).toBe(true);
 
     const SCOPE = "home";
     const classifier: ScopeClassifier = { scopeOf: () => SCOPE, isShared: (scope) => scope === SCOPE };

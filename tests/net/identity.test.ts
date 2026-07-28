@@ -123,8 +123,8 @@ describe("identity import into a fresh install (item A + B)", () => {
     const agent = old.createObject({ id: "agent_auth", parent: "$agent", owner: human, name: "agent" }).id;
     old.ensureApiKey("$wiz", agent, "auth-agent-key", "auth-agent-secret", "agent");
     // Anchor the account and the owned agent to the human authority root.
-    old.object("acct_auth").anchor = human;
-    old.object(agent).anchor = human;
+    old.migrationSetObjectAnchor("acct_auth", human);
+    old.migrationSetObjectAnchor(agent, human);
 
     const identity = exportIdentity(old.exportWorld());
     // The anchor rides the export.

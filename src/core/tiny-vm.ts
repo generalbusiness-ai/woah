@@ -16,6 +16,7 @@ import {
 } from "./types";
 import { rankBetween } from "./fractional-rank";
 import type { CallContext } from "./world";
+import { isCommandPlanTransfer } from "./command-plan-transfer";
 
 export type VmHandler = {
   targetPc: number;
@@ -695,6 +696,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           throw wooError("E_INVARG", `unknown VM opcode: ${op}`);
       }
     } catch (err) {
+      // This is an opaque host control signal, not a Woo error. Letting
+      // `except` catch it would resume a wrapper after ownership of its turn
+      // had transferred to the sequenced target.
+      if (isCommandPlanTransfer(err)) throw err;
       const error = attachVmTrace(normalizeVmError(err), frames, currentPc);
       // Control signals bypass woocode `except` and escape the VM (P1.2): a
       // sparse-planning state miss must ALWAYS reach the gateway's repair path,

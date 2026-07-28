@@ -376,6 +376,6 @@ function normalizeAnchors(world: WooWorld): void {
     // E_MISSING_STATE → E_BUDGET (phase iii found exactly this: the SPA's
     // tab teleport into the pinboard from the chatroom).
     if (reachesClass(obj.id, "$space")) continue;
-    world.object(obj.id).anchor = obj.location;
+    world.migrationSetObjectAnchor(obj.id, obj.location);
   }
 }

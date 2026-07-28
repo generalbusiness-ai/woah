@@ -417,9 +417,8 @@ describe("compact room-roster planning", () => {
   it("uses the complete compact roster when pruning outliner per-actor state", async () => {
     const world = createWorld();
     const session = world.auth("guest:compact-outliner-focus");
-    world.sessions.get(session.id)!.activeScope = "the_outline";
-    world.object(session.actor).location = "the_outline";
-    world.object("the_outline").contents.add(session.actor);
+    world.migrationSetSessionState(session.id, { activeScope: "the_outline" });
+    world.setCatalogObjectLocation(session.actor, "the_outline");
     world.setProp("the_outline", "focus_by_actor", {
       remote_present: null,
       remote_stale: null
@@ -534,7 +533,7 @@ describe("compact room-roster planning", () => {
     const world = createWorld();
     world.createObject({ id: "home", name: "Home", parent: "$room", owner: "$wiz" });
     const session = world.auth("guest:hidden-planner");
-    session.rosterVisible = false;
+    world.migrationSetSessionState(session.id, { rosterVisible: false });
     await world.directCall("hidden-enter-setup", session.actor, "the_chatroom", "leave", [], { sessionId: session.id });
     const destination = "the_chatroom";
     const seq = new ScopeSequencer(SCOPE, EPOCH);

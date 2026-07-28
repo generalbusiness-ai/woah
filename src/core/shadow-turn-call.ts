@@ -255,6 +255,11 @@ export async function runShadowTurnCallOnWorldTranscript(
     const suffix = frame.op === "error" ? `: ${frame.error.code} ${frame.error.message}` : "";
     throw new Error(`fresh turn produced no recording: ${call.target}:${call.verb}${suffix}`);
   }
+  if (recorder.turns.length !== 1) {
+    throw wooError("E_SCOPE_SPLIT", "one call produced more than one recorded turn", {
+      turns: recorder.turns.length
+    });
+  }
   const transcript = effectTranscriptFromRecordedTurn(recorded);
   return {
     frame,
@@ -268,8 +273,6 @@ function preRecordingErrorIsRepairable(code: string): boolean {
 }
 
 class ShadowStateGuardTurnRecorder implements TurnRecorder {
-  private readonly createdObjects = new Set<ObjRef>();
-
   constructor(
     private readonly inner: TurnRecorder,
     private readonly allowedAtomHashes: Set<string>
@@ -277,17 +280,40 @@ class ShadowStateGuardTurnRecorder implements TurnRecorder {
 
   startTurn(turn: TurnStart): ActiveTurnRecorder {
     const active = this.inner.startTurn(turn);
+    // Created-object exemptions belong to this turn and to the behavior scope
+    // that produced them. Keeping them on the TurnRecorder leaked exemptions
+    // across turns; keeping them after an abort lets later events claim atoms
+    // for an object whose creation was rolled back.
+    let createdObjects = new Set<ObjRef>();
+    const createdObjectScopes: Set<ObjRef>[] = [];
     return {
       event: (event) => {
-        const missing = missingAtomsForRecorderEvent(event, this.allowedAtomHashes, this.createdObjects);
+        const missing = missingAtomsForRecorderEvent(event, this.allowedAtomHashes, createdObjects);
         if (missing.length > 0) {
           throw wooError("E_NEED_STATE", "shadow turn touched state outside the materialized atom set", {
             missing_atoms: missing
           });
         }
         active.event(event);
-        if (event.kind === "object_create") this.createdObjects.add(event.object);
-      }
+        if (event.kind === "object_create") createdObjects.add(event.object);
+      },
+      beginBehaviorScope: () => {
+        active.beginBehaviorScope();
+        createdObjectScopes.push(new Set(createdObjects));
+      },
+      commitBehaviorScope: () => {
+        if (createdObjectScopes.length === 0) throw new Error("shadow guard behavior-scope commit without begin");
+        active.commitBehaviorScope();
+        createdObjectScopes.pop();
+      },
+      abortBehaviorScope: () => {
+        const before = createdObjectScopes.pop();
+        if (!before) throw new Error("shadow guard behavior-scope abort without begin");
+        active.abortBehaviorScope();
+        createdObjects = before;
+      },
+      currentBehaviorEvents: () => active.currentBehaviorEvents(),
+      discardTurn: () => active.discardTurn()
     };
   }
 }

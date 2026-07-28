@@ -499,6 +499,14 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     // the FULL listing: the_outline's tools sit past the first page — which is
     // the same fact the count reconciliation above is about.)
     expect(allNames.some((name) => name.startsWith("the_outline__")), "fixture no longer mounts the_outline").toBe(true);
+    // Purity is the pre-execution discriminator, not the target's room
+    // authority alone: this analyzer-proven read has no write set and remains
+    // legal from the mounting room.
+    const crossScopeRead = await call(prog.session, "woo_call", { object: "the_outline", verb: "title", args: [] });
+    await settleAll();
+    expect(crossScopeRead.result?.isError, JSON.stringify(crossScopeRead).slice(0, 400)).not.toBe(true);
+    expect(crossScopeRead.result?.structuredContent?.result).toBe("Outline (outliner)");
+
     const split = await call(prog.session, "woo_call", { object: "the_outline", verb: "add_item", args: ["probe", null] });
     await settleAll();
     expect(split.result?.isError, JSON.stringify(split).slice(0, 400)).toBe(true);

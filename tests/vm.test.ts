@@ -631,7 +631,7 @@ describe("map reads are own-key only (values.md §V6)", () => {
   function programmerWorld(seed: string) {
     const world = createWorld();
     const session = world.auth(seed);
-    world.object(session.actor).owner = session.actor;
+    world.migrationSetObjectOwner(session.actor, session.actor);
     return { world, actor: session.actor };
   }
 
@@ -729,7 +729,7 @@ describe("maps keyed by data use a null prototype (values.md §V6)", () => {
     const world = createWorld();
     const session = world.auth("guest:vm-proto-id");
     const actor = session.actor;
-    world.object(actor).owner = actor;
+    world.migrationSetObjectOwner(actor, actor);
     world.createObject({ id: "__proto__", parent: "$thing", owner: actor, name: "Proto Thing", location: "$nowhere" });
 
     const summaries = await world.scopedObjectSummaries(actor, ["__proto__"]);

@@ -157,7 +157,7 @@ describe("programmer surface (feature-composed)", () => {
     // and surface consistent (setObjectFlags now reconciles the surface), so
     // this state is only reachable via legacy/corrupted data — which is exactly
     // what this invariant guards against.
-    world.object(agent).flags.programmer = true;
+    world.setCatalogObjectFlags(agent, { programmer: true });
     world.setProp(agent, "features", []);
     expect(world.object(agent).flags.programmer).toBe(true);
     expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
@@ -194,7 +194,7 @@ describe("programmer surface (feature-composed)", () => {
     // :can_be_attached_by policy admits only the owner. The attach never lands
     // — whether it is refused at the direct-call boundary or by the policy, the
     // outcome is the same: no surface.
-    world.object(agent).owner = agent;
+    world.migrationSetObjectOwner(agent, agent);
     expect(world.object("$programmer").owner).toBe("$wiz");
     const res = (await world.directCall("af", agent, agent, "add_feature", ["$programmer"])) as CallResult;
     expect(res.op).toBe("error");
@@ -264,7 +264,7 @@ describe("programmer surface (feature-composed)", () => {
     const agent = await createAgent(world, human, "legacybot", false);
     // Simulate a pre-composition legacy agent: the flag was set but no surface
     // was ever attached, and the quota already counts it.
-    world.object(agent).flags.programmer = true;
+    world.setCatalogObjectFlags(agent, { programmer: true });
     world.setProp(agent, "features", []);
     world.setProp(account, "programmer_agent_count", 1);
     expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
@@ -304,7 +304,7 @@ describe("programmer surface (feature-composed)", () => {
     const agent = await createAgent(world, human, "strandedbot", true);
     // Simulate an admin who cleared the flag directly on the object, leaving the
     // surface feature (and thus builder capability) behind.
-    world.object(agent).flags.programmer = false;
+    world.setCatalogObjectFlags(agent, { programmer: false });
     expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
 
     const down = (await world.directCall("down", human, human, "demote_agent_from_programmer", [agent])) as CallResult;

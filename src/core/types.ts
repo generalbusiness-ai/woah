@@ -376,6 +376,7 @@ export type MetricEvent =
   | { kind: "subscribers_write"; space: ObjRef; size: number; delta: number }
   | { kind: "applied"; space: ObjRef; seq: number; verb: string; ms: number }
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }
+  | { kind: "direct_host_effect_delivery"; target: ObjRef; verb: string; effect: string; status: "error"; error: string }
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
@@ -851,17 +852,33 @@ export function isDeeplyFrozen(value: unknown): boolean {
 // bytecode immutable so worlds can share one object by reference instead of
 // deep-cloning it on every import (see freezeTinyBytecode / importBytecode).
 export function deepFreezePlainValue<T>(value: T): T {
-  if (value === null || typeof value !== "object") return value;
-  if (deeplyFrozenValues.has(value as object)) return value;
-  deeplyFrozenValues.add(value as object);
-  Object.freeze(value);
-  if (Array.isArray(value)) {
-    for (const item of value) deepFreezePlainValue(item);
-  } else {
-    for (const key of Object.keys(value as Record<string, unknown>)) {
-      deepFreezePlainValue((value as Record<string, unknown>)[key]);
+  const visiting = new WeakSet<object>();
+  const freeze = (item: unknown): void => {
+    if (item === null || typeof item !== "object") return;
+    const node = item as object;
+    if (deeplyFrozenValues.has(node)) return;
+    if (visiting.has(node)) {
+      throw new TypeError("deepFreezePlainValue: cannot freeze a cyclic structure");
     }
-  }
+    visiting.add(node);
+    try {
+      if (Array.isArray(item)) {
+        for (const child of item) freeze(child);
+      } else {
+        for (const key of Object.keys(item as Record<string, unknown>)) {
+          freeze((item as Record<string, unknown>)[key]);
+        }
+      }
+      // Brand only after traversal and Object.freeze both succeed. A hostile
+      // Proxy may throw from ownKeys/get/freeze; branding it first lets the
+      // next authority ingress incorrectly trust a still-mutable object.
+      Object.freeze(item);
+      deeplyFrozenValues.add(node);
+    } finally {
+      visiting.delete(node);
+    }
+  };
+  freeze(value);
   return value;
 }
 
@@ -871,8 +888,8 @@ export function deepFreezePlainValue<T>(value: T): T {
 // the restore/import paths (reservoir build, KV restore, importWorld) lets every
 // world share the same branded object by reference with no defensive per-import
 // clone, and turns any accidental future in-place mutation into a thrown error
-// rather than silent cross-world corruption. (Verbs installed at runtime via
-// addVerb are NOT frozen here — only the import/restore paths that share.)
+// rather than silent cross-world corruption. Runtime addVerb also routes its
+// bytecode through this boundary before the verb becomes authoritative.
 export function freezeTinyBytecode(bytecode: TinyBytecode): TinyBytecode {
   return deepFreezePlainValue(bytecode);
 }
