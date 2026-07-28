@@ -36,6 +36,28 @@ an idempotent success.
 One MCP session binds to one actor. MCP never changes `actor`, `progr`, verb
 permissions, or the normal Net turn authority rules.
 
+### M1.1 Notifications
+
+A JSON-RPC **notification** — any message with no `id`, whether or not the
+server recognizes its method — is a non-initialize method and is therefore
+subject to the same session validation and per-actor rate limiting as
+`tools/call`. It is authenticated *before* it is acted on and before it is
+acknowledged. This includes `notifications/initialized`, includes
+`notifications/cancelled` (which acts on session-scoped state and must not
+trust a raw `Mcp-Session-Id` header whose expiry was never consulted), and
+includes methods this version does not know: an evolving protocol's
+notifications must not be an unauthenticated door into the gateway.
+
+A notification carries no `id` to correlate a JSON-RPC error against, so the
+HTTP status is the whole answer. An accepted notification is `202` with an
+empty body — including for an unrecognized method, which is then ignored. A
+rejected session is the standard client refusal envelope (`401`,
+`E_NOSESSION`); an exhausted rate bucket is `429`, `E_RATE`. `202` means
+*authenticated and accepted*, never merely *received*.
+
+`initialize` keeps its own path: it is a request, it carries the `Mcp-Token`
+credential rather than a session id, and it mints the session this rule reads.
+
 The `initialize` result's `instructions` string is an agent's entire
 orientation — many MCP clients read nothing else unprompted — so it must name
 the actor, state that the dynamic tool list tracks structural context and must
@@ -759,7 +781,10 @@ re-list at any time even if it missed a live hint.
 - API-key authentication happens before session creation.
 - A present Streamable HTTP `Origin` must exactly match the MCP endpoint's
   request origin; headless clients may omit the header.
-- Every non-initialize method validates `Mcp-Session-Id` and its expiry.
+- Every non-initialize method validates `Mcp-Session-Id` and its expiry, and
+  spends a token from the actor's rate bucket, before it is acted on. A
+  notification is a method (M1.1): "it has no `id`" is not an exemption, and
+  neither is "the server does not recognize the method".
 - Other actors' session bearers never appear in tools, relation results, or
   observations.
 - Dynamic listing and dynamic invocation use one authoritative resolver.

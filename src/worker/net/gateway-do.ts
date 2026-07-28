@@ -5114,22 +5114,8 @@ export class NetGatewayDO {
     if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
       return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
     }
-    // Notifications (no id) acknowledge with 202 and no body — the MCP
-    // handshake's notifications/initialized. `notifications/cancelled` is
-    // ACTED ON first: with a bounded waiter set, dropping it would leave a
-    // client unable to reclaim its own parked slots before their timeouts.
     if (rpc.id === undefined || rpc.id === null) {
-      if (rpc.method === "notifications/cancelled") {
-        const params = mcpRecord(rpc.params);
-        const requestId = params.requestId;
-        // Cancellation is advisory and unauthenticated beyond the session
-        // header: it can only ever release a waiter parked under THIS
-        // session id, and releasing one drains nothing.
-        if (typeof requestId === "string" || typeof requestId === "number") {
-          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", mcpRequestKey(requestId));
-        }
-      }
-      return new Response(null, { status: 202 });
+      return await this.mcpNotification(request, rpc.method, mcpRecord(rpc.params));
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
     if (rpc.method === "tools/list") return await this.mcpToolsList(request, rpc.id, rpc.params ?? {});
@@ -5137,6 +5123,52 @@ export class NetGatewayDO {
       return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
     }
     return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
+  }
+
+  /**
+   * Post-initialize JSON-RPC notifications (no `id`): acknowledged with 202
+   * and no body, per Streamable HTTP.
+   *
+   * AUTHENTICATED AND RATE-LIMITED FIRST (mcp.md M1.1). Every non-initialize
+   * method validates the session; a notification is a method. The blanket 202
+   * that used to precede this check meant an anonymous caller could drive
+   * `notifications/*` — including the unknown ones an evolving protocol
+   * brings — through the DO at whatever rate it liked, entirely outside the
+   * per-actor bucket, and could act on a raw `mcp-session-id` header without
+   * its expiry ever being consulted. Both are refused here now, on exactly
+   * the same terms as `tools/call`.
+   *
+   * `initialize` keeps its own path: it is a REQUEST that carries the
+   * `mcp-token` credential and mints the session this check reads.
+   */
+  private async mcpNotification(
+    request: Request,
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    // Both throws are ClientAuthError, which clientApi's catch renders as the
+    // standard client refusal envelope (401 for a rejected session bearer,
+    // 429 for E_RATE) and records as an AU1.2 edge audit. A notification has
+    // no id to correlate a JSON-RPC error against, so the HTTP status is the
+    // whole answer — and it must not be 202.
+    const actor = await this.mcpSessionActor(session);
+    this.enforceClientRate(actor, "/net-api/mcp");
+    if (method === "notifications/cancelled") {
+      const requestId = params.requestId;
+      // Now that the session is proven, cancellation still only ever releases
+      // a waiter parked under THIS session id, and releasing one drains
+      // nothing. Keyed by CLASS as well as value: JSON-RPC ids `1` and `"1"`
+      // are different ids, so `"1"` must not release a wait parked under `1`.
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        this.mcpCancelWait(session, mcpRequestKey(requestId));
+      }
+    }
+    // Unknown notification methods are still ignored — a notification carries
+    // no id to answer with `method not found`, and an evolving client must be
+    // able to send one harmlessly. It reaches here only after paying for the
+    // session check and a rate token.
+    return new Response(null, { status: 202 });
   }
 
   /** Streamable HTTP's optional standalone GET/SSE carrier. The listen is

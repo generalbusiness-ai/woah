@@ -4,6 +4,9 @@
 // behavior, never on internal shape, so a fix that only rearranges private
 // state fails.
 //
+//   FINDING 4 (mcp.md M1.1) — every no-id JSON-RPC message returned 202
+//   BEFORE session authentication or rate limiting.
+//
 //   FINDING 8 — parked waits and cancellations were both keyed by
 //   `String(id)`, so a cancellation for `"1"` released a wait parked under
 //   the DISTINCT JSON-RPC id `1`.
@@ -370,6 +373,69 @@ describe("MCP gateway hardening", () => {
         { "mcp-session-id": f.aliceSession }
       );
       await parkedString;
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 4.
+  it("authenticates and rate-limits notifications instead of blanket-202ing them", async () => {
+    const f = await fixture();
+    try {
+      // No session header at all: the pre-fix surface answered 202 to this.
+      const sessionless = await f.mcp({ jsonrpc: "2.0", method: "notifications/initialized" });
+      expect(sessionless.status, JSON.stringify(sessionless.body)).not.toBe(202);
+      expect(sessionless.status).toBe(401);
+      expect(sessionless.body?.error?.code).toBe("E_NOSESSION");
+
+      // A fabricated session id is refused on the same terms.
+      const forged = await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { "mcp-session-id": "not-a-session" }
+      );
+      expect(forged.status).toBe(401);
+
+      // ...including for cancellation, which used to act on the raw header.
+      const forgedCancel = await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+        { "mcp-session-id": "not-a-session" }
+      );
+      expect(forgedCancel.status).toBe(401);
+
+      // ...and for a method the server does not recognize. An evolving
+      // protocol's notifications must not be a free unauthenticated door.
+      const unknown = await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "x" } },
+        { "mcp-session-id": "not-a-session" }
+      );
+      expect(unknown.status).toBe(401);
+
+      // An authenticated session still gets the protocol's 202, for known
+      // and unknown notification methods alike.
+      expect((await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { "mcp-session-id": f.aliceSession }
+      )).status).toBe(202);
+      expect((await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "x" } },
+        { "mcp-session-id": f.aliceSession }
+      )).status).toBe(202);
+
+      // Rate limiting applies too. Driven on a SEPARATE actor so the bucket
+      // this exhausts is not one the other assertions depend on.
+      const bobSession = await f.open("apikey:hard-key-b:hard-secret-b");
+      let refused = 0;
+      let accepted = 0;
+      for (let i = 0; i < 300; i++) {
+        const response = await f.mcp(
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { "mcp-session-id": bobSession }
+        );
+        if (response.status === 429) refused++;
+        else if (response.status === 202) accepted++;
+      }
+      expect(accepted, "no notification was accepted at all").toBeGreaterThan(0);
+      expect(refused, "300 notifications from one actor consumed no rate budget").toBeGreaterThan(0);
     } finally {
       f.close();
     }
