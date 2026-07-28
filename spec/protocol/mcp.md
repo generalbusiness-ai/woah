@@ -523,6 +523,13 @@ recorded reply — the original caller's receipt must survive another client's
 mistake. A submit or a recorded reply from before this field existed skips the
 check rather than guessing.
 
+The rule covers **every** recorded outcome, not only accepted ones. A terminal
+rejection is recorded under the key exactly like an accept, so serving one to a
+different request is the same confidently wrong answer — and the cheaper one to
+provoke, since any client can bank a rejection under a key it then reuses. The
+comparison therefore happens before the recorded outcome is returned, whatever
+its verdict.
+
 **Binding.** The retained outcome belongs to the actor whose turn committed
 it. A submit from a different actor under the same key still learns that its
 own submit committed nothing — that is the safety property — but receives
@@ -532,10 +539,36 @@ WebSocket turn frame too, so identical strings from different clients are
 possible and must never become a read channel.
 
 **Past the retention window.** Idempotency is a bounded-window guarantee, not
-an eternal one. The committing scope retains recorded replies for **at least
-its most recent 256 commits** (the recovery-tail window, never pruned) and at
-most 1024 total; the gateway's scope pin has the same posture. A retry
-arriving after its reply has pruned is a NEW turn by every observable
+an eternal one, and the two classes of recorded outcome are retained by
+different rules because their growth is limited by different things.
+
+- **Turns that COMMITTED** (they consumed a sequence number) are retained for
+  **at least the scope's most recent 256 commits** — the recovery-tail window,
+  never pruned — and at most 1024. The sequencer itself rate-limits this class:
+  one reply per seq.
+- **Receipts and terminal rejections** advance nothing, so they are recorded at
+  whatever head is current and the seq-ordered rule above can never age them
+  out. They are retained as a flat **most-recent-256 per scope**, oldest first.
+  A bound of this kind is not optional: a receipt is the cheapest row an actor
+  can write (one keyed act of speech), so without it any authenticated client
+  could grow authority storage without limit. Receipt pressure never evicts a
+  committed turn's reply — the quotas are separate.
+
+The resulting per-scope window is **1280 recorded replies**, each retaining at
+most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
+of insertion, in memory and in durable storage together: a prune that can lag
+its insert is the unbounded cache it was meant to prevent.
+
+**The gateway's scope pin is retained to cover that window**, counted PER SCOPE
+(2048 keys, above the 1280 a scope can retain) rather than shard-wide. The pin
+decides where a retry is routed and the recorded reply decides whether it
+executes, so a pin that expires while its reply is live would let a retry
+re-plan into a second scope and commit there — the same double execution, by a
+different door. The converse is not required: the pin is necessarily written
+before its submit (that is what makes it survive a lost response), so pins with
+no reply behind them are expected, and a pin outliving its reply is harmless.
+
+A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read
 versions, and it will execute. Clients MUST NOT treat an operation id as a
 durable receipt. Operations needing a durable, long-lived outcome record are

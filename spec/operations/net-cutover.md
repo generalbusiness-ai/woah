@@ -343,8 +343,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   writes, slow authority (latency lands attributed in `rpc_ms`), dead
   authority (bounded amplification to the named budget). What it cannot
   prove: real cross-colo tails and cold-start stalls — canary-only.
-- **Bounded growth — BUILT.** Reply cache capped (`REPLY_CACHE_CAP`
-  1024, recovery-tail never pruned), delivered outbox rows deleted,
+- **Bounded growth — BUILT.** Reply cache capped under two quotas
+  (`REPLY_CACHE_CAP` 1024 for committed turns, recovery-tail never
+  pruned; `RECEIPT_CACHE_CAP` 256 for receipts and terminal rejections,
+  which advance no seq and so can never leave that window), delivered outbox rows deleted,
   abandoned rows keep a 256-row debugging tail, drain passes and
   scheduled batches bounded per invocation, dedupe/pin LRUs capped,
   session reaper armed; retry backoff carries deterministic per-row

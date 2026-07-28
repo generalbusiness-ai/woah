@@ -93,6 +93,9 @@ async function fixture() {
 
   const states: Array<ReturnType<typeof netState>> = [];
   const scopeDOs = new Map<string, NetScopeDO>();
+  /** Per-scope DO state, so a test can reach the authority's own SQL (the
+   * recorded-reply table) instead of only its wire surface. */
+  const scopeStates = new Map<string, ReturnType<typeof netState>>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
     if (destination === "gateway:net-api") return gateway;
@@ -114,6 +117,7 @@ async function fixture() {
     expect(seeded.ok, `seed ${scope}`).toBe(true);
     states.push(st);
     scopeDOs.set(scope, instance);
+    scopeStates.set(scope, st);
   }
   const gatewayState = netState("gateway-net-api");
   states.push(gatewayState);
@@ -206,7 +210,15 @@ async function fixture() {
         });
 
   return {
-    alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv,
+    alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv, scopeStates,
+    /** Evict a scope DO: a fresh instance over the SAME durable state, so it
+     * rehydrates its reply cache from SQL instead of keeping the live map.
+     * `resolve` reads the map at call time, so the swap is enough. */
+    reviveScope: (scope: string) => {
+      const st = scopeStates.get(scope);
+      if (!st) throw new Error(`no state for scope ${scope}`);
+      scopeDOs.set(scope, new NetScopeDO(st.state, scopeEnv));
+    },
     mcp, call, hits, bump, say, complain, drain, settleAll,
     close: () => { for (const st of states) st.close(); }
   };
@@ -691,6 +703,169 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       const listed2 = page.result?.structuredContent?.result?.tools ?? [];
       expect(listed2.length).toBeGreaterThan(0);
       expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toBe("string");
+    } finally {
+      f.close();
+    }
+  });
+});
+
+/**
+ * Retention alignment between the gateway's selection pin and the authority's
+ * recorded reply (H2a/H2c).
+ *
+ * These two bounds are one mechanism. The pin decides WHERE a retry is sent;
+ * the recorded reply decides whether it executes when it gets there. If the
+ * pin expires first, a retry re-plans freely and can commit at a SECOND scope
+ * — the same double execution the key exists to prevent, reached through the
+ * routing door instead of the commit door. So the pin must outlive the reply.
+ */
+describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
+  /** Every pin row the gateway holds, newest last. */
+  const pins = (f: { gatewayState: { state: { storage: { sql: any } } } }) =>
+    (f.gatewayState.state.storage.sql.exec(
+      "SELECT idempotency_key, scope FROM net_gateway_pin ORDER BY rowid"
+    ) as { toArray(): Array<{ idempotency_key: string; scope: string }> }).toArray();
+
+  it("a busy NEIGHBOUR scope cannot evict a pin whose reply is still live", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.hits()).toBe(0);
+      const first = await f.bump(f.aliceSession, "op-pinned");
+      expect(first.result?.isError).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+
+      const mine = pins(f).find((row) => row.idempotency_key.endsWith("op-pinned"));
+      expect(mine, "the first submit pinned its scope").toBeTruthy();
+      const home = mine!.scope;
+
+      // Pressure from ANOTHER scope. Under the old shard-wide rule this
+      // pushed `op-pinned` out of the table while its recorded reply was
+      // still live at the scope, and the retry was free to re-plan.
+      const sql = f.gatewayState.state.storage.sql;
+      for (let i = 0; i < 3000; i += 1) {
+        sql.exec(
+          "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, 'a_busy_neighbour') ON CONFLICT DO NOTHING",
+          `neighbour-${i}`
+        );
+      }
+      // A fresh turn drives the retention sweep through the real code path.
+      expect((await f.bump(f.aliceSession, "op-sweep")).result?.isError).not.toBe(true);
+      await f.settleAll();
+
+      const after = pins(f);
+      expect(after.find((row) => row.idempotency_key.endsWith("op-pinned"))?.scope).toBe(home);
+      // Proof that this is the regression and not a vacuous pass: far more
+      // than the old shard-wide limit of 1024 rows are NEWER than the pin, so
+      // the previous `ORDER BY rowid DESC LIMIT 1024` sweep would have taken
+      // it. Retention is now counted within the scope that owns the reply.
+      const index = after.findIndex((row) => row.idempotency_key.endsWith("op-pinned"));
+      expect(after.length - index).toBeGreaterThan(1024);
+
+      // And the guarantee the pin exists for still holds end to end.
+      const retry = await f.bump(f.aliceSession, "op-pinned");
+      expect(retry.result?.structuredContent?.replayed).toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(2); // op-pinned once, op-sweep once. Never three.
+    } finally {
+      f.close();
+    }
+  });
+
+  it("pin gone, receipt alive: the recorded reply still refuses the second execution", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "op-unpinned")).result?.isError).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+
+      // Force the hazard: drop the pin, keep the reply. Selection re-plans
+      // freely — and because it lands on the scope that owns the target, the
+      // authority's recorded reply is what stops the re-execution. The pin is
+      // a routing guarantee, never the only defence.
+      f.gatewayState.state.storage.sql.exec(
+        "DELETE FROM net_gateway_pin WHERE idempotency_key LIKE '%op-unpinned'"
+      );
+      expect(pins(f).find((row) => row.idempotency_key.endsWith("op-unpinned"))).toBeUndefined();
+
+      const retry = await f.bump(f.aliceSession, "op-unpinned");
+      expect(retry.result?.structuredContent?.replayed).toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("receipt gone, pin alive: the retry is a NEW turn, and it runs at the PINNED scope", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "op-expired")).result?.isError).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+
+      const pinned = pins(f).find((row) => row.idempotency_key.endsWith("op-expired"));
+      expect(pinned).toBeTruthy();
+      // Expire the authority's reply the way retention would.
+      const scopeState = f.scopeStates.get(pinned!.scope);
+      expect(scopeState, `scope state for ${pinned!.scope}`).toBeTruthy();
+      scopeState!.state.storage.sql.exec("DELETE FROM net_scope_reply WHERE idempotency_key LIKE '%op-expired'");
+      // The live sequencer holds the same row in memory; evict the DO so it
+      // rehydrates from the durable rows that retention actually prunes.
+      f.reviveScope(pinned!.scope);
+
+      // Documented posture (M4.2): past the window a retry validates fresh and
+      // IS a new turn. What must not happen is it becoming a new turn at a
+      // DIFFERENT scope — the pin is still there and still routes it home.
+      const retry = await f.bump(f.aliceSession, "op-expired");
+      expect(retry.result?.isError).not.toBe(true);
+      expect(retry.result?.structuredContent?.replayed).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(2);
+      expect(pins(f).find((row) => row.idempotency_key.endsWith("op-expired"))?.scope).toBe(pinned!.scope);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("keyed speech records a DURABLE receipt at the authority, in the quota that bounds it", async () => {
+    // The transport half of the reviewer's probe: prove that keyed
+    // observation-only speech really does land as a row in the authority's
+    // reply table (that is what was growing without limit), and that the row
+    // is the marked, non-advancing kind the quota governs. The eviction edge
+    // itself is driven directly in tests/net/scope.test.ts — replaying it here
+    // would cost hundreds of full MCP turns for no extra signal.
+    const f = await fixture();
+    try {
+      const rowsFor = (pattern: string) =>
+        [...f.scopeStates.values()].flatMap((st) =>
+          (st.state.storage.sql.exec(
+            "SELECT idempotency_key, body FROM net_scope_reply WHERE idempotency_key LIKE ?",
+            pattern
+          ) as { toArray(): Array<{ idempotency_key: string; body: string }> }).toArray()
+        );
+
+      for (let i = 0; i < 4; i += 1) {
+        const said = await f.say(f.aliceSession, `line ${i}`, `op-say-${i}`);
+        expect(said.result?.isError, JSON.stringify(said).slice(0, 300)).not.toBe(true);
+        await f.settleAll();
+      }
+
+      const rows = rowsFor("%op-say-%");
+      expect(rows.length).toBe(4);
+      for (const row of rows) {
+        const reply = JSON.parse(row.body) as Record<string, unknown>;
+        expect(reply.status).toBe("accepted");
+        // Marked non-advancing: this is what puts the row under the receipt
+        // quota instead of the seq-ordered rule that can never reach it.
+        expect(reply.replay_receipt).toBe(true);
+      }
+
+      // And the retry still replays rather than re-emitting.
+      const again = await f.say(f.aliceSession, "line 0", "op-say-0");
+      expect(again.result?.structuredContent?.replayed).toBe(true);
+      await f.settleAll();
+      expect(rowsFor("%op-say-%").length).toBe(4);
     } finally {
       f.close();
     }

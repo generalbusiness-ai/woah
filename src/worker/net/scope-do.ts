@@ -361,7 +361,12 @@ export class SqliteScopeStore implements ScopeStore {
 
   readReplies(): Array<{ key: string; reply: CommitReply }> {
     return sqlRows<{ idempotency_key: string; body: string }>(
-      this.storage.sql.exec("SELECT idempotency_key, body FROM net_scope_reply")
+      // ORDER BY rowid, explicitly: the reply cache's non-advancing quota is
+      // insertion-ordered FIFO (scope.ts pruneReplies), and rehydration must
+      // rebuild that order rather than inherit whatever a bare scan yields.
+      // `ON CONFLICT DO UPDATE` keeps a row's original rowid, so rowid order
+      // IS first-insertion order.
+      this.storage.sql.exec("SELECT idempotency_key, body FROM net_scope_reply ORDER BY rowid")
     ).map((row) => ({ key: row.idempotency_key, reply: JSON.parse(row.body) as CommitReply }));
   }
 
