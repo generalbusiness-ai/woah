@@ -10126,7 +10126,11 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
     aliases: tool.aliases,
     args: tool.argNames,
     description: tool.description,
-    ...(includeSchema ? { input_schema: tool.inputSchema } : {})
+    // The PROTOCOL schema, so `woo_list_reachable_tools` and `tools/list`
+    // advertise the same call surface — including the reserved
+    // `operation_id`. Handing back the raw descriptor schema here would hide
+    // retry safety from exactly the agents that discover tools this way.
+    ...(includeSchema ? { input_schema: mcpProtocolTool(tool).inputSchema } : {})
   };
 }
 

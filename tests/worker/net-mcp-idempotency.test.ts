@@ -361,6 +361,14 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       // It is never `required`: an existing client that has never heard of
       // it keeps working exactly as before.
       expect(wooCall?.inputSchema?.required ?? []).not.toContain("operation_id");
+
+      // The discovery control advertises the SAME call surface — an agent
+      // that finds tools this way must not be shown a schema that hides
+      // retry safety.
+      const page = await f.call(f.aliceSession, "woo_list_reachable_tools", { limit: 5, include_schema: true });
+      const listed2 = page.result?.structuredContent?.result?.tools ?? [];
+      expect(listed2.length).toBeGreaterThan(0);
+      expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toBe("string");
     } finally {
       f.close();
     }
