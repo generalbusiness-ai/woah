@@ -820,6 +820,17 @@ carry:
 | corrected seeded map values (`merge_map` hooks) | `repair-seed-properties` |
 | instance data rewrites (`transform_property`, `rename_property`) | **no operator op — see below** |
 
+Two further family members repair aged RUNTIME data rather than catalog content,
+so they are addressed at the scopes that own the data, not at the catalog:
+`repair-contents` (missing membership rows, CO13) and `repair-verb-slots`
+(objects whose verb pages share an ordinal, [../protocol/coherence.md
+§CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)). Both derive their
+own candidates from the addressed scope's own cells; the operator supplies only
+the scope list. `repair-verb-slots` renumbers into the `(slot, name)` order every
+node already resolves in — it cannot recover an authoring order nothing recorded
+— so it changes no dispatch, and it declines objects whose ordinals are already
+distinct, gaps included.
+
 The authorization is the migration file itself: the CLI admits a drop only when
 a bundled migration declares that `drop_verb` / `drop_property` **and** the
 current bundle no longer defines the page, so publishing the migration is what

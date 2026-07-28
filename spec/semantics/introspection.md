@@ -85,11 +85,11 @@ The introspection convention is built on these builtins (existing or near-existi
 | Builtin | Returns | Notes |
 |---|---|---|
 | `properties(obj)` | list<str> | Names of all properties visible on `obj` (including inherited definitions). |
-| `verbs(obj)` | list<str> | Callable verb names visible on `obj`; duplicate local slots with the same name may appear more than once when an implementation exposes the raw slot list. |
+| `verbs(obj)` | list<str> | Callable verb names visible on `obj`, in slot order; duplicate local slots with the same name may appear more than once when an implementation exposes the raw slot list. Under sparse (Net) planning this is a COMPLETE-ENUMERATION read that no cell miss can repair, so it answers from the pages the turn's slice holds: correct for an object the call names as an argument or reaches through an object-valued property, and possibly short for one reached only by literal. Do not derive an allocation from it — `add_verb` allocates authoritatively ([builtins.md §19.4.1](builtins.md), [../protocol/coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)). |
 | `parents(obj)` | list<obj> | Inheritance chain root-ward, excluding `obj` itself. |
 | `children(obj)` | list<obj> | Direct inheritance children of `obj`. |
 | `is_a(obj, class)` | bool | Whether `class` appears in `parents(obj)` or equals `obj`; host-transparent for valid cross-host object refs. |
-| `verb_info(obj, descriptor)` | map | `{slot, name, owner, perms, arg_spec}` for the resolved verb on `obj`; descriptor is a name or 1-based local slot. |
+| `verb_info(obj, descriptor)` | map | `{slot, name, owner, perms, arg_spec}` for the resolved verb on `obj`; descriptor is a name or a stored slot ordinal. |
 | `property_info(obj, name)` | map | `{owner, perms, defined_on, type_hint, has_value}`. |
 | `declared_schemas(obj)` | list<str> | Event types this object has declared schemas for. |
 | `event_schema(obj, type)` | map | The declared schema for a specific event type. |

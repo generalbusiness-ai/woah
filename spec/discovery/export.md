@@ -190,9 +190,16 @@ export, as catalog authors do today.
 ## EX8. Determinism, provenance, integrity
 
 Two exports of the same definitions with the same request metadata produce
-byte-identical bundles: entries sorted by `local_name`, verbs and properties
-by name, V2-canonical value encoding, no timestamps in `manifest.json` or
-`README.md`. Provenance is a detached sidecar — attribution travels with the
+byte-identical bundles: entries sorted by `local_name`, properties by name,
+V2-canonical value encoding, no timestamps in `manifest.json` or `README.md`.
+
+**Verbs are ordered by SLOT, not by name.** A definer's slot order is the
+dispatcher's tie-breaker between two verbs whose alias patterns overlap
+([../semantics/objects.md §9.1](../semantics/objects.md#91-lookup)), and install
+assigns slots from manifest order — so name-sorting a class's verbs on export
+would silently change which verb an alias reaches in every world that installs
+the bundle. Slot order is total and deterministic, so it satisfies the
+byte-identical requirement on its own. Provenance is a detached sidecar — attribution travels with the
 bundle but is not part of the installable identity and is ignored by the
 install path:
 

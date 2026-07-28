@@ -1511,6 +1511,28 @@ It mines every bundled `merge_map` hook, posts each to the scope that owns the
 target cell, and merges key-wise on the server, so operator-edited entries are
 never overwritten and re-running is a no-op.
 
+For a Net world in which any verb was authored before 2026-07-27 — through
+`install_verb`, `add_verb`, the verb editor, or any `set_verb_info` /
+`set_verb_code` — the committed pages of those objects share a verb ordinal
+([coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)).
+Until this runs, MCP refuses an ambiguous alias match on such an object
+(`verb_order_unavailable`) and `list_verb` reports an ordinal that addresses
+nothing. Deploy the runtime, then run the idempotent verb-slot repair per scope
+(add `--dry-run` to size it first):
+
+```bash
+npm run repair:net-verb-slots -- https://woah1.generalbusiness.ai --all-seeded
+npm run repair:net-verb-slots -- https://woah1.generalbusiness.ai cluster:<actor> room:<space>
+```
+
+`--all-seeded` covers the scopes the bundle installs; scopes created after
+install (actor clusters, rooms minted at runtime) must be named — this driver
+never enumerates a world. Each scope derives its own candidates from its own
+verb cells, objects are capped per request, and the reply's `remaining` says
+whether to run again. The repair renumbers into the order every node already
+resolves in, so no verb name starts resolving to a different verb; it cannot
+restore the authoring order, which nothing recorded.
+
 These commands require the currently deployed `WOO_INTERNAL_SECRET`. A missing
 local copy is not recoverable from Cloudflare (Worker secret values are
 write-only); rotate that secret deliberately and store the replacement in the

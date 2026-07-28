@@ -29,9 +29,12 @@ Every object has:
 It additionally has tables of:
 
 - **Verbs** defined locally as an ordered list of slots (slot, name, aliases,
-  source, compiled bytecode, owner, perms, arg spec, version). Multiple local
-  slots may share the same name; descriptors may refer to a verb by name or by
-  1-based slot number.
+  source, compiled bytecode, owner, perms, arg spec, version). A descriptor may
+  name a verb or give its slot ordinal (§9.1). The object model permits multiple
+  local slots under one name — LambdaMOO's arrangement, where they are
+  distinguished by aliases or arg spec — but the AUTHORING surfaces (`add_verb`,
+  `install_verb`, the verb editor) refuse a duplicate name, so a same-name pair
+  can only be introduced by a catalog install or a substrate-level write.
 - **Property values** locally (name, value, owner override, perms override).
 - **Property definitions** locally (name, default value, type hint, owner, perms) — these introduce a new property visible to descendants.
 - **Event schemas** declared locally (event-type → JSON-Schema-ish).
@@ -229,9 +232,35 @@ There is no global object registry, by design. "All instances of `$room`" is ans
 ### 9.1 Lookup
 
 Each object's local verbs are an ordered list, not a name-keyed map. The slot
-number is the verb's 1-based index in that local list, matching LambdaMOO's
-`verbs(obj)` / `@verb#` convention. Slot numbers are stable until a local verb is
-inserted or deleted; deleting a slot compacts later slots.
+number is a **durable per-object ordinal**, not a position in any array: it is
+assigned once, stored with the verb, and never recomputed. Slot values are
+unique within an object (the persistence schema declares
+`PRIMARY KEY (object_id, slot)` — see
+[../reference/persistence.md §15](../reference/persistence.md)); a numeric verb
+descriptor names that stored value, which is the same number `verb_info` and
+`list_verb` report.
+
+**Allocation.** A new local verb takes `max(slot over the object's local verbs)
++ 1`. Slots are therefore monotonic within an object and are never reused.
+
+**Density is not guaranteed.** Deleting a local verb leaves its ordinal vacant;
+surviving verbs keep the slots they had. Only relative ORDER is load-bearing, so
+gaps are ordinary and an object whose slots read `1, 3, 4` is in a correct
+state. Compacting after a delete would rewrite ordinals belonging to verbs the
+delete never touched — invalidating slot descriptors that agents and caches
+already hold, and, on a node that holds only part of the object (every Net
+planning slice), rewriting them from a position that means nothing.
+
+**Sparse authoring.** A node planning against part of an object cannot know the
+object's whole verb set, so its allocation is a proposal. The object's authority
+validates it before commit: a write to an existing page must keep that page's
+slot, and a new page must take exactly the authority's current allocation floor.
+See [../protocol/coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation).
+
+**Ties.** Two local verbs must not share a slot. Aged worlds may nonetheless
+contain objects that do (see CO4.7); implementations MUST order such pages
+deterministically by `(slot, name)` so every node resolves identically, and the
+operator repair renumbers them into exactly that order.
 
 Given `obj:name(args)`:
 
