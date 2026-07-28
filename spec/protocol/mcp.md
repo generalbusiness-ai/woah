@@ -171,6 +171,9 @@ remediation. `detail.reason` carries the machine-readable form:
 | Verb fails the execute prefilter | `E_PERM` | `verb_not_executable` |
 | `direct` route, verb lacks `direct_callable` | `E_DIRECT_DENIED` | `not_direct_callable` |
 
+An argument that does not satisfy the advertised schema is refused before any
+of the above are reached, with its own `detail.reason` (§M4.3).
+
 `E_VERBNF` uses the engine's `{obj, name}` detail shape. Each refusal also
 carries a `remediation` string naming the action that would change the answer.
 A world-level refusal from the turn itself carries no gateway `reason` — that
@@ -232,7 +235,8 @@ There is deliberately no `all` scope. `active` already returns the complete
 structural context; a separate `all` had no distinct selection (it resolved to
 the same local closure) and wrongly implied a global tool enumeration, which
 Big-World forbids ([distribution.md](../semantics/distribution.md)). A request
-for `scope: "all"` is rejected.
+for `scope: "all"` is rejected — by the schema's own `enum` (§M4.3), so the
+refusal names the field and the four allowed values.
 
 ### M2.2 Verb mapping
 
@@ -270,8 +274,9 @@ shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
 string, resolved object slots are object-id strings, and `cmd` is an object.
 
 Named invocation maps JSON object properties to positional verb arguments in
-the declared order. Missing properties become `null`. `woo_call` accepts the
-positional list directly.
+the declared order. `woo_call` accepts the positional list directly. Both are
+validated against the advertised schema first (§M4.3): a missing REQUIRED
+property is refused, and only an absent OPTIONAL one becomes `null`.
 
 ### M2.3 Tool naming
 
@@ -637,11 +642,94 @@ durable receipt. Operations needing a durable, long-lived outcome record are
 domain state (an order id, a task) and belong in the world, not in this
 cache.
 
+### M4.3 Argument validation
+
+**Arguments are validated against the advertised `inputSchema` before
+dispatch.** A refused call runs no verb: it emits no observation, writes no
+cell, and consumes no sequence number. This is a correctness rule, not a
+conformance one — an unvalidated argument otherwise reaches the VM, which
+makes the schema published to a model decorative.
+
+The validator reads the **same object that was advertised**, never a second
+derivation of it. A dynamic tool is checked against the protocol schema
+`tools/list` published for it (the derived `arg_spec` schema plus the reserved
+`operation_id`, §M4.2); a stable control is checked against its own published
+schema. A validator built from an independent restatement of `arg_spec` would
+be free to disagree with the advertisement, which is the defect this rule
+closes.
+
+**What is checked.** Exactly the vocabulary an advertisement can contain:
+
+| Keyword | Meaning enforced |
+|---|---|
+| `required` | The property must be present and not `undefined`. |
+| `type` | `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`. `integer` is the narrower assertion over JSON's single number type. |
+| `enum` | The value must be one of the listed values. |
+| `anyOf` | At least one branch must accept (the form a `a\|b` type hint derives). |
+
+**What is deliberately NOT checked**, because no advertisement can express
+it: nested object properties, array element schemas (`items` is always `{}`),
+`additionalProperties`, `format`, numeric or length bounds, `pattern`,
+`oneOf`/`allOf`/`not`, and `$ref`. A schema fragment the validator does not
+recognize **constrains nothing** rather than refusing, so a future
+advertisement can never begin rejecting calls that were valid before the
+validator learned about it.
+
+**Unknown properties are ignored, not rejected.** Advertised schemas do not
+set `additionalProperties:false`, so JSON Schema's own reading of them permits
+extras, and clients legitimately decorate `arguments`. Rejecting what the
+advertisement permits would be a fresh disagreement between the two. The
+failure this leniency could hide — a misspelled parameter name — is still
+caught, because the correctly spelled parameter is then *missing*: that
+refusal lists the unrecognized properties under `detail.unknown_properties` so
+the typo is diagnosable.
+
+**`null` in an optional slot means "not supplied."** It is precisely what the
+transport substitutes for an absent property when mapping named arguments onto
+positional ones (§M2.2), so refusing it would refuse the protocol's own
+encoding of absence. A `null` supplied for a *required*, type-declared
+parameter is a type mismatch.
+
+**Refusal shape.** `E_INVARG` with a `detail.reason`, the offending parameter,
+what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
+
+| Condition | `detail.reason` | Key detail fields |
+|---|---|---|
+| A required parameter is absent | `missing_required_argument` | `field`, `expected`, `missing`, `required`, `unknown_properties?` |
+| A supplied value has the wrong type | `argument_type_mismatch` | `field`, `expected`, `received` |
+| More positional args than the verb declares | `too_many_arguments` | `declared`, `maximum_arity`, `received_arity` |
+| `woo_call` `object`/`verb` supplied but empty | `empty_required_argument` | `field` |
+
+**`woo_call` is validated in two stages, and carries a residual.** Its own
+schema (`object` and `verb` required strings, `args` an array) is checked
+first. Its `args` list is free-form by construction — the tool cannot
+advertise the parameters of a verb chosen at call time — so the second stage
+runs *after* verb resolution, against the resolved page's own `arg_spec`,
+which is the same input the dynamic `inputSchema` is derived from. That stage
+checks positional arity (minimum from the last required position, maximum from
+the declared count) and the per-position type.
+
+The residual: **a page whose `arg_spec` carries no parameter declaration list
+at all is not arity-checked.** That is the `(dobj prep iobj)` command-header
+form, whose parameters are bound from parsed command tokens rather than
+declared positionally, and any aged page written before `arg_spec` carried a
+list. Such a call passes through unexamined. Assuming "zero parameters"
+instead would refuse every legitimate command-shaped call, and the gateway has
+no other source for the arity. A client cannot rely on a refusal for a
+malformed call to such a verb; the verb body remains its own guard.
+
+Beyond that residual, argument *meaning* is never checked here: that a string
+names a real object, that a number is in range, that a list has the right
+members. Those are the verb's own business and are enforced inside the
+authoritative turn.
+
 ## M5. Observation queue
 
 `woo_wait` drains a gateway-local, per-session FIFO fed by the same
 presence-routed fanout as WebSocket clients. It accepts `timeout_ms` from 0 to
-25,000 and `limit` from 1 to 256 (default 64). It returns
+25,000 and `limit` from 1 to 256 (default 64); values of the declared type are
+clamped into those ranges, while a value of the wrong type is refused (§M4.3)
+rather than silently replaced by the default. It returns
 `{observations:[...], gap:<bool>}`.
 
 The queue holds at most 256 observations and drops the oldest on overflow.

@@ -10562,8 +10562,8 @@ function mcpSchemaForHint(raw: string): Record<string, unknown> {
  * stable-control schemas. Deliberately NOT supported, because no
  * advertisement can express them: nested object/array element schemas
  * (`items` is always `{}`), `additionalProperties`, `format`, numeric or
- * length bounds, `pattern`, `oneOf`/`allOf`/`not`, and `$ref`. A schema
- * fragment this validator does not understand constrains NOTHING rather than
+ * length bounds, `pattern`, `oneOf`/`allOf`/`not`, and schema references. A
+ * schema fragment this validator does not understand constrains NOTHING rather than
  * refusing, so a richer future advertisement can never start rejecting calls
  * that were valid before the validator learned about it.
  */
