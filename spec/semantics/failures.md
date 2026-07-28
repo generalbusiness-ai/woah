@@ -69,6 +69,12 @@ The space-level failure rules in [space.md §S3](space.md#s3-failure-rules-norma
 
 These rules together preserve replay determinism: the log is faithful, the rolled-back state is recoverable, and observers see one coherent story.
 
+Behavior transactions are nested savepoints. An inner failure restores the
+state and recorded effects produced by that inner scope without discarding its
+parent's earlier work. An inner success merges provisionally into its parent;
+if the parent later fails, the inner effects are also rolled back and cannot be
+persisted or submitted to another authority.
+
 Failure-prone transport work belongs after acceptance. A session-ended
 notification, socket closure, or other host callback runs only after the
 authoritative behavior result and persistence are ready. It is best-effort:
@@ -114,7 +120,16 @@ Tick weights for cross-host operations (`GET_PROP` remote 100, `CALL_VERB` remot
 
 ## F6. Storage and persistence failures
 
-The persistence layer (`spec/reference/persistence.md`) gives per-write atomicity. A sequenced call runs on an async behavior path with an in-memory behavior savepoint, then commits the final local state and log outcome in one host transaction ([cloudflare.md §R3.4](../reference/cloudflare.md#r34-transactions-and-rollback-scope)). A verb body is *not* atomic across yield points; cross-DO ops give other tasks the chance to interleave. Storage-level failures fall into two categories with **distinct, definite semantics**:
+The persistence layer (`spec/reference/persistence.md`) gives per-write
+atomicity. A sequenced call runs on an async behavior path with an in-memory
+behavior savepoint, then commits the final local state and log outcome in one
+host transaction
+([cloudflare.md §R3.4](../reference/cloudflare.md#r34-transactions-and-rollback-scope)).
+The host-task queue remains owned across VM yields and awaited RPCs, so another
+local behavior cannot observe or overwrite provisional state. A remote
+authority may independently progress while awaited; its accepted mutation is
+outside this local transaction. Storage-level failures fall into two
+categories with **distinct, definite semantics**:
 
 **Call-commit storage failure.** If persistent storage fails before the final call commit completes — including durable seq allocation, log insert, outcome update, dirty object writes, or final commit — the call is rejected: `op:"error"` with code `E_STORAGE`. **No durable `seq` is visible.** Nothing is committed to the log. From all replay readers and subscribers, the call did not happen.
 

@@ -329,7 +329,25 @@ configurable horizon with the same backup/restore caveat as §14.2.1.
 
 ### 14.3 Atomicity
 
-All writes within a single opcode are atomic (CF DOs give us SQLite transactions). A verb body is *not* atomic across yield points; cross-DO ops give other tasks a chance to interleave on each DO. Authors who need atomicity across multiple ops use `with_lock(obj) { ... }` (deferred to phase 2; simply documented for v1).
+All writes within a single opcode are atomic (CF DOs give us SQLite
+transactions). A single-authority verb body is also failure-atomic across its
+await points: if it raises, its behavior-domain mutations and observations are
+rolled back together. The owning host holds its input gate for the whole call;
+an await does not expose provisional local state to another local turn.
+Independent remote authorities may progress while the call awaits them, which
+is why cross-authority mutations are outside the local rollback scope and
+require the refusal-or-saga rule in
+[failures.md §F3](../semantics/failures.md#f3-validation-authorization-and-behavior-failure).
+No deferred `with_lock` primitive is required for the failure-atomicity
+guarantee.
+
+A `WorldRepository` whole-world `save(world)` is one atomic replacement, not a
+sequence of independently visible files or rows. If it raises, a subsequent
+cold load MUST return the complete prior world; it must never observe a
+partially written candidate. Folder-backed repositories satisfy this by writing
+an immutable staged generation and atomically publishing its completed
+manifest/pointer. Deleting or overwriting the live generation before the
+candidate is complete is non-conforming.
 
 ### 14.4 Scope-authority commit schema
 

@@ -208,9 +208,27 @@ catalog source.
 
 `execute_command_plan(plan)` consumes a command plan produced by
 `$match:plan_command`. Direct plans execute through the normal dispatch path and
-return the target verb's result. Sequenced plans require a live session and run
-through the resolved command space, returning the applied/error frame. This
-builtin is for inherited command-surface verbs such as
+return the target verb's result. A sequenced plan reached through a direct
+compatibility `:command` is a **terminal ingress transfer**, not a nested second
+call. Planning before transfer is read-only and is not separately accepted.
+The original correlation/idempotency key, session, actor, and call identity
+continue into the resolved command-space call; the compatibility wrapper
+allocates and accepts nothing. The transferred target execution produces the
+one transcript and the top-level `applied`/`error` response—an applied frame is
+never wrapped inside a direct `result`. The semantic command space's sequence
+allocation survives only when the write-set-selected commit authority owns
+that space; off-room routing follows coherence.md §CO2.3 and consumes no room
+sequence.
+
+The compatibility wrapper does not resume after transfer. It MUST transfer
+only when its current behavior transaction contains proof reads and dispatch
+metadata but no behavior-domain effect. If the transfer cannot be terminal or
+an effect has already been produced, it refuses with `E_SCOPE_SPLIT` before any
+sequence is allocated. A call already executing as a sequenced turn may inline
+a compatible same-space dispatch; it refuses incompatible sequenced nesting
+rather than accepting a second turn.
+
+This builtin is for inherited command-surface verbs such as
 `$conversational:command(text)`; browser clients should normally use v2 command
 intents instead of calling it indirectly.
 

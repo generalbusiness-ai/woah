@@ -92,6 +92,15 @@ turn commits or rolls back as a whole; it is never half-local, half-remote.
 A state miss is a **pre-execution** failure: abort before committing,
 acquire state, retry the whole turn.
 
+Planning projections are installed or repaired only between whole-turn
+attempts. During an attempt they are immutable inputs. Attempt-local derived
+state and behavior-domain recorder effects follow the same savepoint stack as
+the state they describe: an inner success merges provisionally into its parent,
+and an aborted inner or outer scope cannot influence later reads or contribute
+a domain effect to the submitted transcript. Reads, dispatch proofs, state
+probes, deterministic logical inputs, and untracked-effect evidence may remain
+after abort when the authority needs them to validate the failed attempt.
+
 ### CO2.3 Commit scope by write set, with ride-along
 
 The commit scope is chosen by the turn's write set — the smallest ordering
@@ -242,6 +251,15 @@ A replayed idempotency key returns the recorded reply. A redelivered fanout
 frame is a no-op by scope head. Accepted frames carry the authority's
 acceptance timestamp so retried deliveries never mint fresh wall-clock
 values.
+
+"Returns the recorded reply" means that every retained recorded-outcome field
+has the same immutable decoded value, not that the fresh and replay envelopes
+are identical. A replay adds `replayed`/`replay_outcome` metadata and may
+explicitly report omitted output under CO9. Neither envelope exposes writable
+host-language identity into the cached outcome. Everyday wire encoding need
+not use replay-canonical key order or number formatting (values.md §V8), and
+mutating one delivered representation cannot alter the authority's cache or a
+later delivery.
 
 The recorded reply also carries the OUTCOME of the execution that committed
 under that key — the verb's return value, its transcript error, and its
@@ -1299,9 +1317,10 @@ One write path per fact (CO9), concretized:
     a room-owned act necessarily rides at the room and logs atomically.
   - Accepted turn replies carry the planned transcript's `result`,
     `error`, and `observations` (the gateway holds the planned
-    transcript; `error` matters because an errored verb still commits
-    its complete transcript — without the field an accepted no-op is
-    indistinguishable from success). A scope-confirmed replay of a durable
+    transcript; `error` matters because an errored verb still commits its
+    failure envelope and canonical `$error` outcome — without the field an
+    accepted no-op is indistinguishable from success). Aborted behavior-domain
+    effects are absent. A scope-confirmed replay of a durable
     commit marks `replayed:true` and returns the RECORDED outcome of the
     execution that committed rather than the replay's own re-plan, with
     `replay_outcome` (`full`/`partial`/`none`) and `replay_omitted` naming
@@ -1905,7 +1924,9 @@ deletes the outbox row, and emits it to the scope as an observation.
 Both shapes matter and they look nothing alike. A rejected commit carries
 its verdict nested inside the planner's `TurnResult.reply`; an accepted
 commit whose verb raised carries a top-level `error` and a `status` of
-accepted, because a verb that throws still commits its transcript. Reading
+accepted, because a verb that throws still commits its sequence, failed log
+outcome, and canonical `$error`, while its behavior-domain effects are rolled
+back. Reading
 only one of them — or reading a top-level `status` that the real reply
 never has — records nothing for the case most likely to happen in
 practice. Recording is what makes the "one

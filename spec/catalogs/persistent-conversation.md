@@ -431,9 +431,22 @@ scope and raw text. The server consumes the plan and dispatches:
 
 The catalog-level `:command(text)` verb remains a compatibility command surface
 for older direct callers. It consumes the same plan shape: direct plans execute
-inline and sequenced plans return the applied/error frame from the resolved
-command space. Browser clients use the v2 command-intent path to avoid an extra
-catalog call.
+inline. A sequenced plan performs a terminal ingress transfer to the resolved
+command space: the direct wrapper is not separately accepted and does not
+resume, and the original correlation/idempotency key, session, actor, and call
+identity continue. The wrapper allocates nothing. The target execution supplies
+the single transcript and top-level
+`op:"applied"` or `op:"error"` response; it is never nested inside
+`op:"result"`. Its semantic-space sequence allocation survives only when the
+write-set-selected authority owns that space; CO2.3 off-room routing consumes
+no room sequence.
+
+Planning before transfer is read-only. If the wrapper has already produced a
+behavior-domain effect or the transfer cannot be terminal, the call refuses
+`E_SCOPE_SPLIT` before sequence allocation. Incompatible nesting inside an
+already-sequenced turn is refused rather than accepted as a second turn.
+Browser clients use the v2 command-intent path to avoid the compatibility
+transfer entirely.
 
 The SPA already implements this pattern for task board; persistent
 conversation relies on the same route-aware client behavior.

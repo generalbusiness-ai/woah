@@ -528,7 +528,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
 | `:huh(text, reason?)` | str, str? | Compatibility wrapper. Delegates to `actor:huh(text, reason, this)` so parse-miss output remains actor-owned while old space-level callers continue to work. |
 | `:command_plan(text)` | str | Compatibility wrapper around `$match:plan_command(text, this)`, returning a concrete direct/sequenced/huh route. |
-| `:command(text)` | str | Compatibility command surface. It executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients submit v2 command intents for the same server-side direct/sequenced execution path. |
+| `:command(text)` | str | Compatibility command surface. It executes direct plans inline. For a sequenced plan, its read-only planning scope transfers terminally to the resolved command space without a second accepted call: the original id/session/actor continue, the wrapper allocates nothing, and the target's applied/error frame is the top-level response. The semantic-space sequence survives only when the write-set-selected authority owns it (CO2.3). If transfer is not terminal or planning has already produced a domain effect, it refuses `E_SCOPE_SPLIT` before allocation. Browser clients submit v2 command intents for the same server-side direct/sequenced execution path. |
 | `:can_be_attached_by(actor)` | obj | Attachment policy. Bundled `$conversational` allows attachment by default; stricter feature objects override. |
 
 ### B5.3 `$room` / `$exit` verbs

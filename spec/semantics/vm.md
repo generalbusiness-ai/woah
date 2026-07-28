@@ -255,7 +255,11 @@ Cooperative `YIELD` opcodes are inserted at compile time at:
 - Loop back-edges
 - After every Nth straight-line opcode in a basic block (N=64)
 
-This bounds the time any single task can hold the host without releasing the input gate.
+`YIELD` yields to the host JavaScript runtime so timers, cancellation, and
+platform work can progress; it does not release WooWorld's serialized
+host-task queue to another behavior. The input gate remains held until the
+turn accepts or aborts. This preserves a stable in-memory transaction while
+preventing a long bytecode basic block from monopolizing the isolate.
 
 ### 8.7 Wall-time budget
 

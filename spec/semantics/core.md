@@ -43,6 +43,14 @@ introspection, or hot matching primitives. A native matching primitive may
 iterate candidates and enforce visibility, but per-class name policy and
 human-facing failure text should live in catalog code where possible.
 
+Every mutation of the authoritative object graph MUST pass through a substrate
+primitive that participates in the current behavior transaction. The primitive
+is responsible for rollback, effect recording, versioning, and persistence as
+applicable. Direct mutation of object rows, lineage or lifecycle flags,
+property/verb collections, sessions, logs, snapshots, or derived containment
+state is not a semantic mutation path, even inside trusted bootstrap, catalog,
+or migration code.
+
 ---
 
 ## C1. Objects
@@ -178,6 +186,14 @@ Applying a sequenced message follows this shape:
 
 Within one `$space`, conflicting coordinated mutations are resolved by sequence
 order. Across spaces, Woo-core promises no implicit total order.
+
+Step 5 runs inside a nestable behavior transaction. When the runtime opens an
+inner savepoint, its abort restores only effects produced since that savepoint
+began. An inner commit is
+provisional: it merges into its parent, and a later outer abort removes those
+effects as well. Only the outermost accepted behavior transaction may
+materialize durable state or contribute behavior-domain effects to a
+transcript.
 
 ---
 

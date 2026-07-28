@@ -98,6 +98,16 @@ Values are **immutable**. Operations that look like mutations return new values:
 
 Property writes (`SET_PROP`) mutate an *object's* state, not the value previously held in that slot. Implementations may share substructure for efficiency; the contract is that observers of a value cannot see it change.
 
+Every Woo value that crosses an authority boundary is such an immutable
+snapshot. This includes property and verb reads, verb results, and values
+carried by observations, replay frames, cached replies, and host-seed
+deliveries. The containing boundary record is detached as well: mutating a
+host-language container received at one boundary MUST NOT mutate authoritative
+state, alter a later observation or replay, or change the data returned at a
+later boundary. An implementation may satisfy this with detached copies,
+frozen persistent values, or another representation with the same observable
+semantics.
+
 ---
 
 ## V5. Object references

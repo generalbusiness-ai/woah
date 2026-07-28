@@ -387,12 +387,12 @@ Exactly one seat. `observations` on the reply and the queue's echo dedupe are
 two halves of one rule, so a client that reads both never receives an event
 twice, and delivery to every other session is unaffected.
 
-**The seat survives failure.** A verb that emits and then throws still commits
-its transcript, so those lines happened — and because the echo dedupe has
-already suppressed them from `woo_wait`, the error envelope is their only
-carrier. An `isError:true` result for an accepted commit therefore carries
-`structuredContent.observations` under the same filtering rule as a successful
-one. Transport failures and rejected commits ran no verb and carry none.
+**Failure has one canonical seat.** A verb that emits or mutates and then
+throws rolls those behavior-domain effects back. Its accepted sequenced failure
+commits only the sequence/log envelope and one canonical `$error` observation.
+An `isError:true` result therefore carries that canonical failure observation,
+not any line emitted by the aborted body. Direct failures and rejected commits
+have no accepted turn observations.
 
 A detected idempotent replay (§M4.2) commits nothing this round. It carries
 the observations RECORDED with the committed execution, never the retry's own
@@ -449,8 +449,9 @@ same actor, within the retention window (below):
    `structuredContent.replayed:true`, `replay_outcome`, the recorded
    `result`, the recorded `observations`, and — if the verb threw — the
    recorded error as a normal `isError` result. A verb that threw still
-   commits its transcript, so replaying that as an empty success would be
-   worse than the double execution this mechanism prevents.
+   commits its failure envelope and canonical `$error` outcome, so replaying
+   that as an empty success would be worse than the double execution this
+   mechanism prevents.
 
 The retry's own re-plan is NEVER presented as the outcome. It describes an
 execution that committed nothing, and for a turn reading `now()` or `random()`

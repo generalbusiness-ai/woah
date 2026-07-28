@@ -58,6 +58,11 @@ The protocol-level invariants that make cross-host execution sound:
 
 **2. Idempotency via correlation id.** Every cross-host RPC carries a `correlation_id`. Receivers maintain a recent-replies cache (TTL ~5 minutes) keyed by correlation id. A duplicate request returns the cached reply rather than re-executing. Transient network failures with retries are therefore safe.
 
+The duplicate receives the same immutable decoded reply data and
+protocol-significant fields, not the same writable host-language object.
+Everyday JSON encoding need not be byte-identical. A caller cannot mutate the
+cached receipt or change what a later retry receives.
+
 **3. Originator authoritative for transient-host returns.** A task that called into a transient host has its identity fields (`progr`, `player`, `caller`, `task_id`) retained by the originator. Returned values are inputs to the originator, not authoritative state.
 
 **4. Bytecode versioning on serialized tasks.** Every serialized task carries `vm_version`, and each frame carries the `(definer, verb, version)` triple of its running bytecode. On resume, if the running VM rejects the version, the task raises `E_VERSION` and aborts cleanly — never silently runs against incompatible code.

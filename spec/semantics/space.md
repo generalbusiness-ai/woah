@@ -86,6 +86,13 @@ The six questions of failure semantics, answered:
 
    The `$` prefix marks it as a runtime envelope; user code can handle `:on_$error` or filter by `type`.
 
+When the runtime opens a nested behavior savepoint within a call, an inner
+abort removes only the inner scope's state and effects. An inner success is not
+independently accepted: it merges into its parent, and an outer abort removes
+it too. Ordinary in-VM `CALL_VERB` dispatch shares the current behavior scope;
+it does not create a savepoint for every frame. Neither form can leak a write,
+observation, schedule, or other transcript effect from an aborted parent.
+
 ---
 
 ## S4. Determinism and replay
@@ -179,7 +186,9 @@ If a space's coordinated objects are *not* in its anchor cluster, mutations to t
 
 A space's `call` verb runs serially — one call at a time through validate, sequence, apply-or-park, and deliver before the next call begins. This is the per-actor single-threaded model from [protocol/hosts.md §3](../protocol/hosts.md#3-hosts-and-execution-model) applied to spaces.
 
-The host's input gate is held during a call; the runtime's "release on await" mode is *not* used for `$space:call`. Implementations must enforce this; without it, the seq order is meaningless.
+The host-task input gate is held during a call, including VM yields and awaited
+RPCs. Implementations must enforce this; without it, the seq order and
+in-memory rollback boundary are meaningless.
 
 Deferred work is not "awaiting inside the call." A call that arranges later work completes its sequenced apply now, recording a pending scheduled turn as part of that message's committed effect. When the scheduled turn fires it enters the space as a new sequenced message with its own seq. The original seq records that the work was arranged; the later seq records what it did.
 

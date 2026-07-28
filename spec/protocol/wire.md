@@ -173,6 +173,11 @@ If a client's connection is interrupted and reconnects, gap recovery follows the
 
 **Idempotent retry.** The `id` field on `op: "call"` is a client-chosen correlation token. If a client retries a call with the same `id` (e.g., after a transient network failure or reconnect), the host returns the **same** `applied` frame — same `seq`, same `message`, same `observations`. No new sequence number is allocated; the call is not re-executed. This piggybacks on the host's correlation-id idempotency cache (see [hosts.md §3.4](hosts.md#34-host-rpc-invariants)), default TTL ~5 minutes. Beyond the TTL, the host has no memory of the original call and a retry would create a duplicate; clients should treat the cache as best-effort and rely on gap recovery (above) as the durable continuity mechanism.
 
+"Same frame" means the same immutable decoded fields and values. Everyday JSON
+encoding need not be byte-identical or replay-canonical. A client-side mutation
+of one decoded frame cannot modify the server's cached receipt or a later retry
+response.
+
 ### 17.5 Backpressure and rate limiting
 
 **Outbound**: each player host maintains a bounded outbound queue (default 1024 frames). On overflow:

@@ -76,6 +76,12 @@ for future probes. The merge protocol itself does not depend on the
 digest; it is metadata for cold-load wire-savings strategies layered
 on top.
 
+The digest binds an immutable seed snapshot, including its `SerializedWorld`
+rows and routing metadata. Mutating a host-language record from one delivery
+MUST NOT alter the cached seed, its digest, or a later delivery. A gateway may
+cache the immutable snapshot internally, but each receiver gets detached,
+immutable data.
+
 ### HS1.3 KV accelerator encoding
 
 The authoritative `/__internal/host-seed` response carries executable
@@ -232,6 +238,10 @@ NOT persist otherwise.
 produce zero satellite-side repository writes after the first.
 Implementations MUST cover this with a regression test: it is the one
 observable proof that the spec's invariant survived implementation.
+
+Repeated delivery of one cached seed returns the same immutable decoded data
+and digest. Everyday wire layout may differ as §HS1.2 permits. Delivery does
+not grant the receiver writable identity into the gateway cache.
 
 Cold-load runs the merge, then `runHostScopedLocalCatalogLifecycle`
 (which may further mutate receiver-hosted instance data), then

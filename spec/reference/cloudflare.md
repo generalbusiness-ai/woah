@@ -322,7 +322,22 @@ await hostQueue.enqueue(async () => {
 
 The caller receives an applied frame only after the final commit succeeds. If commit fails, the runtime restores the pre-call in-memory state and returns `op:"error"` with `E_STORAGE`; no durable seq is visible.
 
-Cross-anchor-cluster mutations (cross-DO RPCs from inside the verb body) are **not** in the rollback scope, per [space.md §S3.4](../semantics/space.md#s3-failure-rules-normative). Verb authors avoid them in sequenced flows; if they must, they accept the torn-state risk.
+Behavior savepoints nest. An inner abort restores only its own state and
+effects; an inner success remains provisional and merges into its parent. A
+later outer abort therefore removes successful inner local work as well. Only
+the outermost accepted scope may flush dirty state or expose transcript
+effects.
+
+Cross-anchor-cluster mutations (cross-DO RPCs from inside the verb body) are
+**not** in the rollback scope, per
+[space.md §S3.4](../semantics/space.md#s3-failure-rules-normative). Each such
+remote mutation is independently accepted. If correctness couples it to the
+parent outcome, the operation must refuse before its first mutation unless it
+defines the concrete, durable saga required there; the runtime does not imply
+atomicity merely because both calls occur in one verb. The explicitly
+best-effort `$root:recycle` notification in recycle.md §RC4 is a legacy
+exception: its cross-cluster handler effects are independent child accepts and
+may survive a later local recycle refusal.
 
 The VM routes ordinary remote property-value writes (`SET_PROP`) to the
 owning host, which performs the same permission checks and durable write it
