@@ -140,50 +140,200 @@ describe("AP11 operator wizard provisioning (core)", () => {
       .toEqual({ "ops-1": first.actor_id, "ops-2": second.actor_id });
   });
 
-  it("revoking an agent twice returns its quota slot exactly once", async () => {
-    const world = createWorld();
-    const { human, account } = await signup(world, "ap11j@woo.dev");
-    const doomed = await provision(world, "$wiz", human, "ops-doomed");
-    const survivor = await provision(world, "$wiz", human, "ops-survivor");
-    expect(world.propOrNull(account, "agent_count")).toBe(2);
-    expect(world.propOrNull(account, "programmer_agent_count")).toBe(2);
-
-    const revoke = async (): Promise<unknown> => {
-      const frame = await world.directCall(`rev-${Math.random()}`, human, human, "revoke_agent", [doomed.actor_id] as never);
+  // The quota slot must be returned EXACTLY ONCE by permanent retirement, no
+  // matter what tombstoned the actor first. `deactivated_at` cannot carry that
+  // fact: it is a reversible AUTH tombstone that `$system:deactivate_actor`
+  // sets without touching any counter. Reading it as an accounting fact fails
+  // in both directions, so all four orderings are pinned.
+  describe("quota-slot accounting across every retirement ordering", () => {
+    const revoke = async (world: WooWorld, human: string, agent: string): Promise<unknown> => {
+      const frame = await world.directCall(`rev-${Math.random()}`, human, human, "revoke_agent", [agent] as never);
       if (frame.op === "error") throw Object.assign(new Error(frame.error.message), { code: frame.error.code });
       return (frame as unknown as { result: unknown }).result;
     };
+    const wizardCall = async (world: WooWorld, verb: string, args: unknown[]): Promise<void> => {
+      const frame = await world.directCall(`sys-${Math.random()}`, "$wiz", "$system", verb, args as never);
+      if (frame.op === "error") throw Object.assign(new Error(frame.error.message), { code: frame.error.code });
+    };
+    const audits = (world: WooWorld, action: string): Array<Record<string, unknown>> =>
+      wizardActions(world).filter((entry) => entry.action === action);
 
-    expect(await revoke()).toBe(true);
-    expect(world.propOrNull(account, "agent_count")).toBe(1);
-    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
-    const retiredAt = world.propOrNull(doomed.actor_id, "deactivated_at");
-    expect(retiredAt).toBeTruthy();
-    const auditAfterFirst = wizardActions(world).length;
+    it("(1) revoke of a never-deactivated agent returns the slot once and audits", async () => {
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o1@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
 
-    // `agent_count` is a QUOTA counter, not an event count. A second revoke of
-    // the same agent must not return a slot that is already back — otherwise
-    // the count drops below the number of live agents and the account can mint
-    // past its quota.
-    expect(await revoke()).toBe(true);
-    expect(world.propOrNull(account, "agent_count")).toBe(1);
-    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
-    // Retirement time is not rewritten and no duplicate audit is minted.
-    expect(world.propOrNull(doomed.actor_id, "deactivated_at")).toBe(retiredAt);
-    expect(wizardActions(world).length).toBe(auditAfterFirst);
+      expect(await revoke(world, human, agent)).toBe(true);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+      expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+      expect(world.propOrNull(agent, "retired_at")).toBeTruthy();
+      expect(world.propOrNull(agent, "deactivated_at")).toBeTruthy();
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+    });
 
-    // A third revoke, and the survivor is still fully intact.
-    expect(await revoke()).toBe(true);
-    expect(world.propOrNull(account, "agent_count")).toBe(1);
-    expect(world.propOrNull(survivor.actor_id, "deactivated_at")).toBe(null);
-    expect(world.object(survivor.actor_id).flags.programmer).toBe(true);
-    expect(world.object(survivor.actor_id).flags.wizard).toBe(true);
+    it("(2) deactivate_actor then revoke STILL returns the slot, and audits", async () => {
+      // The leak. deactivate_actor tombstones without decrementing, so a guard
+      // that treats any tombstone as proof the slot came back strands it
+      // forever — the reviewer's probe saw agent_count stay 1 -> 1 -> 1 with no
+      // agent_revoked record at all.
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o2@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      const survivor = (await provision(world, "$wiz", human, "ops-2")).actor_id;
+      expect(world.propOrNull(account, "agent_count")).toBe(2);
+      expect(world.propOrNull(account, "programmer_agent_count")).toBe(2);
 
-    // And the slot really is available exactly once: one more provisioning
-    // succeeds and lands the count back at the number of live agents.
-    const replacement = await provision(world, "$wiz", human, "ops-replacement");
-    expect(replacement.created).toBe(true);
-    expect(world.propOrNull(account, "agent_count")).toBe(2);
+      await wizardCall(world, "deactivate_actor", [agent, "suspected compromise"]);
+      // Deactivation alone changes no accounting and does not retire.
+      expect(world.propOrNull(account, "agent_count")).toBe(2);
+      expect(world.propOrNull(agent, "deactivated_at")).toBeTruthy();
+      expect(world.propOrNull(agent, "retired_at")).toBe(null);
+      const deactivatedAt = world.propOrNull(agent, "deactivated_at");
+
+      expect(await revoke(world, human, agent)).toBe(true);
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+      // The permanent-retirement work that deactivation skipped also happened.
+      expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+      expect(world.object(agent).flags.programmer ?? false).toBe(false);
+      expect(world.propOrNull(agent, "retired_at")).toBeTruthy();
+      // The auth tombstone keeps its ORIGINAL time; retirement records its own.
+      expect(world.propOrNull(agent, "deactivated_at")).toBe(deactivatedAt);
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+      // The sibling is untouched throughout.
+      expect(world.propOrNull(survivor, "retired_at")).toBe(null);
+      expect(world.object(survivor).flags.programmer).toBe(true);
+    });
+
+    it("reviewer probe shape: deactivate_actor -> revoke, one agent, 1 -> 1 -> 0", async () => {
+      // The reported sequence verbatim: a single agent, where the leak showed
+      // as agent_count staying 1 -> 1 -> 1 with no agent_revoked record.
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-probe@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+
+      await wizardCall(world, "deactivate_actor", [agent, null]);
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+
+      expect(await revoke(world, human, agent)).toBe(true);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+    });
+
+    it("(3) revoke of an already-revoked agent changes no counter and adds no duplicate audit", async () => {
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o3@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      const survivor = (await provision(world, "$wiz", human, "ops-2")).actor_id;
+
+      await revoke(world, human, agent);
+      const retiredAt = world.propOrNull(agent, "retired_at");
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+
+      await revoke(world, human, agent);
+      await revoke(world, human, agent);
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+      expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+      expect(world.propOrNull(agent, "retired_at")).toBe(retiredAt);
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+      expect(world.object(survivor).flags.programmer).toBe(true);
+
+      // The slot really is available exactly once.
+      const replacement = await provision(world, "$wiz", human, "ops-3");
+      expect(replacement.created).toBe(true);
+      expect(world.propOrNull(account, "agent_count")).toBe(2);
+    });
+
+    it("a repeat revoke that actually repairs something is audited as a repair", async () => {
+      // The spec promises no real retirement work is ever unaudited. A repeat
+      // call normally does nothing and records nothing — but if a NEW key was
+      // pointed at the retired agent, revoking it is real work and must show up
+      // (marked repair, with no counter movement).
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-repair@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      await revoke(world, human, agent);
+      expect(audits(world, "agent_revoked")).toHaveLength(1);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+
+      const strayKey = world.createApiKey("$wiz", agent, "stray");
+      world.setProp(agent, "api_key_id", strayKey.id);
+
+      await revoke(world, human, agent);
+      const records = audits(world, "agent_revoked");
+      expect(records).toHaveLength(2);
+      expect(records[1]?.repair).toBe(true);
+      // Still no accounting movement.
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+      // ...and the stray key is dead.
+      const keys = world.propOrNull(agent, "api_keys") as Record<string, Record<string, unknown>>;
+      expect(keys[strayKey.id]?.revoked_at).toBeTruthy();
+
+      // A third call now finds nothing left to repair and records nothing.
+      await revoke(world, human, agent);
+      expect(audits(world, "agent_revoked")).toHaveLength(2);
+    });
+
+    it("(4) deactivate then reactivate (no revoke) restores nothing, because nothing was returned", async () => {
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o4@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+
+      await wizardCall(world, "deactivate_actor", [agent, null]);
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+      await wizardCall(world, "reactivate_actor", [agent]);
+      // Fully reversible: the slot was never returned, so there is nothing to
+      // restore and the counter never moved.
+      expect(world.propOrNull(account, "agent_count")).toBe(1);
+      expect(world.propOrNull(agent, "deactivated_at")).toBe(null);
+      expect(world.propOrNull(agent, "retired_at")).toBe(null);
+      expect(audits(world, "agent_revoked")).toHaveLength(0);
+
+      // ...and the agent is usable again, so a later revoke still returns the
+      // slot exactly once.
+      expect(await revoke(world, human, agent)).toBe(true);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+    });
+
+    it("reactivation of a RETIRED agent is refused (the inverse bypass)", async () => {
+      // Symmetry check: without this, reactivating a retired actor produces a
+      // live identity whose slot has already been returned — N live agents
+      // against a count of N-1.
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o5@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      await revoke(world, human, agent);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+
+      await expect(wizardCall(world, "reactivate_actor", [agent])).rejects.toMatchObject({ code: "E_PERM" });
+      expect(world.propOrNull(agent, "deactivated_at")).toBeTruthy();
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+    });
+
+    it("pre-marker worlds are not double-returned (aged-data inference)", async () => {
+      // A world revoked before `retired_at` existed carries the old shape: auth
+      // tombstone set AND the agent's current key already revoked, with the
+      // counter ALREADY decremented. deactivate_actor never produces that
+      // conjunction, so inferring from it keeps the unsafe direction closed.
+      const world = createWorld();
+      const { human, account } = await signup(world, "ap11-o6@woo.dev");
+      const agent = (await provision(world, "$wiz", human, "ops-1")).actor_id;
+      const key = world.createApiKey("$wiz", agent, "aged");
+      await provision(world, "$wiz", human, "ops-1", { api_key_id: key.id });
+
+      // Reconstruct the pre-marker post-revoke state by hand.
+      world.revokeApiKey("$wiz", key.id);
+      world.setProp(agent, "deactivated_at", Date.now());
+      world.setProp(account, "agent_count", 0);
+
+      await revoke(world, human, agent);
+      expect(world.propOrNull(account, "agent_count")).toBe(0);
+      expect(audits(world, "agent_revoked")).toHaveLength(0);
+      // The marker is backfilled, so the next call needs no inference.
+      expect(world.propOrNull(agent, "retired_at")).toBeTruthy();
+    });
   });
 
   it("demoting a non-programmer agent does not double-decrement the programmer count", async () => {

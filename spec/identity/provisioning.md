@@ -253,6 +253,40 @@ not in scope for v1.
 | `deactivated` | `account.deactivated_at` set. All sessions reaped. All API keys under the account refuse new auth. Actor objects remain in the world; their owned objects keep their `owner` pointer. | Yes — clear `deactivated_at`; keys re-allow auth. |
 | `recycled` | Account record marked deleted. Bound actors recycle (becomes `$nothing`) only if `account.recycle_on_delete = true`; default is to keep actor objects for audit/history and unbind them from the account. | No. |
 
+For an owned `$agent` there is a further, distinct state:
+
+| State | What changes | Reversible |
+|---|---|---|
+| `retired` | `agent.retired_at` set (and `deactivated_at` with it). Programmer state stripped, api key revoked, and **the account's quota slot returned**. | No. |
+
+**Deactivation is not retirement, and the two facts need two markers.**
+`deactivated_at` answers "may this identity authenticate?" — a REVERSIBLE fact
+that `$system:deactivate_actor` sets and `$system:reactivate_actor` clears, and
+which never touches any counter. `retired_at` answers "has this agent's quota
+slot been returned to its account?" — a PERMANENT fact recorded only by
+`$human:revoke_agent`.
+
+Conflating them corrupts `account.agent_count` in one direction or the other:
+reading the auth tombstone as "slot returned" strands the slot forever whenever
+`deactivate_actor` ran first (that path decrements nothing), while reading its
+absence as "slot not returned" double-returns a slot on a repeat revoke and lets
+the account mint past its quota. Normatively:
+
+- **The quota slot is returned exactly once, by permanent retirement.** Repeat
+  revocation is a success no-op for accounting and mints no duplicate audit
+  record, while still re-running the idempotent retirement WORK — so a repeat
+  repairs an agent that `deactivate_actor` left half-retired.
+- **Revoking a merely deactivated agent still returns the slot** and still
+  performs the retirement work deactivation skipped.
+- **Retirement is not reversible.** `$system:reactivate_actor` refuses an actor
+  carrying `retired_at`: restoring a live identity whose slot has already been
+  returned is the same quota bypass reached from the other side. Plain
+  deactivation stays fully reversible, because it never returned a slot.
+- Implementations upgrading a world that predates `retired_at` may infer it
+  only from a shape `deactivate_actor` cannot produce (auth tombstone set AND
+  the agent's current key already revoked). The inference must fail toward
+  leaving the slot counted, never toward returning it twice.
+
 `$guest` actors do not have a lifecycle distinct from session;
 session-end reaps them per the existing baseline.
 
@@ -679,8 +713,8 @@ Every state transition routes through one of these `$system` verbs:
 |---|---|---|
 | `$system:provision_actor(class, owner, attrs)` | Create a new actor of `class`, owned by `owner`. | Yes — `actor_provisioned` |
 | `$system:promote_actor(actor, new_class)` | `chparent`; preserves objref + history. | Yes — `actor_promoted` |
-| `$system:deactivate_actor(actor, reason)` | Reap sessions, refuse new auth. | Yes — `actor_deactivated` |
-| `$system:reactivate_actor(actor)` | Reverse deactivate. | Yes — `actor_reactivated` |
+| `$system:deactivate_actor(actor, reason)` | Reap sessions, refuse new auth. Reversible; touches NO quota counter (AP4.3). | Yes — `actor_deactivated` |
+| `$system:reactivate_actor(actor)` | Reverse deactivate. Refuses an actor carrying `retired_at`. | Yes — `actor_reactivated` |
 | `$system:rotate_api_key(actor)` | Mint new key, invalidate old. | Yes — `api_key_rotated`, no key material |
 | `$system:revoke_api_key(actor, reason)` | Invalidate current key without rotating. | Yes — `api_key_revoked` |
 | `$system:recycle_actor(actor)` | Hard-recycle. Not used in normal lifecycle; reserved for incident response. | Yes — `actor_recycled` |
@@ -882,7 +916,8 @@ retirement anyone wants.
 
 The lever is `$human:revoke_agent(actor_id)`, called by the owning human: it
 strips programmer state through the shared transition, marks the actor-owned
-api-key record revoked, sets `deactivated_at`, and decrements `agent_count`.
+api-key record revoked, sets `deactivated_at` and `retired_at`, and returns the
+account's quota slot by decrementing `agent_count`.
 The `wizard` flag is deliberately left set — a deactivated actor cannot
 authenticate at all (`E_PERM identity_deactivated` at session mint), so the
 residual bit grants nothing, and the flag's history stays legible in the
@@ -895,22 +930,28 @@ before that, `$system.wizard_actions` made every revocation fail
 `E_CATALOG_MUTATION`, which left account owners with no way to retire an agent
 on a Net world at all.
 
-**Revocation is idempotent (normative).** `account.agent_count` is a QUOTA
-counter, not an event count. Revoking an already-deactivated agent returns
-success and:
+**Revocation returns the quota slot exactly once (normative).**
+`account.agent_count` is a QUOTA counter, not an event count, and the marker
+that decides is `retired_at` — never `deactivated_at` (AP4.3). Revoking an
+agent that is **already retired** returns success and:
 
-- does **not** decrement `agent_count` again — a second decrement would drop
-  the count below the number of live agents and let the account mint past its
-  quota;
-- does **not** re-stamp `deactivated_at`, so the retirement time is stable;
-- does **not** mint a duplicate audit record for an event that did not happen.
+- does **not** decrement `agent_count` again;
+- does **not** re-stamp `retired_at`, so the retirement time is stable;
+- does **not** mint a duplicate `agent_revoked` record for an event that did
+  not happen — though a repeat that actually repaired something (a key that was
+  still live) records one marked `repair: true`, so no real retirement work is
+  ever unaudited.
 
-Programmer-state stripping and api-key revocation still run on the repeat, both
-being idempotent themselves: that makes a repeat call a *repair* for an actor
-tombstoned by another path (`$system:deactivate_actor` tombstones without
-revoking). The same rule holds for `demote_agent_from_programmer`: the shared
-transition moves the flag and `programmer_agent_count` only on a real
-transition, so repeats are no-ops.
+Revoking an agent that was merely **deactivated** DOES return the slot, records
+`agent_revoked`, and performs the retirement work deactivation skipped. The
+earlier `deactivated_at` is preserved rather than re-stamped: that is when the
+identity stopped authenticating, which is a different instant from when the
+slot came back.
+
+Programmer-state stripping and api-key revocation run on every call, both being
+idempotent themselves. The same rule holds for `demote_agent_from_programmer`:
+the shared transition moves the flag and `programmer_agent_count` only on a real
+transition, so repeats are no-ops and no ordering can double-decrement it.
 
 **Retirement reaches live credentials.** Eligibility is otherwise checked only
 when a session is MINTED, and both client credential classes evade that: a
@@ -933,8 +974,9 @@ api-key check remains the second, authoritative gate: it reads the verifier
 from the owning authority and catches a revoked credential even before the
 tombstone lands.
 
-Re-running provisioning against a deactivated agent's `provision_id` refuses;
-a replacement uses a new `provision_id`.
+Re-running provisioning against a retired or deactivated agent's `provision_id`
+refuses, with a message naming which of the two it is (only one of them can be
+undone); a replacement uses a new `provision_id`.
 
 Revoking only the credential (`$system:revoke_api_key(id)`, also tracked and
 verified over Net) is the narrower action: it kills the operator's access

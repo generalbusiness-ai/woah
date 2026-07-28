@@ -219,6 +219,74 @@ skipped. The world half is the one that produced the reviewer's E_OBJNF. The
 fake-DO test seeds the ledger first so the gateway path is at least exercised
 in the ordering where it matters.
 
+## Review round 3 — the mirror-image accounting bug
+
+**R3-4 (P2) — `deactivate_actor` then revoke leaked the quota slot.** My round-2
+fix read `deactivated_at` as "the slot was already returned" and exited early.
+But `$system:deactivate_actor` sets that tombstone and decrements NOTHING, so
+the reviewer's sequence left `agent_count` at 1 → 1 → 1, returned success, and
+recorded no `agent_revoked` audit at all. Round 2 closed the double-return and
+opened the leak — the same conflation, read from the other side.
+
+Root cause: `deactivated_at` was doing double duty. It answers "may this
+identity authenticate?" (REVERSIBLE — `reactivate_actor` clears it) and was
+being read as "has the quota slot come back?" (PERMANENT). Two facts, one
+marker.
+
+**The marker: `$agent.retired_at`, a timestamp.**
+
+- *Named for the lifecycle state, not the bookkeeping.* `agent_slot_returned_at`
+  would name one consequence of retirement; the slot return is one of several
+  things retirement does (key revocation, programmer strip, tombstone). Naming
+  the marker after the accounting side invites the same conflation in reverse.
+- *A timestamp, not a boolean*, matching `deactivated_at` / `revoked_at`
+  elsewhere, and it records WHEN the slot returned — which the audit trail
+  wants and which is a genuinely different instant from when the identity
+  stopped authenticating.
+- *On the agent*, so it is cluster-resident with everything else revoke writes
+  and needs no extra prefetch.
+
+`deactivated_at` is now purely an auth fact. The round-2 session-tombstone gate
+reads it as an auth fact, which is correct, and is unchanged.
+
+**Symmetry: reactivation of a retired agent is now refused.** Without this the
+new marker creates the inverse bypass — a live identity whose slot has already
+been returned, i.e. N live agents against a count of N-1. Plain deactivation
+stays fully reversible because it never returned a slot. This was not in the
+finding; it is the hole the fix would otherwise have opened.
+
+**Aged data.** A world revoked before `retired_at` existed carries the old shape
+and would be double-returned on the next revoke. `agentSlotReturnedAt` therefore
+infers retirement from a conjunction `deactivate_actor` cannot produce — auth
+tombstone set AND the agent's current key already revoked — and backfills the
+marker so no later call needs the inference. The residual false positive is an
+operator who deactivated and hand-revoked the key; that errs toward leaving the
+slot counted, which is the safe direction. Tested with a hand-built pre-marker
+world.
+
+**Neighbour audit for the same conflation.** Every other `deactivated_at` reader
+is an AUTH check and correctly left alone: `actorCanAuthenticate`, the account
+gates in `createAgentForHuman` / `provisionOperatorWizardAgent`, and the round-2
+session gate. Two surfaces were updated because they are user-facing rather than
+accounting: `list_agents` now reports `retired_at` alongside `deactivated_at`,
+and the AP11 provision-reuse refusal names which of the two states it hit (only
+one of them can be undone). `programmer_agent_count` needed no change —
+`setProgrammerAgentState` moves flag and counter only on a real transition — but
+it is now asserted across every ordering instead of assumed.
+
+**Negative-test matrix.** Each variant breaks a different case, which is what
+tells them apart:
+
+| Variant | Case that fails |
+|---|---|
+| round-2 guard (`deactivated_at` as accounting) | ordering (2), deactivate → revoke: the leak |
+| no guard at all (always decrement) | ordering (3) repeat revoke, and the aged-data case: the double-return |
+| reactivate guard removed | the inverse-bypass case |
+
+Orderings (1) and (4) pass under every variant — they are the unambiguous cases
+and serve as regression anchors, not discriminators. Stated plainly so the
+matrix is not read as stronger than it is.
+
 ## Named residuals (not verified, not claimed)
 
 - **Other `recordWizardAction` call sites on cluster-local primitives** —
@@ -237,6 +305,10 @@ in the ordering where it matters.
   (deactivation) is the lever for retiring an operator wizard. A deactivated
   actor cannot authenticate, so the residual flag grants nothing. Both halves
   are now proved end to end over the client doorway.
+- **The deactivate → revoke ordering is local-profile only over Net.**
+  `$system:deactivate_actor` is an untracked native, so it cannot run over
+  `/net-api/turn` at all; ordering (2) is therefore proved against an in-memory
+  world, not the Net path. The Net path exercises orderings (1) and (3).
 - **Session-tombstone propagation is eventual, and unmeasured under real
   fanout latency.** The fake-DO lane settles fanout synchronously, so the
   window between a committed revocation and the serving gateway refusing an

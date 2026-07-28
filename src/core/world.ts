@@ -4171,6 +4171,46 @@ export class WooWorld {
     }
 
     /**
+     * When was this agent's account quota slot returned, or null if it is still
+     * counted against `account.agent_count`?
+     *
+     * `deactivated_at` cannot answer this. It is an AUTHENTICATION fact — "this
+     * identity may not sign in" — and it is REVERSIBLE
+     * (`$system:reactivate_actor` clears it). Retirement is a different,
+     * PERMANENT fact that happens to also set the auth tombstone. Reading one
+     * as the other breaks both directions:
+     *
+     *  - reading `deactivated_at` as "slot returned" leaks the slot forever
+     *    when `$system:deactivate_actor` tombstoned the agent first — that path
+     *    never touches the counter, so nothing ever returns it;
+     *  - reading it as "slot NOT returned" double-returns on a repeat revoke,
+     *    letting the account mint past its quota.
+     *
+     * `retired_at` is the explicit marker for the permanent fact.
+     *
+     * The second branch is a BOUNDED inference for pre-marker data only. Worlds
+     * revoked before `retired_at` existed carry the old shape — auth tombstone
+     * set AND the agent's current key already revoked — which
+     * `$system:deactivate_actor` never produces (it tombstones without touching
+     * keys). Inferring only from that exact conjunction keeps the unsafe
+     * direction (double-return) closed; the residual false positive is an
+     * operator who deactivated and hand-revoked the key, which errs toward
+     * leaving the slot counted, the safe direction.
+     */
+    private agentSlotReturnedAt(agent: ObjRef): number | null {
+      const retiredAt = this.propOrNull(agent, "retired_at");
+      if (typeof retiredAt === "number") return retiredAt;
+      const deactivatedAt = this.propOrNull(agent, "deactivated_at");
+      if (typeof deactivatedAt !== "number") return null;
+      const keyId = this.propOrNull(agent, "api_key_id");
+      if (typeof keyId !== "string" || !keyId) return null;
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, keyId) ? keys[keyId] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+      return (record as Record<string, WooValue>).revoked_at != null ? deactivatedAt : null;
+    }
+
+    /**
      * Fail-closed validation for an operator-supplied `api_key_id` pointer.
      *
      * The pointer is what retirement follows: `revoke_agent` revokes
@@ -4310,8 +4350,14 @@ export class WooWorld {
         if (this.propOrNull(recorded, "provision_id") !== input.provisionId) {
           throw wooError("E_INVARG", "recorded operator-provisioned agent does not match this provision_id", { account, provision_id: input.provisionId, agent: recorded });
         }
+        // Neither a retired nor a merely deactivated agent is usable, so both
+        // refuse — but they are different facts and the message says which, so
+        // an operator knows whether reactivation is even on the table.
+        if (this.propOrNull(recorded, "retired_at") != null) {
+          throw wooError("E_PERM", "recorded operator-provisioned agent was permanently retired; choose a new provision_id", { agent: recorded });
+        }
         if (this.propOrNull(recorded, "deactivated_at") != null) {
-          throw wooError("E_PERM", "recorded operator-provisioned agent is deactivated; choose a new provision_id", { agent: recorded });
+          throw wooError("E_PERM", "recorded operator-provisioned agent is deactivated; reactivate it or choose a new provision_id", { agent: recorded });
         }
         agent = recorded;
       }
@@ -4630,7 +4676,10 @@ export class WooWorld {
           last_seen: this.propOrNull(obj.id, "last_seen_at"),
           scope: String(this.propOrNull(obj.id, "scope") ?? "write"),
           programmer: obj.flags.programmer === true,
-          deactivated_at: this.propOrNull(obj.id, "deactivated_at")
+          deactivated_at: this.propOrNull(obj.id, "deactivated_at"),
+          // Distinct from deactivated_at: reversible auth tombstone vs the
+          // permanent retirement that returned the account's quota slot.
+          retired_at: this.propOrNull(obj.id, "retired_at")
         });
       }
       out.sort((a, b) => String(a.actor_id).localeCompare(String(b.actor_id)));
@@ -11387,6 +11436,16 @@ export class WooWorld {
     this.nativeHandlers.set("reactivate_actor", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to reactivate actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
+      // Symmetry with retirement: reactivating a RETIRED actor would restore a
+      // live identity whose quota slot has already been returned, so the
+      // account would carry N live agents against a count of N-1 — the same
+      // bypass as a double-return, arrived at from the other side. Retirement
+      // is permanent by contract; a replacement is a fresh provisioning.
+      // Plain deactivation stays fully reversible: it never returned a slot,
+      // so there is nothing to restore.
+      if (this.propOrNull(target, "retired_at") != null) {
+        throw wooError("E_PERM", "actor was permanently retired; provision a replacement instead of reactivating", { actor: target });
+      }
       this.setProp(target, "deactivated_at", null);
       this.recordWizardAction(ctx.actor, "actor_reactivated", { actor: target });
       return true;
@@ -11473,28 +11532,37 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        // Strip programmer state through the shared transition first: it clears
-        // the flag, removes the surface, decrements the quota, and refuses
-        // cross-host before any of that — idempotent if already non-programmer.
-        // Read the tombstone BEFORE any mutation: it decides whether this call
-        // is the one that returns the account's agent slot.
-        const alreadyDeactivated = this.propOrNull(agent, "deactivated_at") != null;
+        const reason = typeof args[1] === "string" ? args[1] : null;
+        // Has the quota slot already been returned? This is deliberately NOT
+        // `deactivated_at` — see agentSlotReturnedAt. Read before any mutation.
+        const slotReturnedAt = this.agentSlotReturnedAt(agent);
+        // The permanent-retirement WORK runs on every call and each step is
+        // individually idempotent, so a repeat call repairs an agent that some
+        // other path left half-retired: $system:deactivate_actor tombstones
+        // without stripping programmer state or revoking keys.
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
-        // Key revocation runs on BOTH paths and is itself idempotent
-        // (revokeApiKeyRecord returns early once revoked_at is set). Re-running
-        // therefore repairs an actor deactivated by some other path — e.g.
-        // $system:deactivate_actor, which tombstones without revoking.
         const key = this.propOrNull(agent, "api_key_id");
-        if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
-        // Idempotent stop. `agent_count` is a QUOTA counter, not an event
-        // count: an already-deactivated agent has already returned its slot, so
-        // decrementing again would let the account mint more agents than its
-        // quota allows (revoke one agent twice with two live and the counter
-        // reaches 0 while one is still active). Re-stamping deactivated_at
-        // would also rewrite the retirement time and mint a duplicate audit
-        // record for an event that did not happen.
-        if (alreadyDeactivated) return true;
-        this.setProp(agent, "deactivated_at", Date.now());
+        const keyNewlyRevoked = typeof key === "string" && key
+          ? this.revokeApiKeyRecordById(ctx.actor, key, true)
+          : false;
+        const now = Date.now();
+        if (slotReturnedAt !== null) {
+          // Backfill the explicit marker when it was inferred, so the next call
+          // needs no inference at all.
+          if (this.propOrNull(agent, "retired_at") == null) this.setProp(agent, "retired_at", slotReturnedAt);
+          // No counter change and no duplicate "this agent retired" record —
+          // but a repeat that actually repaired something is still auditable,
+          // marked as the repair it is.
+          if (keyNewlyRevoked) {
+            this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason, repair: true });
+          }
+          return true;
+        }
+        // Preserve an earlier deactivation time: when deactivate_actor ran
+        // first, THAT is when the identity stopped authenticating. `retired_at`
+        // separately records when the slot came back.
+        if (this.propOrNull(agent, "deactivated_at") == null) this.setProp(agent, "deactivated_at", now);
+        this.setProp(agent, "retired_at", now);
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
         // AU1 seam, not recordWizardAction: every durable effect above is
         // cluster-resident (agent lineage, agent props, account counter, the
@@ -11502,7 +11570,7 @@ export class WooWorld {
         // so appending wizard_actions made the whole revocation fail
         // E_CATALOG_MUTATION — leaving account owners with no way to retire an
         // agent at all. Local profiles still materialize the entry.
-        this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
+        this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason });
         return true;
       });
       this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {

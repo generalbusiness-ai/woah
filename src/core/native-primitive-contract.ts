@@ -412,6 +412,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "$system.programmer_surface",
       "agent.features and features_version",
       "agent.api_key_id and the actor-owned api_keys record",
+      "agent.retired_at and agent.deactivated_at",
       "account.agent_count"
     ],
     writes: [
@@ -421,6 +422,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "account.programmer_agent_count",
       "agent.api_keys[<id>].revoked_at",
       "agent.deactivated_at",
+      "agent.retired_at",
       "account.agent_count"
     ],
     emits: ["cell_write"],
@@ -433,11 +435,12 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
         "features_version",
         "api_key_id",
         "api_keys",
-        "deactivated_at"
+        "deactivated_at",
+        "retired_at"
       ],
       catalog_property_names: ["programmer_surface"]
     },
-    note: "Human self-service revoke: strips programmer state through the shared transition, marks the actor-owned api-key record revoked, sets deactivated_at, and decrements the account agent count — every effect a recorded lineage/property write co-resident in the human authority cluster. Session teardown is a live-runtime action, not a durable effect, so it runs only after an accepted commit (same posture as revoke_api_key). The audit is the commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1). Legacy catalog-owned api-key ids remain outside this contract: revoking one still writes $system and is refused on Net."
+    note: "Human self-service revoke: strips programmer state through the shared transition, marks the actor-owned api-key record revoked, sets deactivated_at and retired_at, and decrements the account agent count EXACTLY ONCE. `retired_at` — not `deactivated_at` — is the slot-returned marker: deactivation is a reversible auth fact that never touches the counter, so reading it as an accounting fact leaks the slot in one order and double-returns it in the other (provisioning.md AP11.7). The retirement work itself is idempotent and re-runs on a repeat call, repairing an actor another path left half-retired — every effect a recorded lineage/property write co-resident in the human authority cluster. Session teardown is a live-runtime action, not a durable effect, so it runs only after an accepted commit (same posture as revoke_api_key). The audit is the commit record; the $system.wizard_actions catalog write is suppressed by the profile sink on Net (audit.md AU1). Legacy catalog-owned api-key ids remain outside this contract: revoking one still writes $system and is refused on Net."
   },
   catalog_registry_install: {
     kind: "woo.native_primitive_contract.shadow.v1",

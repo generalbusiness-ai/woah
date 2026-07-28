@@ -16,7 +16,7 @@
   "src/core/bootstrap.ts": {
     "$account": 20,
     "$actor": 15,
-    "$agent": 13,
+    "$agent": 14,
     "$ambiguous_match": 2,
     "$block": 1,
     "$failed_match": 2,

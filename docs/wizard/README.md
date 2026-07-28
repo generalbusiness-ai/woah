@@ -43,6 +43,12 @@ Sessions it already had open stop working too, within a few seconds.
 Calling `revoke_agent` again on the same agent is harmless — it will not
 double-count against your agent quota.
 
+Note that deactivating an actor (`deactivate_actor`) is a different,
+reversible thing: it stops sign-in but does NOT give the quota slot
+back. Revoking afterwards still returns the slot. Retirement is
+permanent, so a retired agent cannot be reactivated — provision a
+replacement instead.
+
 The operator needs the deployment's internal secret, so this is a
 deploy-machine operation, not something a logged-in user can do. See
 `spec/identity/provisioning.md` §AP11.

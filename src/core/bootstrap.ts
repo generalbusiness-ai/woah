@@ -1225,6 +1225,11 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$agent", "purpose", "", "str", "r");
   define(world, "$agent", "scope", "write", "str", "r");
   define(world, "$agent", "deactivated_at", null, "int|null", "r");
+  // Permanent retirement, distinct from the reversible `deactivated_at` auth
+  // tombstone: this is the marker that the account's quota slot has been
+  // returned, and it is what makes revocation return that slot exactly once
+  // regardless of what tombstoned the actor first (provisioning.md AP11.7).
+  define(world, "$agent", "retired_at", null, "int|null", "r");
   // AP11: the operator token this agent was provisioned for. The reverse pointer
   // of the account's operator_provisioned_agents ledger, checked before any idempotent
   // re-run reuses the recorded agent.
