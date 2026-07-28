@@ -20,10 +20,17 @@ const SECRET = "net-mcp-idempotency-secret";
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
   const deferred: Array<Promise<unknown>> = [];
+  /** Deferred work that FAILED. A rejection raised after the assertions have
+   * run is invisible to vitest — the file reports green while `database is
+   * not open`, fanout and outbox errors scroll past. Collect them instead and
+   * fail the test on them at teardown. */
+  const failures: unknown[] = [];
   const state: NetScopeDurableState & NetGatewayDurableState = {
     id: fake.id,
     waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
+      deferred.push(promise.catch((err) => {
+        failures.push(err);
+      }));
     },
     storage: {
       sql: fake.storage.sql,
@@ -32,12 +39,30 @@ function netState(name: string) {
       deleteAlarm: () => {}
     }
   };
+  const drain = async () => {
+    // Deferred work enqueues more deferred work (a drain pass schedules the
+    // next one), so one sweep is not quiescence. Bounded so a genuinely
+    // self-feeding loop fails the test instead of hanging it.
+    for (let pass = 0; pass < 64; pass += 1) {
+      if (deferred.length === 0) {
+        // Give any already-scheduled microtask/timer a turn to enqueue.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (deferred.length === 0) return;
+      }
+      while (deferred.length > 0) await deferred.shift();
+    }
+    throw new Error(`deferred work for ${name} never reached quiescence`);
+  };
   return {
     state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
+    failures,
+    settle: drain,
+    /** Drain to quiescence BEFORE the storage goes away. Closing under live
+     * deferred work is what produced the post-assertion error noise. */
+    close: async () => {
+      await drain();
+      fake.close();
+    }
   };
 }
 
@@ -220,7 +245,26 @@ async function fixture() {
       scopeDOs.set(scope, new NetScopeDO(st.state, scopeEnv));
     },
     mcp, call, hits, bump, say, complain, drain, settleAll,
-    close: () => { for (const st of states) st.close(); }
+    /**
+     * Teardown that cannot hide a failure: drain every host to quiescence,
+     * close, then raise anything the deferred lanes threw.
+     *
+     * Callers `await` this in a `finally`. If the body ALSO failed, the
+     * deferred error replaces it — accepted deliberately, because a deferred
+     * rejection is a real defect and the message names every one of them. The
+     * previous behaviour (synchronous close, rejections dropped) reported
+     * green over exactly these errors.
+     */
+    close: async () => {
+      for (const st of states) await st.close();
+      const failures = states.flatMap((st) => st.failures);
+      if (failures.length > 0) {
+        throw new Error(
+          `${failures.length} deferred task(s) failed after the test body:\n` +
+            failures.map((err, i) => `  [${i}] ${err instanceof Error ? err.stack ?? err.message : String(err)}`).join("\n")
+        );
+      }
+    }
   };
 }
 
@@ -262,7 +306,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(notice).toContain("ran exactly once");
       expect(notice).toContain("Do not retry it under a new operation_id");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -297,7 +341,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(body.result?.structuredContent?.result).toBe(1);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -312,7 +356,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(second.result?.structuredContent?.replayed).toBeUndefined();
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -325,7 +369,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -351,7 +395,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(mixed.result?.structuredContent?.replayed).toBe(true);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -369,7 +413,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(bobs.result?.structuredContent?.result).toBe(2);
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -401,7 +445,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(retry.result?.structuredContent?.replayed).toBe(true);
       expect(retry.result?.structuredContent?.replay_outcome).toBe("full");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -421,7 +465,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
       expect(lines.length).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -466,7 +510,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(original.result?.structuredContent?.result).toBe(1);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -504,7 +548,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
         expect(viaAlias.result?.structuredContent?.replayed).toBe(true);
       }
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -538,7 +582,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       });
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -578,7 +622,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       // The partial write committed once, and the replay did not repeat it.
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -599,7 +643,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -659,7 +703,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       );
       expect(delivered).toEqual([{ type: "kept" }]);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -674,7 +718,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(after.result?.isError).not.toBe(true);
       expect(after.result?.structuredContent?.result?.observations).toEqual([]);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -704,7 +748,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(listed2.length).toBeGreaterThan(0);
       expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toBe("string");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });
@@ -768,7 +812,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(2); // op-pinned once, op-sweep once. Never three.
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -793,7 +837,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -824,7 +868,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       expect(await f.hits()).toBe(2);
       expect(pins(f).find((row) => row.idempotency_key.endsWith("op-expired"))?.scope).toBe(pinned!.scope);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -867,7 +911,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(rowsFor("%op-say-%").length).toBe(4);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });
