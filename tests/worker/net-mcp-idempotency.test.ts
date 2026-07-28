@@ -69,6 +69,18 @@ async function fixture() {
         "verb :bump() rxd { this.hits = this.hits + 1; return this.hits; }",
         null
       ).ok).toBe(true);
+      // Emits, then throws. The transcript still COMMITS (a refused verb
+      // consumed its seq), so the emitted line is real and the submitter's
+      // only copy of it is the turn reply — woo_wait suppresses its own echo.
+      expect(installVerb(
+        fresh,
+        "the_mug",
+        "complain",
+        "verb :complain() rxd { this.hits = this.hits + 1;"
+        + " observe({ type: \"complained\", text: \"before the fall\", source: this });"
+        + " raise({ code: \"E_PERM\", message: \"refused on purpose\" }); }",
+        null
+      ).ok).toBe(true);
       expect(installVerb(
         fresh,
         "the_mug",
@@ -157,6 +169,32 @@ async function fixture() {
     expect(read.result?.isError, JSON.stringify(read).slice(0, 400)).not.toBe(true);
     return read.result?.structuredContent?.result as number;
   };
+  /** Drain a session's queue and return every observation seen. */
+  const drain = async (session: string): Promise<Record<string, any>[]> => {
+    const seen: Record<string, any>[] = [];
+    for (;;) {
+      const waited = await call(session, "woo_wait", { timeout_ms: 0, limit: 100 });
+      const batch = waited.result?.structuredContent?.result?.observations ?? [];
+      if (batch.length === 0) return seen;
+      seen.push(...batch);
+    }
+  };
+  const say = async (session: string, text: string, operationId?: string) =>
+    await call(session, "woo_call", {
+      object: "the_chatroom",
+      verb: "say",
+      args: [text],
+      ...(operationId ? { operation_id: operationId } : {})
+    });
+
+  const complain = async (session: string, operationId?: string) =>
+    await call(session, "woo_call", {
+      object: "the_mug",
+      verb: "complain",
+      args: [],
+      ...(operationId ? { operation_id: operationId } : {})
+    });
+
   const bump = async (session: string, operationId?: string, viaMeta = false) =>
     viaMeta
       ? await call(session, "woo_call", { object: "the_mug", verb: "bump", args: [] }, { "woo.net/operation_id": operationId })
@@ -169,7 +207,7 @@ async function fixture() {
 
   return {
     alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv,
-    mcp, call, hits, bump, settleAll,
+    mcp, call, hits, bump, say, complain, drain, settleAll,
     close: () => { for (const st of states) st.close(); }
   };
 }
@@ -323,6 +361,215 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
     }
   });
 
+  // FINDING 1. `say` is `persistence:"live"` — a DIRECT turn that writes no
+  // authority cell. The scope classifies that as a pure read and does not
+  // cache it, so before the receipt a retry re-emitted the line to every
+  // peer. The advertised schema promises deduplication for anything that
+  // changes the world, and speech changes what peers perceive.
+  it("an observation-only act is deduplicated: the PEER hears it exactly once", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.bobSession); // presence noise from session mint
+      const text = "retry-safety-line";
+      const first = await f.say(f.aliceSession, text, "speak-1");
+      expect(first.result?.isError, JSON.stringify(first).slice(0, 400)).not.toBe(true);
+      expect(first.result?.structuredContent?.replayed).toBeUndefined();
+      await f.settleAll();
+
+      // Response lost; the client retries the identical call.
+      const retry = await f.say(f.aliceSession, text, "speak-1");
+      await f.settleAll();
+
+      // The assertion that matters, and deliberately FIRST so it is the one
+      // that fires when the receipt regresses: BOB, the peer, heard the line
+      // exactly once.
+      const heard = await f.drain(f.bobSession);
+      const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
+      expect(lines.length, `peer heard ${lines.length} copies: ${JSON.stringify(heard).slice(0, 500)}`).toBe(1);
+      expect(retry.result?.structuredContent?.replayed).toBe(true);
+      expect(retry.result?.structuredContent?.replay_outcome).toBe("full");
+    } finally {
+      f.close();
+    }
+  });
+
+  it("an unkeyed observation-only act still re-emits: the receipt is the client's opt-in", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.bobSession);
+      const text = "unkeyed-line";
+      // No operation id. This is the pre-existing, write-free path that the
+      // browser's per-turn minted keys depend on — the scope records nothing
+      // and the second call is genuinely a second act, not a lost retry.
+      await f.say(f.aliceSession, text);
+      await f.settleAll();
+      await f.say(f.aliceSession, text);
+      await f.settleAll();
+      const heard = await f.drain(f.bobSession);
+      const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
+      expect(lines.length).toBe(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 2. A key answers ONE request. Reusing it for a different call
+  // used to return the first call's reply as though it were this call's —
+  // a confidently wrong answer, worse than the double execution keys prevent.
+  it("refuses key reuse for a DIFFERENT call, with its own conflict code", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "reuse-1")).result?.structuredContent?.result).toBe(1);
+      await f.settleAll();
+
+      const conflict = async (args: Record<string, unknown>) => {
+        const response = await f.call(f.aliceSession, "woo_call", { ...args, operation_id: "reuse-1" });
+        await f.settleAll();
+        return response;
+      };
+      // Changed ARGUMENTS.
+      const changedArgs = await conflict({ object: "the_mug", verb: "bump", args: ["extra"] });
+      expect(changedArgs.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT", detail: { reason: "operation_id_reused" } } }
+      });
+      // The refusal must not leak the original call it collided with.
+      expect(JSON.stringify(changedArgs.result)).not.toContain("hits");
+      // Changed VERB.
+      expect((await conflict({ object: "the_mug", verb: "hits_now", args: [] })).result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+      // Changed TARGET.
+      expect((await conflict({ object: "the_chatroom", verb: "look", args: [] })).result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+
+      // The conflicts changed nothing, and — critically — did not clobber
+      // the receipt: the ORIGINAL call still replays its recorded outcome.
+      expect(await f.hits()).toBe(1);
+      const original = await f.bump(f.aliceSession, "reuse-1");
+      expect(original.result?.structuredContent?.replayed).toBe(true);
+      expect(original.result?.structuredContent?.result).toBe(1);
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("an ALIAS of the same verb is the same request, not a conflict", async () => {
+    const f = await fixture();
+    try {
+      // `go` carries movement aliases; the MCP resolver maps an alias to the
+      // canonical verb before the turn is built, so both spellings must
+      // fingerprint identically. A conflict here would break every client
+      // that retried using a different spelling than its first attempt.
+      const listed = await f.mcp(
+        { jsonrpc: "2.0", id: 4242, method: "tools/list", params: {} },
+        { "mcp-session-id": f.aliceSession }
+      );
+      const aliased = (listed.body?.result?.tools ?? []).length > 0;
+      expect(aliased).toBe(true);
+      // `look` on the chatroom is reachable by its canonical name and by the
+      // alias the catalog declares for it (`l`), if present.
+      const canonical = await f.call(f.aliceSession, "woo_call", {
+        object: "the_chatroom", verb: "look", args: [], operation_id: "alias-1"
+      });
+      expect(canonical.result?.isError, JSON.stringify(canonical).slice(0, 300)).not.toBe(true);
+      await f.settleAll();
+      const viaAlias = await f.call(f.aliceSession, "woo_call", {
+        object: "the_chatroom", verb: "l", args: [], operation_id: "alias-1"
+      });
+      await f.settleAll();
+      // Either the alias resolves (then it replays cleanly) or the world has
+      // no such alias (then it is a plain verb miss) — but it must NEVER be
+      // an idempotency conflict, which would mean the fingerprint keyed on
+      // the client's spelling instead of the resolved call.
+      const error = viaAlias.result?.structuredContent?.error;
+      expect(error?.code).not.toBe("E_IDEMPOTENCY_CONFLICT");
+      if (!viaAlias.result?.isError) {
+        expect(viaAlias.result?.structuredContent?.replayed).toBe(true);
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  it("the fingerprint is durable: a COLD gateway still detects key reuse", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "cold-conflict")).result?.structuredContent?.result).toBe(1);
+      await f.settleAll();
+      // The conflict check lives at the authority and rides the stored reply
+      // row, so a gateway that lost every byte of in-isolate memory still
+      // refuses. An in-memory check would pass this call straight through.
+      const revived = new NetGatewayDO(f.gatewayState.state, f.gatewayEnv);
+      const response = await revived.fetch(new Request("https://do/net-api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", "mcp-session-id": f.aliceSession },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 9100,
+          method: "tools/call",
+          params: {
+            name: "woo_call",
+            arguments: { object: "the_mug", verb: "bump", args: ["different"], operation_id: "cold-conflict" }
+          }
+        })
+      }));
+      const body = await response.json() as Record<string, any>;
+      await f.settleAll();
+      expect(body.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 3. A verb that emits and then throws still COMMITS its
+  // transcript, so those lines happened. The gateway suppresses the
+  // submitter's own committed echo from woo_wait precisely because the reply
+  // is supposed to carry them (M4.1) — so returning the error without them
+  // lost them entirely, and the actor could never see what its own failed
+  // action did. That is the exact hole the own-observations seat was built
+  // to close, still open on the failure path.
+  it("a FAILED turn still carries the submitter's own observations", async () => {
+    const f = await fixture();
+    try {
+      const failed = await f.complain(f.aliceSession, "fail-1");
+      await f.settleAll();
+      expect(failed.result?.isError).toBe(true);
+      expect(failed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
+      const lines = (failed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
+      expect(
+        lines.some((obs) => obs?.type === "complained"),
+        `failed turn dropped its own observations: ${JSON.stringify(failed.result).slice(0, 500)}`
+      ).toBe(true);
+      // And they are not ALSO waiting in the queue — one seat, not two.
+      const queued = await f.drain(f.aliceSession);
+      expect(queued.some((obs) => obs?.type === "complained")).toBe(false);
+
+      // A REPLAYED failure replays the recorded error AND the recorded
+      // lines, and says it is a replay — otherwise a client seeing an error
+      // cannot tell whether its retry ran again.
+      const replayed = await f.complain(f.aliceSession, "fail-1");
+      await f.settleAll();
+      expect(replayed.result?.isError).toBe(true);
+      expect(replayed.result?.structuredContent?.replayed).toBe(true);
+      expect(replayed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
+      const replayedLines = (replayed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
+      expect(replayedLines.some((obs) => obs?.type === "complained")).toBe(true);
+      // The partial write committed once, and the replay did not repeat it.
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
   it("a malformed operation id is refused, never silently downgraded to a fresh key", async () => {
     const f = await fixture();
     try {
@@ -339,6 +586,81 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       // Refused BEFORE the turn: nothing committed.
       await f.settleAll();
       expect(await f.hits()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 5. Every woo_wait parked a closure and a live timer in an
+  // unbounded per-session set, and notifications/cancelled was swallowed by
+  // the blanket 202 — a resource-exhaustion vector on a public surface with
+  // no way for a client to reclaim its own slots.
+  it("bounds parked woo_wait calls per session and names the refusal", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.aliceSession);
+      // Park the cap. Each stays parked because the queue is empty.
+      const parked = [1, 2, 3, 4].map((n) =>
+        f.mcp(
+          { jsonrpc: "2.0", id: 700 + n, method: "tools/call", params: { name: "woo_wait", arguments: { timeout_ms: 20_000 } } },
+          { "mcp-session-id": f.aliceSession }
+        )
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const over = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 20_000 });
+      expect(over.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_WAIT_LIMIT", detail: { reason: "wait_concurrency", limit: 4 } } }
+      });
+
+      // Cancellation releases exactly the request it names, and resolves it
+      // WITHOUT draining — a client that walked away must not consume rows
+      // into a reply nobody reads, nor advance the M5.1 drain watermark.
+      //
+      // The assertion is on ELAPSED TIME, deliberately. An ignored
+      // cancellation also resolves with no observations — by timing out 20s
+      // later — so a shape-only assertion would pass against a server that
+      // dropped the notification entirely. Prompt resolution is the only
+      // thing that distinguishes the two.
+      const startedAt = Date.now();
+      await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 701 } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      const cancelled = await parked[0];
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed, `cancellation took ${elapsed}ms — the park was not released`).toBeLessThan(5_000);
+      expect(cancelled.body?.result?.structuredContent?.result?.observations).toEqual([]);
+
+      // The slot is free again: a call that was refused a moment ago is
+      // accepted now. (timeout_ms 0 returns immediately, so it parks nothing.)
+      const reclaimed = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 0 });
+      expect(reclaimed.result?.isError).not.toBe(true);
+
+      // The other three are still parked and still functional: a delivery
+      // wakes them and exactly one carries the row, with nothing lost to the
+      // cancellation.
+      (f.gateway() as any).mcpEnqueue(f.aliceSession, [{ type: "kept" }]);
+      const settled = await Promise.all(parked.slice(1));
+      const delivered = settled.flatMap(
+        (response) => response.body?.result?.structuredContent?.result?.observations ?? []
+      );
+      expect(delivered).toEqual([{ type: "kept" }]);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("a timed-out woo_wait releases its slot", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.aliceSession);
+      // Four short parks that all expire; if the timeout path leaked its
+      // waiter, the fifth call would be refused.
+      await Promise.all([1, 2, 3, 4].map(() => f.call(f.aliceSession, "woo_wait", { timeout_ms: 5 })));
+      const after = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 5 });
+      expect(after.result?.isError).not.toBe(true);
+      expect(after.result?.structuredContent?.result?.observations).toEqual([]);
     } finally {
       f.close();
     }

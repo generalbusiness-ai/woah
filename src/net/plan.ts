@@ -67,6 +67,11 @@ export type PlanTurnInput = {
   /** Caller-stable turn identity: a replayed submit returns the recorded
    * reply (CO2.5). */
   idempotencyKey: string;
+  /** CO2.5: the CLIENT named this key and expects retry semantics, so an
+   * effect-free but externally visible turn (speech) must still record a
+   * receipt. Absent for a gateway-minted key — which is what keeps the
+   * write-free direct-read path write-free. */
+  retryReceipt?: boolean;
   stamp: EpochStamp;
   /** World counters for the ephemeral planning world. Counters are host
    * state, not cells: a turn that CREATES must plan with the owning
@@ -165,7 +170,7 @@ export type PlanTurnResult = {
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
-  const { call, view, planningScope, classifier, base, idempotencyKey, stamp } = input;
+  const { call, view, planningScope, classifier, base, idempotencyKey, stamp, retryReceipt } = input;
 
   // ONE consistent snapshot per planning attempt, taken synchronously
   // (fix 6: the version-laundering window). The cells the ephemeral world
@@ -404,7 +409,11 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       post_state_version: applied.postStateVersion,
       stamp,
       ...(ownedReadsCompacted ? { owned_reads_compacted: true as const } : {}),
-      ...replaySubmitOutput(transcript)
+      // CO2.5: the request identity a recorded reply answers, and the
+      // client's opt-in to a receipt for an effect-free visible turn.
+      request_fingerprint: requestFingerprint(call),
+      ...(retryReceipt === true ? { retry_receipt: true as const } : {}),
+      ...replaySubmitOutput(transcript, retryReceipt === true)
     },
     selection,
     transcript,
@@ -420,30 +429,65 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
 }
 
 /**
+ * CO2.5: the canonical identity of the request an idempotency key answers.
+ *
+ * Keys are client-chosen strings. Without this, a client reusing one for a
+ * different call is handed the first call's recorded reply as though it were
+ * its own — a confidently wrong answer, which is strictly worse than the
+ * double execution keys exist to prevent.
+ *
+ * Canonicalisation rules, each load-bearing:
+ *
+ * - `cellVersion` hashes with SORTED object keys, so two structurally equal
+ *   argument maps agree regardless of property order on the wire.
+ * - The call is the RESOLVED one. MCP resolves `$me`/`$here` and verb
+ *   ALIASES to their canonical object id and verb name before the turn is
+ *   built, so calling a verb by an alias fingerprints identically to calling
+ *   it by its name. Two spellings of one call must never conflict.
+ * - `session` is excluded: the same actor retrying from a second session is
+ *   still the same operation.
+ * - The planning anchor/scope is excluded: a turn that MOVED the actor
+ *   re-plans from the new room, and that must replay cleanly rather than
+ *   look like a different request.
+ */
+function requestFingerprint(call: ShadowTurnCall): string {
+  return cellVersion({
+    actor: call.actor,
+    target: call.target,
+    verb: call.verb,
+    args: call.args ?? [],
+    route: call.route
+  });
+}
+
+/**
  * CO2.5: carry the verb's return value to the authority as an unhashed
  * sibling, so a replayed submit can return the outcome of the execution that
  * actually committed instead of an empty success.
  *
  * Two deliberate withholdings, both reported rather than silent:
  *
- * - **Non-mutating turns.** A turn with no write, create, or move changed
- *   nothing, so re-issuing it under a fresh key is safe and costs the caller
- *   only a round trip. Read results are also the LARGE ones (a room listing,
- *   an ordered page), and every read envelope must keep its exact former size
- *   against the CO7 ceiling — this rule is what guarantees no existing turn
- *   moves closer to E_ENVELOPE.
+ * - **Turns whose reply will not be recorded.** A turn with no write,
+ *   create, or move changed nothing, and unless the client asked for a
+ *   receipt its reply is not cached at all — so there is nothing to carry a
+ *   result for. Read results are also the LARGE ones (a room listing, an
+ *   ordered page), and every read envelope must keep its exact former size
+ *   against the CO7 ceiling; this rule is what guarantees no existing turn
+ *   moves closer to E_ENVELOPE. A client that DID name a stable key has
+ *   opted into the cost, and gets its result back on replay.
  * - **Oversized results**, against REPLAY_OUTPUT_BYTE_CAP.
  *
  * In both cases `replay_result_omitted` marks that a value existed, so the
  * replay says "not retained" rather than reporting `null`.
  */
 function replaySubmitOutput(
-  transcript: EffectTranscript
+  transcript: EffectTranscript,
+  retryReceipt: boolean
 ): { replay_result?: EffectTranscript["result"]; replay_result_omitted?: true } {
   if (transcript.result === undefined) return {};
   const mutating =
     transcript.writes.length > 0 || transcript.creates.length > 0 || transcript.moves.length > 0;
-  if (!mutating) return { replay_result_omitted: true };
+  if (!mutating && !retryReceipt) return { replay_result_omitted: true };
   const encoded = JSON.stringify(transcript.result);
   // `undefined` here means "not JSON-representable" — retaining it would
   // record a value the replay could not return faithfully.

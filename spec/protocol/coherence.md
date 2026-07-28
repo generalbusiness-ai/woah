@@ -253,11 +253,28 @@ plausible wrong answer. A commit reply therefore distinguishes a fresh accept
 (the caller already holds its planned transcript) from a replay (the caller
 holds nothing, and receives the recorded output).
 
-The retained outcome is bound to the actor that committed it. Idempotency
-keys are client-chosen on `/net-api/turn`, on the WebSocket turn frame, and —
-via the operation id — on MCP, so two clients may name the same key. A submit
-from a different actor still learns that it committed nothing; it never
-receives the first actor's return value or directed lines.
+A recorded reply answers exactly ONE request. It carries a canonical
+fingerprint over `{actor, target, verb, args, route}` — sorted keys, the
+resolved call, excluding session and planning anchor — and a submit reusing
+the key for a different request is refused terminally
+(`idempotency_conflict`). Returning the first request's reply to a second
+request would be a confidently wrong answer, which is worse than the double
+execution the key prevents. The refusal never overwrites the recorded reply:
+the original caller's receipt outlives another client's collision.
+
+The retained outcome is additionally bound to the actor that committed it.
+Idempotency keys are client-chosen on `/net-api/turn`, on the WebSocket turn
+frame, and — via the operation id — on MCP, so two clients may name the same
+key. A submit from a different actor still learns that it committed nothing;
+it never receives the first actor's return value or directed lines.
+
+A validated turn with no authority effect is not cached, which is what keeps
+concurrent view refreshes from becoming writes on an unchanged scope. When
+the client explicitly names a stable key, the scope records a **receipt** for
+such a turn anyway — the reply alone, with no head advance, no sequence
+number, and no ordering — so an externally visible but effect-free act
+(speech) is not re-emitted by a retry. Without the opt-in the write-free path
+is unchanged.
 
 Retention is bounded and therefore so is the guarantee: replies within the
 scope's recovery-tail window are never pruned, and the cache holds a bounded

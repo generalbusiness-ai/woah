@@ -161,6 +161,37 @@ export type CommitSubmit = {
    * "the verb returned something this replay cannot show you" — without it a
    * replay would report `null` for both. */
   replay_result_omitted?: true;
+  /**
+   * CO2.5: the canonical identity of the request this key answers — a hash
+   * over `{actor, target, verb, args, route}` (plan.ts requestFingerprint).
+   *
+   * An idempotency key is a client-chosen string, and a client that reuses
+   * one for a DIFFERENT call would otherwise be handed the first call's
+   * recorded reply as though it were its own. That is a wrong answer
+   * presented as authoritative — strictly worse than the double execution
+   * the key exists to prevent. The scope compares this before serving a
+   * replay and refuses a mismatch terminally (`idempotency_conflict`).
+   *
+   * Absent on submits from a gateway that predates this field; the check is
+   * skipped in that case rather than guessed.
+   */
+  request_fingerprint?: string;
+  /**
+   * CO2.5: record a reply even for a turn that changes no authority cell.
+   *
+   * `pureDirectRead` exists so that V concurrent semantic-view refreshes do
+   * not become V storage writes on an otherwise unchanged scope, and that
+   * property must survive. But an effect-free direct turn can still be
+   * externally VISIBLE — room speech emits to every peer — and a client that
+   * named a stable key was promised that its retry would not repeat the act.
+   *
+   * The flag is the client's explicit opt-in, threaded from the transport
+   * (an MCP `operation_id`, or `retry_safe:true` on `/net-api/turn`). It
+   * records a keyed receipt WITHOUT advancing the head: no CAS, no seq, no
+   * ordering. Turns that did not ask keep exactly today's write-free path —
+   * which is what the browser's per-turn minted keys rely on.
+   */
+  retry_receipt?: true;
   /** CO2.3 rider integrity (rule 1): owner attestations for the
    * transcript's FOREIGN-anchored reads, keyed by owning scope. The
    * gateway fetches these at plan time (`POST /net/attest` — one async
@@ -190,6 +221,7 @@ export type RejectReason =
   | "stale_epoch"         // step 2
   | "stale_head"          // base behind current head
   | "incomplete_transcript" // step 4 — never short-circuited
+  | "idempotency_conflict" // step 3 — key reused for a different request; terminal
   | "read_version_mismatch" // step 7
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
   | "catalog_mutation"    // step 5 — epoch-immutable definition write without an epoch transition
@@ -259,6 +291,13 @@ export type CommitReply =
        * (a fresh accept's caller already holds its own planned transcript),
        * and only when the replaying actor is the one that committed it. */
       replay_output?: ReplayOutput;
+      /** CO2.5: the request fingerprint this recorded reply answers. Stored
+       * with the reply (and therefore durable across a cold gateway or a
+       * scope restart) so key reuse for a different call is detectable at
+       * the authority rather than in one isolate's memory. Never returned:
+       * it is stripped from the replayed copy, since a hash of another
+       * client's request is not this caller's business. */
+      replay_request?: string;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -912,17 +951,41 @@ export class ScopeSequencer {
     const recorded = this.replies.get(submit.idempotency_key);
     if (recorded) {
       if (recorded.status !== "accepted") return recorded;
+      // An idempotency key answers ONE request. Reusing it for a different
+      // call must never hand back the first call's reply — a confidently
+      // wrong answer is worse than the double execution keys prevent. The
+      // fingerprint covers actor/target/verb/args/route, canonically, so an
+      // alias that resolves to the same call agrees and a changed argument
+      // does not. Both sides must carry one: a submit or a recorded reply
+      // from before this field existed is not evidence of agreement, and
+      // guessing either way would be worse than the pre-existing behaviour.
+      const { replay_request: recordedRequest, ...replayable } = recorded;
+      if (
+        recordedRequest !== undefined &&
+        submit.request_fingerprint !== undefined &&
+        recordedRequest !== submit.request_fingerprint
+      ) {
+        return this.reject(submit, "idempotency_conflict", {
+          idempotency_key: submit.idempotency_key,
+          reason: "key_reused_for_different_request",
+          // Deliberately no echo of the recorded call: the holder of a
+          // colliding key must not learn what the original request was.
+          remediation:
+            "this idempotency key already answered a different call; " +
+            "retry the original call unchanged, or use a new key for this one"
+        });
+      }
       // The retained outcome is bound to the actor that committed it. A
       // mismatch still replays the VERDICT (this submit committed nothing —
       // that is the whole safety property) but never the other actor's
-      // return value or lines. Aged rows carry no `actor`, so they replay
-      // their output as before this rule existed only when they have none.
-      const output = recorded.replay_output;
+      // return value or lines. This remains load-bearing for aged rows,
+      // which have no fingerprint for the check above to use.
+      const output = replayable.replay_output;
       if (output?.actor !== undefined && output.actor !== submit.transcript.call.actor) {
-        const { replay_output: _withheld, ...verdict } = recorded;
+        const { replay_output: _withheld, ...verdict } = replayable;
         return { ...verdict, replayed: true };
       }
-      return { ...recorded, replayed: true };
+      return { ...replayable, replayed: true };
     }
 
     // Step 1: envelope/actor/session authority (CO14: the shell wires
@@ -1411,7 +1474,7 @@ export class ScopeSequencer {
       (submit.transcript.cancellations?.length ?? 0) === 0 &&
       submit.transcript.untrackedEffects.length === 0;
     if (pureDirectRead) {
-      return {
+      const reply: Extract<CommitReply, { status: "accepted" }> = {
         kind: "woo.net.commit_reply.v1",
         status: "accepted",
         scope: this.scope,
@@ -1419,6 +1482,18 @@ export class ScopeSequencer {
         touched: [],
         post_state_version: applied.postStateVersion
       };
+      // CO2.5: an effect-free direct turn can still be externally VISIBLE —
+      // room speech reaches every peer through the live carrier — so a
+      // client that named a stable key must not have its retry re-emit the
+      // act. Record the receipt, and ONLY the receipt: the head does not
+      // advance, no seq is consumed, nothing is ordered, so speech still
+      // never contends. The unkeyed refresh path above stays write-free,
+      // which is the property this whole branch exists to protect.
+      //
+      // scope-do gates its live publish on `replayed !== true`, so the
+      // recorded receipt is exactly what stops the second emission.
+      if (submit.retry_receipt === true) this.recordDirectReceipt(submit, reply);
+      return reply;
     }
 
     // Accept: adopt the applied clone as authority, advance head, record
@@ -1542,7 +1617,11 @@ export class ScopeSequencer {
     // reply RETURNED to this fresh accept does not, because its caller holds
     // the planned transcript already and re-sending it would double every
     // observation on the wire.
-    const recordedReply: CommitReply = { ...reply, replay_output: this.recordedOutput(submit) };
+    const recordedReply: CommitReply = {
+      ...reply,
+      replay_output: this.recordedOutput(submit),
+      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {})
+    };
     this.replies.set(submit.idempotency_key, recordedReply);
     // H2a: bound the reply cache on each accepted commit (memory and the
     // durable rows prune in lockstep inside the transaction below).
@@ -2727,6 +2806,32 @@ export class ScopeSequencer {
    * read — and the dropped part is NAMED in `omitted` so the replay says "I
    * am not showing you this" instead of showing an empty list.
    */
+  /**
+   * CO2.5: record the receipt for an accepted turn that advanced nothing.
+   *
+   * Deliberately NOT the accept path's transaction: there is no cell write,
+   * no head, no tail entry, no log row to be atomic with — only the reply
+   * row and any prune the row triggers. The head is untouched, so a
+   * concurrent turn at this scope neither blocks on this nor is blocked by
+   * it, which is the whole point of keeping effect-free turns off the
+   * sequencer.
+   */
+  private recordDirectReceipt(submit: CommitSubmit, reply: Extract<CommitReply, { status: "accepted" }>): void {
+    const recorded: CommitReply = {
+      ...reply,
+      replay_output: this.recordedOutput(submit),
+      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {})
+    };
+    this.replies.set(submit.idempotency_key, recorded);
+    const pruned = this.pruneReplies();
+    const durable = this.options.durable;
+    if (!durable) return;
+    durable.transaction(() => {
+      durable.writeReply(submit.idempotency_key, recorded);
+      for (const key of pruned) durable.deleteReply(key);
+    });
+  }
+
   private recordedOutput(submit: CommitSubmit): ReplayOutput {
     const omitted: Array<"result" | "error" | "observations"> = [];
     if (submit.replay_result_omitted === true) omitted.push("result");
@@ -2824,7 +2929,13 @@ export class ScopeSequencer {
     // between verdicts; retryable ones are not, because the entire point
     // of a retry is a fresh validation against repaired state. The same
     // rule holds durably: only recorded replies are persisted.
-    if (!RETRYABLE_VERDICTS.has(reason)) {
+    //
+    // A recorded reply is NEVER clobbered. The one reject that can reach a
+    // key which already holds one is `idempotency_conflict` — a different
+    // request arriving under a used key — and overwriting the receipt there
+    // would destroy the original caller's proof and let ITS retry execute a
+    // second time. The refusal is returned; the receipt stands.
+    if (!RETRYABLE_VERDICTS.has(reason) && !this.replies.has(submit.idempotency_key)) {
       this.replies.set(submit.idempotency_key, reply);
       this.options.durable?.writeReply(submit.idempotency_key, reply);
     }
