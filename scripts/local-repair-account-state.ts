@@ -63,11 +63,16 @@ export function repairLocalAccountState(
     throw new Error(`SQLite world does not exist or is not a file: ${args.database}`);
   }
   const repo = new LocalSQLiteRepository(args.database, {
-    requireExistingCurrentWorld: true
+    requireExistingCurrentWorld: true,
+    // BEGIN IMMEDIATE protects the database snapshot below; this lifetime
+    // lease additionally proves there is no live in-memory WooWorld that can
+    // later flush an older image over the accepted repair.
+    exclusiveWorldAccess: true
   });
   try {
-    // BEGIN IMMEDIATE covers load + plan + apply. A second process cannot
-    // commit between the diagnostic snapshot and its savepointed writes.
+    // The exclusive world lease proves the server is stopped. BEGIN IMMEDIATE
+    // then covers load + plan + apply, so no second database writer can commit
+    // between the diagnostic snapshot and its savepointed writes.
     const result = repo.transaction(() => {
       const stored = repo.load();
       if (!stored) {

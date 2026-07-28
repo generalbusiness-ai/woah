@@ -605,4 +605,125 @@ describe("Net account-state historical repair", () => {
     catalogState.close();
     clusterState.close();
   });
+
+  it("refuses to re-promote an explicitly demoted AP11 ledger agent", async () => {
+    const catalogState = netState("account-repair-demoted-catalog");
+    const clusterState = netState("account-repair-demoted-cluster");
+    let catalog: NetScopeDO;
+    let cluster: NetScopeDO;
+    const env: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "scope:catalog") return catalog;
+        if (destination === `scope:${CLUSTER}`) return cluster;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    catalog = new NetScopeDO(catalogState.state, env);
+    cluster = new NetScopeDO(clusterState.state, env);
+    const seed = async (scope: NetScopeDO, name: string, cells: unknown[]) => {
+      const response = await scope.fetch(await signInternalRequest(env, new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope: name, catalog_epoch: "account-repair-demoted", cells, relations: [] })
+      })));
+      expect(response.status, await response.clone().text()).toBe(200);
+    };
+    await seed(catalog, "catalog", [
+      {
+        kind: "object_lineage",
+        object: "$system",
+        value: { parent: "$root", owner: "$wiz", name: "System", anchor: null, flags: {} }
+      },
+      prop("$system", "programmer_surface", "$programmer"),
+      ...identityRoleCells()
+    ]);
+    await seed(cluster, CLUSTER, [
+      {
+        kind: "object_lineage",
+        object: HUMAN,
+        value: { parent: "$human", owner: "$wiz", name: "Human", anchor: null, flags: {} }
+      },
+      {
+        kind: "object_lineage",
+        object: ACCOUNT,
+        value: { parent: "$account", owner: "$wiz", name: "Account", anchor: HUMAN, flags: {} }
+      },
+      {
+        kind: "object_lineage",
+        object: AGENT,
+        value: {
+          parent: "$agent",
+          owner: HUMAN,
+          name: "Demoted operator",
+          anchor: HUMAN,
+          // The preserved wizard bit proves AP11 completed before the later
+          // programmer demotion. The historical ledger cannot override it.
+          flags: { wizard: true, programmer: false }
+        }
+      },
+      prop(HUMAN, "account", ACCOUNT),
+      prop(ACCOUNT, "primary_actor", HUMAN),
+      prop(ACCOUNT, "actors", [HUMAN, AGENT]),
+      prop(ACCOUNT, "operator_provisioned_agents", { "demoted-ledger-1": AGENT }),
+      prop(ACCOUNT, "agent_count", 1),
+      prop(ACCOUNT, "programmer_agent_count", 0),
+      prop(AGENT, "provision_id", "demoted-ledger-1"),
+      prop(AGENT, "features", []),
+      prop(AGENT, "api_key_id", null),
+      prop(AGENT, "api_keys", {}),
+      prop(AGENT, "retired_at", null),
+      prop(AGENT, "deactivated_at", null)
+    ]);
+
+    const signed = (path: string, init?: RequestInit) =>
+      signInternalRequest(env, new Request(`https://do${path}`, init));
+    const before = await (await cluster.fetch(await signed("/net/head"))).json() as { head: unknown };
+    const response = await cluster.fetch(await signed("/net/repair-account-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        account: ACCOUNT,
+        human: HUMAN,
+        candidates: [],
+        dry_run: false
+      })
+    }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      status: "conflict",
+      changed: [],
+      patches: [],
+      conflicts: [{
+        code: "operator_agent_explicitly_demoted",
+        object: AGENT,
+        field: "object_lineage"
+      }]
+    });
+    const after = await (await cluster.fetch(await signed("/net/head"))).json() as { head: unknown };
+    expect(after.head).toEqual(before.head);
+
+    const closure = await cluster.fetch(await signed("/net/closure", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        keys: [
+          `object_lineage:${AGENT}`,
+          `property_cell:${AGENT}:features`,
+          `property_cell:${ACCOUNT}:programmer_agent_count`
+        ],
+        known: []
+      })
+    }));
+    const cells = (await closure.json() as { cells: Array<{ key: string; value: any }> }).cells;
+    expect(cells.find((cell) => cell.key === `object_lineage:${AGENT}`)?.value.flags)
+      .toMatchObject({ wizard: true, programmer: false });
+    expect(cells.find((cell) => cell.key === `property_cell:${AGENT}:features`)?.value.value).toEqual([]);
+    expect(cells.find((cell) => cell.key === `property_cell:${ACCOUNT}:programmer_agent_count`)?.value.value).toBe(0);
+
+    catalogState.close();
+    clusterState.close();
+  });
 });

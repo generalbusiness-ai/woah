@@ -254,7 +254,23 @@ export function planAccountStateRepair(snapshot: AccountRepairSnapshot): Account
         nextFeatures = nextFeatures.filter((item) => item !== surface);
       }
     } else if (provisionId !== null) {
-      if (!surface) {
+      // The AP11 ledger proves what provisioning intended at creation time;
+      // it is not a perpetual grant. AP11 sets the wizard bit only AFTER the
+      // programmer transition, while an ordinary demotion deliberately keeps
+      // that bit. The conjunction below is therefore durable, in-band proof
+      // that this actor completed provisioning and was explicitly demoted
+      // later. Re-promoting it would overwrite newer owner intent.
+      if (nextFlags.wizard === true && nextFlags.programmer !== true) {
+        conflict(conflicts, "operator_agent_explicitly_demoted", id, "object_lineage", {
+          wizard: true,
+          programmer: false
+        });
+      } else if (deactivated.value !== null) {
+        // Deactivation is likewise newer state than the provisioning ledger.
+        // It is reversible, so the repair cannot infer whether an operator
+        // wants reactivation, retirement, or continued suspension.
+        conflict(conflicts, "operator_agent_deactivated", id, "deactivated_at");
+      } else if (!surface) {
         conflict(conflicts, "operator_agent_missing_programmer_surface", id, "features");
       } else {
         nextFlags.programmer = true;

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -118,21 +118,34 @@ describe("bounded historical account-state repair", () => {
       expect(afterFailure.object(agent).flags.programmer).toBe(true);
       expect(afterFailure.propOrNull(account, "agent_count")).toBe(9);
 
-      const applied = afterFailure.repairAccountState(account, { apply: true });
-      expect(applied.status).toBe("applied");
-      expect(afterFailure.propOrNull(agent, "deactivated_at")).toBe(1234);
-      expect(afterFailure.object(agent).flags.programmer).toBe(false);
-      expect(afterFailure.propOrNull(agent, "features")).not.toContain("$programmer");
-      expect((afterFailure.propOrNull(agent, "api_keys") as Record<string, any>)[keyId].revoked_at).toBe(1234);
-      expect(afterFailure.propOrNull(account, "actors")).toEqual([...new Set(actors)]);
-      expect(afterFailure.propOrNull(account, "agent_count")).toBe(0);
-      expect(afterFailure.propOrNull(account, "programmer_agent_count")).toBe(0);
+      // BEGIN IMMEDIATE alone cannot see that this live WooWorld owns newer
+      // in-memory state. The CLI must refuse before loading or applying rather
+      // than report success that `afterFailure` could overwrite later.
+      expect(() => repairLocalAccountState([
+        "--db", path,
+        "--account", account,
+        "--apply"
+      ], () => {})).toThrow(/requires a stopped server/);
+      expect(afterFailure.propOrNull(agent, "deactivated_at")).toBeNull();
+      expect(afterFailure.propOrNull(account, "agent_count")).toBe(9);
       afterFailureRepo.close();
+
+      const applied = repairLocalAccountState([
+        "--db", path,
+        "--account", account,
+        "--apply"
+      ], () => {});
+      expect(applied.status).toBe("applied");
 
       const verifyRepo = new LocalSQLiteRepository(path);
       const verify = createWorld({ repository: verifyRepo });
       expect(verify.propOrNull(agent, "deactivated_at")).toBe(1234);
       expect(verify.object(agent).flags.programmer).toBe(false);
+      expect(verify.propOrNull(agent, "features")).not.toContain("$programmer");
+      expect((verify.propOrNull(agent, "api_keys") as Record<string, any>)[keyId].revoked_at).toBe(1234);
+      expect(verify.propOrNull(account, "actors")).toEqual([...new Set(actors)]);
+      expect(verify.propOrNull(account, "agent_count")).toBe(0);
+      expect(verify.propOrNull(account, "programmer_agent_count")).toBe(0);
       expect(verify.repairAccountState(account, { apply: true })).toMatchObject({
         status: "empty",
         changed: [],
@@ -352,6 +365,66 @@ describe("bounded historical account-state repair", () => {
     expect(world.repairAccountState(account, { apply: true }).status).toBe("empty");
   });
 
+  it("never treats a stale AP11 ledger entry as authority to undo an explicit demotion", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "account-demoted-ledger@woo.dev");
+    world.createObject({
+      id: "demoted_operator_agent",
+      name: "Explicitly demoted operator",
+      parent: "$agent",
+      owner: human,
+      anchor: human,
+      location: "$nowhere",
+      // AP11 sets wizard only after programmer promotion. Demotion clears the
+      // programmer bit and surface but deliberately preserves wizard.
+      flags: { wizard: true, programmer: false }
+    });
+    world.setProp("demoted_operator_agent", "provision_id", "demoted-ledger-1");
+    world.setProp("demoted_operator_agent", "features", []);
+    world.createObject({
+      id: "suspended_operator_agent",
+      name: "Suspended operator",
+      parent: "$agent",
+      owner: human,
+      anchor: human,
+      location: "$nowhere"
+    });
+    world.setProp("suspended_operator_agent", "provision_id", "suspended-ledger-1");
+    world.setProp("suspended_operator_agent", "deactivated_at", 42);
+    world.setProp(account, "operator_provisioned_agents", {
+      "demoted-ledger-1": "demoted_operator_agent",
+      "suspended-ledger-1": "suspended_operator_agent"
+    });
+    world.setProp(account, "actors", [human, "demoted_operator_agent", "suspended_operator_agent"]);
+    world.setProp(account, "agent_count", 2);
+    world.setProp(account, "programmer_agent_count", 0);
+
+    const before = world.exportWorld();
+    const result = world.repairAccountState(account, { apply: true });
+
+    expect(result).toMatchObject({
+      status: "conflict",
+      changed: [],
+      patches: []
+    });
+    expect(result.conflicts).toEqual(expect.arrayContaining([expect.objectContaining({
+      code: "operator_agent_explicitly_demoted",
+      object: "demoted_operator_agent",
+      field: "object_lineage"
+    }), expect.objectContaining({
+      code: "operator_agent_deactivated",
+      object: "suspended_operator_agent",
+      field: "deactivated_at"
+    })]));
+    expect(world.exportWorld()).toEqual(before);
+    expect(world.object("demoted_operator_agent").flags).toMatchObject({
+      wizard: true,
+      programmer: false
+    });
+    expect(world.propOrNull("demoted_operator_agent", "features")).toEqual([]);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
+  });
+
   it("persists a lineage-only repair before returning applied", async () => {
     const dir = mkdtempSync(join(tmpdir(), "woo-account-lineage-repair-"));
     const path = join(dir, "world.sqlite");
@@ -408,6 +481,47 @@ describe("bounded historical account-state repair", () => {
       expect(() => second.transaction(() => {})).not.toThrow();
       second.close();
       first.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims dead shared owners but requires explicit recovery of an interrupted exclusive repair", () => {
+    const dir = mkdtempSync(join(tmpdir(), "woo-account-repair-stale-lease-"));
+    const path = join(dir, "world.sqlite");
+    const access = `${path}.woo-access`;
+    try {
+      const seed = new LocalSQLiteRepository(path);
+      createWorld({ repository: seed });
+      seed.close();
+
+      mkdirSync(access);
+      writeFileSync(
+        join(access, "owner-2147483647-dead"),
+        JSON.stringify({ pid: 2147483647, mode: "shared" }),
+        { mode: 0o600 }
+      );
+      const afterDeadOwner = new LocalSQLiteRepository(path, {
+        exclusiveWorldAccess: true
+      });
+      expect(existsSync(join(access, "owner-2147483647-dead"))).toBe(false);
+      afterDeadOwner.close();
+
+      mkdirSync(access);
+      const interrupted = join(access, "exclusive");
+      writeFileSync(
+        interrupted,
+        JSON.stringify({ pid: 2147483647, mode: "exclusive" }),
+        { mode: 0o600 }
+      );
+      expect(() => new LocalSQLiteRepository(path)).toThrow(
+        /remove .*exclusive only after verifying its owner is stopped/
+      );
+      // The constructor refuses without guessing. This explicit deletion
+      // represents the operator verifying the recorded process is gone.
+      rmSync(interrupted);
+      const recovered = new LocalSQLiteRepository(path);
+      recovered.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

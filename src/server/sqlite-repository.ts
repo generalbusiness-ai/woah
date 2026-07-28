@@ -1,5 +1,18 @@
-import { existsSync, mkdirSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  readdirSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   LogReadResult,
@@ -34,6 +47,152 @@ import { wooError, type ErrorValue, type Message, type ObjRef, type Observation,
 type Row = Record<string, any>;
 const LOCAL_SQLITE_SCHEMA_VERSION = 1;
 
+type LocalWorldLease = {
+  directory: string;
+  file: string;
+};
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but this user cannot signal it.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function leasePid(file: string): number | null {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { pid?: unknown };
+    return typeof parsed.pid === "number" ? parsed.pid : null;
+  } catch {
+    // A partially written or otherwise unreadable lease is conservatively
+    // live. Operators can inspect it; silently guessing stale would weaken the
+    // stopped-world boundary.
+    return null;
+  }
+}
+
+function removeIfStaleOwner(file: string): boolean {
+  if (!existsSync(file)) return true;
+  const pid = leasePid(file);
+  if (pid === null || processIsAlive(pid)) return false;
+  try {
+    unlinkSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  return true;
+}
+
+function assertNoExclusiveLease(file: string, canonical: string): void {
+  if (!existsSync(file)) return;
+  const pid = leasePid(file);
+  const owner = pid !== null && processIsAlive(pid)
+    ? `live PID ${pid}`
+    : "a stale or unreadable marker";
+  // Never auto-delete the fixed-name exclusive marker. Two contenders could
+  // both observe an old marker, then one could unlink the other's newly
+  // published marker. The safe crash-recovery path is an explicit operator
+  // removal after checking that its recorded PID is gone.
+  throw wooError(
+    "E_STORAGE",
+    `local SQLite world is already exclusively owned by ${owner}: ${canonical}; remove ${file} only after verifying its owner is stopped`
+  );
+}
+
+function releaseLocalWorldLease(lease: LocalWorldLease): void {
+  try {
+    unlinkSync(lease.file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    rmdirSync(lease.directory);
+  } catch (error) {
+    // Other live owners legitimately keep the directory non-empty.
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      throw error;
+    }
+  }
+}
+
+/**
+ * Acquire the cooperative process-ownership boundary for one local world.
+ *
+ * SQLite's writer lock cannot protect an in-memory WooWorld: an idle server
+ * may hold no SQL transaction while still owning newer state that its next
+ * flush would write over an offline repair. Every ordinary repository
+ * therefore holds a shared owner lease for its lifetime. Offline repair takes
+ * the exclusive marker and refuses while any owner is alive.
+ *
+ * The before/after checks close both creation races: a shared opener that
+ * overlaps an exclusive opener removes its new lease and refuses, while the
+ * exclusive opener re-scans owners after publishing its marker. Unique shared
+ * leases are reclaimed only when their recorded PID no longer exists; the
+ * fixed-name exclusive marker requires explicit crash recovery.
+ */
+function acquireLocalWorldLease(filename: string, exclusive: boolean): LocalWorldLease | null {
+  if (filename === ":memory:") return null;
+  const canonical = existsSync(filename) ? realpathSync(filename) : resolve(filename);
+  const directory = `${canonical}.woo-access`;
+  const exclusiveFile = `${directory}/exclusive`;
+  mkdirSync(directory, { recursive: true });
+
+  assertNoExclusiveLease(exclusiveFile, canonical);
+
+  if (!exclusive) {
+    // UUID makes a stale owner filename single-use even if the OS later reuses
+    // its PID, so stale-owner cleanup cannot unlink a replacement lease.
+    const file = `${directory}/owner-${process.pid}-${randomUUID()}`;
+    const fd = openSync(file, "wx", 0o600);
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, mode: "shared" }));
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      assertNoExclusiveLease(exclusiveFile, canonical);
+    } catch (error) {
+      releaseLocalWorldLease({ directory, file });
+      throw error;
+    }
+    return { directory, file };
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(exclusiveFile, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      assertNoExclusiveLease(exclusiveFile, canonical);
+    }
+    throw error;
+  }
+  try {
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, mode: "exclusive" }));
+  } finally {
+    closeSync(fd);
+  }
+  const lease = { directory, file: exclusiveFile };
+  const liveOwners: string[] = [];
+  for (const name of readdirSync(directory)) {
+    if (!name.startsWith("owner-")) continue;
+    const file = `${directory}/${name}`;
+    if (!removeIfStaleOwner(file)) liveOwners.push(name);
+  }
+  if (liveOwners.length > 0) {
+    releaseLocalWorldLease(lease);
+    throw wooError(
+      "E_STORAGE",
+      `local account repair requires a stopped server; ${liveOwners.length} live world owner(s) still hold ${canonical}`
+    );
+  }
+  return lease;
+}
+
 function persistedSessionFromRow(row: Row, now: number): SerializedSession {
   const session = sessionFromRow(row);
   // A persisted null means "was attached when the process stopped"; after a
@@ -42,11 +201,20 @@ function persistedSessionFromRow(row: Row, now: number): SerializedSession {
 }
 
 export class LocalSQLiteRepository implements WorldRepository, ObjectRepository {
-  private db: DatabaseSync;
+  private db!: DatabaseSync;
+  private worldLease: LocalWorldLease | null = null;
+  private closed = false;
   private transactionDepth = 0;
   private savepointCounter = 0;
 
-  constructor(filename: string, options: { requireExistingCurrentWorld?: boolean } = {}) {
+  constructor(
+    filename: string,
+    options: {
+      requireExistingCurrentWorld?: boolean;
+      /** Offline repair only: refuse while any live repository owns this world. */
+      exclusiveWorldAccess?: boolean;
+    } = {}
+  ) {
     if (
       options.requireExistingCurrentWorld === true &&
       (filename === ":memory:" || !existsSync(filename) || !statSync(filename).isFile())
@@ -54,18 +222,24 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       throw wooError("E_STORAGE", `account repair target is not an existing SQLite file: ${filename}`);
     }
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
-    this.db = new DatabaseSync(filename);
-    if (options.requireExistingCurrentWorld === true) {
-      try {
+    this.worldLease = acquireLocalWorldLease(filename, options.exclusiveWorldAccess === true);
+    try {
+      this.db = new DatabaseSync(filename);
+      if (options.requireExistingCurrentWorld === true) {
         this.assertExistingCurrentWorld();
-      } catch (error) {
-        this.db.close();
-        throw error;
       }
+      this.db.exec("PRAGMA journal_mode = WAL");
+      this.db.exec("PRAGMA synchronous = NORMAL");
+      this.migrate();
+    } catch (error) {
+      try {
+        this.db?.close();
+      } finally {
+        if (this.worldLease) releaseLocalWorldLease(this.worldLease);
+        this.worldLease = null;
+      }
+      throw error;
     }
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA synchronous = NORMAL");
-    this.migrate();
   }
 
   load(): SerializedWorld | null {
@@ -525,7 +699,14 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   }
 
   close(): void {
-    this.db.close();
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.db.close();
+    } finally {
+      if (this.worldLease) releaseLocalWorldLease(this.worldLease);
+      this.worldLease = null;
+    }
   }
 
   /** Same-handle destructive-migration guard for operator-selected paths.
