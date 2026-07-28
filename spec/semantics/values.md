@@ -123,6 +123,46 @@ Keys are UTF-8 strings only. Constraints:
 
 Why string-only: JSON-compatible serialization, simple equality, dominant ergonomic. Anyone who wants object-keyed maps can use a list of pairs.
 
+### V6.1 Map reads are own-key (normative)
+
+A map contains exactly the keys it was given. Every read is an **own-key**
+question, and the three spellings must always agree:
+
+| Expression | Key present | Key absent |
+|---|---|---|
+| `m[k]` (`MAP_GET` / `INDEX_GET`) | the value | `E_PROPNF` |
+| `k in m` (`IN`) | `true` | `false` |
+| `has(m, k)` | `true` | `false` |
+
+"Absent" includes every name the *host* language happens to define on its own
+object type — `constructor`, `__proto__`, `toString`, `hasOwnProperty`, … A
+runtime that answers these from its host prototype chain both invents keys the
+map never had and returns values (host functions, bare objects) that are not
+Woo values at all. `keys()`, `values()`, `length()` and map iteration have
+always been own-key; the read ops must match them.
+
+The converse is equally normative: those names are **ordinary data keys**. A map
+that genuinely holds `"constructor"` or `"__proto__"` must round-trip it through
+get, set, `in`, `has`, `keys` and iteration like any other key. Implementations
+therefore distinguish by own-property test, never by a name blacklist.
+
+### V6.2 Maps keyed by data (normative)
+
+Where a map's keys come from *data* — object ids, object names, verb names,
+exit directions, property names — the implementation must build it so that no
+key can collide with the host object model. In practice: a null-prototype map
+plus own-key writes. Writing `out[id] = v` into an ordinary host object makes an
+id of `__proto__` set the map's prototype instead of adding an entry, so the
+entry is absent from `keys` and from every consumer, with no error anywhere.
+
+Object ids are a data key space
+([objects.md §5.5.1](objects.md#551-mint-time-id-grammar) constrains only `.`,
+so `__proto__` is a legal id), as are user-chosen names and any key that
+originated in a Woo map. Rebuilding a Woo map (filtering, scrubbing, cloning,
+normalizing for comparison) is subject to the same rule: a rebuild that drops a
+key is data loss, and a comparison normalizer that drops one reports two
+different values as equal.
+
 ---
 
 ## V7. Error values

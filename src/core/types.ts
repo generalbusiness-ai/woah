@@ -899,6 +899,36 @@ export function assertMap(value: WooValue): Record<string, WooValue> {
   return value as Record<string, WooValue>;
 }
 
+/**
+ * Own-key test for a Woo map (values.md §V6: a map is data, never a
+ * host-language namespace). The single helper every map read goes through —
+ * `key in map` walks the host prototype chain, so a Woo map that never held a
+ * `constructor` key answers `true` for one and hands back a JavaScript
+ * function, and `{}["__proto__"]` yields an object out of nowhere. Neither
+ * value is expressible in the Woo type system; the map simply does not have
+ * that key.
+ *
+ * A map literally holding `"constructor"` or `"__proto__"` as data is
+ * unremarkable and must round-trip: `hasOwnProperty` is exactly the
+ * distinction, and computed writes (`{...map, [key]: value}`) already define
+ * own properties rather than invoking the `__proto__` setter.
+ */
+export function hasOwnMapKey(map: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(map, key);
+}
+
+/**
+ * Build an output map whose KEYS COME FROM DATA — object ids, object names,
+ * verb names, exit directions. Such a key space is not safe on a normal
+ * object: an entry named `__proto__` written with `out[key] = v` sets the
+ * prototype instead of adding an entry, so it vanishes from `Object.keys`
+ * and from every consumer. A null-prototype object has no inherited names to
+ * collide with and no `__proto__` accessor to trigger, so every key is data.
+ */
+export function dataKeyedMap<T = WooValue>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 export function isErrorValue(value: unknown): value is ErrorValue {
   return Boolean(value && typeof value === "object" && "code" in value);
 }

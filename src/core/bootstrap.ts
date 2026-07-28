@@ -4,7 +4,7 @@ import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, Wo
 import { isSensitiveSerializedPropertyName, redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import { hashSource } from "./source-hash";
 import type { MetricEvent, ObjRef, PresenceProjectionDef, VerbDef, WooValue } from "./types";
-import { valuesEqual } from "./types";
+import { dataKeyedMap, valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
 
@@ -801,7 +801,10 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
  * non-idempotent. */
 function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): Record<string, true> {
   if (!flags) return {};
-  const out: Record<string, true> = {};
+  // Rebuilt from the source record's own keys; a plain `{}` target would
+  // swallow a `__proto__` entry and make two differing flag sets compare
+  // equal, so the seed merge would skip a real divergence (values.md §V6).
+  const out: Record<string, true> = dataKeyedMap<true>();
   for (const [k, v] of Object.entries(flags)) if (v === true) out[k] = true;
   return out;
 }
@@ -819,7 +822,10 @@ function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): R
  * authoritative divergence via source_hash and the remaining metadata
  * (aliases, arg_spec, kind/native, calls, perms, owner, flags). */
 function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+  // Same rule as normalizeFlagsForCompare: keys come from a persisted row's
+  // own keys, and a comparison normalizer that silently drops one reports
+  // "equivalent" for verbs that are not.
+  const out: Record<string, unknown> = dataKeyedMap<unknown>();
   for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
     if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "reads_room_presence" || k === "reads_ordered_children" || k === "pure" || k === "pure_declared") {
       if (v === true) out[k] = true;

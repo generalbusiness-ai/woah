@@ -4,6 +4,7 @@ import {
   assertObj,
   assertString,
   cloneValue,
+  dataKeyedMap,
   freezeTinyBytecode,
   isDeeplyFrozen,
   directedRecipients,
@@ -2021,7 +2022,11 @@ export class WooWorld {
     }
     if (value && typeof value === "object") {
       const src = value as Record<string, WooValue>;
-      const out: Record<string, WooValue> = {};
+      // Rebuilds a Woo map from ITS OWN keys, which are arbitrary author data.
+      // A plain `{}` target would swallow a `__proto__` entry on the way
+      // through, so scrubbing one tombstone out of a map could silently drop
+      // an unrelated key (values.md §V6).
+      const out: Record<string, WooValue> = dataKeyedMap();
       let changed = false;
       for (const [key, entry] of Object.entries(src)) {
         if (typeof entry === "string" && this.tombstones.has(entry)) {
@@ -5644,7 +5649,13 @@ export class WooWorld {
   }
 
   async scopedObjectSummaries(actor: ObjRef, objRefs: ObjRef[], memo: HostOperationMemo = createHostOperationMemo()): Promise<Record<ObjRef, ScopedObjectSummary>> {
-    const out: Record<ObjRef, ScopedObjectSummary> = {};
+    // Keyed by OBJECT ID, which is a data key space, not a safe property
+    // namespace: `out["__proto__"] = summary` on a normal object sets the
+    // prototype instead of adding an entry, so an object legitimately named
+    // `__proto__` reports `hasOwn:false` and vanishes from `Object.keys` —
+    // silently missing from every look, roster, and describe that reads this
+    // map (values.md §V6).
+    const out: Record<ObjRef, ScopedObjectSummary> = dataKeyedMap<ScopedObjectSummary>();
     const remoteByHost = new Map<string, ObjRef[]>();
     for (const objRef of objRefs) {
       const host = await this.remoteHostForObject(objRef, memo);
@@ -11857,7 +11868,8 @@ export class WooWorld {
     if (Array.isArray(target)) {
       const ids = target.filter((item): item is ObjRef => typeof item === "string");
       const { summaries } = await this.objectSummariesForLook(ctx, ids);
-      const out: Record<string, WooValue> = {};
+      // Object-id keys again — same rule as scopedObjectSummaries above.
+      const out: Record<string, WooValue> = dataKeyedMap();
       for (const [id, summary] of summaries) out[id] = summary as unknown as WooValue;
       return out as unknown as WooValue;
     }
@@ -13406,7 +13418,10 @@ function cloneImportedPlainData<T>(value: T): T {
   // isolation contract it needs for cached snapshots.
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map((item) => cloneImportedPlainData(item)) as T;
-  const out: Record<string, unknown> = {};
+  // Keys here are object ids, property names, and arbitrary Woo map keys —
+  // all data. Copying into a plain `{}` loses a `__proto__` entry (the setter
+  // swallows it), so a world could lose data simply by being imported.
+  const out: Record<string, unknown> = dataKeyedMap<unknown>();
   for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
   return out as T;
 }

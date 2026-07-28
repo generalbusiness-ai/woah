@@ -211,6 +211,12 @@ Scope and rationale:
   and enforces that at the transport boundary. That is a wire-format rule, not
   a mint rule, and the two are deliberately not merged.
 
+Nothing else about an id is reserved, so ids collide freely with host-language
+property names — `__proto__` and `constructor` are legal object ids. Any map
+**keyed by object id** must therefore be built as a data-keyed map per
+[values.md §V6.2](values.md#v62-maps-keyed-by-data-normative); an id-keyed map
+built on an ordinary host object silently loses those entries.
+
 ### 5.6 The Directory
 
 The Directory host is a singleton holding small, read-mostly tables:
