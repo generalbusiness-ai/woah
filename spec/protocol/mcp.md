@@ -610,6 +610,14 @@ request id is not an error — and can only ever release a wait parked under the
 same session. Without honouring it, a bounded waiter set would let a client's
 own abandoned polls refuse its next legitimate one until they timed out.
 
+A parked request is identified by its JSON-RPC id **including that id's type**.
+JSON-RPC 2.0 ids may be strings or numbers, and `1` and `"1"` are different
+ids naming different requests; a client may legitimately have both in flight.
+A cancellation matches only the request whose id is equal *and* of the same
+class, so cancelling `"1"` never releases a wait parked under `1`. Collapsing
+the two would silently return an empty, non-draining reply to a request the
+client never cancelled.
+
 **Eviction is not rare, and a silent client goes deaf.** The queue lives in
 the gateway shard's memory, and on Cloudflare an idle shard is evicted within
 roughly ten seconds. A session that stops asking therefore stops hearing:

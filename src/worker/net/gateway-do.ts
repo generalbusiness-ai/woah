@@ -5126,7 +5126,7 @@ export class NetGatewayDO {
         // header: it can only ever release a waiter parked under THIS
         // session id, and releasing one drains nothing.
         if (typeof requestId === "string" || typeof requestId === "number") {
-          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", String(requestId));
+          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", mcpRequestKey(requestId));
         }
       }
       return new Response(null, { status: 202 });
@@ -5342,7 +5342,7 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const drained = await this.mcpWait(session, actor, timeout, limit, String(id));
+      const drained = await this.mcpWait(session, actor, timeout, limit, mcpRequestKey(id));
       if ("refused" in drained) return this.mcpToolError(id, drained.refused);
       return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
@@ -5808,7 +5808,8 @@ export class NetGatewayDO {
     actor: string,
     timeoutMs: number,
     limit: number,
-    requestId: string
+    /** An `mcpRequestKey` value — the class-discriminated JSON-RPC id. */
+    requestKey: string
   ): Promise<{ observations: unknown[]; gap: boolean } | { refused: Record<string, unknown> }> {
     const queue = this.mcpQueues.get(session);
     // No live state at all: nothing to drain and nothing to vouch for.
@@ -5867,7 +5868,7 @@ export class NetGatewayDO {
         // reply nobody sees — at-most-once delivery turning into none.
         resolve(cancelled ? { observations: [], gap: false } : take());
       };
-      queue.waiters.push({ requestId, wake });
+      queue.waiters.push({ requestKey, wake });
     });
   }
 
@@ -5879,11 +5880,14 @@ export class NetGatewayDO {
    * would turn a client's own abandoned polls into a self-inflicted refusal.
    * Unknown ids are silently fine: the request may have completed already,
    * and a cancellation is advisory by construction.
+   *
+   * `requestKey` is an `mcpRequestKey` value, not a raw id — the numeric and
+   * string forms of the same digits are different requests.
    */
-  private mcpCancelWait(session: string, requestId: string): void {
+  private mcpCancelWait(session: string, requestKey: string): void {
     const queue = this.mcpQueues.get(session);
     if (!queue) return;
-    const index = queue.waiters.findIndex((entry) => entry.requestId === requestId);
+    const index = queue.waiters.findIndex((entry) => entry.requestKey === requestKey);
     if (index < 0) return;
     queue.waiters[index].wake(true);
   }
@@ -9897,10 +9901,11 @@ type NetMcpSseWaiter = {
 type NetMcpSessionState = {
   actor: string;
   buffer: unknown[];
-  /** Parked `woo_wait` calls. Keyed by JSON-RPC request id so an explicit
-   * `notifications/cancelled` can release exactly one, and BOUNDED
-   * (MCP_MAX_SESSION_WAITS) because this is a public surface: without a cap
-   * a client could park closures and timers without limit. */
+  /** Parked `woo_wait` calls. Keyed by the class-discriminated JSON-RPC
+   * request id (`mcpRequestKey`) so an explicit `notifications/cancelled` can
+   * release exactly one, and BOUNDED (MCP_MAX_SESSION_WAITS) because this is
+   * a public surface: without a cap a client could park closures and timers
+   * without limit. */
   waiters: NetMcpWaiter[];
   ownEchoIds: Set<string>;
   /** M5.1 continuity marker. True when this gateway cannot prove that the
@@ -9916,7 +9921,7 @@ type NetMcpSessionState = {
 
 /** One parked woo_wait. `wake(cancelled)` resolves it; a cancelled wake must
  * NOT drain, or a client that walked away would consume rows it never read. */
-type NetMcpWaiter = { requestId: string; wake: (cancelled: boolean) => void };
+type NetMcpWaiter = { requestKey: string; wake: (cancelled: boolean) => void };
 
 function mcpSessionState(actor: string): NetMcpSessionState {
   return {
@@ -10117,6 +10122,20 @@ function mcpCursor(value: unknown): number {
  * `$nowhere` sentinel — and both mean "this session has no active space". */
 function mcpPlacedScope(location: string): string | null {
   return location && location !== "$nowhere" ? location : null;
+}
+
+/**
+ * The key a parked request is registered and cancelled under.
+ *
+ * JSON-RPC 2.0 ids are `String | Number` and the two are DISTINCT ids: `1`
+ * and `"1"` name different requests, and a client is free to have both in
+ * flight. Keying both sides by `String(id)` collapsed them, so a
+ * `notifications/cancelled` for `"1"` released — without draining — a
+ * `woo_wait` parked under `1`, silently returning an empty reply to a request
+ * its client never cancelled. Discriminating on class keeps them apart.
+ */
+function mcpRequestKey(id: number | string): string {
+  return typeof id === "number" ? `n:${id}` : `s:${id}`;
 }
 
 function mcpSanitizeId(value: string): string {

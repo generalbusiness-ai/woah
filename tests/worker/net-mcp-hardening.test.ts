@@ -4,6 +4,10 @@
 // behavior, never on internal shape, so a fix that only rearranges private
 // state fails.
 //
+//   FINDING 8 — parked waits and cancellations were both keyed by
+//   `String(id)`, so a cancellation for `"1"` released a wait parked under
+//   the DISTINCT JSON-RPC id `1`.
+//
 //   FINDING 2 (mcp.md M2.3) — `woo_list_reachable_tools` filtered contextual
 //   objects first and generated collision-disambiguating tool names over that
 //   FILTERED subset, while invocation regenerates names over the COMPLETE
@@ -301,6 +305,71 @@ describe("MCP gateway hardening", () => {
         const expected = pingNames.find((name) => canonical.get(name) === id);
         expect(ping?.name, `scope:object ${id} advertised ${ping?.name}, canonical is ${expected}`).toBe(expected);
       }
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 8.
+  it("keeps numeric and string JSON-RPC request ids distinct when cancelling a wait", async () => {
+    const f = await fixture();
+    try {
+      // Drain first so the wait genuinely parks.
+      await f.call(f.aliceSession, "woo_wait", { timeout_ms: 0, limit: 100 });
+
+      // Park under the NUMERIC id 1.
+      const parked = f.mcp(
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "woo_wait", arguments: { timeout_ms: 20_000 } } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      let settled = false;
+      void parked.then(() => { settled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled, "the wait did not park").toBe(false);
+
+      // Cancel the STRING id "1". JSON-RPC says that is a different request,
+      // so this must not touch the parked one.
+      const wrong = await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: "1" } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      expect(wrong.status).toBe(202);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled, `a cancellation for "1" released the wait parked under 1`).toBe(false);
+
+      // The matching numeric cancellation does release it, promptly — the
+      // elapsed-time assertion is what distinguishes a real release from the
+      // 20s timeout, which also resolves with no observations.
+      const startedAt = Date.now();
+      expect((await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+        { "mcp-session-id": f.aliceSession }
+      )).status).toBe(202);
+      const cancelled = await parked;
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed, `cancellation took ${elapsed}ms — the park was not released`).toBeLessThan(5_000);
+      expect(cancelled.body?.result?.structuredContent?.result?.observations).toEqual([]);
+
+      // And the mirror image: a wait parked under the STRING id "7" is not
+      // released by a cancellation for the number 7.
+      const parkedString = f.mcp(
+        { jsonrpc: "2.0", id: "7", method: "tools/call", params: { name: "woo_wait", arguments: { timeout_ms: 20_000 } } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      let stringSettled = false;
+      void parkedString.then(() => { stringSettled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7 } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(stringSettled, `a cancellation for 7 released the wait parked under "7"`).toBe(false);
+      await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: "7" } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      await parkedString;
     } finally {
       f.close();
     }
