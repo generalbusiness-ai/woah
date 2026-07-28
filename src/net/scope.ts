@@ -2903,6 +2903,11 @@ export class ScopeSequencer {
   private pruneReplies(): string[] {
     const limit = this.options.replyLimit ?? REPLY_CACHE_CAP;
     const receiptLimit = this.options.receiptLimit ?? Math.min(RECEIPT_CACHE_CAP, limit);
+    // This runs on every recorded reply, so keep the common case off the
+    // classification pass: below the SMALLER quota neither can be exceeded,
+    // whatever the mix. Above it the pass is O(cache size), which is itself
+    // bounded by the quotas being enforced here.
+    if (this.replies.size <= Math.min(limit, receiptLimit)) return [];
     const pruned: string[] = [];
 
     // Two quotas, because the two kinds of row are bounded by different
