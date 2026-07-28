@@ -6828,23 +6828,33 @@ export class WooWorld {
       return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
     }
 
-    const scope = this.behaviorUndoScopes.at(-1);
-    if (!scope) {
+    if (this.behaviorUndoScopes.length === 0) {
       throw wooError("E_SCOPE_SPLIT", "terminal command transfer requires an active behavior journal");
     }
+    // programmer_eval and other trusted helpers may open nested savepoints.
+    // A proof-only transfer is a claim about the WHOLE provisional wrapper,
+    // not merely the innermost helper scope. Looking only at `.at(-1)` let an
+    // outer write hide behind an empty eval scope and then disappear while the
+    // caller observed a successful transferred command.
+    const mutationCount = this.behaviorUndoScopes.reduce((sum, scope) => sum + scope.undos.length, 0);
+    const acceptanceCount = this.behaviorUndoScopes.reduce((sum, scope) => sum + scope.acceptance.length, 0);
+    const disallowedKinds = new Set<TurnRecorderEvent["kind"]>();
+    for (const scope of this.behaviorUndoScopes) {
+      for (const kind of scope.terminalTransferDisallowedKinds) disallowedKinds.add(kind);
+    }
     if (
-      scope.undos.length > 0 ||
-      scope.acceptance.length > 0 ||
+      mutationCount > 0 ||
+      acceptanceCount > 0 ||
       ctx.observations.length > 0 ||
       this.turnScheduleCount > 0 ||
-      scope.terminalTransferDisallowedKinds.size > 0
+      disallowedKinds.size > 0
     ) {
       throw wooError("E_SCOPE_SPLIT", "sequenced command wrapper is not proof-only", {
-        mutations: scope.undos.length,
-        acceptance: scope.acceptance.length,
+        mutations: mutationCount,
+        acceptance: acceptanceCount,
         observations: ctx.observations.length,
         schedules: this.turnScheduleCount,
-        effects: Array.from(scope.terminalTransferDisallowedKinds)
+        effects: Array.from(disallowedKinds)
       });
     }
     const proofEvents = this.activeTurnRecorder?.currentBehaviorEvents() ?? [];
