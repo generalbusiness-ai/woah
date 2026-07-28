@@ -1466,6 +1466,28 @@ scope-shaped: the first runs a turn, the second builds a genesis submit for a
 new authority cluster. Together they are the only way to obtain a usable wizard
 on a deployed world, because the seeded `$wiz` cannot plan a client turn at all.
 
+Historical native-exception residue uses the fourth exact operator operation,
+`POST /net-operator/account/repair` ([provisioning.md
+§AP11.13](../identity/provisioning.md#ap1113-historical-account-family-diagnostic-and-repair)).
+It is scope-shaped and accepts only addressing facts for one account cluster
+plus bounded object IDs that expand inspection but cannot choose a value or
+authorize a disposition.
+Run the dry diagnostic first:
+
+```bash
+npm run repair:net-account-state -- \
+  --base-url https://woah1.generalbusiness.ai \
+  --authority-scope cluster:<primary-human> \
+  --account <account-id> \
+  --human <primary-human> \
+  [--candidate <suspected-orphan>]
+```
+
+Dry-run is the default. Repeat the reviewed, conflict-free command with
+`--apply` to mutate. Conflicts never partially apply. An ordinary unregistered
+actor cannot be safely identified as a failed create from shape alone and is
+reported for operator disposition, never recycled.
+
 **A freshly cut-over world needs THREE steps, in this order.** The provisioning
 command alone is not enough, and skipping either prerequisite fails with a
 named refusal that says which one is missing:

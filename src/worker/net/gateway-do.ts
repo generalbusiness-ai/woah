@@ -118,6 +118,7 @@ import { observationReachesActor, type Observation } from "../../core/types";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { identityAnchorIds, provisionAnchorSubmit } from "../../net/identity-anchor";
+import { NET_ACCOUNT_CLASS, NET_AGENT_CLASS, NET_HUMAN_CLASS } from "../../net/identity-roles";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import {
@@ -357,9 +358,6 @@ type OperatorProvisionWizardRequest = {
  * rather than inside the genesis builder: the builder stays world-agnostic and
  * this is the single place the net layer states which bootstrap classes carry
  * the account/human contract. */
-const ANCHOR_HUMAN_CLASS = "$human";
-const ANCHOR_ACCOUNT_CLASS = "$account";
-
 /** /net/provision-anchor body (AP11.9; see operatorProvisionAnchor). */
 type OperatorProvisionAnchorRequest = {
   /** Opaque operator-chosen token; the anchor's object ids derive from it, so
@@ -2551,8 +2549,8 @@ export class NetGatewayDO {
       now: this.host.now(),
       epoch,
       agentQuota,
-      humanClass: ANCHOR_HUMAN_CLASS,
-      accountClass: ANCHOR_ACCOUNT_CLASS
+      humanClass: NET_HUMAN_CLASS,
+      accountClass: NET_ACCOUNT_CLASS
     });
     const reply = await this.idempotentSubmit(`scope:${planned.clusterScope}`, planned.submit);
     if (reply.status !== "accepted") {
@@ -2690,7 +2688,7 @@ export class NetGatewayDO {
       // report the first missing thing costs the operator a round trip per
       // missing thing. Both facts are independent, so report both.
       const primitiveInstalled = principal !== null
-        || this.ensureView().has(cellKey("verb_bytecode", ANCHOR_HUMAN_CLASS, "provision_wizard_agent"));
+        || this.ensureView().has(cellKey("verb_bytecode", NET_HUMAN_CLASS, "provision_wizard_agent"));
       // The published authoring-surface reference. A world installed before its
       // catalog began publishing this scalar has no cell at all, and
       // provisioning REFUSES there rather than minting a wizard with authority
@@ -4397,7 +4395,7 @@ export class NetGatewayDO {
       // not a Woo property cell: reading property_cell:<agent>:owner made
       // every real Net agent fail closed as "owner unresolved".
       // $wiz-owned agents authenticate.
-      if (reachesClass(current, "$agent")) {
+      if (reachesClass(current, NET_AGENT_CLASS)) {
         const owner = lineage(current)?.owner;
         if (owner === "$wiz") return;
         if (typeof owner !== "string" || owner.length === 0) refuse({ actor: current, reason_detail: "agent_owner_unresolved" });

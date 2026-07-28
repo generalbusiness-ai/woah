@@ -49,6 +49,14 @@ import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
 import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
+  ACCOUNT_REPAIR_MEMBER_LIMIT,
+  planAccountStateRepair,
+  summarizeAccountRepairPatches,
+  type AccountRepairMember,
+  type AccountRepairPlan,
+  type AccountRepairResult
+} from "./account-state-repair";
+import {
   createV2TurnEffects,
   type TurnEffects,
   type ShadowStructuralCellKind,
@@ -3503,7 +3511,7 @@ export class WooWorld {
       // without needing extra state. last_seen_at is per-key, not per-session;
       // a key with N concurrent sessions still gets one timestamp.
       this.touchApiKeyLastSeen(id, routed?.actor ?? null);
-      if (this.objects.has(actor) && this.inheritsFrom(actor, "$agent")) this.setProp(actor, "last_seen_at", Date.now());
+      if (this.isAgentObject(actor)) this.setProp(actor, "last_seen_at", Date.now());
       return this.createSessionForActor(actor, "apikey", id);
     }
 
@@ -3908,7 +3916,7 @@ export class WooWorld {
   }
 
   connectHermes(actor: ObjRef, returnUrl: string, state: string, profileId: string, options: { force?: boolean } = {}): HermesConnectResult {
-    if (!this.objects.has(actor) || !this.inheritsFrom(actor, "$human")) throw wooError("E_PERM", "Hermes connect requires a human session", actor);
+    if (!this.isHumanObject(actor)) throw wooError("E_PERM", "Hermes connect requires a human session", actor);
     if (!returnUrl || !this.allowedProvisionReturn(returnUrl)) throw wooError("E_INVARG", "return URL scheme is not allowed", returnUrl);
     if (!state) throw wooError("E_INVARG", "state nonce is required");
     if (!profileId) throw wooError("E_INVARG", "profile_id is required");
@@ -4090,10 +4098,22 @@ export class WooWorld {
 
     private findAccountByEmail(email: string): ObjRef | null {
       for (const obj of this.objects.values()) {
-        if (!this.inheritsFrom(obj.id, "$account")) continue;
+        if (!this.isAccountObject(obj.id)) continue;
         if (String(this.propOrNull(obj.id, "email") ?? "").toLowerCase() === email) return obj.id;
       }
       return null;
+    }
+
+    private isAccountObject(object: ObjRef): boolean {
+      return this.objects.has(object) && this.inheritsFrom(object, "$account");
+    }
+
+    private isHumanObject(object: ObjRef): boolean {
+      return this.objects.has(object) && this.inheritsFrom(object, "$human");
+    }
+
+    private isAgentObject(object: ObjRef): boolean {
+      return this.objects.has(object) && this.inheritsFrom(object, "$agent");
     }
 
     private accountActors(account: ObjRef): ObjRef[] {
@@ -6040,6 +6060,153 @@ export class WooWorld {
         });
       }
     }
+  }
+
+  /**
+   * Bounded historical repair for one account authority.
+   *
+   * The candidate set comes only from the account registry, the AP11
+   * provisioning ledger, the primary-actor pointer, and operator-named orphan
+   * candidates. A local SQLite world is physically monolithic, but this method
+   * deliberately does not scan its object table: doing so would turn a
+   * single-account repair into a global operation that Net cannot implement.
+   */
+  repairAccountState(
+    account: ObjRef,
+    options: { dryRun?: true; apply?: true; candidateActors?: ObjRef[] }
+  ): AccountRepairResult {
+    if ((options.dryRun === true) === (options.apply === true)) {
+      throw wooError("E_INVARG", "account-state repair requires exactly one of dryRun or apply");
+    }
+    if ((options.candidateActors?.length ?? 0) > 256) {
+      throw wooError("E_INVARG", "account-state repair accepts at most 256 explicit candidates");
+    }
+    if (!this.isAccountObject(account)) {
+      throw wooError("E_TYPE", "account-state repair requires an account instance", account);
+    }
+    const primary = this.propOrNull(account, "primary_actor");
+    const rawActors = this.propOrNull(account, "actors");
+    const rawLedger = this.propOrNull(account, "operator_provisioned_agents");
+    const actorValues = Array.isArray(rawActors) ? rawActors : [];
+    const ledgerValues = rawLedger && typeof rawLedger === "object" && !Array.isArray(rawLedger)
+      ? Object.values(rawLedger as Record<string, WooValue>)
+      : [];
+    // Refuse oversized source containers before building the de-duplicated
+    // candidate Set. Otherwise a corrupt local account could make a repair
+    // advertised as bounded walk an arbitrarily large payload even though
+    // Net rejects the same state.
+    if (
+      actorValues.length > ACCOUNT_REPAIR_MEMBER_LIMIT ||
+      ledgerValues.length > ACCOUNT_REPAIR_MEMBER_LIMIT
+    ) {
+      throw wooError(
+        "E_INVARG",
+        `account-state repair authority exceeds ${ACCOUNT_REPAIR_MEMBER_LIMIT} members`
+      );
+    }
+    const ids = new Set<ObjRef>();
+    if (typeof primary === "string") ids.add(primary);
+    for (const value of actorValues) {
+      if (typeof value === "string") ids.add(value);
+    }
+    for (const value of ledgerValues) {
+      if (typeof value === "string") ids.add(value);
+    }
+    for (const candidate of options.candidateActors ?? []) ids.add(candidate);
+    if (ids.size > ACCOUNT_REPAIR_MEMBER_LIMIT) {
+      throw wooError(
+        "E_INVARG",
+        `account-state repair authority exceeds ${ACCOUNT_REPAIR_MEMBER_LIMIT} members`
+      );
+    }
+
+    const authorityRoot = this.authorityAnchorRoot(account);
+    const members: AccountRepairMember[] = [];
+    for (const id of ids) {
+      const obj = this.objects.get(id);
+      if (!obj) continue;
+      const kind = this.isHumanObject(id)
+        ? "human"
+        : this.isAgentObject(id)
+          ? "agent"
+          : "other";
+      let memberAuthorityRoot: string | null = null;
+      try {
+        memberAuthorityRoot = this.authorityAnchorRoot(id);
+      } catch {
+        // The planner reports this as an authority mismatch. Preserve the
+        // diagnostic boundary instead of turning one corrupt candidate into a
+        // thrown operation with no account-level report.
+      }
+      members.push({
+        id,
+        kind,
+        owner: obj.owner,
+        authority_root: memberAuthorityRoot,
+        account: kind === "human" && typeof this.propOrNull(id, "account") === "string"
+          ? this.propOrNull(id, "account") as string
+          : null,
+        flags: { ...obj.flags },
+        features: this.propOrNull(id, "features"),
+        api_key_id: this.propOrNull(id, "api_key_id"),
+        api_keys: this.propOrNull(id, "api_keys"),
+        deactivated_at: this.propOrNull(id, "deactivated_at"),
+        retired_at: this.propOrNull(id, "retired_at"),
+        provision_id: this.propOrNull(id, "provision_id")
+      });
+    }
+
+    const plan = planAccountStateRepair({
+      account,
+      authority_scope: authorityRoot.startsWith("$") ? "catalog" : `cluster:${authorityRoot}`,
+      authority_root: authorityRoot,
+      primary_actor: primary,
+      actors: rawActors,
+      agent_count: this.propOrNull(account, "agent_count"),
+      programmer_agent_count: this.propOrNull(account, "programmer_agent_count"),
+      operator_provisioned_agents: rawLedger,
+      programmer_surface: this.programmerSurface(),
+      explicit_candidates: options.candidateActors ?? [],
+      members
+    });
+    const changed = plan.patches.map(accountRepairPatchKey);
+    const patches = summarizeAccountRepairPatches(plan.patches);
+    if (options.dryRun === true || plan.status !== "would_apply") {
+      return {
+        ...plan,
+        patches,
+        dry_run: options.dryRun === true,
+        changed
+      };
+    }
+
+    // Repository.savepoint is the real SQLite rollback boundary; the nested
+    // behavior snapshot keeps memory and storage in agreement if any adapter
+    // write fails. Property versions advance normally for actual repairs and
+    // are never rewritten to disguise a historical failed attempt.
+    this.withMutationSavepoint(() => {
+      for (const patch of plan.patches) {
+        if (patch.kind === "property") {
+          this.setProp(patch.object, patch.name, cloneValue(patch.after));
+          continue;
+        }
+        this.mutateLineage(patch.object, () => {
+          this.object(patch.object).flags = { ...patch.after };
+        });
+        this.markObjectDirty(patch.object);
+      }
+      // A lineage-only plan has no later setProp() to trigger an incremental
+      // flush. Persist inside the repository savepoint so returning `applied`
+      // always means memory and SQLite agree across restart.
+      this.persist(true);
+    });
+    return {
+      ...plan,
+      patches,
+      status: "applied",
+      dry_run: false,
+      changed
+    };
   }
 
   state(actor?: ObjRef): WorldSnapshot {
@@ -14072,6 +14239,12 @@ function addSortedSetValue(set: Set<ObjRef> | undefined, value: ObjRef): void {
   const sorted = Array.from(set).sort();
   set.clear();
   for (const item of sorted) set.add(item);
+}
+
+function accountRepairPatchKey(patch: AccountRepairPlan["patches"][number]): string {
+  return patch.kind === "property"
+    ? `property_cell:${patch.object}:${patch.name}`
+    : `object_lineage:${patch.object}`;
 }
 
 // Group identical strings, return the K most-frequent as [name, count] pairs.

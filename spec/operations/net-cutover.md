@@ -231,6 +231,21 @@ the request body chooses a slot — the assignment is the `(slot, name)` order t
 system already resolves in, so the repair changes no dispatch, and an object
 whose ordinals are already distinct (gaps included) is declined, which is what
 makes replays `empty`.
+
+Historical account-family repair is deliberately outside the install doorway:
+`POST /net-operator/account/repair` is internal-signed and addresses exactly
+one `cluster:*` authority. The operator supplies only the scope, account,
+mutually bound primary human, dry-run bit, and at most 256 object IDs that
+expand inspection without authorizing a change; the authority derives all
+candidate changes from its owned cells and canonical catalog lineage closure.
+It never enumerates its scope or other scopes, rewrites property versions, or
+accepts a requested cell value. A conflict suppresses all writes. A
+conflict-free apply advances
+the owner head once, commits its replacement cells in the same DO SQLite
+transaction, refans them, and becomes `empty` on replay. See provisioning.md
+§AP11.13 for the evidence boundary, especially the refusal to recycle an
+unregistered actor without a durable operation identity.
+
 The trust model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 

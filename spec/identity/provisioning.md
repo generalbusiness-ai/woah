@@ -1152,3 +1152,90 @@ server's own guard and the CT14.7 boundary — instance data rewrites have no
 operator op. `set` hooks also target instances (a room's exits, say), whose
 cells belong to no install partition; mining one would produce a request the
 authority refuses, or an unresolvable scope before it got there.
+
+### AP11.13 Historical account-family diagnostic and repair
+
+Runtime rollback correction does not rewrite an aged world's state. Operators
+therefore have one bounded repair per account authority:
+`POST /net-operator/account/repair`, driven by
+`npm run repair:net-account-state`. Its body contains only
+`authority_scope`, `account`, the mutually bound `primary_actor` human,
+`dry_run`, and at most 256 candidate object IDs; no caller supplies a cell
+value, property version, flag, credential decision, or object disposition.
+Candidate IDs expand inspection only and never authorize a change.
+The edge requires the internal HMAC and freshly signs one hop to the named
+cluster. The authority reads the published programmer surface and lineage
+closure from the catalog, requires the addressed objects' ancestry to reach the
+canonical substrate `$account`, `$human`, and `$agent` roots, but mutates only
+cells it owns. Property-shaped lookalike classes are not identity witnesses.
+
+The operation derives these facts:
+
+- `account.actors` is deduplicated and the mutually attested primary human is
+  present;
+- an unregistered AP11 agent is added only when the account's
+  `provision_id -> agent` entry and the agent's reverse `provision_id` agree;
+- `agent_count` is the number of registered, non-retired agents, and
+  `programmer_agent_count` is the programmer subset;
+- `retired_at` implies the authentication tombstone, a cleared programmer
+  state/surface, and revocation of the current pointed credential at the
+  durable retirement time;
+- a live mutually attested AP11 agent carries the programmer flag, wizard flag,
+  and published programmer surface.
+
+Every other disagreement is a conflict and suppresses the whole apply. This
+includes malformed features, missing registry objects, wrong owners/authority
+roots, stale or mismatched current credentials, extra active credentials on a
+retired actor, and an ordinary unregistered failed-create actor. In particular,
+no object is recycled or registered merely because its shape resembles F4:
+without a durable operation identity there is insufficient evidence of whether
+creation failed or registration did.
+
+Dry-run and apply execute the same pure plan. Both CLIs default to dry-run and
+require an explicit `--apply` on the reviewed second invocation. The internal
+method requires exactly one mode, so an omitted boolean can never become an
+implicit apply. A Net apply is one ordered owner event and one Durable Object
+SQLite transaction; a local SQLite apply holds `BEGIN IMMEDIATE` across
+load/plan/apply and nests the mutation in `ObjectRepository.savepoint`. The
+local CLI opens only an existing current Woo database, verifying that fact on
+the same handle before migration code can run. Replays return `empty`. Actual
+repairs advance ordinary property/cell versions; the operation never rewrites a
+version to make a historical failed attempt disappear.
+
+Inspection is capped at 1,024 source members and at 1,024 distinct members of
+the one addressed authority. Neither adapter scans a scope or object table: both
+examine only the registry, ledger, primary pointer, and bounded operator-named
+orphan candidates. Net captures the owner head and sequencer identity before
+awaiting catalog role facts and refuses a stale snapshot if either changed.
+When the repair changes an actor's credential map, the authority-private
+verifier index is updated in that same owner transaction; authentication MUST
+observe the revocation immediately and after cold rehydration.
+The authoritative `api_keys` cell still follows normal closure and fanout
+coherence; only the derived verifier index is private and non-transferable.
+Operator-visible reports name affected cells and reasons but omit property
+before/after values, so a credential-map repair cannot disclose verifier
+hashes or salts in a terminal, HTTP response, or operations log.
+
+For local SQLite, dry-run is the default:
+
+```bash
+npm run repair:local-account-state -- \
+  --db /path/to/world.sqlite \
+  --account <account-id> \
+  [--candidate <suspected-orphan>]
+```
+
+After reviewing a conflict-free plan, repeat the same command with `--apply`.
+Candidate arguments expand inspection only; they do not authorize recycling or
+provide replacement values.
+
+The Net form accepts the same repeatable candidate option:
+
+```bash
+npm run repair:net-account-state -- \
+  --base-url <worker-url> \
+  --authority-scope cluster:<primary-human> \
+  --account <account-id> \
+  --human <primary-human> \
+  [--candidate <suspected-orphan>]
+```

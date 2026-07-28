@@ -117,6 +117,13 @@ import {
 } from "../../net/relations";
 import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
+import {
+  ACCOUNT_REPAIR_MEMBER_LIMIT,
+  planAccountStateRepair,
+  summarizeAccountRepairPatches,
+  type AccountRepairMember,
+  type AccountRepairPatch
+} from "../../core/account-state-repair";
 import { applySeedScalarProperty, mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { repairedVerbSlots, verbCellSlot } from "../../net/verb-slots";
@@ -125,9 +132,10 @@ import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
 import { CATALOG_SCOPE } from "../../net/topology";
-import { verifyInternalRequest } from "../internal-auth";
+import { signInternalRequest, verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
+import { NET_ACCOUNT_CLASS, NET_AGENT_CLASS, NET_HUMAN_CLASS } from "../../net/identity-roles";
 
 /** The structural slice of DurableObjectState this DO uses. Matches the
  * CommitScopeDO idiom (structural, not workers-types-nominal) so the
@@ -523,7 +531,6 @@ export class SqliteScopeStore implements ScopeStore {
  * `remaining` — the operator re-runs until it reaches zero. Keeps one signed
  * request a bounded transaction rather than a scope-sized rewrite. */
 const VERB_SLOT_REPAIR_OBJECT_LIMIT = 32;
-
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
 const LIVE_ALARM_KEY = "live";
@@ -1813,6 +1820,210 @@ export class NetScopeDO {
           removed: repaired.removed
         });
       }
+      if (request.method === "POST" && url.pathname === "/net/repair-account-state") {
+        const parsedBody = await request.json() as unknown;
+        const body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+          ? parsedBody as {
+          account?: unknown;
+          human?: unknown;
+          candidates?: unknown;
+          dry_run?: unknown;
+          }
+          : {};
+        const account = typeof body.account === "string" ? body.account : "";
+        const human = typeof body.human === "string" ? body.human : "";
+        const explicitCandidates = Array.isArray(body.candidates) &&
+          body.candidates.length <= 256 &&
+          body.candidates.every((candidate) => typeof candidate === "string" && candidate)
+          ? [...new Set(body.candidates as string[])]
+          : null;
+        const dryRun = body.dry_run;
+        const seq = this.ensureSequencer();
+        if (!account || !human || !explicitCandidates || typeof dryRun !== "boolean" || !seq.scope.startsWith("cluster:")) {
+          throw netError("E_INVARG", "account repair requires account, primary human, bounded candidates, and explicit dry_run on a cluster authority", {
+            scope: seq.scope
+          });
+        }
+        const accountKey = cellKey("object_lineage", account);
+        const humanKey = cellKey("object_lineage", human);
+        if (
+          !this.ownsCellLocally(seq, accountKey) ||
+          !this.ownsCellLocally(seq, humanKey) ||
+          this.ownedPropertyValue(seq, human, "account", null) !== account ||
+          this.ownedPropertyValue(seq, account, "primary_actor", null) !== human
+        ) {
+          throw netError("E_INVARG", "account repair target is not a mutually bound owned primary account family", {
+            scope: seq.scope,
+            account,
+            human
+          });
+        }
+        const lineageParent = (id: string): string | null => {
+          const value = seq.store.get(cellKey("object_lineage", id))?.value as { parent?: unknown } | undefined;
+          return typeof value?.parent === "string" && value.parent ? value.parent : null;
+        };
+
+        const rawActors = this.ownedPropertyValue(seq, account, "actors", []);
+        const rawLedger = this.ownedPropertyValue(seq, account, "operator_provisioned_agents", {});
+        const actorValues = Array.isArray(rawActors) ? rawActors : [];
+        const ledgerValues = rawLedger && typeof rawLedger === "object" && !Array.isArray(rawLedger)
+          ? Object.values(rawLedger as Record<string, unknown>)
+          : [];
+        if (
+          actorValues.length > ACCOUNT_REPAIR_MEMBER_LIMIT ||
+          ledgerValues.length > ACCOUNT_REPAIR_MEMBER_LIMIT
+        ) {
+          return json({
+            ok: false,
+            kind: "woo.account_state_repair.v1",
+            scope: seq.scope,
+            account,
+            status: "conflict",
+            dry_run: dryRun,
+            changed: [],
+            patches: [],
+            conflicts: [{
+              code: "authority_member_limit",
+              object: account,
+              field: "actors",
+              detail: { limit: ACCOUNT_REPAIR_MEMBER_LIMIT }
+            }]
+          }, 409);
+        }
+        const candidateIds = new Set<string>([human, ...explicitCandidates]);
+        if (Array.isArray(rawActors)) {
+          for (const value of rawActors) if (typeof value === "string") candidateIds.add(value);
+        }
+        for (const value of ledgerValues) {
+          if (typeof value === "string") candidateIds.add(value);
+        }
+        if (candidateIds.size > ACCOUNT_REPAIR_MEMBER_LIMIT) {
+          return json({
+            ok: false,
+            kind: "woo.account_state_repair.v1",
+            scope: seq.scope,
+            account,
+            status: "conflict",
+            dry_run: dryRun,
+            changed: [],
+            patches: [],
+            conflicts: [{
+              code: "authority_member_limit",
+              object: account,
+              field: "actors",
+              detail: { limit: ACCOUNT_REPAIR_MEMBER_LIMIT }
+            }]
+          }, 409);
+        }
+        const authorityRoot = this.ownedAuthorityRoot(seq, account);
+        if (!authorityRoot || seq.scope !== `cluster:${authorityRoot}`) {
+          throw netError("E_INVARG", "account is not rooted in the addressed authority", {
+            scope: seq.scope,
+            account,
+            authority_root: authorityRoot
+          });
+        }
+        const snapshotHead = { ...seq.head() };
+        const roleParents = new Set<string>();
+        for (const id of [account, human, ...candidateIds]) {
+          const parent = lineageParent(id);
+          if (parent) roleParents.add(parent);
+        }
+        const catalogFacts = await this.accountRepairCatalogFacts([...roleParents]);
+        const currentSeq = this.ensureSequencer();
+        const currentHead = currentSeq.head();
+        if (
+          currentSeq !== seq ||
+          currentHead.seq !== snapshotHead.seq ||
+          currentHead.hash !== snapshotHead.hash ||
+          currentHead.generation !== snapshotHead.generation
+        ) {
+          throw netError("E_STALE_HEAD", "account repair authority changed while catalog facts were read", {
+            scope: seq.scope,
+            expected_seq: snapshotHead.seq,
+            actual_seq: currentHead.seq
+          });
+        }
+        const accountParent = lineageParent(account);
+        const humanParent = lineageParent(human);
+        if (
+          !accountParent ||
+          !humanParent ||
+          !catalogFacts.accountParents.has(accountParent) ||
+          !catalogFacts.humanParents.has(humanParent)
+        ) {
+          throw netError("E_INVARG", "account repair target lacks catalog-attested account/human lineage roles", {
+            scope: seq.scope,
+            account,
+            human
+          });
+        }
+        const members = [...candidateIds]
+          .map((id) => this.accountRepairMember(seq, id, account, catalogFacts))
+          .filter((member): member is AccountRepairMember => member !== null);
+        const plan = planAccountStateRepair({
+          account,
+          authority_scope: seq.scope,
+          authority_root: authorityRoot,
+          primary_actor: this.ownedPropertyValue(seq, account, "primary_actor", null),
+          actors: rawActors,
+          agent_count: this.ownedPropertyValue(seq, account, "agent_count", 0),
+          programmer_agent_count: this.ownedPropertyValue(seq, account, "programmer_agent_count", 0),
+          operator_provisioned_agents: rawLedger,
+          programmer_surface: catalogFacts.programmerSurface,
+          explicit_candidates: explicitCandidates,
+          members
+        });
+        const changed = plan.patches.map((patch) => patch.kind === "property"
+          ? cellKey("property_cell", patch.object, patch.name)
+          : cellKey("object_lineage", patch.object));
+        const patches = summarizeAccountRepairPatches(plan.patches);
+        if (dryRun || plan.status !== "would_apply") {
+          return json({
+            ok: plan.status !== "conflict",
+            ...plan,
+            patches,
+            scope: seq.scope,
+            dry_run: dryRun,
+            changed,
+            head: seq.head()
+          }, plan.status === "conflict" ? 409 : 200);
+        }
+        const cells = this.accountRepairCells(seq, plan.patches);
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.operatorRepairAccountState(cells);
+          if (result.status === "applied") {
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            const repairBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
+              cells: result.cells,
+              removed_cells: [],
+              observations: []
+            };
+            const repairText = JSON.stringify(repairBody);
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, repairBody, repairText);
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({
+          ok: true,
+          ...plan,
+          patches,
+          scope: seq.scope,
+          status: repaired.status,
+          dry_run: false,
+          changed: repaired.cells.map((cell) => cell.key).sort(),
+          head: repaired.head
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/repair-seed-properties") {
         // Aged-world repair for seeded property VALUES — the data twin of
         // /net/repair-definitions. A deployed runtime never rewrites durable
@@ -3006,6 +3217,175 @@ export class NetScopeDO {
       );
     }
     return this.riderCacheMemo;
+  }
+
+  /** Read one property value from an authoritative cell. Instance defaults
+   * are supplied by the caller because an absent instance page means "inherit
+   * the class default", not malformed state. */
+  private ownedPropertyValue(
+    seq: ScopeSequencer,
+    object: string,
+    name: string,
+    inheritedDefault: unknown
+  ): unknown {
+    const key = cellKey("property_cell", object, name);
+    const cell = seq.store.get(key);
+    if (!cell || !this.ownsCellLocally(seq, key)) return inheritedDefault;
+    const payload = cell.value as { value?: unknown } | null;
+    return payload && Object.prototype.hasOwnProperty.call(payload, "value")
+      ? payload.value
+      : inheritedDefault;
+  }
+
+  /** Follow immutable anchor links within this authority's owned lineage
+   * pages. A missing/cyclic chain returns null and becomes a planner conflict
+   * rather than a guessed cluster root. */
+  private ownedAuthorityRoot(seq: ScopeSequencer, object: string): string | null {
+    let cursor = object;
+    const seen = new Set<string>();
+    for (let depth = 0; depth < 64; depth += 1) {
+      if (seen.has(cursor)) return null;
+      seen.add(cursor);
+      const key = cellKey("object_lineage", cursor);
+      const cell = seq.store.get(key);
+      if (!cell || !this.ownsCellLocally(seq, key)) return null;
+      const anchor = (cell.value as { anchor?: unknown } | null)?.anchor;
+      if (anchor === null || anchor === undefined) return cursor;
+      if (typeof anchor !== "string" || !anchor) return null;
+      cursor = anchor;
+    }
+    return null;
+  }
+
+  private accountRepairMember(
+    seq: ScopeSequencer,
+    id: string,
+    account: string,
+    roles: {
+      humanParents: ReadonlySet<string>;
+      agentParents: ReadonlySet<string>;
+    }
+  ): AccountRepairMember | null {
+    const key = cellKey("object_lineage", id);
+    const cell = seq.store.get(key);
+    if (!cell || !this.ownsCellLocally(seq, key)) return null;
+    const lineage = cell.value as { parent?: unknown; owner?: unknown; flags?: unknown };
+    const parent = typeof lineage.parent === "string" ? lineage.parent : null;
+    const accountValue = this.ownedPropertyValue(seq, id, "account", null);
+    const kind = parent && roles.humanParents.has(parent) && accountValue === account
+      ? "human"
+      : parent && roles.agentParents.has(parent)
+        ? "agent"
+        : "other";
+    const flags = lineage.flags && typeof lineage.flags === "object" && !Array.isArray(lineage.flags)
+      ? { ...(lineage.flags as Record<string, boolean>) }
+      : {};
+    return {
+      id,
+      kind,
+      owner: typeof lineage.owner === "string" ? lineage.owner : null,
+      authority_root: this.ownedAuthorityRoot(seq, id),
+      account: typeof accountValue === "string" ? accountValue : null,
+      flags,
+      features: this.ownedPropertyValue(seq, id, "features", []),
+      api_key_id: this.ownedPropertyValue(seq, id, "api_key_id", null),
+      api_keys: this.ownedPropertyValue(seq, id, "api_keys", {}),
+      deactivated_at: this.ownedPropertyValue(seq, id, "deactivated_at", null),
+      retired_at: this.ownedPropertyValue(seq, id, "retired_at", null),
+      provision_id: this.ownedPropertyValue(seq, id, "provision_id", null)
+    };
+  }
+
+  /** Fetch the published programmer surface and prove actual identity
+   * ancestry from catalog data.
+   *
+   * This is deliberately identity-specific: AP11 repairs accounts, humans,
+   * and agents, so a class that merely defines similarly named properties is
+   * not a role witness. The canonical roots are the same substrate seed
+   * identities used by signup, login, and wizard provisioning. */
+  private async accountRepairCatalogFacts(objects: string[]): Promise<{
+    programmerSurface: unknown;
+    accountParents: ReadonlySet<string>;
+    humanParents: ReadonlySet<string>;
+    agentParents: ReadonlySet<string>;
+  }> {
+    const key = cellKey("property_cell", "$system", "programmer_surface");
+    const stub = resolveNetDestination(this.env, `scope:${CATALOG_SCOPE}`);
+    const response = await stub.fetch(await signInternalRequest(this.env, new Request("https://do/net/closure", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys: [key], known: [], objects })
+    })));
+    if (!response.ok) {
+      throw netError("E_MISSING_STATE", "account repair could not read the catalog programmer surface", {
+        status: response.status
+      });
+    }
+    const closure = await response.json() as CellTransfer;
+    const cell = closure.cells.find((entry) => entry.key === key);
+    const lineage = new Map<string, string | null>();
+    for (const entry of closure.cells) {
+      if (entry.kind === "object_lineage") {
+        const parent = (entry.value as { parent?: unknown } | null)?.parent;
+        lineage.set(entry.object, typeof parent === "string" ? parent : null);
+      }
+    }
+    const reachesClass = (start: string, canonical: string): boolean => {
+      const seen = new Set<string>();
+      let cursor: string | null = start;
+      while (cursor && !seen.has(cursor)) {
+        if (cursor === canonical) return true;
+        seen.add(cursor);
+        cursor = lineage.get(cursor) ?? null;
+      }
+      return false;
+    };
+    const select = (canonical: string) =>
+      new Set(objects.filter((object) => reachesClass(object, canonical)));
+    return {
+      programmerSurface: (cell?.value as { value?: unknown } | undefined)?.value ?? null,
+      accountParents: select(NET_ACCOUNT_CLASS),
+      humanParents: select(NET_HUMAN_CLASS),
+      agentParents: select(NET_AGENT_CLASS)
+    };
+  }
+
+  private accountRepairCells(seq: ScopeSequencer, patches: AccountRepairPatch[]): Array<Pick<Cell, "kind" | "object" | "name" | "value">> {
+    return patches.map((patch) => {
+      if (patch.kind === "lineage_flags") {
+        const key = cellKey("object_lineage", patch.object);
+        const held = seq.store.get(key);
+        if (!held || !this.ownsCellLocally(seq, key)) {
+          throw netError("E_INVARG", "account repair lineage patch left the addressed authority", { key });
+        }
+        return {
+          kind: "object_lineage" as const,
+          object: patch.object,
+          value: {
+            ...(held.value as Record<string, unknown>),
+            flags: { ...patch.after }
+          }
+        };
+      }
+      const key = cellKey("property_cell", patch.object, patch.name);
+      const lineageKey = cellKey("object_lineage", patch.object);
+      if (!this.ownsCellLocally(seq, lineageKey)) {
+        throw netError("E_INVARG", "account repair property patch left the addressed authority", {
+          key,
+          lineage_key: lineageKey
+        });
+      }
+      const held = seq.store.get(key);
+      const payload = held?.value && typeof held.value === "object" && !Array.isArray(held.value)
+        ? held.value as Record<string, unknown>
+        : {};
+      return {
+        kind: "property_cell" as const,
+        object: patch.object,
+        name: patch.name,
+        value: { ...payload, value: patch.after }
+      };
+    });
   }
 
   /** Ownership witness for one cell (see the `owns` wiring comment): this

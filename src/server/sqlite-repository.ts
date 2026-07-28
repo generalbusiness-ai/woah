@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
@@ -46,9 +46,23 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   private transactionDepth = 0;
   private savepointCounter = 0;
 
-  constructor(filename: string) {
+  constructor(filename: string, options: { requireExistingCurrentWorld?: boolean } = {}) {
+    if (
+      options.requireExistingCurrentWorld === true &&
+      (filename === ":memory:" || !existsSync(filename) || !statSync(filename).isFile())
+    ) {
+      throw wooError("E_STORAGE", `account repair target is not an existing SQLite file: ${filename}`);
+    }
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.db = new DatabaseSync(filename);
+    if (options.requireExistingCurrentWorld === true) {
+      try {
+        this.assertExistingCurrentWorld();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+    }
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.migrate();
@@ -512,6 +526,27 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
   close(): void {
     this.db.close();
+  }
+
+  /** Same-handle destructive-migration guard for operator-selected paths.
+   * The normal runtime deliberately recreates pre-versioned local worlds;
+   * repair tooling must prove this exact opened file is already a current,
+   * nonempty Woo world before migrate() can run. */
+  private assertExistingCurrentWorld(): void {
+    const version = Number((this.db.prepare("PRAGMA user_version").get() as Row | undefined)?.user_version ?? 0);
+    const rows = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).all() as Array<{ name: string }>;
+    const tables = new Set(rows.map((row) => row.name));
+    const missing = SQL_DELETE_TABLES.filter((table) => !tables.has(table));
+    const hasWorld = tables.has("object") &&
+      Boolean(this.db.prepare("SELECT 1 AS present FROM object LIMIT 1").get());
+    if (version !== LOCAL_SQLITE_SCHEMA_VERSION || missing.length > 0 || !hasWorld) {
+      throw wooError(
+        "E_STORAGE",
+        `account repair target is not a current persisted Woo world (schema ${version}, missing ${missing.length}, world ${hasWorld})`
+      );
+    }
   }
 
   private migrate(): void {

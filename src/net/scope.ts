@@ -586,6 +586,15 @@ export class ScopeSequencer {
     return this.orderedOperatorRepair("operator_seed_property_repair", cells, []);
   }
 
+  /** Signed, account-local historical repair. The Worker shell derives every
+   * replacement from this scope's owned account-family cells through the
+   * shared pure planner; the request body cannot supply a value or version. */
+  operatorRepairAccountState(
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>
+  ): OperatorDefinitionRepair {
+    return this.orderedOperatorRepair("operator_account_state_repair", cells, []);
+  }
+
   /** Signed operator repair for aged verb-slot data (CO4.7). The Worker shell
    * derives each replacement page from this scope's OWN verb cells — assigning
    * the ordinals implied by the resolution order every node already computes
@@ -636,6 +645,25 @@ export class ScopeSequencer {
       stamp: nextStamp
     }));
     for (const key of removed) this.store.delete(key);
+    // Account repair can revoke the current actor credential. The api_keys
+    // cell is authoritative, but authentication reads the authority-private
+    // O(1) verifier index; update both representations before the same durable
+    // transaction commits or a repaired actor could keep authenticating until
+    // the DO is evicted and rehydrated.
+    const changedVerifierKeys = new Set<string>();
+    const credentialActors = new Set(changed
+      .filter((cell) =>
+        cell.kind === "property_cell" &&
+        cell.name === ACTOR_API_KEYS_PROPERTY &&
+        cell.object !== "$system"
+      )
+      .map((cell) => cell.object));
+    for (const actor of credentialActors) {
+      const cell = this.store.get(cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY));
+      for (const key of this.replaceApiKeyVerifiersForActor(actor, cell?.value)) {
+        changedVerifierKeys.add(key);
+      }
+    }
     const touched = [...committed.map((cell) => cell.key), ...removed].sort();
     this.headState = nextHead;
     const tailEntry: TailEntry = {
@@ -655,6 +683,11 @@ export class ScopeSequencer {
         durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        for (const key of changedVerifierKeys) {
+          const row = this.apiKeyVerifiers.get(key);
+          if (row) durable.writeApiKeyVerifier(key, row);
+          else durable.deleteApiKeyVerifier(key);
+        }
       });
     }
     return { status: "applied", head: this.headState, cells: committed, removed };
