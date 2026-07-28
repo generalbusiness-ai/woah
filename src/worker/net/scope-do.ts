@@ -117,7 +117,7 @@ import {
 } from "../../net/relations";
 import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
-import { mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
+import { applySeedScalarProperty, mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { repairedVerbSlots, verbCellSlot } from "../../net/verb-slots";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
@@ -1829,8 +1829,11 @@ export class NetScopeDO {
           entries?: Array<{
             object: string;
             property: string;
-            value: Record<string, unknown>;
-            supersedes?: SeedMapSupersedes;
+            value: unknown;
+            supersedes?: SeedMapSupersedes | unknown[];
+            /** Absent means merge_map, the only mode this op originally
+             * carried, so an older CLI keeps working unchanged. */
+            mode?: "merge_map" | "set";
           }>;
           dry_run?: boolean;
         };
@@ -1844,13 +1847,19 @@ export class NetScopeDO {
         const cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">> = [];
         const skipped: string[] = [];
         for (const entry of entries) {
+          const mode = entry?.mode === "set" ? "set" : "merge_map";
+          const validSupersedes = entry?.supersedes === undefined || (mode === "set"
+            // Scalar: a flat list of historical shipped values.
+            ? Array.isArray(entry.supersedes)
+            // Map: keyed per map key.
+            : Boolean(entry.supersedes) && typeof entry.supersedes === "object" && !Array.isArray(entry.supersedes) &&
+              Object.values(entry.supersedes as Record<string, unknown>).every((priors) => Array.isArray(priors)));
           const validShape = entry && typeof entry === "object" &&
             typeof entry.object === "string" && entry.object.startsWith("$") &&
             typeof entry.property === "string" && entry.property.length > 0 &&
-            Boolean(entry.value) && typeof entry.value === "object" && !Array.isArray(entry.value) &&
-            (entry.supersedes === undefined ||
-              (Boolean(entry.supersedes) && typeof entry.supersedes === "object" && !Array.isArray(entry.supersedes) &&
-                Object.values(entry.supersedes).every((priors) => Array.isArray(priors))));
+            // A scalar hook's value may be any JSON; a map hook's must be a map.
+            (mode === "set" || (Boolean(entry.value) && typeof entry.value === "object" && !Array.isArray(entry.value))) &&
+            validSupersedes;
           const key = validShape ? cellKey("property_cell", entry.object, entry.property) : "";
           // The owned-lineage check keeps this op on objects this scope is
           // authoritative for — a rider-cache copy must never be repaired
@@ -1862,9 +1871,27 @@ export class NetScopeDO {
           keys.add(key);
           const stored = seq.store.get(key);
           const payload = stored?.value as { value?: unknown; def?: unknown } | undefined;
-          const result = mergeSeedMapProperty(payload?.value, entry.value, entry.supersedes);
-          if (!result || !result.changed) {
-            // Malformed stored value (left alone) or already converged.
+          const next = mode === "set"
+            ? applySeedScalarProperty(
+                payload?.value,
+                // "Present" means the cell exists AND carries a value slot; an
+                // absent cell is the aged-world case the scalar repair exists
+                // for, and is the only case that may be filled unconditionally.
+                Boolean(payload) && Object.prototype.hasOwnProperty.call(payload, "value"),
+                entry.value,
+                entry.supersedes as unknown[] | undefined
+              )
+            : (() => {
+                const merged = mergeSeedMapProperty(
+                  payload?.value,
+                  entry.value as Record<string, unknown>,
+                  entry.supersedes as SeedMapSupersedes | undefined
+                );
+                return merged && merged.changed ? { value: merged.merged, changed: true as const } : null;
+              })();
+          if (!next) {
+            // Malformed stored value (left alone), operator-edited, or already
+            // converged.
             skipped.push(key);
             continue;
           }
@@ -1872,7 +1899,7 @@ export class NetScopeDO {
             kind: "property_cell",
             object: entry.object,
             name: entry.property,
-            value: { ...(payload ?? {}), value: result.merged }
+            value: { ...(payload ?? {}), value: next.value }
           });
         }
         if (dryRun || cells.length === 0) {

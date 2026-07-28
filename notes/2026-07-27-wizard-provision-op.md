@@ -382,6 +382,93 @@ through the real signed routes. Negative-tested: restoring the replace-only
 clause fails 3 cases; removing the slot normalization fails the replace case;
 removing the human-absence branch fails the probe case.
 
+## Prod round 2 — what shipped worked, and the aged-world gap it exposed
+
+Deployed (`54e66d4c`, main `8da19ed7`). The verb-ADD path, the anchor genesis
+submit, provisioning, and the credential all worked first try in production, and
+the `unplannable_scope` brick is gone: the provisioned agent authenticates over
+MCP and commits turns. Three defects remained.
+
+### Defect 1 — authority without tools. ROOT CAUSE CONFIRMED, not inferred.
+
+The coordinator's hypothesis was right, and I verified it by construction rather
+than accepting it: with `$system.programmer_surface` unset,
+`programmerSurface()` returns null, `attachProgrammerSurface` no-ops, and the
+shared transition still sets the flag. Reproduced locally —
+
+    RESULT promoted = true flagged = true
+    agent flags = {"programmer":true,"wizard":true}
+    agent features = []
+
+which is exactly prod's symptom (10 tools, no `eval`/`create`/`install_verb`,
+`property_cell:agent_1:features` → null). A fresh world has
+`programmer_surface = "$programmer"` and the class exists; the deployed world
+was installed 2026-07-13, the publishing seed hook landed 2026-07-23
+(`8f8f548d`), so the world predates the scalar while having the class — which is
+also why the coordinator's `repair:net-definitions '$programmer:edit_verb'`
+succeeded.
+
+Fix: AP11 now REFUSES with `E_MISSING_STATE` naming the remedy. Core's general
+promote is unchanged — flag-only remains correct for a world that never
+installed an authoring catalog (AP6) — but AP11's contract is a *usable* wizard,
+so for this op a toolless outcome is a failed provisioning reported as success.
+
+**A finding worth more than the fix.** Placing that check next to the promote it
+guards was not enough: the refusal left `account.agent_count` incremented.
+**A native that throws part way through still commits the writes it already
+made.** My own AP11.3 claimed "a failure at any step commits nothing" — that was
+FALSE, and is now corrected in the spec. The check moved to the top, ahead of
+the first write, and the correction generalises: any precondition this family
+can check must be checked before the first write, or expressed as idempotent
+re-runnable state.
+
+### Defect 2 — no operator op carried a scalar seed value
+
+`repair-definitions` carries definition pages; `repair-seed-properties` mined
+only `merge_map`. A `mode: "set"` scalar was covered by neither, so an aged
+world could never learn a scalar a later catalog began publishing. Extended the
+existing op rather than adding a sibling — it is the same trust model, the same
+mining discipline, and CT14.7 already frames it as the seeded-value lane.
+
+Overwrite rule (the scalar analogue of `supersedes`): absent → deliver;
+equal → no-op; present-and-different → refuse UNLESS the manifest lists the
+stored value in `supersedes`. Operator edits survive, as in the map path.
+
+Mining had to be narrowed while widening the mode: `set` hooks also target
+INSTANCES (`tasks:the_taskboard.exits`), whose cells are in no partition and
+which the server's `$` guard would refuse anyway. Restricted to catalog-owned
+`$` objects, which is exactly the CT14.7 boundary (instance rewrites have no
+operator op). Mined set is now `$help.topics` (merge_map),
+`$system.programmer_surface`, `$weather_block.summary_props`.
+
+### Defect 3 — probe threw instead of reporting. NOT REPRODUCED; say so.
+
+I could not reproduce it, and I am not going to claim a root cause I do not
+have. Evidence against every hypothesis I formed: both my commits were ancestors
+of the deployed main; the merged source has the probe branch ahead of BOTH
+refusals; and a new test that drives the REAL driver against the REAL routes
+across all four (anchor present/absent × primitive present/absent) combinations
+passes. The reported 409 is unexplained by the source I can read.
+
+So I fixed the class of failure instead of guessing at the instance:
+
+- the server's probe branch moved ahead of the authority prefetch, the only
+  throwing step that preceded it (that prefetch is deliberately HARD for a real
+  run, but a diagnostic must never fail closed);
+- the CLI now treats a refusal as DATA on any probe hop and still prints the
+  plan, so no probe can end in a stack trace whatever the worker says.
+
+The probe also gained `authoring_surface`, which closes the coordinator's
+separate complaint that catalog-scope state is unreadable from outside
+(`/net-api/cell` is presence-scoped and refuses `$system.programmer_surface`
+even for a wizard). Without it the operator would pass a clean probe and only
+then hit the new provisioning refusal — a probe must predict every refusal the
+real run can produce, so `next` now lists the seed-property repair too.
+
+The blind spot that let this ship: the existing CLI test stubbed `fetch` with an
+always-200 fake, so it could not have caught a refusal. That test now has a
+sibling wired to a real gateway.
+
 ## Named residuals (not verified, not claimed)
 
 - **Other `recordWizardAction` call sites on cluster-local primitives** —
@@ -400,7 +487,12 @@ removing the human-absence branch fails the probe case.
   (deactivation) is the lever for retiring an operator wizard. A deactivated
   actor cannot authenticate, so the residual flag grants nothing. Both halves
   are now proved end to end over the client doorway.
-- **Nothing here has been run against the deployed world.** The fake-DO lane
+- **Defect 3's prod root cause is unknown.** The observable failure is closed
+  by construction, but I cannot explain the reported 409 from the deployed
+  source, and I did not have network access to probe it. If it recurs, the
+  refusal will now print as data rather than throw, which should capture the
+  actual status and body.
+- **Nothing in THIS round has been run against the deployed world.** The fake-DO lane
   models the aged/fresh-cutover shape faithfully in structure, but it is still
   one process with fast RPC. The operator commands below are the first real
   exercise.

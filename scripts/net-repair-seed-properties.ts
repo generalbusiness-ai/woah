@@ -16,8 +16,12 @@ import { signInternalRequest } from "../src/worker/internal-auth";
 export type SeedPropertyRepairEntry = {
   object: string;
   property: string;
-  value: Record<string, unknown>;
-  supersedes?: Record<string, unknown[]>;
+  /** `merge_map` carries a map; `set` carries any scalar/structured value. */
+  value: unknown;
+  /** Keyed per map key for `merge_map`; a flat list of historical shipped
+   * values for `set`. */
+  supersedes?: Record<string, unknown[]> | unknown[];
+  mode: "merge_map" | "set";
 };
 
 /**
@@ -31,15 +35,29 @@ export async function seedPropertyRepairInputs(): Promise<Map<string, SeedProper
   const hooks: SeedPropertyRepairEntry[] = [];
   for (const entry of BUNDLED_CATALOGS) {
     for (const hook of entry.manifest.seed_hooks ?? []) {
-      if (hook.kind !== "set_property" || hook.mode !== "merge_map") continue;
-      if (!hook.value || typeof hook.value !== "object" || Array.isArray(hook.value)) {
+      if (hook.kind !== "set_property") continue;
+      // Both delivery modes now ride this op. `merge_map` is the map-database
+      // twin; `set` is the scalar one — without it a world installed before a
+      // catalog began publishing a scalar could never learn it, which is how a
+      // deployed world ended up with no `$system.programmer_surface` and every
+      // wizard provisioned there got authority with no authoring surface.
+      if (hook.mode !== "merge_map" && hook.mode !== "set") continue;
+      // CATALOG-OWNED OBJECTS ONLY. The server enforces the same `$` rule, and
+      // CT14.7 draws the boundary: this op carries seeded values on catalog
+      // classes and seed objects, while INSTANCE data rewrites have no operator
+      // op. Mining an instance-targeted hook would only produce a request the
+      // authority refuses — and, for a hook whose target is never materialized
+      // as a cell, an unresolvable scope before it ever got there.
+      if (!hook.object.startsWith("$")) continue;
+      if (hook.mode === "merge_map" && (!hook.value || typeof hook.value !== "object" || Array.isArray(hook.value))) {
         throw new Error(`refused: merge_map hook ${hook.object}.${hook.property} in ${entry.path} does not carry a map value`);
       }
       hooks.push({
         object: hook.object,
         property: hook.property,
-        value: hook.value as Record<string, unknown>,
-        ...(hook.supersedes ? { supersedes: hook.supersedes as Record<string, unknown[]> } : {})
+        value: hook.value,
+        mode: hook.mode,
+        ...(hook.supersedes ? { supersedes: hook.supersedes as Record<string, unknown[]> | unknown[] } : {})
       });
     }
   }
@@ -76,7 +94,7 @@ async function main(): Promise<void> {
 
   const byScope = await seedPropertyRepairInputs();
   if (byScope.size === 0) {
-    console.log("no bundled merge_map seed hooks declared; nothing to repair");
+    console.log("no bundled merge_map or set seed hooks declared; nothing to repair");
     return;
   }
   for (const [scope, entries] of byScope) {

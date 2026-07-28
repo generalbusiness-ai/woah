@@ -1503,6 +1503,15 @@ npm run repair:net-definitions -- \
   https://woah1.generalbusiness.ai '$human:provision_wizard_agent'
 ```
 
+Then deliver the seeded scalars an aged world never learned — on a world
+installed before the prog catalog began publishing `$system.programmer_surface`
+this is REQUIRED, because provisioning refuses rather than minting a wizard
+with authority and no authoring surface:
+
+```bash
+npm run repair:net-seed-properties -- https://woah1.generalbusiness.ai
+```
+
 Then the provisioning run itself:
 
 ```bash

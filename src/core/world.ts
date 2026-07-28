@@ -4406,6 +4406,30 @@ export class WooWorld {
       }
       if (!input.name) throw wooError("E_INVARG", "name is required");
 
+      // PRECONDITION, checked before any mutation.
+      //
+      // AP11's contract is a wizard with authority AND tools (AP11.3: the
+      // promote is REQUIRED before the flag — the flag supplies authority, the
+      // surface supplies the verbs). The SHARED transition deliberately
+      // tolerates a world with no published surface, because flag-only is the
+      // correct outcome for a world that never installed an authoring catalog
+      // (AP6). For THIS op it is not: it reported `promoted: true` for an actor
+      // whose `features` cell was never written — a success message that was
+      // not true, and the defect that cost a production round.
+      //
+      // Position matters. A native that throws PART WAY THROUGH still commits
+      // the writes it already made (verified: refusing after the create left
+      // `agent_count` incremented), so this cannot sit next to the promote it
+      // guards — it has to precede the first write.
+      const publishedSurface = this.programmerSurface();
+      if (publishedSurface === null) {
+        throw wooError(
+          "E_MISSING_STATE",
+          "no authoring surface is published at $system.programmer_surface, so a provisioned wizard would hold authority with no verbs; install an authoring catalog, or on a world that predates the published reference run the seed-property repair",
+          { human, account }
+        );
+      }
+
       const provisioned = this.operatorProvisionedAgents(account);
       // Own-key read. `provisioned` has a null prototype so plain indexing is
       // already own-only; hasOwn states the intent so a later refactor to a
@@ -4486,14 +4510,23 @@ export class WooWorld {
         this.setProp(agent, "api_key_id", input.apiKeyId);
       }
 
-      // Step 3 — programmer promotion through the shared transition. Grant the
-      // quota it will consume first, and only when this is a real transition:
-      // an already-promoted agent needs no headroom.
+      // Step 3 — programmer promotion through the shared transition.
+      //
       const alreadyProgrammer = this.object(agent).flags.programmer === true;
       if (!alreadyProgrammer) {
         grant("programmer_grant_quota", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
       }
       await this.setProgrammerAgentState(caller, agent, account, true, "agent_promoted_to_programmer");
+      // Post-condition, not decoration: the surface resolved above, so if it is
+      // still not attached something refused it silently and the actor is in the
+      // half-state this op exists to avoid.
+      if (!this.featureList(agent).includes(publishedSurface)) {
+        throw wooError(
+          "E_MISSING_STATE",
+          "the published authoring surface did not attach to the provisioned wizard",
+          { agent, surface: publishedSurface }
+        );
+      }
 
       // Step 4 — wizard authority. setObjectFlags is the in-world equivalent
       // but writes $system.wizard_actions unconditionally; the flag write and

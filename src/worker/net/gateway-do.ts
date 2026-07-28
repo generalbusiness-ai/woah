@@ -2646,6 +2646,84 @@ export class NetGatewayDO {
     // class defaults (quota 0, provision_id null) and would then either refuse
     // confusingly or grant the wrong headroom. Failing the operator's request
     // is the correct outcome.
+    // The acting principal is the OWNER of the provisioning primitive, read
+    // from the resolved verb page — the same data-driven derivation the guest
+    // door uses for `maintenance_principal`. The gateway therefore never names
+    // `$wiz`, and a world whose primitive is absent refuses here with a legible
+    // message instead of an E_VERBNF deep inside planning.
+    const page = this.callVerbPage(this.ensureView(), {
+      kind: "woo.turn_call.shadow.v1",
+      id: `provision-probe:${human}`,
+      route: "direct",
+      scope: human,
+      actor: human,
+      target: human,
+      verb: "provision_wizard_agent",
+      args: []
+    });
+    const principal = typeof page?.owner === "string" && page.owner ? page.owner : null;
+
+    // "No such human" and "no such primitive" both make callVerbPage return
+    // null — it resolves through the TARGET'S lineage chain, so an absent
+    // target has no chain to walk. Reporting both as E_VERBNF sent an operator
+    // hunting for a missing verb when the real answer was a missing identity,
+    // and those are opposite remedies (repair the definition vs seed an
+    // anchor). Separate them explicitly from the view.
+    const humanPresent = this.ensureView().has(cellKey("object_lineage", human));
+    if (probe) {
+      // VIEW-ONLY, and deliberately placed before the authority prefetch below:
+      // that prefetch is HARD (a degraded read there would silently mis-plan a
+      // real run), but a diagnostic must never fail closed — a probe that
+      // refuses tells the operator nothing, which is the whole failure this
+      // command exists to prevent.
+      const probeAccount = this.netObjectProperty(human, "account");
+      const probeLedger = typeof probeAccount === "string" && probeAccount
+        ? this.netObjectProperty(probeAccount, "operator_provisioned_agents")
+        : undefined;
+      const probeRecordedAgent = probeLedger && typeof probeLedger === "object" && !Array.isArray(probeLedger)
+        && Object.hasOwn(probeLedger as Record<string, unknown>, provisionId)
+        ? ((probeLedger as Record<string, unknown>)[provisionId] as string | null) ?? null
+        : null;
+      // The primitive's presence is read from the CLASS PAGE directly, not from
+      // `principal`: verb resolution runs through the target's lineage chain,
+      // so with no human it could not answer at all — and a probe that can only
+      // report the first missing thing costs the operator a round trip per
+      // missing thing. Both facts are independent, so report both.
+      const primitiveInstalled = principal !== null
+        || this.ensureView().has(cellKey("verb_bytecode", ANCHOR_HUMAN_CLASS, "provision_wizard_agent"));
+      // The published authoring-surface reference. A world installed before its
+      // catalog began publishing this scalar has no cell at all, and
+      // provisioning REFUSES there rather than minting a wizard with authority
+      // and no verbs — so the probe must predict that refusal, not let the
+      // operator discover it by running the real thing. It is also the only way
+      // to read this catalog-scope value from outside: /net-api/cell is
+      // presence-scoped and refuses it even for a wizard.
+      const authoringSurface = this.netObjectProperty("$system", "programmer_surface");
+      const surfacePublished = typeof authoringSurface === "string" && authoringSurface.length > 0;
+      const steps: string[] = [];
+      if (!humanPresent) steps.push("seed an operator anchor (POST /net-operator/identity/anchor)");
+      if (!primitiveInstalled) {
+        steps.push("install the primitive (npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent')");
+      }
+      if (!surfacePublished) {
+        steps.push("deliver seeded scalars (npm run repair:net-seed-properties -- <worker>)");
+      }
+      return json({
+        ok: true,
+        probe: true,
+        scope: planningScope,
+        catalog_epoch: epoch,
+        human,
+        human_present: humanPresent,
+        human_class: humanPresent ? this.netAncestry(human, 6) : [],
+        account: typeof probeAccount === "string" ? probeAccount : null,
+        primitive_installed: primitiveInstalled,
+        authoring_surface: surfacePublished ? authoringSurface : null,
+        recorded_agent: probeRecordedAgent,
+        // Every remaining step, in order, so one probe is a complete plan.
+        next: steps.length === 0 ? ["ready: run the provisioning op"] : steps
+      });
+    }
     let recordedAgent: string | null = null;
     const account = this.netObjectProperty(human, "account");
     if (typeof account === "string" && account) {
@@ -2685,58 +2763,6 @@ export class NetGatewayDO {
     // are safe: the second loses the read-version check, repairs, replans
     // against the committed state, and reports `created: false`.
     const key = `operator-provision-wizard:${human}:${provisionId}:${crypto.randomUUID()}`;
-    // The acting principal is the OWNER of the provisioning primitive, read
-    // from the resolved verb page — the same data-driven derivation the guest
-    // door uses for `maintenance_principal`. The gateway therefore never names
-    // `$wiz`, and a world whose primitive is absent refuses here with a legible
-    // message instead of an E_VERBNF deep inside planning.
-    const page = this.callVerbPage(this.ensureView(), {
-      kind: "woo.turn_call.shadow.v1",
-      id: key,
-      route: "direct",
-      scope: human,
-      actor: human,
-      target: human,
-      verb: "provision_wizard_agent",
-      args: []
-    });
-    const principal = typeof page?.owner === "string" && page.owner ? page.owner : null;
-
-    // "No such human" and "no such primitive" both make callVerbPage return
-    // null — it resolves through the TARGET'S lineage chain, so an absent
-    // target has no chain to walk. Reporting both as E_VERBNF sent an operator
-    // hunting for a missing verb when the real answer was a missing identity,
-    // and those are opposite remedies (repair the definition vs seed an
-    // anchor). Separate them explicitly from the view.
-    const humanPresent = this.ensureView().has(cellKey("object_lineage", human));
-    if (probe) {
-      // The primitive's presence is read from the CLASS PAGE directly, not from
-      // `principal`: verb resolution runs through the target's lineage chain,
-      // so with no human it could not answer at all — and a probe that can only
-      // report the first missing thing costs the operator a round trip per
-      // missing thing. Both facts are independent, so report both.
-      const primitiveInstalled = principal !== null
-        || this.ensureView().has(cellKey("verb_bytecode", ANCHOR_HUMAN_CLASS, "provision_wizard_agent"));
-      const steps: string[] = [];
-      if (!humanPresent) steps.push("seed an operator anchor (POST /net-operator/identity/anchor)");
-      if (!primitiveInstalled) {
-        steps.push("install the primitive (npm run repair:net-definitions -- <worker> '$human:provision_wizard_agent')");
-      }
-      return json({
-        ok: true,
-        probe: true,
-        scope: planningScope,
-        catalog_epoch: epoch,
-        human,
-        human_present: humanPresent,
-        human_class: humanPresent ? this.netAncestry(human, 6) : [],
-        account: typeof account === "string" ? account : null,
-        primitive_installed: primitiveInstalled,
-        recorded_agent: recordedAgent,
-        // Every remaining step, in order, so one probe is a complete plan.
-        next: steps.length === 0 ? ["ready: run the provisioning op"] : steps
-      });
-    }
     if (!humanPresent) {
       return json({
         error: {

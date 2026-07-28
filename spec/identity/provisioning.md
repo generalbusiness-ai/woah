@@ -811,8 +811,25 @@ Step 3 is **required** before step 4. The two-gate model (AP4) separates
 authority from tools: a wizard-flagged actor without the authoring surface has
 permission to author and no verbs with which to do it.
 
-**Atomicity.** All four steps are one turn, so a failure at any step commits
-nothing. There is no partially-provisioned outcome to clean up.
+**The op REFUSES rather than producing that half-state.** `$system.programmer_surface`
+is read as catalog data, and the shared transition tolerates it being absent —
+flag-only is the right outcome for a world that never installed an authoring
+catalog (AP6). For this op it is not: it reported `promoted: true, flagged: true`
+for an actor whose `features` cell was never written, which is a success message
+that is not true. A published surface is now a **precondition**, refused with
+`E_MISSING_STATE` naming the remedy, and a post-condition re-checks that the
+surface actually attached. A world that predates the published reference is
+repaired by the scalar seed-property repair (§AP11.12).
+
+**Atomicity — with a correction.** All four steps commit in one turn, so a
+turn-level rejection (a scope refusal, a read-version mismatch) applies none of
+them. **A verb that THROWS part way through is different: the writes it already
+made are still committed.** Verified — refusing after the create left
+`account.agent_count` incremented. Every precondition this op can check must
+therefore be checked BEFORE the first write, not next to the step it guards.
+The published-surface precondition below is checked at the top for exactly this
+reason. Preconditions that are only knowable mid-sequence must be expressed as
+idempotent, re-runnable state rather than as a mid-flight throw.
 
 **Audit.** As in AP6, the audit is profile-materialized. On Net the accepted
 commit record IS the audit; the `$system.wizard_actions` catalog write is
@@ -1051,8 +1068,12 @@ identity — opposite remedies. The two are now distinguished:
 `POST /net-operator/wizard/provision` with `{probe: true}` reports the world's
 state **without mutating anything**: `human_present`, `human_class` (the
 target's parent chain, so an operator can see it really is a `$human`),
-`primitive_installed`, `recorded_agent`, and a `next` LIST naming every
-remaining step in order. The primitive's presence is read from the class page
+`primitive_installed`, `authoring_surface`, `recorded_agent`, and a `next` LIST
+naming every remaining step in order. `authoring_surface` reports the published
+reference (§AP11.12) — a probe must predict EVERY refusal the real run can
+produce, and this is also the only way to read that catalog-scope value from
+outside, since `/net-api/cell` is presence-scoped and refuses it even for a
+wizard. The primitive's presence is read from the class page
 directly rather than from verb resolution, which runs through the target's
 lineage chain and so could not answer at all when the human is absent — one
 probe therefore reports both facts instead of costing a round trip per missing
@@ -1094,3 +1115,33 @@ replacing `$root:look` with arbitrary bytecode (including its `perms`, `owner`,
 every existing caller immediately, whereas an added name is invoked by nobody
 until something calls it. Adding cannot reach a class the world does not hold,
 cannot leave the `$` namespace, and cannot displace an existing page's ordinal.
+
+### AP11.12 Delivering a scalar seed value to an aged world (implemented)
+
+`repair-definitions` carries definition PAGES; the seed-property repair
+originally mined only `merge_map` hooks, the map-database twin. A plain
+`mode: "set"` scalar was covered by neither, so **a world could never learn a
+scalar a later catalog version began publishing**. That gap is what produced a
+deployed world with no `$system.programmer_surface`, and therefore wizards with
+authority and no authoring surface.
+
+The seed-property repair now carries `set` hooks as well. The overwrite rule is
+the scalar analogue of `supersedes`, and is deliberately narrower than a plain
+`set`:
+
+| Stored value | Action |
+|---|---|
+| absent | **deliver** — the aged-world case; the world never held a value, so there is no operator intent to destroy |
+| equal to the shipped value | no change (idempotent replay) |
+| present and different | **refuse**, unless the manifest declares it in `supersedes` — i.e. the catalog attests it was one of its own historical defaults |
+
+For a map hook `supersedes` is keyed per map key; for a scalar it is a flat list
+of historical shipped values. An operator edit is never overwritten in either
+form, and an operator still cannot name an arbitrary cell: entries are mined
+from bundled manifests only.
+
+**Mining is confined to catalog-owned (`$`-prefixed) objects**, matching the
+server's own guard and the CT14.7 boundary — instance data rewrites have no
+operator op. `set` hooks also target instances (a room's exits, say), whose
+cells belong to no install partition; mining one would produce a request the
+authority refuses, or an unresolvable scope before it got there.
