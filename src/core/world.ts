@@ -1,14 +1,18 @@
 import {
   assertMap,
+  assertMintableObjectId,
   assertObj,
   assertString,
   cloneValue,
+  dataKeyedMap,
   freezeTinyBytecode,
   isDeeplyFrozen,
   directedRecipients,
   isErrorValue,
+  observationReachesActor,
   valuesEqual,
   type AppliedFrame,
+  type CompileDiagnostic,
   type DirectLiveAudience,
   type DirectResultFrame,
   type ErrorFrame,
@@ -39,6 +43,7 @@ import {
   type CustomerAttribution
 } from "./attribution";
 import { normalizeVerbPerms } from "./verb-perms";
+import { verbAliasMatches, verbPageAnswersTo } from "./verb-name-match";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, SCHEDULE_MIN_LEAD_MS } from "./scheduling";
@@ -1812,9 +1817,22 @@ export class WooWorld {
     location?: ObjRef | null;
     anchor?: ObjRef | null;
     flags?: WooObject["flags"];
+    /** Reconstructing an object that already exists somewhere else (identity
+     * import, world adoption) rather than minting a new one. The id was chosen
+     * by whatever world produced it — possibly before the reservation below —
+     * and refusing it here would strand a restorable world. Ordinary hydration
+     * (importWorld, Net cell application) writes `objects` directly and never
+     * reaches this method at all. */
+    restoring?: boolean;
   }): WooObject {
     const existing = this.objects.get(input.id);
     if (existing) return existing;
+    // The single mint seam. Every path that introduces a NEW object — the
+    // `create` builtin, actor/account provisioning, guest seeding, catalog
+    // install (`local_name` / `seed_hooks.as` become ids verbatim, so a
+    // third-party manifest is the one genuinely unconstrained source) —
+    // funnels through here.
+    if (!input.restoring) assertMintableObjectId(input.id);
     const now = Date.now();
     const obj: WooObject = {
       id: input.id,
@@ -2005,7 +2023,11 @@ export class WooWorld {
     }
     if (value && typeof value === "object") {
       const src = value as Record<string, WooValue>;
-      const out: Record<string, WooValue> = {};
+      // Rebuilds a Woo map from ITS OWN keys, which are arbitrary author data.
+      // A plain `{}` target would swallow a `__proto__` entry on the way
+      // through, so scrubbing one tombstone out of a map could silently drop
+      // an unrelated key (values.md §V6).
+      const out: Record<string, WooValue> = dataKeyedMap();
       let changed = false;
       for (const [key, entry] of Object.entries(src)) {
         if (typeof entry === "string" && this.tombstones.has(entry)) {
@@ -2014,7 +2036,14 @@ export class WooWorld {
         }
         const next = this.scrubTombstoneRefs(entry);
         if (!valuesEqual(entry, next)) changed = true;
-        out[key] = next;
+        // Own-property definition, not [[Set]] (values.md V6): a `__proto__`
+        // entry would otherwise vanish from any map that survives a tombstone
+        // scrub, turning a GC pass into silent data loss.
+        if (key === "__proto__") {
+          Object.defineProperty(out, key, { value: next, writable: true, enumerable: true, configurable: true });
+        } else {
+          out[key] = next;
+        }
       }
       return changed ? out as WooValue : value;
     }
@@ -2345,23 +2374,52 @@ export class WooWorld {
     return value;
   }
 
+  /**
+   * Write one verb page on `objRef`, choosing its SLOT (spec/semantics/core.md
+   * §C7.4). A slot is a durable per-object ordinal, never an array index:
+   *
+   *  - `options.slot` — bind that exact slot value. Replaces whatever page
+   *    currently holds it, or introduces the slot if it is vacant. (Used by
+   *    set_verb_info / set_verb_code / install-over-existing, which must
+   *    NEVER move a verb.)
+   *  - `options.append` — allocate `max(existing slots) + 1`.
+   *  - neither — bind the same-named own page's existing slot; append when
+   *    there is no such page.
+   *
+   * Slots are allocated monotonically and are NOT re-densified: removeVerb
+   * leaves a gap, and every other page keeps the slot it was given. That is
+   * what makes a slot meaningful on a node that holds only part of the
+   * object — under Net planning `obj.verbs` is the turn's SLICE, so any rule
+   * derived from array position (the pre-2026-07-27 behavior) silently
+   * renumbered live verbs down to 1. See notes/2026-07-27-net-verb-slots.md.
+   */
   addVerb(objRef: ObjRef, verb: VerbDef, options: { append?: boolean; slot?: number } = {}): VerbDef {
     const obj = this.object(objRef);
     const parsedPerms = normalizeVerbPerms(verb.perms, verb.direct_callable === true);
-    const index =
+    const existingIndex = this.findOwnVerbIndex(obj, verb.name);
+    const slot =
       options.slot !== undefined
-        ? options.slot - 1
+        ? options.slot
+        : options.append === true
+          ? this.nextVerbSlot(obj)
+          : existingIndex >= 0
+            ? obj.verbs[existingIndex].slot ?? this.nextVerbSlot(obj)
+            : this.nextVerbSlot(obj);
+    const normalized = { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable, slot } as VerbDef;
+    // The page being replaced is the one that holds this slot (an explicit
+    // slot rebinds that position) or, by default, the same-named own page.
+    // `append` never replaces: it is how the substrate installs an additional
+    // page, including a second page under a name that already exists (which
+    // LambdaMOO permits and `addVerbForActor` separately refuses).
+    const targetIndex =
+      options.slot !== undefined
+        ? obj.verbs.findIndex((entry) => entry.slot === options.slot)
         : options.append === true
           ? -1
-          : this.findOwnVerbIndex(obj, verb.name);
-    const normalized = { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable };
-    const writtenIndex = index >= 0 && index < obj.verbs.length ? index : obj.verbs.length;
-    if (index >= 0 && index < obj.verbs.length) {
-      obj.verbs[index] = this.withVerbSlot(normalized, index);
-    } else {
-      obj.verbs.push(this.withVerbSlot(normalized, obj.verbs.length));
-    }
-    this.reindexVerbs(obj);
+          : existingIndex;
+    if (targetIndex >= 0) obj.verbs[targetIndex] = normalized;
+    else obj.verbs.push(normalized);
+    this.orderVerbs(obj);
     // Verb writes are part of the host-seed body delivered to satellites; a
     // verb edit that does not bump mutationCounter would let the gateway's
     // hostSeedCache serve a stale seed to the next satellite that asks for
@@ -2371,15 +2429,21 @@ export class WooWorld {
     this.bumpMutationVersion();
     this.persistObject(objRef);
     this.persist();
-    return obj.verbs[writtenIndex];
+    return normalized;
   }
 
+  /** Removing a verb LEAVES ITS SLOT VACANT. Renumbering the survivors would
+   * change the durable ordinal of pages this write never touched — over Net
+   * those pages are not even in the turn's slice, so the renumber could not be
+   * committed anyway, and locally it would silently invalidate every slot
+   * descriptor an agent already holds. Gaps are the honest primitive; only
+   * relative ORDER is load-bearing (spec/semantics/core.md §C7.4). */
   removeVerb(objRef: ObjRef, name: string): boolean {
     const obj = this.object(objRef);
     const before = obj.verbs.length;
     obj.verbs = obj.verbs.filter((verb) => verb.name !== name);
     if (obj.verbs.length === before) return false;
-    this.reindexVerbs(obj);
+    this.orderVerbs(obj);
     this.bumpMutationVersion();
     this.persistObject(objRef);
     this.persist();
@@ -2495,12 +2559,25 @@ export class WooWorld {
     return obj.verbs.findIndex((verb) => verb.name === name);
   }
 
-  private withVerbSlot(verb: VerbDef, index: number): VerbDef {
-    return { ...verb, slot: index + 1 } as VerbDef;
+  /** The next free ordinal for an appended verb: one past the highest slot
+   * this world holds for the object. On a full world that is exact. Under Net
+   * sparse planning it is a HINT computed from the turn's slice — the owning
+   * scope re-derives the floor at commit and rejects a page that does not
+   * match (spec/protocol/coherence.md §CO4 verb-slot allocation), so an
+   * under-estimate becomes a retryable replan, never a silent collision. */
+  private nextVerbSlot(obj: WooObject): number {
+    let high = 0;
+    for (const verb of obj.verbs) high = Math.max(high, verb.slot ?? 0);
+    return high + 1;
   }
 
-  private reindexVerbs(obj: WooObject): void {
-    obj.verbs = obj.verbs.map((verb, index) => this.withVerbSlot(verb, index));
+  /** Keep `obj.verbs` in resolution order: slot ascending, name ascending for
+   * pages that (in an unrepaired aged world) still share a slot. This is the
+   * SAME total order the net bridge and the shadow page normalizer produce, so
+   * every node that holds the same page set resolves the same verb. It does
+   * NOT renumber — see removeVerb. */
+  private orderVerbs(obj: WooObject): void {
+    obj.verbs.sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0) || a.name.localeCompare(b.name));
     obj.modified = Date.now();
   }
 
@@ -2811,16 +2888,23 @@ export class WooWorld {
     return this.objects.has(objRef);
   }
 
-  // Resolve a verb by name (with optional `*`/`@` aliases) or 1-based slot
-  // index, restricted to verbs defined directly on `objRef`. Raises
-  // E_VERBNF when not found. LambdaMOO `verb_info(obj, desc)`.
+  // Resolve a verb by name (with optional `*`/`@` aliases) or by SLOT VALUE,
+  // restricted to verbs defined directly on `objRef`. Raises E_VERBNF when not
+  // found. LambdaMOO `verb_info(obj, desc)`.
+  //
+  // A numeric descriptor names the slot the object REPORTS (verb_info.slot,
+  // list_verb.slot), not a position in the array: slots are monotonic with
+  // gaps after removeVerb, so index-addressing would silently answer with a
+  // neighbour once anything had been deleted (spec/semantics/core.md §C7.4).
   ownVerbResolve(objRef: ObjRef, descriptor: WooValue): VerbDef {
     const obj = this.object(objRef);
     if (typeof descriptor === "number") {
-      if (!Number.isInteger(descriptor) || descriptor < 1 || descriptor > obj.verbs.length) {
+      if (!Number.isInteger(descriptor) || descriptor < 1) {
         throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
       }
-      return obj.verbs[descriptor - 1];
+      const bySlot = obj.verbs.find((verb) => verb.slot === descriptor);
+      if (!bySlot) throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
+      return bySlot;
     }
     if (typeof descriptor !== "string") {
       throw wooError("E_TYPE", "verb descriptor must be a name string or 1-based slot integer", descriptor);
@@ -4093,7 +4177,12 @@ export class WooWorld {
       // gap the audit trail surfaces, never a guess.
       const derived = deriveCustomerAttribution(this.attributionSource(), id);
       if (derived !== null) this.setCustomerOf(id, { ...derived, bound_at: Date.now() });
-      this.recordWizardAction(caller, "actor_provisioned", { actor: id, class: classRef, owner });
+      // Routed through the profile audit adapter (AU1), not recordWizardAction
+      // directly: `$system` is catalog-scoped on Net, so appending
+      // wizard_actions here would make every provisioning turn an
+      // E_CATALOG_MUTATION. Local/SQLite profiles still materialize the entry
+      // through the default sink; on Net the accepted transcript is the record.
+      this.recordProvisioningAudit(caller, "actor_provisioned", { actor: id, class: classRef, owner });
       return { actor: id };
     }
 
@@ -4127,8 +4216,321 @@ export class WooWorld {
       this.setProp(account, "actors", [...this.accountActors(account), actor]);
       this.setProp(account, "agent_count", count + 1);
       if (programmer) this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
-      this.recordWizardAction(human, "actor_provisioned", { actor, owner: human, account, surface: "create_agent" });
+      // Same AU1 seam as provisionActorInternal above: the catalog `$system`
+      // write is suppressed on Net and materialized everywhere else.
+      this.recordProvisioningAudit(human, "actor_provisioned", { actor, owner: human, account, surface: "create_agent" });
       return { actor_id: actor, api_key: `apikey:${key.id}:${key.secret}`, api_key_id: key.id, api_key_secret: key.secret, label: key.label, created_at: key.created_at };
+    }
+
+    /**
+     * The account map that makes operator wizard provisioning idempotent:
+     * `provision_id` (an opaque operator-chosen token) -> the agent minted for
+     * it. Bounded by the account's own agent quota, read from the account the
+     * turn already touches, and never enumerated globally.
+     */
+    private operatorProvisionedAgents(account: ObjRef): Record<string, ObjRef> {
+      const raw = this.propOrNull(account, "operator_provisioned_agents");
+      // NULL-PROTOTYPE on purpose. A provision_id is operator-chosen text, so
+      // it can be `constructor`, `toString`, or `__proto__`. On an ordinary
+      // object `map[id]` would then resolve an INHERITED member — a lookup for
+      // `constructor` returns `function Object()`, which the caller treats as a
+      // recorded agent and dereferences. A null prototype has nothing to
+      // inherit, so every read is an own-key read and every write (including
+      // `__proto__`) defines an own property instead of hitting the accessor.
+      const map: Record<string, ObjRef> = Object.create(null) as Record<string, ObjRef>;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return map;
+      // Object.entries is own-enumerable-keys only, so the stored cell cannot
+      // smuggle inherited members in either.
+      for (const [key, value] of Object.entries(raw as Record<string, WooValue>)) {
+        if (typeof value === "string" && value) map[key] = value;
+      }
+      return map;
+    }
+
+    /**
+     * When was this agent's account quota slot returned, or null if it is still
+     * counted against `account.agent_count`?
+     *
+     * `deactivated_at` cannot answer this. It is an AUTHENTICATION fact — "this
+     * identity may not sign in" — and it is REVERSIBLE
+     * (`$system:reactivate_actor` clears it). Retirement is a different,
+     * PERMANENT fact that happens to also set the auth tombstone. Reading one
+     * as the other breaks both directions:
+     *
+     *  - reading `deactivated_at` as "slot returned" leaks the slot forever
+     *    when `$system:deactivate_actor` tombstoned the agent first — that path
+     *    never touches the counter, so nothing ever returns it;
+     *  - reading it as "slot NOT returned" double-returns on a repeat revoke,
+     *    letting the account mint past its quota.
+     *
+     * `retired_at` is the explicit marker for the permanent fact.
+     *
+     * The second branch is a BOUNDED inference for pre-marker data only. Worlds
+     * revoked before `retired_at` existed carry the old shape — auth tombstone
+     * set AND the agent's current key already revoked — which
+     * `$system:deactivate_actor` never produces (it tombstones without touching
+     * keys). Inferring only from that exact conjunction keeps the unsafe
+     * direction (double-return) closed; the residual false positive is an
+     * operator who deactivated and hand-revoked the key, which errs toward
+     * leaving the slot counted, the safe direction.
+     */
+    private agentSlotReturnedAt(agent: ObjRef): number | null {
+      const retiredAt = this.propOrNull(agent, "retired_at");
+      if (typeof retiredAt === "number") return retiredAt;
+      const deactivatedAt = this.propOrNull(agent, "deactivated_at");
+      if (typeof deactivatedAt !== "number") return null;
+      const keyId = this.propOrNull(agent, "api_key_id");
+      if (typeof keyId !== "string" || !keyId) return null;
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, keyId) ? keys[keyId] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+      return (record as Record<string, WooValue>).revoked_at != null ? deactivatedAt : null;
+    }
+
+    /**
+     * Fail-closed validation for an operator-supplied `api_key_id` pointer.
+     *
+     * The pointer is what retirement follows: `revoke_agent` revokes
+     * `agent.api_key_id` and nothing else. A pointer that names a key which is
+     * not this agent's therefore means the agent's REAL credential survives
+     * retirement — a retired wizard that still authenticates. Accepting any
+     * non-empty string is not good enough, so all four facts are checked:
+     *
+     *  - the id parses as a routed (self-routing) id at all;
+     *  - it is bound to THIS agent;
+     *  - its immutable authority root matches the agent's anchor root, which is
+     *    what cold-gateway routing resolves the credential through;
+     *  - a live verifier record for it exists in the agent's OWN `api_keys`
+     *    map — the actor-owned store the signed credential-ensure route writes
+     *    (routed ids never live in the legacy catalog `$system.api_keys`).
+     *
+     * Requiring the record is safe because the operator runbook installs the
+     * credential BEFORE the call that records the pointer (AP11.6).
+     */
+    private assertBindableApiKeyPointer(agent: ObjRef, id: string): void {
+      const routed = parseRoutedApiKeyId(id);
+      if (!routed) {
+        throw wooError("E_INVARG", "api_key_id must be a routed api-key id", { agent, api_key_id: id });
+      }
+      if (routed.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id is bound to a different actor", { agent, api_key_id: id, bound_to: routed.actor });
+      }
+      const anchorRoot = this.authorityAnchorRoot(agent);
+      if (routed.authorityRoot !== anchorRoot) {
+        throw wooError("E_INVARG", "api_key_id authority root does not match the actor's anchor root", {
+          agent,
+          api_key_id: id,
+          authority_root: routed.authorityRoot,
+          anchor_root: anchorRoot
+        });
+      }
+      // Own-key read for the same reason as the ledger. The routed-id grammar
+      // above already makes an `n1_`-prefixed id structurally incapable of
+      // naming an Object.prototype member, so this is belt to that brace — but
+      // it means no reader has to reconstruct that argument to trust the line.
+      const keys = this.apiKeyMap(agent);
+      const record = Object.hasOwn(keys, id) ? keys[id] : undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        throw wooError("E_INVARG", "api_key_id has no verifier record on this actor; install the credential first", { agent, api_key_id: id });
+      }
+      const entry = record as Record<string, WooValue>;
+      if (entry.actor !== agent) {
+        throw wooError("E_INVARG", "api_key_id verifier record names a different actor", { agent, api_key_id: id, record_actor: entry.actor ?? null });
+      }
+      if (entry.revoked_at != null) {
+        throw wooError("E_INVARG", "api_key_id names a revoked credential", { agent, api_key_id: id });
+      }
+    }
+
+    /**
+     * AP11 — signed-operator provisioning of a wizard-flagged agent anchored
+     * under an existing human account.
+     *
+     * Motivation (auth.md A11 "backup wizard", identity/provisioning.md §AP11):
+     * a deployed world whose only wizard is the unplaced catalog seed `$wiz`
+     * has no usable wizard on the client/MCP surface, and programmer minting is
+     * quota-gated to zero with only a wizard able to raise the quota. A non-`$`
+     * actor anchored to a human authority root plans at that cluster even while
+     * located nowhere, so it is immediately usable; this primitive mints one.
+     *
+     * The sequence deliberately mirrors the ordinary in-world flow so every
+     * counter and audit record stays consistent with self-service provisioning:
+     *
+     *   1. grant the account exactly the quota headroom the next two steps
+     *      consume (`set_quota` semantics + `account_quota_changed` audit),
+     *   2. create the agent (`create_agent` semantics: the agent kind, owned by
+     *      the human, anchored at the family root, `agent_count`, `actors`,
+     *      `actor_provisioned` audit) — WITHOUT minting a key, because the
+     *      operator holds a locally generated verifier that the separate signed
+     *      credential-ensure route installs,
+     *   3. promote to programmer through the shared transition
+     *      (`setProgrammerAgentState`): consumes the grant quota, increments
+     *      `programmer_agent_count`, sets the flag, attaches the published
+     *      programmer surface. REQUIRED before step 4 — the wizard flag supplies
+     *      authority, the surface supplies the tools, and an actor with one and
+     *      not the other has half a capability,
+     *   4. set `flags.wizard` through the lineage seam so it commits over Net.
+     *
+     * Idempotent by construction: the account's `operator_provisioned_agents`
+     * map short-circuits the mint, quota headroom is only granted when the next
+     * step would actually exceed it, `setProgrammerAgentState` moves the flag
+     * and counter only on a real transition, and the wizard flag write is
+     * skipped when already set. A re-run with the same `provision_id` therefore
+     * changes nothing and returns the same agent.
+     *
+     * Fail-closed: if the recorded map names an object that is not a live
+     * live agent owned by this human carrying the same `provision_id`, the call
+     * refuses rather than minting a second agent (a stale/unwarmed read must
+     * never become a duplicate identity).
+     */
+    private async provisionOperatorWizardAgent(
+      caller: ObjRef,
+      human: ObjRef,
+      input: { provisionId: string; name: string; purpose: string; apiKeyId: string | null }
+    ): Promise<Record<string, WooValue>> {
+      if (!this.canBypassPerms(caller)) {
+        throw wooError("E_PERM", "wizard authority required to provision an operator wizard agent", { actor: caller });
+      }
+      // assertSelfHuman is the shared kind check (caller === human holds
+      // trivially here; the operator's authority was proved above).
+      this.assertSelfHuman(human, human);
+      const account = assertObj(this.propOrNull(human, "account"));
+      if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
+      // Shape bound only. The WIRE grammar (leading alphanumeric, a fixed
+      // punctuation set) is enforced by the operator route; this primitive is
+      // reachable by any wizard, so it guards the durable cell's size and must
+      // stay correct for whatever text it is handed — including keys that name
+      // Object.prototype members (see operatorProvisionedAgents).
+      if (!input.provisionId || input.provisionId.length > 128) {
+        throw wooError("E_INVARG", "provision_id must be 1..128 characters", { provision_id: input.provisionId });
+      }
+      if (!input.name) throw wooError("E_INVARG", "name is required");
+
+      const provisioned = this.operatorProvisionedAgents(account);
+      // Own-key read. `provisioned` has a null prototype so plain indexing is
+      // already own-only; hasOwn states the intent so a later refactor to a
+      // normal object cannot silently reintroduce the inherited-member read.
+      const recorded = Object.hasOwn(provisioned, input.provisionId) ? provisioned[input.provisionId] : null;
+      let agent: ObjRef | null = null;
+      let created = false;
+      if (recorded !== null) {
+        // Every branch here is fail-closed: the only accepted outcome is an
+        // agent that unambiguously belongs to this provision_id.
+        //
+        // assertOwnedAgent is the shared kind + ownership check, and it opens
+        // with `this.object(recorded)` on purpose: under a sparse guarded plan
+        // that emits a materialization probe and drives the repair loop, so an
+        // unmaterialized recorded agent converges on retry instead of failing
+        // as a semantic absence. The reverse provision_id pointer below is what
+        // makes the match unambiguous.
+        this.assertOwnedAgent(human, recorded);
+        if (this.propOrNull(recorded, "provision_id") !== input.provisionId) {
+          throw wooError("E_INVARG", "recorded operator-provisioned agent does not match this provision_id", { account, provision_id: input.provisionId, agent: recorded });
+        }
+        // Neither a retired nor a merely deactivated agent is usable, so both
+        // refuse — but they are different facts and the message says which, so
+        // an operator knows whether reactivation is even on the table.
+        if (this.propOrNull(recorded, "retired_at") != null) {
+          throw wooError("E_PERM", "recorded operator-provisioned agent was permanently retired; choose a new provision_id", { agent: recorded });
+        }
+        if (this.propOrNull(recorded, "deactivated_at") != null) {
+          throw wooError("E_PERM", "recorded operator-provisioned agent is deactivated; reactivate it or choose a new provision_id", { agent: recorded });
+        }
+        agent = recorded;
+      }
+
+      const quotaGrants: Array<Record<string, WooValue>> = [];
+      // Step 1 — quota headroom, granted with `set_quota` semantics but only in
+      // the amount the following steps consume. `set_quota` itself is a
+      // `$system` native whose target is catalog-scoped, so the equivalent
+      // effect is applied here against the (cluster-resident) account.
+      const grant = (kind: "agent_quota" | "programmer_grant_quota", need: number): void => {
+        const old = Number(this.propOrNull(account, kind) ?? 0);
+        if (old >= need) return;
+        this.setProp(account, kind, need);
+        this.recordProvisioningAudit(caller, "account_quota_changed", { account, kind, old, new: need });
+        quotaGrants.push({ kind, old, new: need });
+      };
+
+      if (agent === null) {
+        grant("agent_quota", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        // Step 2 — mint the actor. provisionActorInternal is the shared
+        // primitive behind $system:provision_actor and create_agent: it picks
+        // the id, anchors an agent to its owner's authority root, stamps
+        // customer attribution, and records the actor_provisioned audit.
+        const provision = this.provisionActorInternal(
+          "$agent",
+          human,
+          { name: input.name, purpose: input.purpose, created_via: "operator_wizard_provision" },
+          caller
+        );
+        agent = provision.actor;
+        this.setProp(agent, "provision_id", input.provisionId);
+        this.setProp(account, "actors", [...this.accountActors(account), agent]);
+        this.setProp(account, "agent_count", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        // Object-literal spread + COMPUTED key, never `obj[key] = value`: a
+        // computed key defines an own property even for `__proto__`, whereas
+        // plain assignment on a normal object would invoke Object.prototype's
+        // `__proto__` setter and silently store nothing.
+        this.setProp(account, "operator_provisioned_agents", { ...provisioned, [input.provisionId]: agent } as WooValue);
+        created = true;
+      }
+
+      // The api-key id is a pointer, not a credential: the verifier record
+      // (hash+salt) is installed by the signed credential-ensure route from a
+      // tuple generated on the operator machine, so no secret ever transits
+      // this turn. Kept in sync so rotate/revoke find the current key — which
+      // is exactly why it is validated fail-closed rather than stored as given.
+      if (input.apiKeyId && this.propOrNull(agent, "api_key_id") !== input.apiKeyId) {
+        this.assertBindableApiKeyPointer(agent, input.apiKeyId);
+        this.setProp(agent, "api_key_id", input.apiKeyId);
+      }
+
+      // Step 3 — programmer promotion through the shared transition. Grant the
+      // quota it will consume first, and only when this is a real transition:
+      // an already-promoted agent needs no headroom.
+      const alreadyProgrammer = this.object(agent).flags.programmer === true;
+      if (!alreadyProgrammer) {
+        grant("programmer_grant_quota", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
+      }
+      await this.setProgrammerAgentState(caller, agent, account, true, "agent_promoted_to_programmer");
+
+      // Step 4 — wizard authority. setObjectFlags is the in-world equivalent
+      // but writes $system.wizard_actions unconditionally; the flag write and
+      // surface reconciliation are reproduced here through the Net-safe seams.
+      const flaggedBefore = this.object(agent).flags.wizard === true;
+      if (!flaggedBefore) {
+        const target = agent;
+        this.mutateLineage(target, () => { this.object(target).flags.wizard = true; });
+        this.markObjectDirty(target);
+        this.reconcileProgrammerSurface(target, true);
+        this.recordProvisioningAudit(caller, "actor_wizard_flag_set", { target, account, transition: true });
+      }
+
+      this.recordProvisioningAudit(caller, "operator_wizard_agent_provisioned", {
+        target: agent,
+        account,
+        owner: human,
+        provision_id: input.provisionId,
+        created,
+        promoted: !alreadyProgrammer,
+        flagged: !flaggedBefore
+      });
+      return {
+        actor_id: agent,
+        account,
+        owner: human,
+        provision_id: input.provisionId,
+        created,
+        promoted: !alreadyProgrammer,
+        flagged: !flaggedBefore,
+        api_key_id: (this.propOrNull(agent, "api_key_id") ?? null) as WooValue,
+        agent_quota: Number(this.propOrNull(account, "agent_quota") ?? 0),
+        agent_count: Number(this.propOrNull(account, "agent_count") ?? 0),
+        programmer_grant_quota: Number(this.propOrNull(account, "programmer_grant_quota") ?? 0),
+        programmer_agent_count: Number(this.propOrNull(account, "programmer_agent_count") ?? 0),
+        quota_grants: quotaGrants as unknown as WooValue
+      };
     }
 
     private assertSelfHuman(caller: ObjRef, human: ObjRef): void {
@@ -4351,7 +4753,10 @@ export class WooWorld {
           last_seen: this.propOrNull(obj.id, "last_seen_at"),
           scope: String(this.propOrNull(obj.id, "scope") ?? "write"),
           programmer: obj.flags.programmer === true,
-          deactivated_at: this.propOrNull(obj.id, "deactivated_at")
+          deactivated_at: this.propOrNull(obj.id, "deactivated_at"),
+          // Distinct from deactivated_at: reversible auth tombstone vs the
+          // permanent retirement that returned the account's quota slot.
+          retired_at: this.propOrNull(obj.id, "retired_at")
         });
       }
       out.sort((a, b) => String(a.actor_id).localeCompare(String(b.actor_id)));
@@ -5628,7 +6033,13 @@ export class WooWorld {
   }
 
   async scopedObjectSummaries(actor: ObjRef, objRefs: ObjRef[], memo: HostOperationMemo = createHostOperationMemo()): Promise<Record<ObjRef, ScopedObjectSummary>> {
-    const out: Record<ObjRef, ScopedObjectSummary> = {};
+    // Keyed by OBJECT ID, which is a data key space, not a safe property
+    // namespace: `out["__proto__"] = summary` on a normal object sets the
+    // prototype instead of adding an entry, so an object legitimately named
+    // `__proto__` reports `hasOwn:false` and vanishes from `Object.keys` —
+    // silently missing from every look, roster, and describe that reads this
+    // map (values.md §V6).
+    const out: Record<ObjRef, ScopedObjectSummary> = dataKeyedMap<ScopedObjectSummary>();
     const remoteByHost = new Map<string, ObjRef[]>();
     for (const objRef of objRefs) {
       const host = await this.remoteHostForObject(objRef, memo);
@@ -6339,6 +6750,21 @@ export class WooWorld {
     };
   }
 
+  /** Upgrade the compiler's generic objref hint into a "did you mean" once the
+   * world can confirm the symbol really is an object id. The compiler has no
+   * world access, so it can only offer the general rule; eval is the surface
+   * where an agent types a freshly-created id (`obj_human_2_1:ping()`) and
+   * needs to be told the literal form is `#obj_human_2_1`. A sparse view that
+   * has not warmed the object simply keeps the generic hint — never a claim
+   * that the id does not exist. */
+  private sharpenEvalDiagnostics(diagnostics: CompileDiagnostic[]): CompileDiagnostic[] {
+    return diagnostics.map((diagnostic) => {
+      const symbol = diagnostic.symbol;
+      if (!symbol || !this.objects.has(symbol)) return diagnostic;
+      return { ...diagnostic, hint: `${symbol} is an object; address it with the objref literal — did you mean #${symbol}?` };
+    });
+  }
+
   async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(ctx.actor, surfaceClass);
     const options = progOptions(opts);
@@ -6353,7 +6779,7 @@ export class WooWorld {
     const wrapped = `verb :_eval() rxd {\n  ${body}\n}`;
     const compiled = compileVerb(wrapped);
     if (!compiled.ok || !compiled.bytecode) {
-      return { ok: false, dry_run: dryRun, diagnostics: compiled.diagnostics as unknown as WooValue };
+      return { ok: false, dry_run: dryRun, diagnostics: this.sharpenEvalDiagnostics(compiled.diagnostics) as unknown as WooValue };
     }
     if (dryRun) return { ok: true, dry_run: true, diagnostics: [] };
     // The wrapper verb is not persisted. Run it directly with the actor as
@@ -6941,7 +7367,8 @@ export class WooWorld {
   private resolveVerbSlotWithWalk(actor: ObjRef, objRef: ObjRef, slot: number, walk: Record<string, WooValue>[]): ResolvedVerb {
     if (!Number.isInteger(slot) || slot < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", slot);
     const obj = this.object(objRef);
-    const verb = obj.verbs[slot - 1];
+    // By slot VALUE, not array index — see ownVerbResolve.
+    const verb = obj.verbs.find((entry) => entry.slot === slot);
     walk.push({ id: objRef, kind: "slot", slot, matched: verb !== undefined });
     if (!verb) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${slot}`, { obj: objRef, slot, actor });
     return { definer: objRef, verb };
@@ -6955,7 +7382,8 @@ export class WooWorld {
     const obj = this.object(objRef);
     if (typeof descriptor === "number") {
       if (!Number.isInteger(descriptor) || descriptor < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", descriptor);
-      const current = obj.verbs[descriptor - 1] ?? null;
+      // By slot VALUE, not array index — see ownVerbResolve.
+      const current = obj.verbs.find((verb) => verb.slot === descriptor) ?? null;
       if (!current) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${descriptor}`, { obj: objRef, slot: descriptor });
       if (options.mode === "define") throw wooError("E_INVARG", "define mode requires a name descriptor, not an existing slot", descriptor);
       return { current, slot: descriptor, name: current.name, append: false };
@@ -6971,7 +7399,10 @@ export class WooWorld {
     if (options.mode === "set_code" && !current) throw wooError("E_VERBNF", `verb not found for set_code: ${objRef}:${descriptorName}`, { obj: objRef, name: descriptorName });
     return {
       current,
-      slot: current ? (current.slot ?? existingIndex + 1) : obj.verbs.length + 1,
+      // An update keeps the page's own slot; a new verb reports the ordinal the
+      // append will allocate. `obj.verbs.length + 1` was the same array-index
+      // guess addVerb made, and under Net planning both were 1 for every verb.
+      slot: current ? (current.slot ?? this.nextVerbSlot(obj)) : this.nextVerbSlot(obj),
       name,
       append: options.append || !current
     };
@@ -7758,14 +8189,26 @@ export class WooWorld {
         if (error.code !== "E_HELPNF") throw err;
       }
     }
-    if (dbs.length > 0) {
-      await this.dispatch({ ...ctx, caller: ctx.thisObj }, dbs[0], "record_miss", [topic]).catch(() => null);
+    // An unknown topic is a reply, not a failure. This used to record the miss
+    // on the first db as a `missed_topics` property write; that write is
+    // refused on Net worlds (E_CATALOG_MUTATION — ordinary turns cannot mutate
+    // installed catalog state), nothing ever read it back, and the refusal is a
+    // turn verdict rather than a catchable error, so it failed the whole help
+    // call. The reply now carries the valid topic list instead.
+    const topics: string[] = [];
+    for (const db of dbs) {
+      for (const name of Object.keys(this.helpDbTopics({ ...ctx, thisObj: db }))) {
+        if (!topics.includes(name)) topics.push(name);
+      }
     }
+    const lines = [`No help available for "${topic || "index"}".`];
+    if (topics.length > 0) lines.push(`Topics: ${topics.join(", ")}`);
     return {
       ok: false,
       status: "not_found",
       topic,
-      lines: [`No help available for "${topic || "index"}".`]
+      topics,
+      lines
     };
   }
 
@@ -7816,16 +8259,6 @@ export class WooWorld {
     }
     const lines = Array.isArray(raw) ? raw.map((line) => valueToText(line)) : [valueToText(raw)];
     return { ok: true, status: "found", topic, db, title: topic, lines };
-  }
-
-  private helpDbRecordMiss(ctx: CallContext, args: WooValue[]): WooValue {
-    const topic = helpTopic(args[0]);
-    if (!topic) return false;
-    const existing = this.propOrNull(ctx.thisObj, "missed_topics");
-    const misses = Array.isArray(existing) ? existing : [];
-    const entry: WooValue = { topic, actor: ctx.actor, ts: this.logicalNow("help_miss.now") };
-    this.setProp(ctx.thisObj, "missed_topics", [...misses.slice(-99), entry]);
-    return true;
   }
 
   chparentAuthoredObject(actor: ObjRef, objRef: ObjRef, parentRef: ObjRef): void {
@@ -8352,7 +8785,7 @@ export class WooWorld {
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
           properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
           propertyVersions: new Map(item.propertyVersions),
-          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          verbs: importedVerbs(item.verbs),
           children: new Set(item.children),
           contents: new Set(item.contents),
           eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -8406,7 +8839,7 @@ export class WooWorld {
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
           properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
           propertyVersions: new Map(item.propertyVersions),
-          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          verbs: importedVerbs(item.verbs),
           children: new Set(item.children),
           contents: new Set(item.contents),
           eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -9026,7 +9459,7 @@ export class WooWorld {
       propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
       properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
       propertyVersions: new Map(item.propertyVersions),
-      verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+      verbs: importedVerbs(item.verbs),
       children: new Set(item.children),
       contents: new Set(item.contents),
       eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
@@ -10196,6 +10629,13 @@ export class WooWorld {
     if (changes.programmer || changes.wizard) {
       this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
     }
+    // Deliberately still recordWizardAction. `$system:set_actor_flag`, the only
+    // caller, is an UNTRACKED native and is therefore refused over Net before
+    // this line can run (incomplete_transcript) — routing the audit through the
+    // AU1 sink would be inert while implying Net support that does not exist.
+    // On Net, wizard authority is granted by the AP11 provisioning op
+    // (spec/identity/provisioning.md §AP11), which writes the flag through the
+    // lineage seam and audits through the sink.
     this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
     this.markObjectDirty(target);
     return { ...obj.flags };
@@ -10446,12 +10886,33 @@ export class WooWorld {
     // delivery projections, matching the direct-observation path. Local stale
     // projection rows are excluded so accepted-frame fanout cannot deliver a
     // destination-room event to a session that already moved away.
-    const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
-    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) sessionSet.add(sessionId);
-    const sessions = Array.from(sessionSet);
+    const sessionActors = new Map<string, ObjRef | null>();
+    const projected = this.presenceSessionsIn(space);
+    for (const sessionId of this.sessionTableAudienceIn(space).sessions) {
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? null);
+    }
+    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) {
+      if (sessionActors.has(sessionId)) continue;
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? projected?.get(sessionId) ?? null);
+    }
+    const sessions = Array.from(sessionActors.keys());
+    if (observations.length === 0) {
+      return { audienceSessions: sessions.length > 0 ? sessions : undefined };
+    }
+    // The observation-intrinsic audience rules (directed `told`/`text`,
+    // self-addressed `looked`/`who`) apply to committed frames too: a
+    // sequenced verb that emits `tell()` must not broadcast the recipient's
+    // second-person line to the whole room. Delivery lanes that re-resolve
+    // presence themselves apply the same predicate (see gateway-do
+    // pushScopedObservations); keeping it here means the frame's own audience
+    // hint never contradicts what the transports do.
+    const perObservation = observations.map((observation) =>
+      sessions.filter((sessionId) => observationReachesActor(observation, sessionActors.get(sessionId) ?? null))
+    );
+    const union = Array.from(new Set(perObservation.flat()));
     return {
-      audienceSessions: sessions.length > 0 ? sessions : undefined,
-      observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
+      audienceSessions: union.length > 0 ? union : undefined,
+      observationSessionAudiences: perObservation
     };
   }
 
@@ -11101,6 +11562,16 @@ export class WooWorld {
     this.nativeHandlers.set("reactivate_actor", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to reactivate actors", { actor: ctx.actor });
       const target = assertObj(args[0]);
+      // Symmetry with retirement: reactivating a RETIRED actor would restore a
+      // live identity whose quota slot has already been returned, so the
+      // account would carry N live agents against a count of N-1 — the same
+      // bypass as a double-return, arrived at from the other side. Retirement
+      // is permanent by contract; a replacement is a fresh provisioning.
+      // Plain deactivation stays fully reversible: it never returned a slot,
+      // so there is nothing to restore.
+      if (this.propOrNull(target, "retired_at") != null) {
+        throw wooError("E_PERM", "actor was permanently retired; provision a replacement instead of reactivating", { actor: target });
+      }
       this.setProp(target, "deactivated_at", null);
       this.recordWizardAction(ctx.actor, "actor_reactivated", { actor: target });
       return true;
@@ -11163,7 +11634,12 @@ export class WooWorld {
       if (kind !== "agent_quota" && kind !== "programmer_grant_quota") throw wooError("E_INVARG", "unknown quota kind", kind);
       const old = Number(this.propOrNull(account, kind) ?? 0);
       this.setProp(account, kind, value);
-      this.recordWizardAction(ctx.actor, "account_quota_changed", { account, kind, old, new: value });
+      // AU1 seam, not recordWizardAction: the quota cell is cluster-resident but
+      // `$system` is catalog-scoped on Net, so appending wizard_actions here made
+      // every set_quota turn fail E_CATALOG_MUTATION — which left a deployed
+      // world with no way to grant programmer quota at all, even holding a
+      // working wizard. Local profiles still materialize the entry.
+      this.recordProvisioningAudit(ctx.actor, "account_quota_changed", { account, kind, old, new: value });
       return true;
     });
     this.nativeHandlers.set("human_create_agent", (ctx, args) => {
@@ -11182,15 +11658,45 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
-        // Strip programmer state through the shared transition first: it clears
-        // the flag, removes the surface, decrements the quota, and refuses
-        // cross-host before any of that — idempotent if already non-programmer.
+        const reason = typeof args[1] === "string" ? args[1] : null;
+        // Has the quota slot already been returned? This is deliberately NOT
+        // `deactivated_at` — see agentSlotReturnedAt. Read before any mutation.
+        const slotReturnedAt = this.agentSlotReturnedAt(agent);
+        // The permanent-retirement WORK runs on every call and each step is
+        // individually idempotent, so a repeat call repairs an agent that some
+        // other path left half-retired: $system:deactivate_actor tombstones
+        // without stripping programmer state or revoking keys.
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         const key = this.propOrNull(agent, "api_key_id");
-        if (typeof key === "string" && key) this.revokeApiKeyRecordById(ctx.actor, key, true);
-        this.setProp(agent, "deactivated_at", Date.now());
+        const keyNewlyRevoked = typeof key === "string" && key
+          ? this.revokeApiKeyRecordById(ctx.actor, key, true)
+          : false;
+        const now = Date.now();
+        if (slotReturnedAt !== null) {
+          // Backfill the explicit marker when it was inferred, so the next call
+          // needs no inference at all.
+          if (this.propOrNull(agent, "retired_at") == null) this.setProp(agent, "retired_at", slotReturnedAt);
+          // No counter change and no duplicate "this agent retired" record —
+          // but a repeat that actually repaired something is still auditable,
+          // marked as the repair it is.
+          if (keyNewlyRevoked) {
+            this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason, repair: true });
+          }
+          return true;
+        }
+        // Preserve an earlier deactivation time: when deactivate_actor ran
+        // first, THAT is when the identity stopped authenticating. `retired_at`
+        // separately records when the slot came back.
+        if (this.propOrNull(agent, "deactivated_at") == null) this.setProp(agent, "deactivated_at", now);
+        this.setProp(agent, "retired_at", now);
         this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
-        this.recordWizardAction(ctx.actor, "agent_revoked", { target: agent, reason: typeof args[1] === "string" ? args[1] : null });
+        // AU1 seam, not recordWizardAction: every durable effect above is
+        // cluster-resident (agent lineage, agent props, account counter, the
+        // actor-owned api-key record), but `$system` is catalog-scoped on Net,
+        // so appending wizard_actions made the whole revocation fail
+        // E_CATALOG_MUTATION — leaving account owners with no way to retire an
+        // agent at all. Local profiles still materialize the entry.
+        this.recordProvisioningAudit(ctx.actor, "agent_revoked", { target: agent, reason });
         return true;
       });
       this.nativeHandlers.set("human_promote_agent_to_programmer", async (ctx, args) => {
@@ -11206,6 +11712,22 @@ export class WooWorld {
         const account = this.assertOwnedAgent(ctx.thisObj, agent);
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
         return true;
+      });
+      // AP11 operator provisioning. Defined on the human kind — and therefore invoked
+      // with the HUMAN as the turn target — so the whole transition commits in
+      // the human's authority cluster, where the account, the new agent, and
+      // its api-key record all live. A $system-targeted verb would commit at
+      // the catalog scope and could not write any of them.
+      this.nativeHandlers.set("human_provision_wizard_agent", async (ctx, args) => {
+        const options = args[1] && typeof args[1] === "object" && !Array.isArray(args[1])
+          ? args[1] as Record<string, WooValue>
+          : {};
+        return await this.provisionOperatorWizardAgent(ctx.actor, ctx.thisObj, {
+          provisionId: assertString(args[0] ?? ""),
+          name: typeof options.name === "string" && options.name ? options.name : assertString(args[0] ?? ""),
+          purpose: typeof options.purpose === "string" ? options.purpose : "",
+          apiKeyId: typeof options.api_key_id === "string" && options.api_key_id ? options.api_key_id : null
+        }) as unknown as WooValue;
       });
       this.nativeHandlers.set("human_rotate_agent_key", (ctx, args) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
@@ -11389,7 +11911,6 @@ export class WooWorld {
     this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
     this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
     this.nativeHandlers.set("help_db_dump_topic", (ctx, args) => this.helpDbDumpTopic(ctx, args));
-    this.nativeHandlers.set("help_db_record_miss", (ctx, args) => this.helpDbRecordMiss(ctx, args));
   }
 
   private chatPresent(room: ObjRef): ObjRef[] {
@@ -11805,7 +12326,8 @@ export class WooWorld {
     if (Array.isArray(target)) {
       const ids = target.filter((item): item is ObjRef => typeof item === "string");
       const { summaries } = await this.objectSummariesForLook(ctx, ids);
-      const out: Record<string, WooValue> = {};
+      // Object-id keys again — same rule as scopedObjectSummaries above.
+      const out: Record<string, WooValue> = dataKeyedMap();
       for (const [id, summary] of summaries) out[id] = summary as unknown as WooValue;
       return out as unknown as WooValue;
     }
@@ -12951,29 +13473,10 @@ function findPreposition(tokens: ParsedToken[]): { index: number; length: number
   return null;
 }
 
-function verbAliasMatches(pattern: string, name: string): boolean {
-  for (const segment of pattern.split("|")) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-    if (trimmed === name) return true;
-    const star = trimmed.indexOf("*");
-    if (star === trimmed.length - 1) {
-      const literal = trimmed.slice(0, -1);
-      if (literal && name.startsWith(literal)) return true;
-      continue;
-    }
-    const abbreviation = star >= 0 ? star : trimmed.indexOf("@");
-    if (abbreviation >= 0) {
-      const literal = trimmed.slice(0, abbreviation) + trimmed.slice(abbreviation + 1);
-      if (literal && literal.startsWith(name) && name.length >= Math.max(1, abbreviation)) return true;
-      continue;
-    }
-  }
-  return false;
-}
-
+/** The alias-pattern rule now lives in ./verb-name-match so every surface that
+ * resolves a verb without going through the dispatcher shares it verbatim. */
 function verbNameMatches(verb: VerbDef, name: string): boolean {
-  return verb.name === name || verb.aliases.some((alias) => verbAliasMatches(alias, name));
+  return verbPageAnswersTo(verb.name, verb.aliases, name);
 }
 
 function commandPattern(argSpec: Record<string, WooValue> | undefined): CommandPattern | null {
@@ -13294,6 +13797,30 @@ const STORAGE_FLUSH_TOP_N = 5;
 
 type BytecodeVerbDef = Extract<VerbDef, { kind: "bytecode" }>;
 
+/**
+ * Hydrate one object's verb list, PRESERVING each page's stored slot.
+ *
+ * This used to stamp `index + 1`, which made `slot` a property of the array
+ * a node happened to be holding rather than of the verb. Under Net sparse
+ * planning the array is the turn's slice, so a verb whose real slot was 3
+ * hydrated as slot 1 and — because every authoring write re-serializes the
+ * page it touched — that lie was committed back as authority. See
+ * notes/2026-07-27-net-verb-slots.md.
+ *
+ * A page with no stored slot is legacy (pre-slot persistence, or a
+ * hand-written fixture); those are numbered by position, which reproduces the
+ * old behavior exactly for worlds that never recorded slots. Ties are broken
+ * by name, matching the net bridge and the shadow page normalizer, so the
+ * hydrated array is already in resolution order.
+ */
+function importedVerbs(verbs: readonly VerbDef[]): VerbDef[] {
+  let fallback = 0;
+  for (const verb of verbs) fallback = Math.max(fallback, verb.slot ?? 0);
+  return verbs
+    .map((verb) => cloneImportedVerb(verb, verb.slot ?? ++fallback))
+    .sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0) || a.name.localeCompare(b.name));
+}
+
 function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
   // importWorld may hydrate directly from cached boot snapshots. Copy every
   // mutable verb cell so callers can freely edit the live world without
@@ -13354,7 +13881,10 @@ function cloneImportedPlainData<T>(value: T): T {
   // isolation contract it needs for cached snapshots.
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map((item) => cloneImportedPlainData(item)) as T;
-  const out: Record<string, unknown> = {};
+  // Keys here are object ids, property names, and arbitrary Woo map keys —
+  // all data. Copying into a plain `{}` loses a `__proto__` entry (the setter
+  // swallows it), so a world could lose data simply by being imported.
+  const out: Record<string, unknown> = dataKeyedMap<unknown>();
   for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
   return out as T;
 }

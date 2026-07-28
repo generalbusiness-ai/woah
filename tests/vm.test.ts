@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
+import { installVerb } from "../src/core/authoring";
 import { BUILTIN_NAMES, runTinyVm } from "../src/core/tiny-vm";
-import { freezeTinyBytecode, type Message, type TinyBytecode, type VerbDef } from "../src/core/types";
+import { dataKeyedMap, freezeTinyBytecode, hasOwnMapKey, type Message, type TinyBytecode, type VerbDef } from "../src/core/types";
 
 function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
   return { actor, target, verb, args: args as any[] };
@@ -612,5 +613,129 @@ describe("builtin index stability", () => {
         runTinyVm(vmCtx(world, actor, "delay_1", `aged_${op.toLowerCase()}`), freezeTinyBytecode(bytecode), [])
       ).rejects.toMatchObject({ code: "E_VERSION" });
     }
+  });
+});
+
+// values.md §V6: a Woo map is DATA, never a host-language namespace. `key in
+// map` and `map[key]` in TypeScript answer for the host prototype chain, so
+// before this an empty Woo map claimed to contain `constructor`, `__proto__`
+// and every other Object.prototype name — and reading one handed back a
+// JavaScript function or a bare object, neither of which is a Woo value.
+describe("map reads are own-key only (values.md §V6)", () => {
+  async function evalBody(world: ReturnType<typeof createWorld>, actor: string, name: string, body: string) {
+    const installed = installVerb(world, actor, name, `verb :${name}() rxd { ${body} }`, null);
+    expect(installed.ok, JSON.stringify(installed.diagnostics)).toBe(true);
+    return await world.directCall(undefined, actor, actor, name, []);
+  }
+
+  function programmerWorld(seed: string) {
+    const world = createWorld();
+    const session = world.auth(seed);
+    world.object(session.actor).owner = session.actor;
+    return { world, actor: session.actor };
+  }
+
+  it("treats every inherited host name as absent on an empty map", async () => {
+    const { world, actor } = programmerWorld("guest:vm-own-key-miss");
+    // Reads: absent is absent, and the miss is the SAME E_PROPNF an ordinary
+    // missing key has always raised — this is a correctness fix, not a new
+    // error vocabulary.
+    for (const [index, key] of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"].entries()) {
+      const frame = await evalBody(world, actor, `miss_get_${index}`, `let m = {}; return m[${JSON.stringify(key)}];`);
+      expect(frame.op, `${key} did not raise`).toBe("error");
+      if (frame.op === "error") expect(frame.error.code, `${key} raised the wrong code`).toBe("E_PROPNF");
+    }
+    // Membership agrees with the reads. `in` and `has` are the same question
+    // asked two ways and must never disagree with each other or with a get.
+    for (const [index, key] of ["constructor", "__proto__", "toString"].entries()) {
+      const inFrame = await evalBody(world, actor, `miss_in_${index}`, `let m = {}; return ${JSON.stringify(key)} in m;`);
+      expect(inFrame.op).toBe("result");
+      if (inFrame.op === "result") expect(inFrame.result, `"${key}" in {}`).toBe(false);
+      const hasFrame = await evalBody(world, actor, `miss_has_${index}`, `let m = {}; return has(m, ${JSON.stringify(key)});`);
+      expect(hasFrame.op).toBe("result");
+      if (hasFrame.op === "result") expect(hasFrame.result, `has({}, "${key}")`).toBe(false);
+    }
+  });
+
+  it("round-trips a map that genuinely holds a reserved-looking key", async () => {
+    // The negative of the rule: `constructor` as DATA is unremarkable and must
+    // survive get, index-set, in, has, keys and iteration. A fix that made
+    // these keys unusable would be as wrong as the leak.
+    const { world, actor } = programmerWorld("guest:vm-own-key-hit");
+    const read = await evalBody(world, actor, "own_get", `let m = {"constructor": 3}; return m["constructor"];`);
+    expect(read.op === "result" && read.result).toBe(3);
+
+    const membership = await evalBody(world, actor, "own_in", `let m = {"constructor": 3}; return ["constructor" in m, has(m, "constructor")];`);
+    expect(membership.op === "result" && membership.result).toEqual([true, true]);
+
+    const enumerated = await evalBody(world, actor, "own_keys", `let m = {"constructor": 3, "b": 4}; let out = []; for k, v in m { out = out + [k, v]; } return [keys(m), length(m), out];`);
+    expect(enumerated.op === "result" && enumerated.result).toEqual([["constructor", "b"], 2, ["constructor", 3, "b", 4]]);
+
+    const written = await evalBody(world, actor, "own_set", `let m = {}; m["constructor"] = 9; return [keys(m), m["constructor"], has(m, "constructor")];`);
+    expect(written.op === "result" && written.result).toEqual([["constructor"], 9, true]);
+  });
+
+  it("still reads ordinary keys and still misses ordinary absent ones", async () => {
+    // Guard against the fix over-reaching into normal map behavior.
+    const { world, actor } = programmerWorld("guest:vm-own-key-ordinary");
+    const hit = await evalBody(world, actor, "plain_hit", `let m = {"a": 1, "": 2}; return [m["a"], m[""], "a" in m, "" in m, has(m, "a")];`);
+    expect(hit.op === "result" && hit.result).toEqual([1, 2, true, true, true]);
+    const miss = await evalBody(world, actor, "plain_miss", `let m = {"a": 1}; return m["zz"];`);
+    expect(miss.op).toBe("error");
+    if (miss.op === "error") expect(miss.error.code).toBe("E_PROPNF");
+    const missIn = await evalBody(world, actor, "plain_miss_in", `let m = {"a": 1}; return ["zz" in m, has(m, "zz")];`);
+    expect(missIn.op === "result" && missIn.result).toEqual([false, false]);
+  });
+
+  it("carries a __proto__ key through the VM as ordinary map data", async () => {
+    // The end-to-end half of the own-key rule, and it takes BOTH halves of the
+    // §V6 work to pass: the read ops must ask own-key (this file's fix), and
+    // clonePlainData — which every value crosses on its way onto the VM stack —
+    // must write own-property rather than through the inherited __proto__
+    // setter. Until the latter landed, a `__proto__` key could not reach the VM
+    // as data at all and this could only be asserted at unit level below.
+    const { world, actor } = programmerWorld("guest:vm-proto-data");
+    const listed = await evalBody(world, actor, "proto_keys", `return keys({"__proto__": 5, "constructor": 7});`);
+    expect(listed.op === "result" && listed.result).toEqual(["__proto__", "constructor"]);
+    const read = await evalBody(world, actor, "proto_get", `let m = {"__proto__": 5}; return [m["__proto__"], "__proto__" in m, has(m, "__proto__")];`);
+    expect(read.op === "result" && read.result).toEqual([5, true, true]);
+    // …and the same key is still absent from a map that never held it.
+    const bare = await evalBody(world, actor, "proto_absent", `return ["__proto__" in {}, has({}, "__proto__")];`);
+    expect(bare.op === "result" && bare.result).toEqual([false, false]);
+  });
+
+  it("hasOwnMapKey is the one distinction, including for a key named __proto__", async () => {
+    const own = Object.fromEntries([["__proto__", 5], ["constructor", 7]]);
+    expect(hasOwnMapKey(own, "__proto__")).toBe(true);
+    expect(hasOwnMapKey(own, "constructor")).toBe(true);
+    expect(hasOwnMapKey({}, "__proto__")).toBe(false);
+    expect(hasOwnMapKey({}, "constructor")).toBe(false);
+    expect(hasOwnMapKey({}, "toString")).toBe(false);
+    // A null-prototype map has nothing inherited to confuse it either.
+    const bare = dataKeyedMap<number>();
+    bare.a = 1;
+    expect(hasOwnMapKey(bare, "a")).toBe(true);
+    expect(hasOwnMapKey(bare, "constructor")).toBe(false);
+  });
+});
+
+describe("maps keyed by data use a null prototype (values.md §V6)", () => {
+  it("keeps an object legitimately named __proto__ in an id-keyed summary map", async () => {
+    // Object ids are a DATA key space. `out[objRef] = summary` on a plain
+    // object turns an id of `__proto__` into the map's prototype: hasOwn is
+    // false, Object.keys is empty, and the object silently disappears from
+    // every look/describe that reads this map. `__proto__` remains a legal
+    // object id — the mint reservation only covers `.`.
+    const world = createWorld();
+    const session = world.auth("guest:vm-proto-id");
+    const actor = session.actor;
+    world.object(actor).owner = actor;
+    world.createObject({ id: "__proto__", parent: "$thing", owner: actor, name: "Proto Thing", location: "$nowhere" });
+
+    const summaries = await world.scopedObjectSummaries(actor, ["__proto__"]);
+    expect(Object.getPrototypeOf(summaries)).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(summaries, "__proto__")).toBe(true);
+    expect(Object.keys(summaries)).toEqual(["__proto__"]);
+    expect(summaries["__proto__"]?.id).toBe("__proto__");
   });
 });

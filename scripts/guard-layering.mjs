@@ -8,7 +8,10 @@ const baselinePath = join(root, "scripts", "guard-layering-baseline.json");
 
 // These names are substrate identities or compiler/runtime placeholders. They
 // are architectural vocabulary rather than knowledge of an installed catalog.
-const allowedRefs = new Set(["$wiz", "$system", "$nowhere", "$catalog_registry", "$catalog", "$error", "$me", "$verb"]);
+// `$me` and `$here` are the session placeholders a client may write in an
+// object slot ("the actor I am", "the space I am in"); no world object bears
+// either id, so resolving them names no catalog.
+const allowedRefs = new Set(["$wiz", "$system", "$nowhere", "$catalog_registry", "$catalog", "$error", "$me", "$here", "$verb"]);
 const objectRefPattern = /\$[A-Za-z_][A-Za-z0-9_]*/g;
 const observed = new Map();
 const violations = [];

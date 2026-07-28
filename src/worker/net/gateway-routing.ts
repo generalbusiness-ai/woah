@@ -61,7 +61,14 @@ export function routeNetGateway(input: NetGatewayRouteInput): string {
       : guestClaim
         ? `guest:${guestClaim}`
         : input.anonymousKey;
-  return netGatewayShardName(stableHash(key) % input.shardCount, input.shardCount);
+  return netGatewayShardForKey(key, input.shardCount);
+}
+
+/** The one place a routing key becomes a shard name. Shared with the signed
+ * operator routes, which have no credential or session to hash but still need
+ * repeated runs for one subject to land on one warm gateway. */
+export function netGatewayShardForKey(key: string, shardCount: number): string {
+  return netGatewayShardName(stableHash(key) % shardCount, shardCount);
 }
 
 function validShardHint(hint: string, count: number): boolean {

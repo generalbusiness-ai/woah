@@ -119,6 +119,7 @@ import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import { mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
+import { repairedVerbSlots, verbCellSlot } from "../../net/verb-slots";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
@@ -516,6 +517,12 @@ export class SqliteScopeStore implements ScopeStore {
     ).map((row) => JSON.parse(row.body) as ReplayLogEntry);
   }
 }
+
+/** Objects repaired per `/net/repair-verb-slots` request (CO4.7). One aged
+ * object can carry many pages, so the cap is on OBJECTS and the reply reports
+ * `remaining` — the operator re-runs until it reaches zero. Keeps one signed
+ * request a bounded transaction rather than a scope-sized rewrite. */
+const VERB_SLOT_REPAIR_OBJECT_LIMIT = 32;
 
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
@@ -1867,6 +1874,126 @@ export class NetScopeDO {
           head: repaired.head,
           changed: repaired.cells.map((cell) => cell.key).sort(),
           skipped: skipped.sort()
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/net/repair-verb-slots") {
+        // Aged-world repair for verb ORDINALS (CO4.7). Worlds authored before
+        // 2026-07-27 hold objects whose verb pages share a slot, because the
+        // Net authoring path could not see an object's other pages and wrote
+        // `slot: 1` for every one of them. Slot order is the dispatcher's
+        // tie-breaker, so such an object has no defined order and the MCP
+        // resolver refuses the ambiguous calls outright.
+        //
+        // BOUNDED, NOT GLOBAL: the operator names the scopes (one signed
+        // request each), and within a scope this derives candidates from its
+        // OWN verb cells. Objects are capped per request; `remaining` tells the
+        // operator to run again. Nothing in the body chooses a slot — the
+        // assignment is computed from the stored pages by the same resolution
+        // order every node already applies (src/net/verb-slots.ts), so the
+        // repair cannot change which verb any name resolves to.
+        const body = (await request.json()) as { objects?: string[]; dry_run?: boolean };
+        const dryRun = body.dry_run === true;
+        const named = Array.isArray(body.objects) ? body.objects.filter((id) => typeof id === "string" && id.length > 0) : null;
+        if (named !== null && (named.length === 0 || named.length > VERB_SLOT_REPAIR_OBJECT_LIMIT)) {
+          throw netError("E_INVARG", `verb slot repair accepts 1..${VERB_SLOT_REPAIR_OBJECT_LIMIT} objects`, { count: named.length });
+        }
+        const seq = this.ensureSequencer();
+        // Candidate objects: the ones named, else every object this scope holds
+        // verb pages for. Keys are sorted so a capped run is deterministic and
+        // a re-run makes progress rather than revisiting the same prefix.
+        const candidates = new Set<string>();
+        if (named !== null) {
+          for (const id of named) candidates.add(id);
+        } else {
+          for (const key of seq.store.keys()) {
+            if (!key.startsWith("verb_bytecode:")) continue;
+            const rest = key.slice("verb_bytecode:".length);
+            const split = rest.lastIndexOf(":");
+            if (split > 0) candidates.add(rest.slice(0, split));
+          }
+        }
+        const cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">> = [];
+        const repairedObjects: string[] = [];
+        const skipped: string[] = [];
+        let remaining = 0;
+        for (const object of [...candidates].sort()) {
+          // Only this scope's own objects: a rider-cache copy is repaired by
+          // its owner, and fanout converges the readers.
+          if (!this.ownsCellLocally(seq, cellKey("object_lineage", object))) {
+            skipped.push(object);
+            continue;
+          }
+          const pages = seq.store.cellsForObject(object)
+            .filter((cell) => cell.kind === "verb_bytecode" && typeof cell.name === "string")
+            .map((cell) => ({
+              name: cell.name as string,
+              cell,
+              slot: verbCellSlot(cell.value)
+            }));
+          const assignment = repairedVerbSlots(pages.map(({ name, slot }) => ({ name, slot })));
+          if (assignment === null) continue; // already a distinct ascending set
+          if (repairedObjects.length >= VERB_SLOT_REPAIR_OBJECT_LIMIT) {
+            remaining += 1;
+            continue;
+          }
+          repairedObjects.push(object);
+          for (const page of pages) {
+            const slot = assignment.get(page.name);
+            if (slot === undefined || slot === page.slot) continue;
+            cells.push({
+              kind: "verb_bytecode",
+              object,
+              name: page.name,
+              value: { ...(page.cell.value as Record<string, unknown>), slot }
+            });
+          }
+        }
+        if (dryRun || cells.length === 0) {
+          return json({
+            ok: true,
+            scope: seq.scope,
+            status: cells.length === 0 ? "empty" : "would_apply",
+            dry_run: dryRun,
+            head: seq.head(),
+            changed: cells.map((cell) => cellKey(cell.kind, cell.object, cell.name)).sort(),
+            objects: repairedObjects.sort(),
+            skipped: skipped.sort(),
+            remaining
+          });
+        }
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.operatorRepairVerbSlots(cells);
+          if (result.status === "applied") {
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            const slotBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
+              cells: result.cells,
+              removed_cells: [],
+              observations: []
+            };
+            const slotText = JSON.stringify(slotBody);
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, slotBody, slotText);
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({
+          ok: true,
+          scope: seq.scope,
+          status: repaired.status,
+          dry_run: false,
+          head: repaired.head,
+          changed: repaired.cells.map((cell) => cell.key).sort(),
+          objects: repairedObjects.sort(),
+          skipped: skipped.sort(),
+          remaining
         });
       }
       if (request.method === "POST" && url.pathname === "/net/activate") {

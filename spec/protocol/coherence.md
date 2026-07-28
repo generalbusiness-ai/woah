@@ -522,6 +522,48 @@ If validation fails, no write from the transcript commits; the gateway
 repairs its planning state (per the reply's taxonomy code) and retries the
 whole turn within `repair_budget_ms` (CO10).
 
+### CO4.7 Verb-slot allocation
+
+A verb's slot is a durable per-object ordinal and the dispatcher's tie-breaker
+([../semantics/objects.md §9.1](../semantics/objects.md#91-lookup)). Only the
+object's authority holds the whole verb-page set, and NO cell's absence means
+"this object has other verbs" — a name-descriptor miss names one page (CO2.6), a
+numeric one names none — so a sparse planner cannot derive the allocation floor
+from a miss and can only propose. This is the same position the object-id
+allocator is in, and it is resolved the same way: propose from a hint, and let
+the owner refuse a proposal its own state contradicts.
+
+For every verb cell write, the owning scope validates against its pre-state:
+
+1. A write to a page the scope already holds MUST carry that page's stored
+   slot. Nothing may move a verb.
+2. A write that introduces a NEW page MUST carry exactly the allocation floor —
+   `max(slot over the object's verb cells) + 1`.
+3. Exception to (2): a RENAME is a removal plus a write under the new name in
+   one transcript, and MAY take an ordinal that same transcript vacates. It is
+   the same verb.
+
+A page carrying no slot is aged data; it raises the floor but is not enforced
+against, so an unrepaired world keeps committing.
+
+Both refusals are retryable `read_version_mismatch` naming the object's verb
+cells, so one repair round installs the set the planner needed and the re-plan
+converges. Rule 2 is also what SERIALIZES concurrent appends: two turns planned
+against one pre-state necessarily propose the same ordinal, so the second is
+refused and replans one higher. Without it both would commit and the object
+would hold two verbs claiming one slot — with no defined order between them.
+
+**Aged worlds.** Worlds authored before this rule contain objects whose pages do
+share an ordinal, and their true insertion order is UNRECOVERABLE: verb pages
+carry no timestamp (the bridge zeroes `created`/`modified` — they would churn
+content addresses) and `version` counts edits to one verb rather than global
+writes. The signed operator repair `repair:net-verb-slots` therefore does not
+attempt to recover it. It renumbers such an object into the `(slot, name)` order
+every node already resolves in, which changes no dispatch — see
+[../discovery/catalogs.md §CT14.7](../discovery/catalogs.md#ct147-reaching-a-deployed-net-world).
+Until it runs, a transport resolving from those pages MUST refuse an ambiguous
+match rather than guess ([mcp.md §M2.1](mcp.md#m21-woo_call)).
+
 ## CO5. The named-copy registry
 
 **This table is exhaustive and normative.** Any durable materialization of
@@ -1015,6 +1057,15 @@ One write path per fact (CO9), concretized:
   idempotency key), used only by the receiving gateway to skip the submitting
   session, and public `echo_id`, a domain-separated SHA-256 digest of that key.
   The raw replay credential must never appear on a client-visible frame.
+  Presence membership selects the *candidate* carriers; the receiving shard
+  then applies the observation-intrinsic audience rules of
+  [events.md §12.7.1](../semantics/events.md#1271-directed-observation-types-v1)
+  to each candidate — a directed `told`/`text` reaches only its named
+  recipient, a self-addressed `looked`/`who` only its `to`. A committed frame
+  carries no audience vector to lean on, so this filter is not optional: it is
+  the only thing keeping a `tell()` emitted inside a sequenced verb off every
+  bystander's carrier, and no client-side filtering may be assumed (an MCP
+  wait queue delivers raw observations to an agent).
 
 ## CO14. Session authority and authentication
 

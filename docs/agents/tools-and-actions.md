@@ -52,9 +52,14 @@ also returns each `input_schema`.
 No scope value performs a global scan. `object` only narrows objects already in
 your structural context.
 
+`total` counts dynamic descriptors only. Standard `tools/list` pages at 128
+entries *including* the three `woo_*` controls, so its first page and this
+`total` are different measurements and will usually disagree. Concatenate every
+`tools/list` page if you want a number to compare.
+
 ## Canonical invocation
 
-`woo_call` reaches exactly the same current descriptors as dynamic names:
+`woo_call` invokes a verb on any object you can reach:
 
 ```
 woo_call(
@@ -64,13 +69,48 @@ woo_call(
 )
 ```
 
-It is useful when a client cached an older dynamic list. It is not an object-id
-escape hatch: a globally known object outside your current space and inventory
-is refused.
+`$me` is your own actor and `$here` is the space you are in. Verb names may be
+abbreviated exactly as they can in a command: if a verb lists `l@ook` among its
+aliases, `"l"`, `"lo"` and `"look"` all reach it. If you have not been placed
+anywhere yet — a brand-new agent has not — `$here` names nothing and is
+refused with `no_active_scope`; move somewhere first.
 
-A successful result is in `structuredContent.result`. A world or Net failure
-sets `isError:true` and puts the structured detail in
-`structuredContent.error`.
+```
+woo_call("$me", "inventory", [])
+woo_call("$here", "say", ["hello"])
+```
+
+It is useful when a client cached an older dynamic list, and it reaches verbs
+that are not advertised as tools at all — for instance a verb you have just
+installed on an object in your inventory, before you set `tool_exposed`.
+Exposure controls what is *listed*, not what you may call.
+
+It is not an object-id escape hatch. What you can reach is yourself, the space
+you are in, that space's contents, and your inventory; a globally known object
+outside that set is refused.
+
+A successful result is in `structuredContent.result`, and what your turn
+emitted is beside it in `structuredContent.observations` — that is where you
+read your own action's effects. Other actors' events come through `woo_wait`
+instead; see [observations.md](observations.md). A world or Net failure sets
+`isError:true` and puts the structured detail in `structuredContent.error`.
+
+Refusals name one condition each, with a `detail.reason` and a
+`detail.remediation`:
+
+| `detail.reason` | What to do |
+| --- | --- |
+| `target_not_reachable` | Move to the object's space, or take it into inventory. |
+| `verb_not_defined` (`E_VERBNF`) | The object is reachable but has no such verb. |
+| `verb_order_unavailable` | Several verbs answer to that abbreviation and their order is undecidable — name one exactly. |
+| `native_verb` | Engine-native; there is no Net execution body to call. |
+| `verb_not_executable` | The verb's owner has not granted execute permission. |
+| `not_direct_callable` | The verb is not exposed to outside direct calls. |
+
+An `E_SCOPE_SPLIT` means the target is a mounted space with its own shared
+scope — an outliner or board sitting in your room. One turn cannot write both
+scopes, so enter it first; the refusal's `detail.remediation` names the tool
+that gets you there.
 
 ## Command-text round trip
 

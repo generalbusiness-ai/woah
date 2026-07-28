@@ -172,6 +172,21 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     // test would actually have failed under plain alphabetical ordering.
     expect(allNames.some((name) => name.startsWith("the_"))).toBe(true);
 
+    // The walkthrough's "128 vs 142" count mismatch, stated as an invariant.
+    // tools/list pages at MCP_PAGE INCLUDING the woo_* controls;
+    // woo_list_reachable_tools `total` counts dynamic descriptors with no cap.
+    // Nothing is filtered differently — a reader comparing page 1 against the
+    // pager total is comparing a page to a total.
+    expect(firstPageNames.length, "the first page is no longer capped").toBe(MCP_PAGE);
+    const pager = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "woo_list_reachable_tools", arguments: { scope: "active", limit: 1 } } },
+      { "mcp-session-id": session }
+    );
+    const pagerTotal = pager.body?.result?.structuredContent?.result?.total as number;
+    expect(allNames.length - MCP_STATIC_TOOLS, `pager total ${pagerTotal} does not reconcile with the full listing`)
+      .toBe(pagerTotal);
+    expect(pagerTotal, "the fixture no longer reproduces the page-vs-total gap").toBeGreaterThan(MCP_PAGE - MCP_STATIC_TOOLS);
+
     // PRECEDENCE is the actual guarantee (spec M2.2): the actor's tools are a
     // contiguous block at the head of the dynamic listing, directly after the
     // stable woo_* controls. Completeness on page 1 is a *consequence* that
@@ -278,6 +293,47 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     // The new orientation topics resolve, including the aliases.
     for (const topic of ["self", "suit", "me", "tools"]) {
       expect(await helpTopic(topic)).toContain("<object>__<verb>");
+    }
+
+    // --- an UNKNOWN topic is a reply, not a turn failure -------------------
+    // Verified live on the deployed world 2026-07-27: `guest_1:help("programmer")`
+    // returned the raw engine error
+    //   E_CATALOG_MUTATION: ordinary turns cannot mutate installed catalog
+    //   class definitions {objects:["$help"], keys:["property_cell:$help:missed_topics"]}
+    // The miss path recorded the unknown topic as a `missed_topics` property
+    // write on the first help db. $help is installed catalog state, so CO15
+    // refuses that write — and the refusal is a *turn verdict* settled at
+    // commit, so the `try`/`except` wrapped around the record_miss dispatch
+    // never saw it and the whole help call failed. help v1.0.0 drops both the
+    // verb and the property; the reply now carries the topic list instead.
+    //
+    // This must run on the Net lane specifically: a local world does not
+    // enforce the catalog-write rule, so only here does the old code fail.
+    const unknown = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: { name: "woo_call", arguments: { object: STRANDED_ACTOR, verb: "help", args: ["programmer"] } }
+      },
+      { "mcp-session-id": session }
+    );
+    expect(unknown.status, JSON.stringify(unknown.body)).toBe(200);
+    const unknownText = JSON.stringify(unknown.body);
+    expect(unknown.body?.result?.isError, unknownText).not.toBe(true);
+    expect(unknownText, "an unknown help topic must not surface an engine invariant").not.toContain("E_CATALOG_MUTATION");
+    expect(unknownText).toContain("not_found");
+    expect(unknownText).toContain('No help available for \\"programmer\\".');
+    // ...and it hands back the valid topics, the same list the index renders,
+    // so the asker recovers in one step instead of guessing again.
+    expect(unknownText).toContain("Topics: ");
+    const indexNames = (/Topics: ([^"\\]+)/.exec(await helpTopic("index")) as RegExpExecArray)[1]
+      .split(", ")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    expect(indexNames.length).toBeGreaterThan(5);
+    for (const name of indexNames) {
+      expect(unknownText, `not_found reply omits topic "${name}"`).toContain(name);
     }
 
     // Drain deferred work before closing the fake storage. Without this the

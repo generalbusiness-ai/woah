@@ -286,6 +286,17 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     return row ? verbFromRow(row) : null;
   }
 
+  /** Upsert one verb page, keyed on its SLOT — the durable per-object ordinal
+   * (spec/semantics/objects.md §9.1), enforced here by `PRIMARY KEY
+   * (object_id, slot)`. Replace-at-slot is what a rename needs: the new name is
+   * written at the same ordinal and the old name is then deleted. It relies on
+   * the in-memory invariant that no two of an object's verbs share a slot, which
+   * `WooWorld.addVerb` maintains for everything it writes. A world hydrated from
+   * a corrupt image (an aged Net world's duplicate-slot pages — see
+   * spec/protocol/coherence.md §CO4.7) would violate that; `saveWorld`'s plain
+   * INSERT fails loudly on the constraint rather than persisting the shape, and
+   * such an image must be walked forward with `repair:net-verb-slots` before it
+   * is loaded into a SQLite host. */
   saveVerb(id: ObjRef, verb: SerializedVerb): void {
     this.ensureHostedObject(id);
     const slot =
@@ -591,14 +602,38 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   savepoint<T>(fn: () => T): T {
     const name = `woo_sp_${++this.savepointCounter}`;
     this.db.exec(`SAVEPOINT ${name}`);
+    // A SAVEPOINT opened outside an explicit BEGIN starts a transaction
+    // IMPLICITLY, so a nested transaction() must flatten into it exactly as it
+    // does inside transaction(). Without this the inner call issues
+    // BEGIN IMMEDIATE while the savepoint's implicit transaction is open and
+    // SQLite fails the statement with "cannot start a transaction within a
+    // transaction".
+    //
+    // That defect made every catalog migration STEP fail on the SQLite
+    // profile: applyCatalogMigration runs each step inside
+    // world.withMutationSavepoint(), and any step that mutates definitions
+    // (drop_verb -> removeVerb, drop_property -> deleteProp, add_property ->
+    // defineProperty, change_parent, ...) calls world.persist(), which flushes
+    // through transaction(). The thrown step error was then swallowed into
+    // `migration_state` while the schema sync still advanced the recorded
+    // catalog version — so a persisted world reported itself migrated with
+    // none of its drops applied. In-memory worlds have no repository and so
+    // never showed it. See tests/persistence.test.ts.
+    const outerDepth = this.transactionDepth;
+    this.transactionDepth = outerDepth + 1;
     try {
       const result = fn();
+      // Releasing the OUTERMOST savepoint commits the implicit transaction, so
+      // it owes the same pending-outcome check a real COMMIT makes.
+      if (outerDepth === 0) this.assertNoPendingLogOutcomes();
       this.db.exec(`RELEASE SAVEPOINT ${name}`);
       return result;
     } catch (err) {
       this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
       this.db.exec(`RELEASE SAVEPOINT ${name}`);
       throw err;
+    } finally {
+      this.transactionDepth = outerDepth;
     }
   }
 }

@@ -223,6 +223,23 @@ async function buildHarness(
     null
   );
   expect(wave.ok).toBe(true);
+  // A SEQUENCED verb that emits a directed second-person line next to a public
+  // one — the shape $exit:move has (tell(who, leave_msg) before the room's
+  // `left`). Its `text` observation rides the committed applied frame, which
+  // carries no audience vector, so every delivery lane must re-apply the
+  // directed rule itself (events.md §12.7.1).
+  const whisperSelf = installVerb(
+    world,
+    "ws_wave_box",
+    "whisper_self",
+    `verb :whisper_self(text) rxd {
+      tell(actor, "private " + text);
+      observe({ type: "spoke", actor: actor, text: "public " + text });
+      return true;
+    }`,
+    null
+  );
+  expect(whisperSelf.ok).toBe(true);
   const speak = installVerb(
     world,
     "ws_wave_box",
@@ -1096,6 +1113,77 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // fake SQLite stores so the test cannot hide a post-assertion delivery
     // failure behind waitUntil teardown.
     await h.settle();
+    h.close();
+  });
+
+  it("keeps a sequenced turn's directed text echo off bystander carriers and still delivers it to the recipient's other session", async () => {
+    // Regression for the walkthrough leak (notes/2026-07-27-mcp-surface-walkthrough.md
+    // §(a)): a `tell()` inside a SEQUENCED verb rides the committed applied
+    // frame, which carries no per-observation audience vector. The committed
+    // fanout used to filter on `to` only, so a bystander's carrier — a raw MCP
+    // queue does no client-side `target` filtering — received another actor's
+    // second-person line ("You slide the glass door open…").
+    const h = await buildHarness();
+    await h.subscribe(h.annexScope);
+    const mine = await h.mint(); // submitter, actor
+    const myOtherTab = await h.mint(); // same actor, second session → MUST receive
+    const bystander = await h.mintOther(); // different actor, same room → MUST NOT
+    const enter = async (sid: string, token: string, key: string): Promise<void> => {
+      const entered = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "ws_annex", verb: "welcome", session: sid, idempotency_key: key }
+      });
+      expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+      expect((entered.body.reply as { status?: string })?.status).toBe("accepted");
+    };
+    await enter(mine, `apikey:${KEY_ID}:${KEY_SECRET}`, "ws-directed-enter-1");
+    await enter(myOtherTab, `apikey:${KEY_ID}:${KEY_SECRET}`, "ws-directed-enter-2");
+    await enter(bystander, "apikey:ws-key-2:ws-secret-2", "ws-directed-enter-3");
+    await h.settle();
+
+    const submitter = (await upgrade(h, mine)).server as FakeWebSocket;
+    const sameActorTab = (await upgrade(h, myOtherTab)).server as FakeWebSocket;
+    const otherActorTab = (await upgrade(h, bystander, {
+      ticket: await mintTicket(h, bystander, "apikey:ws-key-2:ws-secret-2")
+    })).server as FakeWebSocket;
+
+    await h.gateway.webSocketMessage(
+      submitter as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "whisper-1",
+        target: "ws_wave_box",
+        verb: "whisper_self",
+        args: ["line"],
+        idempotency_key: "ws-whisper-1"
+      })
+    );
+    const reply = frames(submitter).at(-1) as { type: string; status: number; observations?: Array<Record<string, unknown>> };
+    expect(reply.type).toBe("turn_result");
+    expect(reply.status, JSON.stringify(reply)).toBe(200);
+    // Item-1 contract: the submitter's own echo arrives on the turn reply.
+    expect(reply.observations?.map((obs) => obs.type)).toEqual(expect.arrayContaining(["text", "spoke"]));
+    await h.settle();
+
+    const observationsOn = (socket: FakeWebSocket): Array<Record<string, unknown>> =>
+      frames(socket)
+        .filter((frame) => frame.type === "observations")
+        .flatMap((frame) => frame.observations as Array<Record<string, unknown>>);
+
+    // The recipient's OTHER session is a legitimate carrier for the same
+    // actor's private line and must still receive it through fanout.
+    const mineViaFanout = observationsOn(sameActorTab);
+    expect(mineViaFanout.map((obs) => obs.type).sort()).toEqual(["spoke", "text"]);
+    expect(mineViaFanout.find((obs) => obs.type === "text")).toMatchObject({
+      target: h.actor,
+      text: "private line"
+    });
+
+    // The bystander sees only the public line — never the directed echo.
+    const bystanderObservations = observationsOn(otherActorTab);
+    expect(bystanderObservations.map((obs) => obs.type)).toEqual(["spoke"]);
+    expect(JSON.stringify(bystanderObservations)).not.toContain("private line");
+
     h.close();
   });
 

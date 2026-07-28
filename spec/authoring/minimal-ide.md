@@ -161,10 +161,14 @@ remains the bitset defined in [objects.md §4](../semantics/objects.md#4-objects
 }
 ```
 
-`slot` is the 1-based position of the verb in `definer`'s local ordered verb
-list. Names are not unique: multiple slots may share the same `name` and differ
-by aliases or `arg_spec`. Name-based authoring updates the first matching slot
-unless the caller supplies an explicit slot descriptor.
+`slot` is the verb's durable ordinal within `definer`'s local verb list — a
+stored value, not an array position, so it survives deletions of other verbs and
+may leave gaps ([../semantics/objects.md §9.1](../semantics/objects.md#91-lookup)).
+Names are not unique at the object-model level: multiple slots may share the same
+`name` and differ by aliases or `arg_spec`, though the authoring surfaces refuse
+to create a duplicate. Name-based authoring updates the first matching slot
+unless the caller supplies an explicit slot descriptor, and it never MOVES the
+verb it updates.
 
 `VerbInfo` extends `VerbSummary`:
 
@@ -321,6 +325,8 @@ Compile diagnostics have a stable shape:
   severity: "error" | "warning" | "info",
   code: str,
   message: str,
+  hint?: str,      // remediation sentence, safe to show verbatim
+  symbol?: str,    // the offending source symbol, when there is one
   span?: {
     line: int,
     column: int,
@@ -329,6 +335,14 @@ Compile diagnostics have a stable shape:
   }
 }
 ```
+
+`hint` carries the *remediation*, not a restatement of the error: the
+compiler supplies the generic rule (an unknown identifier is told that object
+ids are written `#<id>`), and a caller with world knowledge may sharpen it —
+`$programmer:eval` turns that into "did you mean `#<id>`?" once it confirms the
+world holds that object. A surface that renders diagnostics MUST render `hint`
+when present; dropping it leaves the author exactly where the bare error did.
+`symbol` exists so such a caller does not have to re-parse `message`.
 
 Span positions are 1-based for `line` / `end_line` and 0-based for `column` /
 `end_column`. Columns are Unicode code-point offsets in the NFC-normalized

@@ -1458,6 +1458,34 @@ arguments, or repository files. Operator tooling generates the secret
 locally and writes the one-time full token to an owner-only (`0600`) file
 before sending the verifier or installing it as a Worker secret.
 
+The entry exposes one further internal-signed operator operation:
+`POST /net-operator/wizard/provision`
+([provisioning.md §AP11](../identity/provisioning.md#ap11-operator-wizard-provisioning-implemented)).
+Unlike the credential and repair operations it runs a **turn**, so it is
+addressed to a gateway shard (keyed by the target human) rather than to a scope
+authority. It mints a non-catalog, wizard-flagged, programmer-surfaced agent
+anchored under an existing human account — the only way to obtain a usable
+wizard on a deployed world, because the seeded `$wiz` cannot plan a client turn
+at all. It is idempotent on an operator-supplied `provision_id` and mints no
+credential material.
+
+Deploy-day runbook (the two operator commands are separate steps; code landing
+is not a healed world):
+
+```bash
+npm run provision:net-wizard -- \
+  --base-url https://woah1.generalbusiness.ai \
+  --human <human actor id> \
+  --provision-id ops-wizard-1 \
+  --name OpsWizard \
+  --credential-name OPS_WIZARD_WOO_APIKEY
+```
+
+The driver provisions, then installs a locally generated verifier through
+`/net-operator/credentials/ensure`, then re-runs provisioning to record the key
+pointer. The replayable token lands only in the owner-only credential file.
+Re-running the whole command is a no-op.
+
 For a Net world installed before `$actor.api_keys` existed, deploy the runtime
 and then run the explicit, idempotent bootstrap-definition migration before
 minting through block verbs:
@@ -1482,6 +1510,28 @@ npm run repair:net-seed-properties -- https://woah1.generalbusiness.ai
 It mines every bundled `merge_map` hook, posts each to the scope that owns the
 target cell, and merges key-wise on the server, so operator-edited entries are
 never overwritten and re-running is a no-op.
+
+For a Net world in which any verb was authored before 2026-07-27 — through
+`install_verb`, `add_verb`, the verb editor, or any `set_verb_info` /
+`set_verb_code` — the committed pages of those objects share a verb ordinal
+([coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)).
+Until this runs, MCP refuses an ambiguous alias match on such an object
+(`verb_order_unavailable`) and `list_verb` reports an ordinal that addresses
+nothing. Deploy the runtime, then run the idempotent verb-slot repair per scope
+(add `--dry-run` to size it first):
+
+```bash
+npm run repair:net-verb-slots -- https://woah1.generalbusiness.ai --all-seeded
+npm run repair:net-verb-slots -- https://woah1.generalbusiness.ai cluster:<actor> room:<space>
+```
+
+`--all-seeded` covers the scopes the bundle installs; scopes created after
+install (actor clusters, rooms minted at runtime) must be named — this driver
+never enumerates a world. Each scope derives its own candidates from its own
+verb cells, objects are capped per request, and the reply's `remaining` says
+whether to run again. The repair renumbers into the order every node already
+resolves in, so no verb name starts resolving to a different verb; it cannot
+restore the authoring order, which nothing recorded.
 
 These commands require the currently deployed `WOO_INTERNAL_SECRET`. A missing
 local copy is not recoverable from Cloudflare (Worker secret values are

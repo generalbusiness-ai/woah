@@ -14,7 +14,8 @@ quotas of agent identities, with onboarding optimized for Hermes-style
 multi-profile setups — is normative below.
 
 Operator-grade pieces (directory sync, federation, bulk reconcile) stay
-deferred, called out in AP8.
+deferred, called out in AP8. AP11 covers the one operator surface that is
+implemented: signed provisioning of a usable wizard on a deployed world.
 
 ---
 
@@ -251,6 +252,40 @@ not in scope for v1.
 | `active` | Default. Sessions allowed, API keys live. | — |
 | `deactivated` | `account.deactivated_at` set. All sessions reaped. All API keys under the account refuse new auth. Actor objects remain in the world; their owned objects keep their `owner` pointer. | Yes — clear `deactivated_at`; keys re-allow auth. |
 | `recycled` | Account record marked deleted. Bound actors recycle (becomes `$nothing`) only if `account.recycle_on_delete = true`; default is to keep actor objects for audit/history and unbind them from the account. | No. |
+
+For an owned `$agent` there is a further, distinct state:
+
+| State | What changes | Reversible |
+|---|---|---|
+| `retired` | `agent.retired_at` set (and `deactivated_at` with it). Programmer state stripped, api key revoked, and **the account's quota slot returned**. | No. |
+
+**Deactivation is not retirement, and the two facts need two markers.**
+`deactivated_at` answers "may this identity authenticate?" — a REVERSIBLE fact
+that `$system:deactivate_actor` sets and `$system:reactivate_actor` clears, and
+which never touches any counter. `retired_at` answers "has this agent's quota
+slot been returned to its account?" — a PERMANENT fact recorded only by
+`$human:revoke_agent`.
+
+Conflating them corrupts `account.agent_count` in one direction or the other:
+reading the auth tombstone as "slot returned" strands the slot forever whenever
+`deactivate_actor` ran first (that path decrements nothing), while reading its
+absence as "slot not returned" double-returns a slot on a repeat revoke and lets
+the account mint past its quota. Normatively:
+
+- **The quota slot is returned exactly once, by permanent retirement.** Repeat
+  revocation is a success no-op for accounting and mints no duplicate audit
+  record, while still re-running the idempotent retirement WORK — so a repeat
+  repairs an agent that `deactivate_actor` left half-retired.
+- **Revoking a merely deactivated agent still returns the slot** and still
+  performs the retirement work deactivation skipped.
+- **Retirement is not reversible.** `$system:reactivate_actor` refuses an actor
+  carrying `retired_at`: restoring a live identity whose slot has already been
+  returned is the same quota bypass reached from the other side. Plain
+  deactivation stays fully reversible, because it never returned a slot.
+- Implementations upgrading a world that predates `retired_at` may infer it
+  only from a shape `deactivate_actor` cannot produce (auth tombstone set AND
+  the agent's current key already revoked). The inference must fail toward
+  leaving the slot counted, never toward returning it twice.
 
 `$guest` actors do not have a lifecycle distinct from session;
 session-end reaps them per the existing baseline.
@@ -678,15 +713,16 @@ Every state transition routes through one of these `$system` verbs:
 |---|---|---|
 | `$system:provision_actor(class, owner, attrs)` | Create a new actor of `class`, owned by `owner`. | Yes — `actor_provisioned` |
 | `$system:promote_actor(actor, new_class)` | `chparent`; preserves objref + history. | Yes — `actor_promoted` |
-| `$system:deactivate_actor(actor, reason)` | Reap sessions, refuse new auth. | Yes — `actor_deactivated` |
-| `$system:reactivate_actor(actor)` | Reverse deactivate. | Yes — `actor_reactivated` |
+| `$system:deactivate_actor(actor, reason)` | Reap sessions, refuse new auth. Reversible; touches NO quota counter (AP4.3). | Yes — `actor_deactivated` |
+| `$system:reactivate_actor(actor)` | Reverse deactivate. Refuses an actor carrying `retired_at`. | Yes — `actor_reactivated` |
 | `$system:rotate_api_key(actor)` | Mint new key, invalidate old. | Yes — `api_key_rotated`, no key material |
 | `$system:revoke_api_key(actor, reason)` | Invalidate current key without rotating. | Yes — `api_key_revoked` |
 | `$system:recycle_actor(actor)` | Hard-recycle. Not used in normal lifecycle; reserved for incident response. | Yes — `actor_recycled` |
 | `$system:issue_signup_invite(quantity, expires_at)` | Mint redeemable signup codes. | Yes — `signup_invite_issued` |
 | `$system:gc_pending_credentials()` | Sweep expired bearers, verification tokens, provision-state nonces, expired unused invites, and old used invite records. | Yes — `gc_pending_credentials` |
 | `$system:set_actor_flag(actor, flag, value)` | Flip a runtime-blessed flag (`programmer`, `wizard`). Quota-checked for `programmer` on `$agent` per AP6; unrestricted for wizard-on-`$human`. | Yes — `actor_flag_changed` with `flag`, `old`, `new` |
-| `$system:set_quota(account, kind, value)` | Adjust `agent_quota` or `programmer_grant_quota` per account. | Yes — `account_quota_changed` |
+| `$system:set_quota(account, kind, value)` | Adjust `agent_quota` or `programmer_grant_quota` per account. Tracked native; on Net the audit is the commit record (AP11.8). | Yes — `account_quota_changed` |
+| `$human:provision_wizard_agent(provision_id, options?)` | Signed-operator provisioning of a wizard-flagged, programmer-surfaced agent under this human's account (AP11). Wizard-gated; not `tool_exposed`. | Yes — `account_quota_changed`, `actor_provisioned`, `agent_promoted_to_programmer`, `actor_wizard_flag_set`, `operator_wizard_agent_provisioned` |
 
 Self-service surfaces (`$human:create_agent`, `/signup`, `/connect`)
 call these primitives under wizard authority via the perms-bypass
@@ -707,3 +743,255 @@ with `$human` or `$agent`, set quota/account fields as needed, and use
 the same API-key rotation and deactivation verbs. The self-service
 signup path adds browser-facing credential exchange and guest
 promotion, but it does not create a separate actor model.
+
+---
+
+## AP11. Operator wizard provisioning (implemented)
+
+### AP11.1 The lock this breaks
+
+A deployed Net world can reach a state in which **no wizard can act and no
+programmer agent can ever be minted**. Two independent facts compose:
+
+1. The seeded `$wiz` is a catalog identity with no placement. A client turn's
+   planning anchor falls back to the actor itself when it is located nowhere
+   (CO14), a `$`-prefixed anchor classifies to the `catalog` scope, and the
+   catalog scope is not client-plannable — so every `$wiz` turn is refused
+   `E_INVARG unplannable_scope`, including the ones whose purpose is to fix
+   placement.
+2. Programmer minting consumes `account.programmer_grant_quota` (AP6), which
+   defaults to 0, and only a wizard may raise it.
+
+The world is not broken — it is *unreachable*. Nothing inside it can grant the
+first capability, so the repair must arrive from outside, signed.
+
+### AP11.2 The remedy: an anchored, non-catalog wizard
+
+`$human:provision_wizard_agent(provision_id, options?)` mints a **non-`$`
+agent anchored under an existing human account** and gives it both authority
+and tools. A non-catalog actor anchored to a human authority root plans at
+that cluster **even while located nowhere**, so the provisioned actor is usable
+over MCP/`/net-api` immediately, with no placement step.
+
+The verb is defined on `$human` and is invoked with the human as the turn
+target, so the entire transition plans and commits in the human's authority
+cluster — where the account, the new agent, and its api-key record all live. A
+`$system`-targeted verb would commit at the catalog scope and could write none
+of them.
+
+It is **wizard-gated** and **not `tool_exposed`**: the only intended caller is
+the internal-signed operator route (AP11.5).
+
+### AP11.3 Ledger-honest sequence (normative)
+
+One turn performs, in order, the exact effects of the corresponding
+self-service primitives — so every counter and audit record afterwards is
+indistinguishable from an ordinary provisioning:
+
+1. **Quota headroom** with `$system:set_quota` semantics, granted only in the
+   amount the next step consumes and only immediately before it: `agent_quota`
+   is raised to `agent_count + 1` only if the mint would exceed it, and
+   `programmer_grant_quota` to `programmer_agent_count + 1` only if the promote
+   would be a real transition. A converged re-run grants nothing. Each grant
+   records `account_quota_changed`. (Because the grants are just-in-time, the
+   materialized audit order is `actor_provisioned` before the programmer grant.)
+2. **Create** through the shared `provisionActorInternal` path used by
+   `$system:provision_actor` and `create_agent`: `$agent` parent, owned by the
+   human, anchored at the family authority root, customer attribution derived,
+   `actor_provisioned` recorded, `account.actors` appended, `agent_count`
+   incremented.
+3. **Promote** through the same shared transition as
+   `promote_agent_to_programmer`: consumes the grant quota, increments
+   `programmer_agent_count`, sets the `programmer` flag through the
+   `object_lineage` lineage seam, and attaches the published programmer surface
+   (`$system.programmer_surface`).
+4. **Wizard flag** through the lineage seam, with the surface reconciled.
+
+Step 3 is **required** before step 4. The two-gate model (AP4) separates
+authority from tools: a wizard-flagged actor without the authoring surface has
+permission to author and no verbs with which to do it.
+
+**Atomicity.** All four steps are one turn, so a failure at any step commits
+nothing. There is no partially-provisioned outcome to clean up.
+
+**Audit.** As in AP6, the audit is profile-materialized. On Net the accepted
+commit record IS the audit; the `$system.wizard_actions` catalog write is
+suppressed by the profile sink (audit.md AU1). Local and SQLite profiles
+materialize `account_quota_changed`, `actor_provisioned`,
+`agent_promoted_to_programmer`, `actor_wizard_flag_set`, and
+`operator_wizard_agent_provisioned` as usual.
+
+### AP11.4 Idempotency
+
+The operator supplies an opaque `provision_id`. The account carries
+`operator_provisioned_agents`, a `provision_id -> agent` map, and the agent
+carries `provision_id` as the reverse pointer.
+
+- A re-run whose `provision_id` is already in the ledger reuses that agent:
+  nothing is created, no counter moves, no quota is granted, and the receipt
+  reports `created: false`.
+- The reuse path is **fail-closed**. If the recorded id names an object that is
+  absent, is not a live agent owned by this human, or does not carry the same
+  `provision_id`, the call refuses. A stale or unwarmed read must never become
+  a duplicate identity.
+- The verb declares an authority prefetch for the account and for every agent
+  the ledger names, because a property read of an unwarmed instance silently
+  returns the class default rather than an error the repair loop could act on.
+
+Distinct `provision_id`s under one account mint distinct agents, each with its
+own unit of quota.
+
+**The ledger is a data map, not an object namespace.** A `provision_id` is
+operator-chosen text, so it may name a member of `Object.prototype`
+(`constructor`, `toString`, and — outside the wire grammar but reachable by any
+wizard calling the verb directly — `__proto__`). Every read of the ledger, in
+the primitive and in the gateway's prefetch alike, is an **own-key** read, and
+the map is constructed so that storing such a key defines an own property
+rather than reaching an inherited accessor. Without this, a lookup for
+`constructor` resolves the `Object` constructor and the caller dereferences a
+function as an agent id. The primitive additionally bounds `provision_id` to
+1..128 characters, since it becomes a durable key on the account cell.
+
+### AP11.5 The signed operator route
+
+`POST /net-operator/wizard/provision`, alongside
+`POST /net-operator/credentials/ensure`
+([cloudflare.md §R14](../reference/cloudflare.md)). Same trust model as the
+rest of the operator surface: the inbound internal HMAC is the gate, the edge
+strips the inbound signature and freshly signs the DO hop, and the allow-list
+is exact.
+
+Body: `{human, provision_id, name?, purpose?, api_key_id?}`. The route refuses
+a missing or `$`-prefixed `human`, a `provision_id` outside
+`[A-Za-z0-9._:-]{1,128}`, and a `human` that does not classify to an authority
+cluster. It is addressed to a gateway shard (not a scope) because it runs a
+turn, keyed by the human so repeated runs reuse one warm view.
+
+The acting principal is the **owner of the resolved `provision_wizard_agent`
+verb page**, the same data-driven derivation the guest door uses for
+`maintenance_principal`; the runtime never names `$wiz`. A world that does not
+install the primitive refuses `E_VERBNF` at the route rather than failing deep
+inside planning.
+
+### AP11.6 Credential handling
+
+The primitive **mints no credential**. A routed api-key id embeds the actor it
+is bound to, so it cannot exist before the agent does; the operator therefore:
+
+1. provisions (learning the agent id),
+2. generates the id/secret/salt locally, writes them to an owner-only file, and
+   installs only the salted verifier through
+   `POST /net-operator/credentials/ensure`,
+3. re-runs provisioning with `api_key_id` so the agent's key pointer names the
+   credential the operator holds.
+
+Every step is independently idempotent and the replayable secret never crosses
+the wire. `npm run provision:net-wizard` drives all three.
+
+**The pointer is validated fail-closed before it is stored.** Retirement
+follows `agent.api_key_id` and nothing else, so a pointer naming a key that is
+not this agent's would leave the agent's real credential alive through
+retirement — a retired wizard that still authenticates. A supplied
+`api_key_id` is accepted only when all of the following hold, and is otherwise
+refused `E_INVARG` naming the axis that mismatched:
+
+- it parses as a routed (self-routing) api-key id;
+- the id is bound to this agent;
+- its immutable authority root equals the agent's anchor root (what
+  cold-gateway routing resolves the credential through);
+- a verifier record for it exists in the agent's own `api_keys` map — the
+  actor-owned store the credential-ensure route writes; routed ids never live
+  in the legacy catalog `$system.api_keys` — with `record.actor` equal to the
+  agent and `revoked_at` unset.
+
+Requiring the record is safe because step 2 installs it before step 3 runs.
+
+### AP11.7 Revocation
+
+`demote_agent_from_programmer` clears the `programmer` flag and the surface but
+**not** the `wizard` flag — demote's meaning is "stop being a programmer", and
+clearing an unrelated authority bit would be a surprise. It therefore leaves an
+operator-provisioned wizard with authority and no tools, which is not the
+retirement anyone wants.
+
+The lever is `$human:revoke_agent(actor_id)`, called by the owning human: it
+strips programmer state through the shared transition, marks the actor-owned
+api-key record revoked, sets `deactivated_at` and `retired_at`, and returns the
+account's quota slot by decrementing `agent_count`.
+The `wizard` flag is deliberately left set — a deactivated actor cannot
+authenticate at all (`E_PERM identity_deactivated` at session mint), so the
+residual bit grants nothing, and the flag's history stays legible in the
+lineage cell.
+
+`revoke_agent` is a tracked native with the same authority prefetch as
+promote/demote, so it commits over `/net-api/turn` in the human's authority
+cluster. Its audit goes through the AU1 sink for the same reason as AP11.8:
+before that, `$system.wizard_actions` made every revocation fail
+`E_CATALOG_MUTATION`, which left account owners with no way to retire an agent
+on a Net world at all.
+
+**Revocation returns the quota slot exactly once (normative).**
+`account.agent_count` is a QUOTA counter, not an event count, and the marker
+that decides is `retired_at` — never `deactivated_at` (AP4.3). Revoking an
+agent that is **already retired** returns success and:
+
+- does **not** decrement `agent_count` again;
+- does **not** re-stamp `retired_at`, so the retirement time is stable;
+- does **not** mint a duplicate `agent_revoked` record for an event that did
+  not happen — though a repeat that actually repaired something (a key that was
+  still live) records one marked `repair: true`, so no real retirement work is
+  ever unaudited.
+
+Revoking an agent that was merely **deactivated** DOES return the slot, records
+`agent_revoked`, and performs the retirement work deactivation skipped. The
+earlier `deactivated_at` is preserved rather than re-stamped: that is when the
+identity stopped authenticating, which is a different instant from when the
+slot came back.
+
+Programmer-state stripping and api-key revocation run on every call, both being
+idempotent themselves. The same rule holds for `demote_agent_from_programmer`:
+the shared transition moves the flag and `programmer_agent_count` only on a real
+transition, so repeats are no-ops and no ordering can double-decrement it.
+
+**Retirement reaches live credentials.** Eligibility is otherwise checked only
+when a session is MINTED, and both client credential classes evade that: a
+session bearer presents a session id and never re-presents its key, and an
+apikey holder pairs a long-lived key with an already-minted session id. Note
+`revoke_agent` revokes only the key named by `agent.api_key_id`, so any second
+credential on that actor survives retirement — a retired wizard was verified to
+commit a wizard-only `set_quota` turn this way. Both classes therefore refuse
+`E_PERM identity_deactivated` when the resolved actor's `deactivated_at` cell is
+present in the serving gateway's view with a non-null value.
+
+This check is deliberately **view-only and conservative**: it never warms or
+fetches (it is on the hot path of every authenticated request), and an absent cell is not a
+refusal, because a gateway that has not pulled the actor's cluster cannot
+distinguish "not deactivated" from "not pulled". Propagation is therefore
+**eventual** — the tombstone commits in the same authority cluster that hosts
+the session cell, a scope the serving gateway subscribed to when it minted the
+session, so it arrives by ordinary fanout in seconds, not instantly. The
+api-key check remains the second, authoritative gate: it reads the verifier
+from the owning authority and catches a revoked credential even before the
+tombstone lands.
+
+Re-running provisioning against a retired or deactivated agent's `provision_id`
+refuses, with a message naming which of the two it is (only one of them can be
+undone); a replacement uses a new `provision_id`.
+
+Revoking only the credential (`$system:revoke_api_key(id)`, also tracked and
+verified over Net) is the narrower action: it kills the operator's access
+without retiring the actor.
+
+### AP11.8 Related fix: `$system:set_quota` on Net
+
+`set_quota` previously appended `$system.wizard_actions`, a catalog cell, so
+every call over Net failed `E_CATALOG_MUTATION` — a deployed world could not
+grant programmer quota even holding a working wizard, which is half of the lock
+in AP11.1. Its audit now goes through the AU1 profile sink and the primitive is
+a tracked native with an argument-0 authority prefetch (the turn target
+`$system` is catalog-resident, so the account must be prefetched from the
+argument).
+
+`$system:set_actor_flag` remains an **untracked** native and is therefore still
+refused over Net (`incomplete_transcript`, fail-closed). Granting wizard
+authority on a Net world goes through AP11, not through `set_actor_flag`.

@@ -680,6 +680,33 @@ function buildSeedSlice(view: CellStore, call: ShadowTurnCall): Set<string> {
       }
     }
   }
+  // Object refs named in the call's ARGUMENTS get their full cell set, the
+  // same treatment `expandObjRefs` gives a ref found inside a cell value.
+  //
+  // Without this an argument object arrives with only the cells a NAMED miss
+  // could ask for — lineage + live, plus the one verb page an E_VERBNF
+  // identified — because the sparse repair loop can only grow around a key
+  // some throw spelled out. There is no cell whose absence means "this object
+  // has other verbs", so a turn that enumerates or APPENDS to an argument
+  // object's verb list saw an empty list and could not tell that apart from an
+  // object with no verbs. `verbs(id)` answered `[]` for a three-verb object,
+  // and every verb authored over Net landed on slot 1
+  // (notes/2026-07-27-net-verb-slots.md). Verb-slot allocation is still
+  // authority-checked at commit (scope.ts §CO4 verb-slot rules) — this seeding
+  // is what makes the common case converge in ONE round instead of a repair
+  // cycle per verb.
+  //
+  // Every string ANYWHERE in the argument payload is a candidate ref (an id
+  // nested in an options map is as much a subject as a positional one), and
+  // only view-resident objects are seeded, so the cost is bounded by
+  // (argument payload × that object's own cells) — the turn's own read-set
+  // shape, never a scan of the view.
+  const argRefs = new Set<string>();
+  collectStrings(call.args ?? [], argRefs);
+  for (const ref of argRefs) {
+    if (!view.has(cellKey("object_lineage", ref))) continue; // not a resident object
+    for (const cell of view.cellsForObject(ref)) seed.add(cell.key);
+  }
   // Resolve object-valued properties so obj-ref reads land on materialized
   // objects: an unmaterialized ref target makes the engine attribute the
   // downstream property miss to the frame's OWN `this` (not the ref

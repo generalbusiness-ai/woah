@@ -79,8 +79,19 @@ woo_call("$me", "install_verb", [<obj-id>, <descriptor>, <source>, opts?])
 
 - A **bare verb name** (`"look_self"`) — install into the first
   matching slot, or create a new one if none exists.
-- An **integer slot** (`3`) — install into a specific 1-based slot.
+- An **integer slot** (`3`) — install into the verb holding that slot.
   Useful when a verb has multiple ordered slots with the same name.
+
+A slot is the verb's permanent number on that object, not its position in a
+list. New verbs get the next number above every verb the object already has;
+deleting a verb leaves its number empty and does not renumber the others, so
+after deleting slot 2 an object's verbs can read 1, 3, 4. That is normal. The
+number `list_verb` shows you is the number you can pass back as a descriptor,
+and it keeps meaning the same verb.
+
+Slot order matters: when two verbs on one object have aliases that both match
+what you typed, the lower slot wins. Installing or editing a verb never moves
+another one.
 
 `opts`:
 

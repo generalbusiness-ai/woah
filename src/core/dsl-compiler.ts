@@ -92,7 +92,10 @@ class CompileError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly span?: Span
+    readonly span?: Span,
+    /** Optional remediation sentence + the offending symbol; both surface on
+     * the CompileDiagnostic so callers (eval, install_verb) can relay them. */
+    readonly extra?: { hint?: string; symbol?: string }
   ) {
     super(message);
   }
@@ -198,6 +201,8 @@ function compileDiagnostic(err: unknown): CompileDiagnostic {
       severity: "error",
       code: err.code,
       message: err.message,
+      ...(err.extra?.hint ? { hint: err.extra.hint } : {}),
+      ...(err.extra?.symbol ? { symbol: err.extra.symbol } : {}),
       span: err.span ? toDiagnosticSpan(err.span) : undefined
     };
   }
@@ -284,8 +289,16 @@ class Lexer {
   }
 
   private string(): void {
-    const quote = this.peek();
     const start = this.mark();
+    const decoded = this.quoted(start);
+    this.push("string", decoded, start, decoded);
+  }
+
+  /** Scan a quoted run at the cursor and return its decoded text. Shared by
+   * string literals and the quoted ref forms (`#"..."` / `$"..."`), so escape
+   * handling cannot drift between them. */
+  private quoted(start: Mark): string {
+    const quote = this.peek();
     this.advance();
     let raw = "";
     while (!this.atEnd() && this.peek() !== quote) {
@@ -299,9 +312,9 @@ class Lexer {
     }
     if (this.atEnd()) throw this.error("unterminated string literal", start);
     this.advance();
-    const quoted = `"${raw.replace(/"/g, '\\"')}"`;
+    const json = `"${raw.replace(/"/g, '\\"')}"`;
     try {
-      this.push("string", JSON.parse(quoted), start, JSON.parse(quoted));
+      return JSON.parse(json) as string;
     } catch {
       throw this.error("invalid string escape", start);
     }
@@ -309,8 +322,29 @@ class Lexer {
 
   private ref(kind: "objref" | "coreref"): void {
     const start = this.mark();
-    let value = this.advance();
-    while (!this.atEnd() && /[A-Za-z0-9_.-]/.test(this.peek())) value += this.advance();
+    const sigil = this.advance();
+    let value = sigil;
+    if (this.peek() === '"' || this.peek() === "'") {
+      // QUOTED form: `#"foo.bar"` / `$"foo.bar"`. The bare form below stops at
+      // the first character outside [A-Za-z0-9_-], so an id holding any other
+      // character would otherwise be inexpressible in DSL source. Ids are
+      // opaque in storage and on the wire, and a world minted before the
+      // creation-time reservation (see assertMintableObjectId) may already
+      // hold one; this is how such an object stays reachable. The quoted body
+      // is taken verbatim — no sigil is implied inside it.
+      const body = this.quoted(start);
+      if (!body) throw this.error(`invalid ${kind}`, start);
+      const literal = kind === "objref" ? body : `${sigil}${body}`;
+      this.push(kind, `${sigil}"${body}"`, start, literal);
+      return;
+    }
+    // `.` deliberately TERMINATES a bare ref token. language.md §7.3 makes `.`
+    // property access on whatever precedes it, and a ref is an expression like
+    // any other — `$system.spec_version` and `#the_mug.description` must read
+    // properties. Including `.` in the ref charset silently produced a single
+    // string literal ("$system.spec_version") instead, so the read compiled
+    // fine and returned the wrong kind of value with no diagnostic.
+    while (!this.atEnd() && /[A-Za-z0-9_-]/.test(this.peek())) value += this.advance();
     if (value.length === 1) throw this.error(`invalid ${kind}`, start);
     // Coreref ids are stored with the leading `$` ($wiz, $root, ...).
     // Objref ids are stored without the leading `#`, so strip it here so
@@ -1085,7 +1119,17 @@ class Codegen {
       this.emit(globalOp);
       return;
     }
-    throw new CompileError("E_COMPILE", `unknown identifier: ${expr.name}`, expr.span);
+    // A bare name resolves only to a local/argument or a frame global. Object
+    // ids are NOT in that namespace — they are written as the `#<id>` objref
+    // literal (a leading-dollar name for corerefs). An agent that just called
+    // `create()` and got back `obj_human_2_1` has no way to guess that from
+    // "unknown identifier", so the remediation ships with the diagnostic. A
+    // caller that knows the world (see World.programmerEval) sharpens this
+    // into a "did you mean" once it confirms the id exists.
+    throw new CompileError("E_COMPILE", `unknown identifier: ${expr.name}`, expr.span, {
+      symbol: expr.name,
+      hint: `bare names resolve only to locals, verb arguments, and frame globals; write an object id as the objref literal #${expr.name} (or $${expr.name} for a core reference)`
+    });
   }
 
   private compileBinary(expr: BinaryExpr): void {

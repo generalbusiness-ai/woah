@@ -190,6 +190,13 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
       expect(progNames, `${verb} missing from ${JSON.stringify(progNames.filter((n) => n.startsWith(p)))}`).toContain(`${p}__${verb}`);
     }
 
+    // ...and `trace` is deliberately NOT among them. It is a v1.1 stub whose
+    // only behavior is to raise, so listing it would advertise a tool that can
+    // never succeed. Assert from the LIVE list, not the manifest flag: this is
+    // the project's repeat defect (tool_exposed in a manifest is not evidence
+    // of callability, and a flag flip here is silent).
+    expect(progNames, "trace is a raise-only stub; it must not be advertised").not.toContain(`${p}__trace`);
+
     // The removed "all" scope is rejected by the MCP validator, not silently
     // degraded to the local closure (§7 / no global enumeration).
     const scopeAll = await call(progSession, "woo_list_reachable_tools", { scope: "all" });
@@ -240,17 +247,24 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const listedText = JSON.stringify(listed.result?.structuredContent?.result ?? {});
     expect(listedText, listedText.slice(0, 400)).toContain("return 42");
 
-    // (8) The second reachability gate. The widget is now in structural context
-    // (inventory), but inventory objects expose only EXPLICITLY tool_exposed
-    // verbs — mcpActiveCommandContext grants command-shaped affordances to the
-    // room and its contents, never to self or inventory. So a freshly installed
-    // verb is durable and callable in-world but is deliberately not yet a tool.
+    // (8) `tool_exposed` is a LISTING gate and nothing more (spec M2.1/M2.2).
+    // The widget is in structural context (inventory), but inventory objects
+    // advertise only EXPLICITLY tool_exposed verbs — mcpActiveCommandContext
+    // grants command-shaped affordances to the room and its contents, never to
+    // self or inventory. So the freshly installed verb is not yet a tool...
     const w = sanitize(widget);
     const beforeExposure = await listNames(progSession);
     expect(beforeExposure, "an unexposed authored verb must not be advertised").not.toContain(`${w}__hi`);
-    // woo_call agrees with the advertised set: same resolver, same answer.
+    // ...and yet `woo_call` reaches it, which is the contract `help tools`
+    // states ("calls any verb you may reach"). Gating woo_call on the
+    // advertising flag left an author unable to run the verb they had just
+    // written on an object in their own hand, with a refusal that named no
+    // remediation. woo_call's gates are reachability and existence; every
+    // authority check still runs inside the authoritative turn.
     const unexposedCall = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
-    expect(unexposedCall.result?.isError, JSON.stringify(unexposedCall).slice(0, 400)).toBe(true);
+    await settleAll();
+    expect(unexposedCall.result?.isError, JSON.stringify(unexposedCall).slice(0, 400)).not.toBe(true);
+    expect(unexposedCall.result?.structuredContent?.result, JSON.stringify(unexposedCall).slice(0, 400)).toBe(42);
 
     // The last tools/list pinned this session's digest; open the live stream so
     // the exposure change has somewhere to push its notification.
@@ -289,6 +303,25 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const invokedGeneric = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
     await settleAll();
     expect(invokedGeneric.result?.structuredContent?.result, JSON.stringify(invokedGeneric).slice(0, 600)).toBe(42);
+
+    // (12) Reaching the unadvertised `trace` stub anyway (eval dispatches under
+    // the actor's own authority and is not tool-gated) must produce an answer
+    // an agent can act on: what it would have done, that it is absent from this
+    // world, and what to use instead. The programmer flag is NOT the blocker —
+    // this agent holds it — so a "you lack authority" style refusal would send
+    // the reader hunting for a permission that would not help.
+    const tracedRaw = await call(progSession, "woo_call", {
+      object: progAgent,
+      verb: "eval",
+      args: [`this:trace(#${widget}, "hi")`, {}]
+    });
+    await settleAll();
+    const tracedText = JSON.stringify(tracedRaw);
+    expect(tracedRaw.result?.isError, tracedText.slice(0, 400)).toBe(true);
+    expect(tracedText).toContain("E_NOT_IMPLEMENTED");
+    expect(tracedText).toContain("not implemented in this world");
+    expect(tracedText).toContain("list_verb");
+    expect(tracedText).not.toContain("E_PERM");
 
     for (const st of states) st.close();
   });

@@ -6,20 +6,66 @@ The help catalog provides LambdaMOO-shaped in-world help without adding a web UI
 
 | Class | Parent | Description |
 |---|---|---|
-| `$generic_help_db` | `$thing` | Generic help database. Stores topic values, resolves exact and abbreviated topic names, renders compact output, records misses. |
+| `$generic_help_db` | `$thing` | Generic help database. Stores topic values, resolves exact and abbreviated topic names, renders compact output. |
 
 ### `$generic_help_db` API
 
-`$generic_help_db` stores a `topics` map and a bounded `missed_topics` list. Its public verbs are:
+`$generic_help_db` stores a `topics` map. Its public verbs are:
 
-- `:find_topics(topic?)` returns exact or abbreviated topic matches.
+- `:find_topics(topic?)` returns exact or abbreviated topic matches, or every topic name when the query is empty.
 - `:get_topic(topic?, remaining_dbs?)` returns rendered help output.
 - `:dump_topic(topic)` returns the raw stored topic value.
-- `:record_miss(topic)` records missing lookup terms for later documentation work.
+
+**A help lookup never writes.** v0.x also carried `:record_miss(topic)` and a
+bounded `missed_topics` list, recording unknown topics for later documentation
+work. Nothing ever read that list back, and on a Net world the write is refused:
+`$help` is installed catalog state, so an ordinary turn writing
+`property_cell:$help:missed_topics` is rejected with `E_CATALOG_MUTATION`. That
+refusal is a *turn verdict*, decided at commit, so the `try`/`except` around the
+`record_miss` dispatch could not catch it — a guest asking for an unknown topic
+got an invariant dump instead of an answer. v1.0.0 drops both the verb and the
+property (`migration-v0-to-v1.json`) and returns the topic list in the reply
+instead, which is what the asker needed anyway.
+
+A miss returns `{ok: false, status: "not_found", topic, topics, lines}`, where
+`topics` is the union of every reachable database's topic names and `lines`
+renders as `No help available for "x".` followed by `Topics: ...`.
+
+### Applying v1.0.0 to an existing world
+
+Same declaration, three lanes, as with the topic corrections above:
+
+- **Fresh worlds** install v1.0.0 directly.
+- **Aged local/classic worlds** heal on the next cold init: boot sees the
+  recorded version behind the bundle, and the major edge runs
+  `migration-v0-to-v1.json` through the ordinary update path. Covered in
+  `tests/catalogs.test.ts`, including a SQLite round trip.
+- **Aged Net worlds do NOT self-heal**, and here the reason is stronger than for
+  the topics: a Net runtime never runs a local catalog lifecycle at all, so
+  there is no deployed counterpart to the boot upgrade (spec §CT14.7). Delivery
+  is one signed operator call carrying both halves of the edge — the corrected
+  caller and the retired definitions — run once after the deploy:
+
+  ```
+  npm run repair:net-definitions -- <worker> '$player:help' \
+    --drop '$generic_help_db:record_miss' 'prop:$generic_help_db:missed_topics'
+  ```
+
+  The drops are authorized *by* `migration-v0-to-v1.json`: the CLI admits a
+  removal only when a bundled migration declares it and the current bundle no
+  longer defines the page. Proven end-to-end by
+  `tests/worker/net-help-migration-aged.test.ts`.
+
+Until that repair runs, an aged Net world's miss path stays broken — before the
+deploy with `E_CATALOG_MUTATION`, and after it with `incomplete_transcript`
+(`native:$help:record_miss`), because this version also deletes the native the
+retired verb page points at. Neither state is unrecoverable and the same repair
+resolves both, so the deploy and the repair may be run in either order; both
+shapes are covered by that test.
 
 The seeded `$help` instance is the global baseline database. Catalogs can add additional database objects and register them by appending to `$system.help_dbs`; objects and spaces can also expose contextual databases through their inherited `.help` property.
 
-The first-light database verbs are native-backed. Their DSL source bodies are intentionally explicit `/* native */` stubs so verb inspection does not present an incomplete shadow implementation as the behavior that actually runs. The native path is the authority for topic matching, directive expansion, and miss recording until the DSL has the remaining help primitives.
+The first-light database verbs are native-backed. Their DSL source bodies are intentionally explicit `/* native */` stubs so verb inspection does not present an incomplete shadow implementation as the behavior that actually runs. The native path is the authority for topic matching and directive expansion until the DSL has the remaining help primitives.
 
 ## Topic Values
 
