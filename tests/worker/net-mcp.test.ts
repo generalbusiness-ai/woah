@@ -15,6 +15,7 @@ import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from ".
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { turnEchoId } from "../../src/net/turn-echo";
+import { PUBLIC_ORIGIN_HEADER } from "../../src/worker/public-origin";
 
 const SECRET = "net-mcp-test-secret";
 
@@ -221,9 +222,20 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       new Request("https://do/net-api/mcp", { method: "DELETE", headers: { "mcp-session-id": session } })
     );
     const listen = async (session: string): Promise<Response> => {
+      // A browser Origin is admitted against the origin the EDGE asserts
+      // (x-woo-internal-public-origin), never against this DO's own
+      // `https://do` request URL — that comparison refused every browser and
+      // admitted every headless client. Origin admission itself is covered
+      // through the real Worker entry in net-mcp-origin.test.ts; this harness
+      // just has to state what the edge would.
       const response = await gateway.fetch(new Request("https://do/net-api/mcp", {
         method: "GET",
-        headers: { accept: "text/event-stream", "mcp-session-id": session, origin: "https://do" }
+        headers: {
+          accept: "text/event-stream",
+          "mcp-session-id": session,
+          origin: "https://woah1.example",
+          [PUBLIC_ORIGIN_HEADER]: "https://woah1.example"
+        }
       }));
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/event-stream");
@@ -237,7 +249,8 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       headers: {
         accept: "text/event-stream",
         "mcp-session-id": aliceSession,
-        origin: "https://hostile.example"
+        origin: "https://hostile.example",
+        [PUBLIC_ORIGIN_HEADER]: "https://woah1.example"
       }
     }));
     expect(foreignOrigin.status).toBe(403);

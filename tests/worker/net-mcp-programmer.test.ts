@@ -174,9 +174,12 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
       const listed = await mcp({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} }, { "mcp-session-id": session });
       return (listed.body?.result?.tools ?? []).map((t: any) => t.name);
     };
+    // Headless SSE open: no Origin, which mcp.md §M7.1 admits. Origin
+    // admission is exercised through the real Worker entry in
+    // tests/worker/net-mcp-origin.test.ts — a direct DO fetch cannot see it.
     const listen = async (session: string) => gateway.fetch(new Request("https://do/net-api/mcp", {
       method: "GET",
-      headers: { accept: "text/event-stream", "mcp-session-id": session, origin: "https://do" }
+      headers: { accept: "text/event-stream", "mcp-session-id": session }
     }));
 
     const progSession = await open(progToken);
