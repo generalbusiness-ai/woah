@@ -151,7 +151,7 @@ export type CommitSubmit = {
    * REPLAY_OUTPUT_BYTE_CAP (see plan.ts replaySubmitOutput): a read is safe
    * to re-issue under a fresh key, and every read envelope must keep its
    * exact former size against the CO7 ceiling. */
-  replay_result?: unknown;
+  replay_result?: EffectTranscript["result"];
   /** Set when a result EXISTS but was deliberately not carried (too large,
    * or a non-mutating turn). Distinguishes "the verb returned nothing" from
    * "the verb returned something this replay cannot show you" — without it a
@@ -286,7 +286,7 @@ export type ReplayOutput = {
    * CAN pick the same string; that must never become a read channel. */
   actor?: string;
   /** The verb's return value (submit.replay_result), when carried. */
-  result?: unknown;
+  result?: EffectTranscript["result"];
   /** The recorded transcript error — a verb that THREW still commits, so a
    * replay without this would report the failure as a success. */
   error?: EffectTranscript["error"];

@@ -439,7 +439,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
  */
 function replaySubmitOutput(
   transcript: EffectTranscript
-): { replay_result?: unknown; replay_result_omitted?: true } {
+): { replay_result?: EffectTranscript["result"]; replay_result_omitted?: true } {
   if (transcript.result === undefined) return {};
   const mutating =
     transcript.writes.length > 0 || transcript.creates.length > 0 || transcript.moves.length > 0;
