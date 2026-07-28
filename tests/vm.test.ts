@@ -687,12 +687,24 @@ describe("map reads are own-key only (values.md §V6)", () => {
     expect(missIn.op === "result" && missIn.result).toEqual([false, false]);
   });
 
+  it("carries a __proto__ key through the VM as ordinary map data", async () => {
+    // The end-to-end half of the own-key rule, and it takes BOTH halves of the
+    // §V6 work to pass: the read ops must ask own-key (this file's fix), and
+    // clonePlainData — which every value crosses on its way onto the VM stack —
+    // must write own-property rather than through the inherited __proto__
+    // setter. Until the latter landed, a `__proto__` key could not reach the VM
+    // as data at all and this could only be asserted at unit level below.
+    const { world, actor } = programmerWorld("guest:vm-proto-data");
+    const listed = await evalBody(world, actor, "proto_keys", `return keys({"__proto__": 5, "constructor": 7});`);
+    expect(listed.op === "result" && listed.result).toEqual(["__proto__", "constructor"]);
+    const read = await evalBody(world, actor, "proto_get", `let m = {"__proto__": 5}; return [m["__proto__"], "__proto__" in m, has(m, "__proto__")];`);
+    expect(read.op === "result" && read.result).toEqual([5, true, true]);
+    // …and the same key is still absent from a map that never held it.
+    const bare = await evalBody(world, actor, "proto_absent", `return ["__proto__" in {}, has({}, "__proto__")];`);
+    expect(bare.op === "result" && bare.result).toEqual([false, false]);
+  });
+
   it("hasOwnMapKey is the one distinction, including for a key named __proto__", async () => {
-    // Unit level, because a `__proto__` key cannot reach the VM as data today:
-    // every value pushed on the VM stack goes through clonePlainData, whose
-    // `copy[key] = ...` invokes the __proto__ setter and drops it. That is the
-    // sibling finding against clonePlainData; the ops below are correct for
-    // the map they are handed either way.
     const own = Object.fromEntries([["__proto__", 5], ["constructor", 7]]);
     expect(hasOwnMapKey(own, "__proto__")).toBe(true);
     expect(hasOwnMapKey(own, "constructor")).toBe(true);
