@@ -204,7 +204,7 @@ The supported scopes change presentation, never authority:
 | `active` | Actor, active space, active-space contents, and inventory. This is the default. |
 | `here` | Active space and its direct contents. |
 | `object` | One named object, only if it is already in structural context. |
-| `space` | One contextual space (or the active space) and its direct contents. |
+| `space` | One contextual space (or the active space) and its direct contents that are themselves in structural context. |
 
 There is deliberately no `all` scope. `active` already returns the complete
 structural context; a separate `all` had no distinct selection (it resolved to
@@ -242,22 +242,6 @@ to 500 characters on a word boundary with a trailing ellipsis. Taking the first
 *line* instead truncates wrapped doc-comments mid-sentence, which is what an
 agent then reads as the verb's whole contract.
 
-Names are deterministic within a listing. The base form is
-`<sanitized-object>__<sanitized-verb>`; a numeric suffix resolves collisions.
-Tools are sorted by canonical object then verb before collision assignment,
-except that **the session actor's own object sorts ahead of the alphabetical
-remainder**. The actor's own verbs are how it acts at all, so they must never be
-displaced past the page cap by objects that merely happen to share its space:
-the actor's tools occupy the first dynamic slots of the first page, after the
-stable controls.
-
-This is a guarantee of **precedence, not completeness**. Nothing bounds how many
-verbs a class chain and its features can contribute, so a suit larger than one
-page still spans pages; what the ordering guarantees is that the overflow is the
-actor's own tail rather than an arbitrary subset displaced by unrelated objects.
-A client that pages only once therefore sees the actor's tools first and, while
-the suit fits, all of them. This ordering is the only privileged position in the
-listing; it changes rank, not membership or authority.
 `inputSchema` is derived from `arg_spec.args`/`params` and optional type
 hints. When explicit hints are absent, the gateway preserves the stable JSON
 shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
@@ -266,6 +250,62 @@ string, resolved object slots are object-id strings, and `cmd` is an object.
 Named invocation maps JSON object properties to positional verb arguments in
 the declared order. Missing properties become `null`. `woo_call` accepts the
 positional list directly.
+
+### M2.3 Tool naming
+
+The base form is `<sanitized-object>__<sanitized-verb>`, where sanitizing
+strips one leading `$` and replaces every character outside `[A-Za-z0-9_]`
+with `_`; a numeric suffix (`_2`, `_3`, …) resolves collisions. Tools are
+sorted by canonical object then verb before collision assignment, except that
+**the session actor's own object sorts ahead of the alphabetical remainder**.
+The actor's own verbs are how it acts at all, so they must never be displaced
+past the page cap by objects that merely happen to share its space: the
+actor's tools occupy the first dynamic slots of the first page, after the
+stable controls.
+
+That ordering is a guarantee of **precedence, not completeness**. Nothing
+bounds how many verbs a class chain and its features can contribute, so a suit
+larger than one page still spans pages; what the ordering guarantees is that
+the overflow is the actor's own tail rather than an arbitrary subset displaced
+by unrelated objects. A client that pages only once therefore sees the actor's
+tools first and, while the suit fits, all of them. This is the only privileged
+position in the listing; it changes rank, not membership or authority.
+
+**Names are assigned canonically, over the session's complete reachable
+context, and neither filtering nor paging ever changes one.** Whatever a
+client asks for — standard `tools/list`, any `woo_list_reachable_tools`
+`scope`, an `object` or `query` filter, any page of any of them — a given
+`(object, verb)` pair in that session's context is advertised under one and
+only one name, and invoking that name reaches that object. This is the
+property an agent relies on when it calls what it was told to call, so it is a
+protocol guarantee rather than an implementation detail.
+
+The reason it needs stating is that sanitizing is **lossy**: `$a-b`, `a+b`,
+`a b`, and `$a_b` all render `a_b`, so distinct objects genuinely do compete
+for one base name and the numeric suffix is the only thing separating them. A
+suffix is meaningful only relative to the set it was computed over, so a name
+computed over a *subset* is not the same name — a filtered view that
+disambiguated among only the objects it kept would hand out the unsuffixed
+name for one of them while invocation, resolving over the whole context, bound
+that name to another. Discovery therefore computes one canonical descriptor
+set, names included, and every scope, filter, and page is a projection of it.
+
+A corollary: presentation scopes select from that canonical set by object and
+can never widen it. `space` names one *contextual* space and its direct
+contents; contents that are not themselves in structural context (M3) are not
+advertised, because a descriptor neither dynamic-name invocation nor
+`woo_call` would accept is not an advertisement.
+
+Prose that names a tool — refusal remediations, `instructions` — must read the
+name from the canonical assignment for the same reason. Re-deriving one by
+sanitizing an id ignores the suffix and can name a different object's tool.
+The single exception is the session actor's own tools: the actor sorts first,
+so its descriptors are never the ones that carry a suffix.
+
+Names are stable for as long as the context is. Context changes (moving,
+taking, an object arriving) can re-rank a collision, which is exactly what
+`notifications/tools/list_changed` (M6) exists to announce; a client that
+re-lists on the hint never observes a shifted name.
 
 ## M3. Structural context and navigation
 

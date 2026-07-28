@@ -5277,6 +5277,13 @@ export class NetGatewayDO {
           // This string is an agent's ENTIRE onboarding: many MCP clients
           // never call anything they were not pointed at. Two sentences of
           // orientation cost nothing and remove the "what now?" turn.
+          //
+          // `mcpSanitizeId(actor)__help` is the canonical name here without a
+          // lookup: mcpToolsForObjects sorts the session actor ahead of every
+          // other contextual object, so the actor's descriptors are named
+          // first and never carry a collision suffix (M2.3). Any OTHER
+          // object's tool must be read from the canonical listing instead —
+          // see mcpAdvertisedName.
           instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives. Start with ${mcpSanitizeId(actor)}__help for orientation — with no topic it returns the index. Use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
         }
       },
@@ -5346,7 +5353,10 @@ export class NetGatewayDO {
     if (name === "woo_list_reachable_tools") {
       try {
         const page = this.mcpToolPage(actor, session, args);
-        this.mcpMarkToolListSeen(session, actor);
+        // Re-baseline from the canonical set the page was projected from —
+        // the same descriptors tools/list would render, so a discovery call
+        // never records a digest that disagrees with the standard listing.
+        this.mcpMarkToolListSeen(session, actor, this.mcpToolListDigest(actor, session, page.canonical, page.context));
         const includeSchema = args.include_schema === true;
         return this.mcpResult(id, {
           scope: page.scope,
@@ -5623,9 +5633,13 @@ export class NetGatewayDO {
         target,
         // The target is reachable (it was resolved from structural context)
         // but writes at its own shared scope, so presence has to move there.
+        // The tool name is read from the canonical listing rather than
+        // re-derived by sanitizing the id: with collision suffixes in play a
+        // re-derived guess can name a DIFFERENT object's tool (M2.3).
         remediation:
           `${target} is a separate shared scope from ${active ?? "your current position"}; ` +
-          `one turn cannot write both. Enter ${target} first — call ${mcpSanitizeId(target)}__enter, ` +
+          `one turn cannot write both. Enter ${target} first — call ` +
+          `${this.mcpAdvertisedName(actor, session, target, "enter") ?? `${target}:enter`}, ` +
           `or the movement verb that leads there — then retry, and re-list tools afterwards.`
       }
     };
@@ -6070,8 +6084,32 @@ export class NetGatewayDO {
     }
   }
 
-  /** Resolve a paged discovery request against structural MCP context. The
-   * scope vocabulary changes presentation only; it never grants reachability. */
+  /**
+   * Resolve a paged discovery request against structural MCP context. The
+   * scope vocabulary changes presentation only; it never grants reachability.
+   *
+   * NAME CANONICALISATION (mcp.md M2.3). The descriptor set — **final tool
+   * names included** — is computed ONCE over the session's complete
+   * structural context, by the same producer `tools/list` and dynamic-name
+   * invocation use. Scope, `query`, and paging are pure projections of that
+   * one set.
+   *
+   * This ordering is load-bearing, not tidiness. Tool names are sanitized
+   * (`mcpSanitizeId` collapses every character outside `[A-Za-z0-9_]` to
+   * `_`), so distinct ids can share a base name — `a-b` and `a_b` both
+   * render `a_b`. Collisions are broken by a `_2`, `_3`… suffix assigned in
+   * listing order. Generating names over a FILTERED subset therefore handed
+   * out the *unsuffixed* name for whichever colliding object the filter
+   * happened to keep, while invocation — which always regenerates over the
+   * full context — bound that same name to the other object. An agent that
+   * called exactly what discovery advertised reached a different object.
+   *
+   * The scope selection is now applied to canonical descriptors, which also
+   * closes a second disagreement in the same place: `scope:"space"` used to
+   * synthesize command-shaped drafts for a target and its contents even when
+   * those objects were not in structural context, advertising descriptors
+   * that neither dynamic-name invocation nor `woo_call` would accept.
+   */
   private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
     const scope = mcpToolScope(args.scope);
     const activeScope = this.mcpActiveScope(actor, session);
@@ -6080,45 +6118,18 @@ export class NetGatewayDO {
     const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
     const cursor = mcpCursor(args.cursor);
     const context = this.mcpContextObjects(actor, session);
-    let selected = context;
-    let commandObjects = this.mcpActiveCommandContext(actor, session);
-
-    if (scope === "here") {
-      selected = new Set();
-      commandObjects = new Set();
-      if (activeScope) {
-        selected.add(activeScope);
-        commandObjects.add(activeScope);
-        for (const id of this.mcpContentsContext(activeScope, actor)) {
-          selected.add(id);
-          commandObjects.add(id);
-        }
-      }
-    } else if (scope === "object") {
-      selected = new Set();
-      if (object && context.has(object)) selected.add(object);
-      commandObjects = new Set(object && commandObjects.has(object) ? [object] : []);
-    } else if (scope === "space") {
-      selected = new Set();
-      commandObjects = new Set();
-      const target = object ?? activeScope;
-      if (target && context.has(target)) {
-        selected.add(target);
-        commandObjects.add(target);
-        for (const id of this.mcpContentsContext(target, actor)) {
-          selected.add(id);
-          commandObjects.add(id);
-        }
-      }
-    }
+    const canonical = this.mcpToolsForObjects(actor, context, this.mcpActiveCommandContext(actor, session));
+    const selected = this.mcpScopeSelection(scope, actor, activeScope, object, context);
 
     const normalized = query?.toLowerCase() ?? "";
-    const all = this.mcpToolsForObjects(actor, selected, commandObjects).filter((tool) =>
-      !normalized || tool.name.toLowerCase().includes(normalized) ||
-      tool.object.toLowerCase().includes(normalized) ||
-      tool.verb.toLowerCase().includes(normalized) ||
-      tool.description.toLowerCase().includes(normalized) ||
-      tool.aliases.some((alias) => alias.toLowerCase().includes(normalized))
+    const all = canonical.filter((tool) =>
+      selected.has(tool.object) && (
+        !normalized || tool.name.toLowerCase().includes(normalized) ||
+        tool.object.toLowerCase().includes(normalized) ||
+        tool.verb.toLowerCase().includes(normalized) ||
+        tool.description.toLowerCase().includes(normalized) ||
+        tool.aliases.some((alias) => alias.toLowerCase().includes(normalized))
+      )
     );
     const tools = all.slice(cursor, cursor + limit);
     const next = cursor + tools.length;
@@ -6131,8 +6142,38 @@ export class NetGatewayDO {
       cursor: args.cursor === undefined ? null : String(cursor),
       nextCursor: next < all.length ? String(next) : null,
       total: all.length,
-      tools
+      tools,
+      // Handed back so the caller can re-baseline the tools/list digest from
+      // the set it just computed instead of computing the whole listing twice.
+      canonical,
+      context
     };
+  }
+
+  /** Which contextual objects a presentation scope selects. Selection is by
+   * object id only — it filters the canonical descriptor set and can never
+   * add an object the session does not structurally reach. */
+  private mcpScopeSelection(
+    scope: NetMcpToolScope,
+    actor: string,
+    activeScope: string | null,
+    object: string | null,
+    context: Set<string>
+  ): Set<string> {
+    if (scope === "active") return context;
+    const out = new Set<string>();
+    if (scope === "object") {
+      if (object && context.has(object)) out.add(object);
+      return out;
+    }
+    // `here` is the active space; `space` names one contextual space (the
+    // active one by default). Both select that space plus its direct
+    // contents, intersected with structural context by the caller's filter.
+    const target = scope === "here" ? activeScope : (object ?? activeScope);
+    if (!target || !context.has(target)) return out;
+    out.add(target);
+    for (const id of this.mcpContentsContext(target, actor)) out.add(id);
+    return out;
   }
 
   /**
@@ -6261,6 +6302,16 @@ export class NetGatewayDO {
       this.mcpContextObjects(actor, session),
       this.mcpActiveCommandContext(actor, session)
     );
+  }
+
+  /** The advertised name for one (object, verb) pair in THIS session's
+   * canonical listing, or null when the pair is not advertised. Prose that
+   * names a tool must read the canonical assignment; re-deriving a name by
+   * sanitizing the id ignores collision suffixes and can therefore name a
+   * different object's tool (M2.3). */
+  private mcpAdvertisedName(actor: string, session: string, object: string, verb: string): string | null {
+    return this.mcpContextTools(actor, session)
+      .find((tool) => tool.object === object && tool.verb === verb)?.name ?? null;
   }
 
   /** The active command surface and its visible contents receive
@@ -6450,6 +6501,16 @@ export class NetGatewayDO {
     // presentation work for them too would have made every tools/list pay for
     // pages nobody is going to see.
     return drafts.map((draft) => {
+      // Sanitization is LOSSY — every character outside `[A-Za-z0-9_]`
+      // becomes `_`, so `a-b` and `a_b` share the base `a_b` — and the
+      // suffix that separates them is assigned in listing order. The
+      // assignment is therefore only meaningful relative to the set it was
+      // computed over, which is why every caller MUST pass the session's
+      // complete structural context (mcp.md M2.3): `tools/list`, the
+      // dynamic-name invocation resolver, the list digest, and
+      // `woo_list_reachable_tools` (which then projects a page out of the
+      // canonical set) all do. Naming a filtered subset would advertise a
+      // name that invocation binds to a different object.
       const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
       let name = base;
       let suffix = 2;
@@ -9949,6 +10010,12 @@ type NetMcpToolPage = {
   nextCursor: string | null;
   total: number;
   tools: NetMcpDynamicTool[];
+  /** The complete canonical descriptor set the page was projected from, and
+   * the structural context it was computed over. Carried so the caller can
+   * re-baseline the tools/list digest without recomputing the whole listing.
+   * NOT part of the client reply. */
+  canonical: NetMcpDynamicTool[];
+  context: Set<string>;
 };
 
 function mcpRecord(value: unknown): Record<string, unknown> {
