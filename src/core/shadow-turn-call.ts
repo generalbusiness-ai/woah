@@ -1,5 +1,10 @@
 import { createWorldFromSerialized } from "./bootstrap";
-import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
+import {
+  effectTranscriptFromRecordedTurn,
+  withFailureEffectsGeneration,
+  type EffectTranscript
+} from "./effect-transcript";
+import { FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION } from "./failed-transcript-effects";
 import type { OrderedNeighborsQuery } from "./ordered-edge";
 import type { PlanningWorld, PlanningWorldProvenance } from "./planning-world";
 import type { SerializedWorld } from "./repository";
@@ -260,7 +265,13 @@ export async function runShadowTurnCallOnWorldTranscript(
       turns: recorder.turns.length
     });
   }
-  const transcript = effectTranscriptFromRecordedTurn(recorded);
+  // This is a real execution producer, backed by the behavior rollback
+  // journal. Advertise the clean failure shape only here—not in the generic
+  // RecordedTurn converter, which also consumes legacy/imported recordings.
+  const transcript = withFailureEffectsGeneration(
+    effectTranscriptFromRecordedTurn(recorded),
+    FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+  );
   return {
     frame,
     recorded,

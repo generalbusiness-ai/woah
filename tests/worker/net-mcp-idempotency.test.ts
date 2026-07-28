@@ -530,14 +530,10 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
     }
   });
 
-  // FINDING 3. A verb that emits and then throws still COMMITS its
-  // transcript, so those lines happened. The gateway suppresses the
-  // submitter's own committed echo from woo_wait precisely because the reply
-  // is supposed to carry them (M4.1) — so returning the error without them
-  // lost them entirely, and the actor could never see what its own failed
-  // action did. That is the exact hole the own-observations seat was built
-  // to close, still open on the failure path.
-  it("a FAILED turn still carries the submitter's own observations", async () => {
+  // Failed behavior is atomic: its domain observation and write are rolled
+  // back, while the canonical error outcome still occupies the one committed
+  // turn. Exact retries replay that outcome without executing the verb again.
+  it("a failed turn rolls back domain effects and replays one canonical error", async () => {
     const f = await fixture();
     try {
       const failed = await f.complain(f.aliceSession, "fail-1");
@@ -545,26 +541,24 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(failed.result?.isError).toBe(true);
       expect(failed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
       const lines = (failed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
-      expect(
-        lines.some((obs) => obs?.type === "complained"),
-        `failed turn dropped its own observations: ${JSON.stringify(failed.result).slice(0, 500)}`
-      ).toBe(true);
-      // And they are not ALSO waiting in the queue — one seat, not two.
+      expect(lines.some((obs) => obs?.type === "complained")).toBe(false);
+      expect(lines.filter((obs) => obs?.type === "$error")).toHaveLength(1);
+      // The rolled-back domain line is not waiting in the queue either.
       const queued = await f.drain(f.aliceSession);
       expect(queued.some((obs) => obs?.type === "complained")).toBe(false);
 
-      // A REPLAYED failure replays the recorded error AND the recorded
-      // lines, and says it is a replay — otherwise a client seeing an error
-      // cannot tell whether its retry ran again.
+      // A replay returns the same canonical failure and says it is a replay —
+      // otherwise a client seeing an error cannot tell whether its retry ran
+      // again.
       const replayed = await f.complain(f.aliceSession, "fail-1");
       await f.settleAll();
       expect(replayed.result?.isError).toBe(true);
       expect(replayed.result?.structuredContent?.replayed).toBe(true);
       expect(replayed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
       const replayedLines = (replayed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
-      expect(replayedLines.some((obs) => obs?.type === "complained")).toBe(true);
-      // The partial write committed once, and the replay did not repeat it.
-      expect(await f.hits()).toBe(1);
+      expect(replayedLines.some((obs) => obs?.type === "complained")).toBe(false);
+      expect(replayedLines.filter((obs) => obs?.type === "$error")).toHaveLength(1);
+      expect(await f.hits()).toBe(0);
     } finally {
       f.close();
     }

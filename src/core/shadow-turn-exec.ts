@@ -5,7 +5,13 @@ import type {
   SpaceSnapshotRecord
 } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
-import { effectTranscriptFromRecordedTurn, type EffectTranscript, type TranscriptCell } from "./effect-transcript";
+import {
+  effectTranscriptFromRecordedTurn,
+  withFailureEffectsGeneration,
+  type EffectTranscript,
+  type TranscriptCell
+} from "./effect-transcript";
+import { FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION } from "./failed-transcript-effects";
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
@@ -688,7 +694,13 @@ export async function executeShadowRecordedTurnOrNeedState(
 
   const serializedBefore = structuredClone(node.serialized) as SerializedWorld;
   const replay = await replayRecordedTurn(serializedBefore, turn);
-  const transcript = effectTranscriptFromRecordedTurn(replay.recorded);
+  // replayRecordedTurn executes against the same atomic behavior journal as a
+  // fresh shadow call, so its transcript may advertise generation 1. Keep the
+  // generic RecordedTurn converter unstamped for legacy/imported recordings.
+  const transcript = withFailureEffectsGeneration(
+    effectTranscriptFromRecordedTurn(replay.recorded),
+    FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+  );
   const receipt = shadowCommitReceipt(serializedBefore, replay.serializedAfter, transcript);
   if (!receipt.accepted) {
     return {

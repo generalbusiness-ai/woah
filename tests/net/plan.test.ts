@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
+import { FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION } from "../../src/core/failed-transcript-effects";
 import { cellsFromSerialized, storeCells } from "../../src/net/bridge";
 import { CellStore, cellVersion } from "../../src/net/cells";
 import { planTurn, type PlanTurnResult } from "../../src/net/plan";
@@ -109,6 +110,12 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
     expect(plan.selection).toEqual({ scope: SCOPE, riders: [] });
     expect(plan.submit.scope).toBe(SCOPE);
     expect(plan.transcript.scope).toBe(SCOPE);
+    expect(plan.transcript.failureEffectsGeneration).toBe(
+      FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+    );
+    expect(plan.submit.transcript.failureEffectsGeneration).toBe(
+      FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+    );
     // Every validated read carries a view version, never an engine counter.
     for (const read of plan.transcript.reads) {
       if (netCellKeyFor(read.cell) === null) continue;

@@ -11,11 +11,18 @@ import {
   classifyFailedTranscriptEffects,
   type FailedTranscriptEffectsReport
 } from "../src/core/failed-transcript-effects";
+import { createWorld } from "../src/core/bootstrap";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
+import { runShadowTurnCallOnWorldTranscript } from "../src/core/shadow-turn-call";
 import {
   createShadowCommitScope,
   submitShadowCommit
 } from "../src/core/shadow-commit-scope";
+import {
+  createShadowExecutionNode,
+  executeShadowRecordedTurnOrNeedState
+} from "../src/core/shadow-turn-exec";
+import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { MetricEvent } from "../src/core/types";
 import { CellStore, cellVersion } from "../src/net/cells";
 import { ScopeSequencer, type CommitSubmit } from "../src/net/scope";
@@ -202,6 +209,47 @@ describe("failed transcript effect classifier", () => {
     expect(marked.failureEffectsGeneration).toBe(1);
     expect(marked.hash).not.toBe(recorded.hash);
     expect(marked.hash).toBe(sameBodyDifferentPriorHash.hash);
+  });
+});
+
+describe("clean failed-transcript producers", () => {
+  it("stamps fresh execution and deterministic replay without stamping the generic converter", async () => {
+    const world = createWorld();
+    const serializedBefore = world.exportWorld();
+    const fresh = await runShadowTurnCallOnWorldTranscript(world, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "clean-producer",
+      route: "direct",
+      scope: "$wiz",
+      actor: "$wiz",
+      target: "$wiz",
+      verb: "eval",
+      args: ["1 + 2", {}]
+    });
+    expect(fresh.transcript.failureEffectsGeneration).toBe(
+      FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+    );
+    expect(
+      effectTranscriptFromRecordedTurn(fresh.recorded).failureEffectsGeneration
+    ).toBeUndefined();
+
+    const key = shadowTurnKeyFromTranscript(fresh.transcript);
+    const replay = await executeShadowRecordedTurnOrNeedState(
+      createShadowExecutionNode({
+        node: "clean-replay",
+        scope: key.scope,
+        atom_hashes: key.atom_hashes,
+        serialized: serializedBefore
+      }),
+      fresh.recorded,
+      key
+    );
+    if (!replay.ok) {
+      throw new Error(`unexpected replay failure: ${JSON.stringify(replay)}`);
+    }
+    expect(replay.transcript.failureEffectsGeneration).toBe(
+      FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+    );
   });
 });
 
