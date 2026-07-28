@@ -1143,11 +1143,15 @@ export class NetGatewayDO {
     if (!pinColumns.has("expires_at")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
       state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
-      state.storage.sql.exec(
-        "UPDATE net_gateway_pin SET expires_at = ?, guaranteed = 1 WHERE expires_at IS NULL",
-        Date.now() + GATEWAY_PIN_LEASE_MS
-      );
     }
+    // Backfill unconditionally, not only when the columns are first added: any
+    // row that reaches this table without a lease is undateable, and an
+    // undateable row must not become an ageless one. Indexed on expires_at and
+    // a no-op once clean, so the steady-state cost is a lookup.
+    state.storage.sql.exec(
+      "UPDATE net_gateway_pin SET expires_at = ?, guaranteed = 1 WHERE expires_at IS NULL",
+      Date.now() + GATEWAY_PIN_LEASE_MS
+    );
     // Retention sweeps read by expiry and by class; both stay off a full-table
     // scan. Every SQLite index carries the rowid as its payload already, so
     // "oldest first within a class" is served by the class index — and naming
@@ -8428,7 +8432,12 @@ export class NetGatewayDO {
   private pinnedScope(idempotencyKey: string): string | null {
     const rows = sqlRows<{ scope: string }>(
       this.state.storage.sql.exec(
-        "SELECT scope FROM net_gateway_pin WHERE idempotency_key = ? AND expires_at > ?",
+        // A NULL lease is a legacy row, and legacy reads as LIVE: honouring a
+        // route we can no longer date is the harmless direction (a pin
+        // outliving its reply costs nothing), while treating it as expired
+        // would silently drop exactly the routes this change exists to keep.
+        // The constructor backfill retires them on the next boot.
+        "SELECT scope FROM net_gateway_pin WHERE idempotency_key = ? AND (expires_at IS NULL OR expires_at > ?)",
         idempotencyKey,
         Date.now()
       )

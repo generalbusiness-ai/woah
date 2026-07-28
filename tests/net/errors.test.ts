@@ -25,7 +25,11 @@ const ALL_CODES: NetErrorCode[] = [
   "E_SEED_LAG",
   "E_EPOCH_MISMATCH",
   "E_SEED_COMMITTED",
-  "E_INVARG"
+  "E_INVARG",
+  // H2c: the shard holds its full complement of UNEXPIRED retry guarantees.
+  // Terminal for this request and nothing was submitted — the guarantee was
+  // refused, not the operation.
+  "E_RETRY_CAPACITY"
 ];
 
 describe("net divergence taxonomy (CO6)", () => {

@@ -1021,7 +1021,11 @@ export class ScopeSequencer {
       // recorded under the key exactly like an accept, so serving one to a
       // DIFFERENT request is the same wrong answer — and it is the cheaper
       // one to provoke, since any client can bank a rejection under a key.
-      const { replay_request: recordedRequest, ...replayableAll } = recorded;
+      // `replay_request` and `recorded_at` are stored-only: a hash of another
+      // client's request is not this caller's business, and the retention
+      // stamp is bookkeeping. Both are stripped from every replayed copy,
+      // whatever its verdict.
+      const { replay_request: recordedRequest, recorded_at: _leased, ...replayableAll } = recorded;
       if (
         recordedRequest !== undefined &&
         submit.request_fingerprint !== undefined &&
@@ -1037,8 +1041,8 @@ export class ScopeSequencer {
             "retry the original call unchanged, or use a new key for this one"
         });
       }
-      // A recorded rejection replays as itself. It carries no output and no
-      // actor binding, so the only thing to strip is the stored fingerprint.
+      // A recorded rejection replays as itself: no output, no actor binding,
+      // nothing left to strip beyond what was taken above.
       if (replayableAll.status !== "accepted") return replayableAll;
       // `replay_receipt` is retention bookkeeping (which quota this row sits
       // in), not something the caller is owed — strip it with the fingerprint.
