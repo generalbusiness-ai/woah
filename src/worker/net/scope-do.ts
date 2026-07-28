@@ -1707,7 +1707,19 @@ export class NetScopeDO {
           const key = cellKey(cell.kind, cell.object, cell.name);
           const page = cell.value as Record<string, unknown> | null;
           const installedClass = seq.store.has(cellKey("object_lineage", cell.object));
-          const validVerb = cell.kind === "verb_bytecode" && page?.name === cell.name && seq.store.has(key);
+          // A verb page may be ADDED, not only replaced. The `seq.store.has(key)`
+          // clause that used to sit here made a genuinely NEW bootstrap verb
+          // unreachable by ANY mechanism on an aged world — a runtime never
+          // rewrites durable cells, and this is the only door. The property
+          // branch below never had that clause and the CLI header already
+          // documents installing a definition an aged world predates, so the
+          // asymmetry was unintended. The server's independent guards for an
+          // add are unchanged and stated in full below the loop: catalog scope,
+          // `$`-namespace object, a class whose lineage this scope already
+          // holds, a well-formed page whose name matches its key, uniqueness,
+          // and a batch of at most 32. The ordinal is NOT taken from the
+          // caller — see normalizeVerbSlot.
+          const validVerb = cell.kind === "verb_bytecode" && page?.name === cell.name;
           const def = page && typeof page === "object" && !Array.isArray(page) ? page.def : null;
           const validProperty = cell.kind === "property_cell" && def !== null && typeof def === "object" &&
             !Array.isArray(def) && (def as Record<string, unknown>).name === cell.name;
@@ -1734,8 +1746,41 @@ export class NetScopeDO {
           }
           keys.add(key);
         }
+        // Verb ORDINALS are owned by this authority, never by the caller —
+        // the same posture as /net/repair-verb-slots, and for a sharper reason
+        // here: the bundled page carries the slot a FRESH install would give
+        // it, which has no reason to match an aged world's numbering.
+        //
+        //  - REPLACE keeps the ordinal the stored page holds. The page is the
+        //    same verb; moving it is precisely what the ordinary commit path
+        //    refuses as `verb_slot_moved`, and a move that lands on a sibling's
+        //    ordinal recreates the duplicate-slot corruption the verb-slot
+        //    repair exists to undo.
+        //  - ADD allocates above every ordinal the object already holds — the
+        //    same floor the ordinary commit path demands of a new page — so an
+        //    added verb can never collide with a live one.
+        const slotFloors = new Map<string, number>();
+        const normalized = cells.map((cell) => {
+          if (cell.kind !== "verb_bytecode") return cell;
+          const page = cell.value as Record<string, unknown>;
+          const existing = seq.store.get(cellKey("verb_bytecode", cell.object, cell.name));
+          if (existing !== undefined) {
+            const held = verbCellSlot(existing.value);
+            return held === null ? cell : { ...cell, value: { ...page, slot: held } };
+          }
+          let floor = slotFloors.get(cell.object) ?? 1;
+          if (!slotFloors.has(cell.object)) {
+            for (const other of seq.store.cellsForObject(cell.object)) {
+              if (other.kind !== "verb_bytecode" || typeof other.name !== "string") continue;
+              floor = Math.max(floor, (verbCellSlot(other.value) ?? 0) + 1);
+            }
+          }
+          // Two adds for one object in one batch must not both claim the floor.
+          slotFloors.set(cell.object, floor + 1);
+          return { ...cell, value: { ...page, slot: floor } };
+        });
         const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
-          const result = seq.operatorRepairDefinitions(cells, removals);
+          const result = seq.operatorRepairDefinitions(normalized, removals);
           if (result.status === "applied") {
             const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
               this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")

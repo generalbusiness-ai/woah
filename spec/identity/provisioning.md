@@ -995,3 +995,102 @@ argument).
 `$system:set_actor_flag` remains an **untracked** native and is therefore still
 refused over Net (`incomplete_transcript`, fail-closed). Granting wizard
 authority on a Net world goes through AP11, not through `set_actor_flag`.
+
+### AP11.9 The operator anchor (implemented)
+
+**A fresh net install contains no `$human` and no `$account` instance at all.**
+Both are created by signup, and the net stack exposes no signup route
+(`verifySignup` is an in-process world method). Verified against the install
+plan: zero instances of either class in any partition. So on a freshly
+cut-over world AP11 has nothing to anchor to, and the whole runbook is
+unexecutable until an anchor exists.
+
+`POST /net-operator/identity/anchor` mints one. Body:
+`{anchor_id, label?, agent_quota?}`.
+
+**It is a genesis submit, not a turn.** A turn needs a target object whose
+scope already has a head; this operation's purpose is to bring a
+never-before-seen authority cluster into existence. The mechanism is the one
+elastic guest provisioning already uses: one transcript against
+`{seq: 0, hash: cellVersion(["genesis", scope])}`, handed to the new cluster's
+own sequencer. That is why it is a separate op rather than a flag on
+`provision_wizard_agent` — that verb is defined on `$human` and TARGETS the
+human, so it structurally cannot run before the human exists.
+
+**Shape.** The human is anchorless and actor-classed, so it is its own cluster
+root; the account is anchored TO the human, exactly as `bindHumanToAccount`
+does at signup. Both therefore classify into `cluster:<human>`, which is what
+keeps every later promote/demote/revoke turn single-scope and atomic (AP6).
+
+**Identity posture — why this does not weaken the model.** The minted account
+carries **no `password_hash`, no `password_salt`, and no `oauth_identities`**,
+so `/net-api/login` cannot produce a session for it: nothing can authenticate
+AS the anchor. No api key and no session are minted. Credentials only ever
+reach the AGENT that AP11 provisions, through the separate signed
+credential-ensure route (AP11.6). The result is exactly the credential-less
+manual-provisioning shape AP10 already sanctions — previously reachable only
+in-process. `programmer_grant_quota` starts at 0; AP11 grants exactly the
+headroom it consumes.
+
+**Idempotency.** The object ids are DERIVED from `anchor_id`
+(`human_op_<hex>` / `account_op_<hex>`), not allocated from a counter — a
+genesis cluster has no counter, and derivation makes a lost reply replayable as
+a byte-identical submit. A re-run against an existing anchor reports it
+(`created: false`) without attempting a second commit.
+
+### AP11.10 Probing a deployed world
+
+`callVerbPage` resolves through the TARGET'S lineage chain, so an absent human
+and an absent verb page both return null. Reporting both as `E_VERBNF` sent an
+operator hunting for a missing definition when the real answer was a missing
+identity — opposite remedies. The two are now distinguished:
+
+- human absent → `E_OBJNF`, carrying `remedy: POST /net-operator/identity/anchor`;
+- primitive absent → `E_VERBNF`, carrying the `repair:net-definitions` command.
+
+`POST /net-operator/wizard/provision` with `{probe: true}` reports the world's
+state **without mutating anything**: `human_present`, `human_class` (the
+target's parent chain, so an operator can see it really is a `$human`),
+`primitive_installed`, `recorded_agent`, and a `next` LIST naming every
+remaining step in order. The primitive's presence is read from the class page
+directly rather than from verb resolution, which runs through the target's
+lineage chain and so could not answer at all when the human is absent — one
+probe therefore reports both facts instead of costing a round trip per missing
+thing. The anchor op accepts `{probe: true}` for the same reason, so resolving
+a token to its ids never seeds one. This is the sanctioned way to answer "does a human exist on this
+world?" — `/net-api/cell` is presence-scoped and refuses identically for
+present and absent objects, so absence is not provable there.
+
+### AP11.11 Installing the primitive on an aged world
+
+A world installed before AP11 does not carry the `$human:provision_wizard_agent`
+page, and **a runtime never rewrites durable cells**, so the page reaches an
+aged world only through `repair-definitions`
+([cloudflare.md §R14](../reference/cloudflare.md)). That operation previously
+accepted a verb page only when one was already stored, which made a genuinely
+NEW bootstrap verb unreachable by any mechanism. Verb pages may now be ADDED,
+as property definitions always could.
+
+**Server-side invariants for an add** (the CLI's fresh-plan allow-list is a
+client-side check the server cannot see, so these stand alone): the catalog
+scope; a `$`-namespace object whose class lineage this scope already holds; a
+well-formed page whose `name` matches its cell key; uniqueness within the
+batch; at most 32 changes.
+
+**The authority owns the ordinal.** A bundled page carries the `slot` a FRESH
+install would assign, which has no reason to match an aged world's numbering,
+so the caller's slot is discarded: a REPLACE keeps the ordinal the stored page
+holds (moving a live verb is what the ordinary commit path refuses as
+`verb_slot_moved`, and a move onto a sibling's ordinal recreates the
+duplicate-slot corruption CO4.7 exists to undo), and an ADD allocates above
+every ordinal the object already holds — the same floor the ordinary commit
+path demands of a new page.
+
+**Marginal authority.** An internal-signed operator can now choose a NEW verb
+name on an installed bootstrap class, where before they could only overwrite an
+existing one. This is strictly weaker than the authority they already held:
+replacing `$root:look` with arbitrary bytecode (including its `perms`, `owner`,
+`direct_callable`, and `tool_exposed` metadata, which ride the page) affects
+every existing caller immediately, whereas an added name is invoked by nobody
+until something calls it. Adding cannot reach a class the world does not hold,
+cannot leave the `$` namespace, and cannot displace an existing page's ordinal.

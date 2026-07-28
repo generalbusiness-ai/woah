@@ -287,6 +287,101 @@ Orderings (1) and (4) pass under every variant — they are the unambiguous case
 and serve as regression anchors, not discriminators. Stated plainly so the
 matrix is not read as stronger than it is.
 
+## Deploy round — the two blockers the ladder promised
+
+Main deployed (`691cc882`, worker `e8b835c9`), and the runbook was
+**unexecutable**. Both blockers were deploy-only in the honest sense: no
+fake-DO test had ever modelled a *freshly cut-over* world, which is the one
+shape that has neither of the things AP11 needs.
+
+### Blocker A — a new bootstrap verb could not reach an aged world
+
+`repair-definitions` refused `$human:provision_wizard_agent` with
+`E_INVARG ... accepts unique bootstrap definition pages only`. Root cause in
+`scope-do.ts`: `validVerb` carried `&& seq.store.has(key)`, making verb pages
+**replace-only**. `validProperty` has no such clause and the CLI header already
+documents installing a property definition an aged world predates, so the
+asymmetry was unintended. Since a runtime never rewrites durable cells and this
+is the only door, a genuinely NEW bootstrap verb could reach a deployed world
+by *no mechanism at all*.
+
+Fixed by dropping the clause — and, because that clause was also the server's
+independent guard, by replacing it with a **stronger** one rather than nothing:
+
+**The authority now owns the verb ordinal.** A bundled page carries the `slot` a
+FRESH install would assign, which has no reason to match an aged world's
+numbering. Writing it verbatim could move a live verb onto a sibling's ordinal —
+the exact duplicate-slot corruption CO4.7's repair exists to undo, and which the
+ordinary commit path refuses as `verb_slot_moved`. So: REPLACE keeps the stored
+ordinal; ADD allocates above every ordinal the object already holds, the same
+floor the ordinary commit path demands of a new page. Two adds for one object in
+one batch each get their own. This was a latent defect in the pre-existing
+replace path too, not just in the new add path.
+
+**Marginal authority of the ADD.** An internal-signed operator can now choose a
+NEW verb name on an installed bootstrap class. That is strictly weaker than the
+authority they already held: replacing `$root:look` with arbitrary bytecode —
+including the `perms`/`owner`/`direct_callable`/`tool_exposed` metadata that
+ride the page — changes behaviour for every existing caller immediately, whereas
+an added name is invoked by nobody until something calls it. The add cannot
+reach a class the world does not hold, cannot leave the `$` namespace, cannot
+displace an existing ordinal, and is still capped at 32 changes in the catalog
+scope. Removals are untouched.
+
+### Blocker B — there was no human to anchor to, and no way to make one
+
+Confirmed offline against the real install plan rather than by probing prod:
+**a fresh install seeds zero `$human` and zero `$account` instances** in any
+partition. They come from signup, and the net stack exposes no signup route. So
+the deployed world had nothing for AP11 to anchor to.
+
+Two things were wrong, and they are separate defects:
+
+1. **The refusal was ambiguous.** `callVerbPage` resolves through the target's
+   lineage chain, so an absent human and an absent verb page both returned
+   null → both reported `E_VERBNF`. That sent the operator hunting for a
+   missing definition when the real answer was a missing identity — opposite
+   remedies. Now: human absent → `E_OBJNF` carrying the anchor remedy;
+   primitive absent → `E_VERBNF` carrying the exact `repair:net-definitions`
+   command. Plus `{probe: true}`, a **non-mutating** report of
+   `human_present` / `human_class` / `primitive_installed` / `recorded_agent`
+   and a `next` field naming the command to run. That is the answer to "is
+   there a human on this world?" — `/net-api/cell` cannot answer it, being
+   presence-scoped and refusing identically for present and absent objects.
+
+2. **The anchor had to be creatable.** Decision: a **separate signed operator
+   op**, `POST /net-operator/identity/anchor`, not a flag on the provisioning
+   verb. The coordinator listed "extend AP11 to mint the human when a flag says
+   so" as an option, and it is not implementable: `provision_wizard_agent` is
+   defined on the human class and TARGETS the human, so it cannot run before
+   the human exists. More fundamentally, creating a never-before-seen authority
+   cluster is not a turn at all — a turn needs a target whose scope has a head.
+   It is a GENESIS SUBMIT, and the proven precedent is elastic guest
+   provisioning: one transcript against `{seq: 0, hash: cellVersion(["genesis",
+   scope])}`, handed to the new cluster's own sequencer. `src/net/identity-anchor.ts`
+   is that construction, deliberately parameterised on the class names the same
+   way `guest.ts` takes its parent from installed template data.
+
+**Why this does not weaken the identity model.** The minted account carries no
+`password_hash`, no `password_salt`, and no `oauth_identities`, so
+`/net-api/login` cannot produce a session for it — *nothing can authenticate as
+the anchor*. No api key and no session are minted. Credentials only ever reach
+the AGENT, through the existing credential-ensure route, from a tuple generated
+on the operator machine. The result is exactly the credential-less
+manual-provisioning shape AP10 already sanctions, previously reachable only
+in-process. `programmer_grant_quota` starts at 0. Ids derive from the operator's
+token (`human_op_<hex>`), so there is no counter to coordinate in a genesis
+cluster and a lost reply replays byte-identically.
+
+### Evidence
+
+`tests/worker/net-operator-anchor.test.ts` builds the deployed shape — catalog
+partition with the AP11 page removed, no human anywhere, scope DOs created on
+demand so a genesis submit has somewhere to land — and drives the whole runbook
+through the real signed routes. Negative-tested: restoring the replace-only
+clause fails 3 cases; removing the slot normalization fails the replace case;
+removing the human-absence branch fails the probe case.
+
 ## Named residuals (not verified, not claimed)
 
 - **Other `recordWizardAction` call sites on cluster-local primitives** —
@@ -305,6 +400,13 @@ matrix is not read as stronger than it is.
   (deactivation) is the lever for retiring an operator wizard. A deactivated
   actor cannot authenticate, so the residual flag grants nothing. Both halves
   are now proved end to end over the client doorway.
+- **Nothing here has been run against the deployed world.** The fake-DO lane
+  models the aged/fresh-cutover shape faithfully in structure, but it is still
+  one process with fast RPC. The operator commands below are the first real
+  exercise.
+- **`repair-definitions` still overwrites a verb page's `version`** with the
+  bundle's, which could move an authoring optimistic lock backwards. Observed
+  while working on slots, out of scope for this round, not probed.
 - **The deactivate → revoke ordering is local-profile only over Net.**
   `$system:deactivate_actor` is an untracked native, so it cannot run over
   `/net-api/turn` at all; ordering (2) is therefore proved against an in-memory
