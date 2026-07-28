@@ -220,7 +220,7 @@ export type RejectReason =
   | "scope_mismatch"      // step 2/4
   | "stale_epoch"         // step 2
   | "stale_head"          // base behind current head
-  | "incomplete_transcript" // step 4 — never short-circuited
+  | "incomplete_transcript" // step 4 — terminal envelope refusal; outranks failed-effect admission
   | "idempotency_conflict" // step 3 — key reused for a different request; terminal
   | "read_version_mismatch" // step 7
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal

@@ -564,9 +564,13 @@ buried in VTN):
   invalid authority image. The submit carries no executor post-state.
 - **Doomed-round short-circuit** is permitted exactly as VTN8 bounds it:
   steps 1–9 are pre-state-only; a rejection they determine
-  (`stale_head`, `scope_mismatch`, `permission_denied`, and
+  (`stale_head`, `scope_mismatch`, `incomplete_transcript`,
+  `permission_denied`, and
   convergence-safe `read_version_mismatch`) may skip the apply.
-  `incomplete_transcript` and `nondeterministic` are never short-circuited.
+  `nondeterministic` is never short-circuited. Completeness is the step-4
+  envelope gate and outranks generation-specific failed-effect admission, so
+  both authorities report `incomplete_transcript` when both defects are
+  present.
 - **A current head is not required when the retained recovery tail proves a
   rebase.** Exact `(seq, hash)` match accepts as before. A behind base may
   continue to steps 7–10 only when the scope's bounded recovery tail proves

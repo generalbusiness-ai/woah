@@ -14,7 +14,7 @@ function addDirectNative(world: WooWorld, handler: NativeHandler): void {
   });
 }
 
-async function measuredNoopMsPerCall(unrelatedObjects: number): Promise<number> {
+async function measuredNoopP95Ms(unrelatedObjects: number): Promise<number> {
   const world = createWorld();
   for (let index = 0; index < unrelatedObjects; index += 1) {
     world.createObject({
@@ -35,34 +35,32 @@ async function measuredNoopMsPerCall(unrelatedObjects: number): Promise<number> 
   for (let index = 0; index < 30; index += 1) {
     await world.directCall(`savepoint-cost-warm-${index}`, "$wiz", "savepoint_cost_target", "noop", []);
   }
-  const batches: number[] = [];
-  for (let batch = 0; batch < 3; batch += 1) {
+  const durations: number[] = [];
+  for (let index = 0; index < 300; index += 1) {
     const started = performance.now();
-    for (let index = 0; index < 100; index += 1) {
-      const frame = await world.directCall(
-        `savepoint-cost-${unrelatedObjects}-${batch}-${index}`,
-        "$wiz",
-        "savepoint_cost_target",
-        "noop",
-        []
-      );
-      if (frame.op !== "result") throw new Error(`savepoint cost probe failed: ${JSON.stringify(frame)}`);
-    }
-    batches.push((performance.now() - started) / 100);
+    const frame = await world.directCall(
+      `savepoint-cost-${unrelatedObjects}-${index}`,
+      "$wiz",
+      "savepoint_cost_target",
+      "noop",
+      []
+    );
+    if (frame.op !== "result") throw new Error(`savepoint cost probe failed: ${JSON.stringify(frame)}`);
+    durations.push(performance.now() - started);
   }
-  batches.sort((left, right) => left - right);
-  return batches[1]!;
+  durations.sort((left, right) => left - right);
+  return durations[Math.ceil(durations.length * 0.95) - 1]!;
 }
 
 describe("behavior savepoint wall-clock scaling", () => {
   it("keeps a no-op behavior independent of untouched authority size", async () => {
-    const smallMs = await measuredNoopMsPerCall(100);
-    const loadedMs = await measuredNoopMsPerCall(5_000);
-    const detail = `small=${smallMs.toFixed(3)}ms loaded=${loadedMs.toFixed(3)}ms`;
+    const smallP95Ms = await measuredNoopP95Ms(100);
+    const loadedP95Ms = await measuredNoopP95Ms(5_000);
+    const detail = `small_p95=${smallP95Ms.toFixed(3)}ms loaded_p95=${loadedP95Ms.toFixed(3)}ms`;
 
     // The additive allowance absorbs timer/scheduler noise; the multiplicative
     // bound catches a return to the former O(authority-size) eager snapshot.
-    expect(loadedMs, detail).toBeLessThanOrEqual(smallMs * 8 + 0.25);
-    expect(loadedMs, detail).toBeLessThan(10);
+    expect(loadedP95Ms, detail).toBeLessThanOrEqual(smallP95Ms * 8 + 0.5);
+    expect(loadedP95Ms, detail).toBeLessThan(10);
   });
 });

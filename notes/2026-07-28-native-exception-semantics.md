@@ -9,6 +9,8 @@ Audited base: main `fb8bfe85`
 
 Implementation base: main `6cbeb490`
 
+Current merge target included: main `29ff95d1` (note-only successor)
+
 Deployed worker reported during the audit: `02bbc479`
 
 ## Implementation disposition
@@ -24,6 +26,26 @@ table records the actual disposition.
 | F3 — programmer transition validates after mutation | Feature-list shape and surface composition are preflighted. A shared object-flag plan computes the lineage, features, counters, and audit result before applying them. |
 | F4 — programmer-agent creation allocates too early | Prospective inherited surface composition is validated before allocation. Create, registration, counters, and credentials then run in one behavior transaction. |
 | F5 — session callback rewrites accepted success | Session-ended delivery is a typed post-accept effect. Synchronous throws and promise rejections become bounded metrics and cannot change the accepted domain result. |
+
+### Adversarial re-review disposition
+
+The first implementation review found one P1 proof defect and the following
+P2/defense-in-depth gaps. They are fixed on this branch:
+
+| Review finding | Disposition |
+|---|---|
+| Post-write read-backs survive abort | Recorder abort now invalidates proofs in execution order at cell granularity. A pre-mutation proof remains; a later property/version, location/contents, lifecycle, created-object, or exact-dispatch proof whose state was rolled back is pruned. The exact fresh write/read/raise transcript is accepted by the shadow authority, and the exact compacted gateway submission is accepted by both authority implementations. |
+| Authority reason-priority divergence | Completeness is the terminal step-4 envelope gate in both authorities and precedes generation-specific failed-effect admission. A transcript violating both rules returns `incomplete_transcript` from both. |
+| Failed-transcript grammar can drift | A compile-time `Record<keyof EffectTranscript, FailedTranscriptFieldClass>` assigns every field to envelope, proof, effect, outcome, or integrity semantics. Adding or removing a transcript field cannot compile until the classification is updated; the exact vocabulary is also pinned by test. |
+| Native contract guard is incomplete and outside the fast gate | All 50 built-in handlers register as `read_only`, `authoritative`, or `live_only`. The fast AST guard rejects direct unclassified registration and cross-checks every non-read-only handler against the complete failure-contract registry, including handlers deliberately untracked for Net admission. |
+| Proof-only transfer checks only the inner savepoint | Terminal command transfer sums mutations, staged acceptance, and disallowed recorder events over the complete active behavior-scope stack. An outer write hidden behind `$programmer:eval` now refuses `E_SCOPE_SPLIT` without sequence allocation. |
+| Programmer transition duplicates the flag planner | `setProgrammerAgentState`, `set_actor_flag`, and generic flag mutation now share `prepareObjectFlagPlan`/`applyObjectFlagPlan`; account quota/counter and profile audit wrap that one flag/surface plan. |
+| Catalog update claims rollback | `catalog_registry_update` declares `durable_progress`/`idempotent_progress`, matching its bounded migration-state recovery rather than promising rollback of already completed migration steps. |
+| AP11 ledger can undo an explicit demotion | `wizard = true` with `programmer = false` is treated as in-band evidence that AP11 completed and a later demotion preserved the wizard bit. Repair reports a conflict and does not re-promote; reversible deactivation is likewise newer operator intent. Local and Net paths share the planner. |
+| Local repair can race a live SQLite server | Every file-backed local repository holds a cooperative shared lifetime lease. The repair CLI requires the exclusive lease even for dry-run, then holds `BEGIN IMMEDIATE` across load/plan/apply. It refuses while a live server owns the world, closing the in-memory stale-flush race that a SQL transaction alone cannot see. |
+| Staged acceptance can be silently discarded | An outer behavior savepoint refuses if persistence deferral would pop it with unexecuted durable acceptance. Accepted-in-memory/absent-in-storage is not representable. |
+| Abort is not exception-safe | Abort attempts every inverse in LIFO order and preserves the original behavior error. Any restore failure latches `E_WORLD_POISONED`; later behavior and mutation refuse until the host discards and reloads the instance. |
+| Test-matrix gaps | Tests now cover failed-call `meSnapshot` restore metadata, a real second refusal for promote/demote/revoke, failed-turn deterministic replay, exact producer-to-authority proof acceptance, and an automated 100-versus-5,000-object savepoint cost gate in `npm test`. |
 
 The bounded historical repair is implemented for local SQLite and Net account
 authorities. It walks only account-owned evidence, supports dry-run, refuses
@@ -75,9 +97,18 @@ Adversarial tests exposed and closed additional members of the same class:
   wrapper; a different request under the same live session/actor/frame id is
   refused before wrapper dispatch or sequence allocation.
 - a failed scope may retain durable pre-state proofs, but it cannot retain
-  reads or exact-definer dispatch proofs for an object created and rolled back
-  in that same scope. Such proofs have no surviving authority that can attest
-  them and otherwise turn an ordinary failed behavior into `rider_unattested`;
+  a read or state probe made after a rolled-back mutation of that same cell.
+  Property/version, location/contents, lifecycle/recycle, created-object, and
+  exact-dispatch dependencies are invalidated in execution order across merged
+  nested scopes. Keeping such transient proofs either creates an
+  authority-specific retry loop or records a value/version that never existed
+  durably;
+- restore itself is a safety boundary: every inverse is attempted, an inverse
+  failure cannot mask the behavior error, and an instance whose restore failed
+  becomes poisoned rather than serving partially restored state;
+- staged durable acceptance cannot cross persistence deferral silently. The
+  composition refuses while the outer journal is live instead of returning an
+  accepted in-memory result with no storage record;
 - the first post-fix legibility failure was not another rollback defect:
   cross-log Acts genuinely cross incompatible semantic spaces. The Acts
   catalog now reports the specific `E_SCOPE_SPLIT` refusal rather than
@@ -694,12 +725,16 @@ should support dry-run before mutation and check:
 Repair only facts whose intended state is unambiguous. An orphan created by a
 failed operation can be retired/recycled only with evidence tying it to that
 operation. A malformed feature list may require an operator decision; report
-the exact object and conflict rather than inventing user intent.
+the exact object and conflict rather than inventing user intent. The AP11
+provisioning ledger is historical evidence, not a perpetual capability grant:
+a wizard agent whose programmer flag is now false, or whose reversible
+deactivation marker is set, is a conflict rather than a repair candidate.
 
 For Net, expose the operation through an authenticated, signed operator route
-and constrain it to the addressed authority/account. For SQLite, run the repair
-inside a real transaction/savepoint and test it on a local database. Repeated
-runs must report no further changes.
+and constrain it to the addressed authority/account. For SQLite, require an
+offline exclusive world lease before reading even in dry-run mode, then run the
+repair inside a real transaction/savepoint and test it on a local database.
+Repeated runs must report no further changes.
 
 Pure property-version drift is monotonic coherence bookkeeping. Once the value
 is correct, do not rewrite versions merely to make them look as though the
