@@ -770,11 +770,19 @@ A step's savepoint is frequently the **outermost** persistence scope — the boo
 
 This is deliberately **not** the same as an unhandled behavior failure. If the migration body lets the error escape, the standard `$space:call` failure rule applies and the whole behavior savepoint rolls back. Catalog migration code must catch step failures when it wants the partial-progress semantics described here.
 
-Recovery from a failed migration is operator work in v1. The registry exposes `:migration_state(catalog)` returning `{from_version, to_version, completed_steps, failed_step?}` so operators can either complete the migration manually or roll back to a backup.
+**Version honesty.** A recorded catalog version means *this edge fully applied*. An update whose migration returns anything other than a completed state MUST leave the recorded version at its pre-migration value; only a completed (or not-required) migration may advance it. Definitions repaired from the new manifest may therefore sit AHEAD of the recorded version after a failure — that is intended, and safe, because manifest repair is idempotent and re-runs on every cold init.
+
+Recording the target version on a failed edge is not a cosmetic inaccuracy, it is terminal. The next attempt validates the migration's `from_version` against the recorded version, so a prematurely-advanced world refuses the only migration that could finish the job (`migration version range does not match 2.0.0 -> 2.0.0`) while still holding pre-migration data. Nothing can then move it forward, which contradicts the rerun recovery §CT14.4 requires. Holding the version back is what makes a rerun *admissible*; §CT14.4 idempotency is what makes it *safe*.
+
+A caller MUST treat a returned failed state the same way it treats a thrown one. The failure is returned rather than thrown by design (above), so a caller that inspects only exceptions sees success: the boot lifecycle must report it and BLOCK the catalog from later repair phases (§CT5.4.1), and a fail-closed install must abort. Otherwise the schema sync installs the new definitions without the major's data rewrites and nothing records that it happened.
+
+Recovery from a failed migration is operator work in v1. The registry exposes `:migration_state(catalog)` returning `{from_version, to_version, completed_steps, failed_step?}` so operators can either complete the migration manually or roll back to a backup. Because the version was held back, the ordinary path — fix the cause, re-run the same edge — is available without registry surgery.
 
 ### CT14.4 Idempotency
 
 Migration steps must be **idempotent** — running them twice is safe. This is the recovery story: if step N fails, the operator fixes the underlying issue (data, code, environment) and reruns the migration; steps 1..N-1 no-op (rename to a target that already has the target name; transform a value already transformed; drop a property already dropped). The runtime does not enforce idempotency; catalog publishers attest to it.
+
+This depends on the version-honesty rule above: a rerun that the version check refuses is not a recovery path, however idempotent its steps are. The two halves are one contract — the version stays put so the edge is re-admitted, and the steps converge so re-admitting it is harmless. The `drop_verb` and `drop_property` steps satisfy their half structurally, since both no-op on an already-absent target.
 
 ### CT14.5 Operator practice: one catalog per window
 

@@ -648,6 +648,77 @@ describe("local catalogs", () => {
     }
   });
 
+  // Boot must treat a RETURNED failure exactly like a THROWN one. §CT14.3 has
+  // the migration body catch step failures on purpose, so a stopped edge comes
+  // back as `migration_state.status === "failed"` rather than as an exception.
+  // The boot path read only the throw, so a half-migrated catalog rode on into
+  // the schema sync — new definitions installed without the major's data
+  // rewrites — with nothing reported. Injecting the step failure at the world
+  // writer keeps this about the boot path's HANDLING rather than about any
+  // particular way a step can fail.
+  it("blocks and reports a bundled catalog whose version migration returns failed, then retries it next boot", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    ageHelpWorldToV0(world);
+
+    const warnings: Array<[string, Record<string, unknown>]> = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((event: unknown, detail: unknown) => {
+      warnings.push([String(event), (detail ?? {}) as Record<string, unknown>]);
+    });
+    const removeVerb = vi.spyOn(world, "removeVerb").mockImplementationOnce(() => {
+      throw new Error("injected step failure");
+    });
+    try {
+      installLocalCatalogs(world, ["help"]);
+    } finally {
+      removeVerb.mockRestore();
+      warn.mockRestore();
+    }
+
+    // Reported, naming the step that stopped the edge.
+    const reported = warnings.find(([event]) => event === "woo.local_catalog_version_migration_failed");
+    expect(reported, `expected a migration failure warning, saw ${JSON.stringify(warnings.map(([e]) => e))}`).toBeTruthy();
+    expect(reported?.[1]).toMatchObject({
+      catalog: "help",
+      from: "0.1.1",
+      to: "1.0.0",
+      failed_step: "1:drop_verb:$generic_help_db:record_miss"
+    });
+
+    // The version is held back, so the next boot re-attempts this same edge
+    // instead of skipping it as already applied.
+    expect(installedHelpVersion(world)).toBe("0.1.1");
+    // Blocked: the drift schema sync was skipped, so the retired surface is
+    // still there for operator attention rather than half-repaired.
+    expect(helpTelemetrySurface(world)).toEqual({ verb: true, property: true });
+
+    // Next boot, cause gone: the edge runs to completion with no operator
+    // intervention beyond fixing what broke it.
+    installLocalCatalogs(world, ["help"]);
+    expect(installedHelpVersion(world)).toBe("1.0.0");
+    expect(helpTelemetrySurface(world)).toEqual({ verb: false, property: false });
+  });
+
+  // Same failure under the fail-closed rule the net install planner uses: an
+  // install plan must never be built from a world it already knows it could
+  // not migrate.
+  it("aborts a fail-closed install when a version migration returns failed", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["help"]);
+    ageHelpWorldToV0(world);
+
+    const removeVerb = vi.spyOn(world, "removeVerb").mockImplementationOnce(() => {
+      throw new Error("injected step failure");
+    });
+    try {
+      expect(() => installLocalCatalogs(world, ["help"], { failClosed: true }))
+        .toThrow("catalog install failed closed");
+    } finally {
+      removeVerb.mockRestore();
+    }
+    expect(installedHelpVersion(world)).toBe("0.1.1");
+  });
+
   // AGENTS.md migration discipline: a migration must be test-run on a local
   // SQLite woo. Seed an aged world, close it, reopen, migrate, close, reopen —
   // so the repair is proven to survive the storage round trip rather than only
