@@ -484,6 +484,42 @@ describe("AP11 operator wizard provisioning (core)", () => {
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(countsBefore.programmers);
   });
 
+  it("heals an agent already provisioned in the toolless half-state (the prod remediation)", async () => {
+    // Production already holds an agent minted BEFORE the refusal existed:
+    // flags set, features never written. The remediation must be "deliver the
+    // scalar, re-run the same command" — not a bespoke repair — so this
+    // reconstructs that exact state and proves the re-run heals it.
+    const world = createWorld();
+    const { human, account } = await signup(world, "ap11-heal@woo.dev");
+    const surface = world.propOrNull("$system", "programmer_surface") as string;
+    expect(surface).toBeTruthy();
+
+    const provisioned = await provision(world, "$wiz", human, "ops-1");
+    const agent = provisioned.actor_id;
+    // Age it back: strip the surface feature and the published reference, which
+    // together are exactly what a pre-hook world looks like.
+    world.setProp(agent, "features", []);
+    world.setProp("$system", "programmer_surface", null as never);
+    expect(world.object(agent).flags.wizard).toBe(true);
+    expect(world.propOrNull(agent, "features")).toEqual([]);
+
+    // Re-running in that state REFUSES rather than reporting success again.
+    await expect(provision(world, "$wiz", human, "ops-1")).rejects.toMatchObject({ code: "E_MISSING_STATE" });
+
+    // Deliver the scalar (what the seed-property repair does on a live world)
+    // and re-run: the shared transition reconciles the surface unconditionally,
+    // so the existing agent heals with no counter movement and no new identity.
+    world.setProp("$system", "programmer_surface", surface as never);
+    const healed = await provision(world, "$wiz", human, "ops-1");
+    expect(healed.actor_id).toBe(agent);
+    expect(healed.created).toBe(false);
+    expect(healed.promoted).toBe(false);
+    expect(world.propOrNull(agent, "features")).toContain(surface);
+    expect(world.object(agent).flags.wizard).toBe(true);
+    expect(world.propOrNull(account, "agent_count")).toBe(1);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+  });
+
   it("requires wizard authority and a live human account", async () => {
     const world = createWorld();
     const { human, account } = await signup(world, "ap11f@woo.dev");
