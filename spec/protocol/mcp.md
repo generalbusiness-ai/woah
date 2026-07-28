@@ -1,6 +1,6 @@
 ---
 date: 2026-05-02
-updated: 2026-07-27
+updated: 2026-07-28
 status: implemented
 ---
 
@@ -35,6 +35,28 @@ an idempotent success.
 
 One MCP session binds to one actor. MCP never changes `actor`, `progr`, verb
 permissions, or the normal Net turn authority rules.
+
+### M1.1 Notifications
+
+A JSON-RPC **notification** — any message with no `id`, whether or not the
+server recognizes its method — is a non-initialize method and is therefore
+subject to the same session validation and per-actor rate limiting as
+`tools/call`. It is authenticated *before* it is acted on and before it is
+acknowledged. This includes `notifications/initialized`, includes
+`notifications/cancelled` (which acts on session-scoped state and must not
+trust a raw `Mcp-Session-Id` header whose expiry was never consulted), and
+includes methods this version does not know: an evolving protocol's
+notifications must not be an unauthenticated door into the gateway.
+
+A notification carries no `id` to correlate a JSON-RPC error against, so the
+HTTP status is the whole answer. An accepted notification is `202` with an
+empty body — including for an unrecognized method, which is then ignored. A
+rejected session is the standard client refusal envelope (`401`,
+`E_NOSESSION`); an exhausted rate bucket is `429`, `E_RATE`. `202` means
+*authenticated and accepted*, never merely *received*.
+
+`initialize` keeps its own path: it is a request, it carries the `Mcp-Token`
+credential rather than a session id, and it mints the session this rule reads.
 
 The `initialize` result's `instructions` string is an agent's entire
 orientation — many MCP clients read nothing else unprompted — so it must name
@@ -204,7 +226,7 @@ The supported scopes change presentation, never authority:
 | `active` | Actor, active space, active-space contents, and inventory. This is the default. |
 | `here` | Active space and its direct contents. |
 | `object` | One named object, only if it is already in structural context. |
-| `space` | One contextual space (or the active space) and its direct contents. |
+| `space` | One contextual space (or the active space) and its direct contents that are themselves in structural context. |
 
 There is deliberately no `all` scope. `active` already returns the complete
 structural context; a separate `all` had no distinct selection (it resolved to
@@ -242,22 +264,6 @@ to 500 characters on a word boundary with a trailing ellipsis. Taking the first
 *line* instead truncates wrapped doc-comments mid-sentence, which is what an
 agent then reads as the verb's whole contract.
 
-Names are deterministic within a listing. The base form is
-`<sanitized-object>__<sanitized-verb>`; a numeric suffix resolves collisions.
-Tools are sorted by canonical object then verb before collision assignment,
-except that **the session actor's own object sorts ahead of the alphabetical
-remainder**. The actor's own verbs are how it acts at all, so they must never be
-displaced past the page cap by objects that merely happen to share its space:
-the actor's tools occupy the first dynamic slots of the first page, after the
-stable controls.
-
-This is a guarantee of **precedence, not completeness**. Nothing bounds how many
-verbs a class chain and its features can contribute, so a suit larger than one
-page still spans pages; what the ordering guarantees is that the overflow is the
-actor's own tail rather than an arbitrary subset displaced by unrelated objects.
-A client that pages only once therefore sees the actor's tools first and, while
-the suit fits, all of them. This ordering is the only privileged position in the
-listing; it changes rank, not membership or authority.
 `inputSchema` is derived from `arg_spec.args`/`params` and optional type
 hints. When explicit hints are absent, the gateway preserves the stable JSON
 shape implied by aligned `arg_spec.command.args_from` entries: parser text is a
@@ -266,6 +272,62 @@ string, resolved object slots are object-id strings, and `cmd` is an object.
 Named invocation maps JSON object properties to positional verb arguments in
 the declared order. Missing properties become `null`. `woo_call` accepts the
 positional list directly.
+
+### M2.3 Tool naming
+
+The base form is `<sanitized-object>__<sanitized-verb>`, where sanitizing
+strips one leading `$` and replaces every character outside `[A-Za-z0-9_]`
+with `_`; a numeric suffix (`_2`, `_3`, …) resolves collisions. Tools are
+sorted by canonical object then verb before collision assignment, except that
+**the session actor's own object sorts ahead of the alphabetical remainder**.
+The actor's own verbs are how it acts at all, so they must never be displaced
+past the page cap by objects that merely happen to share its space: the
+actor's tools occupy the first dynamic slots of the first page, after the
+stable controls.
+
+That ordering is a guarantee of **precedence, not completeness**. Nothing
+bounds how many verbs a class chain and its features can contribute, so a suit
+larger than one page still spans pages; what the ordering guarantees is that
+the overflow is the actor's own tail rather than an arbitrary subset displaced
+by unrelated objects. A client that pages only once therefore sees the actor's
+tools first and, while the suit fits, all of them. This is the only privileged
+position in the listing; it changes rank, not membership or authority.
+
+**Names are assigned canonically, over the session's complete reachable
+context, and neither filtering nor paging ever changes one.** Whatever a
+client asks for — standard `tools/list`, any `woo_list_reachable_tools`
+`scope`, an `object` or `query` filter, any page of any of them — a given
+`(object, verb)` pair in that session's context is advertised under one and
+only one name, and invoking that name reaches that object. This is the
+property an agent relies on when it calls what it was told to call, so it is a
+protocol guarantee rather than an implementation detail.
+
+The reason it needs stating is that sanitizing is **lossy**: `$a-b`, `a+b`,
+`a b`, and `$a_b` all render `a_b`, so distinct objects genuinely do compete
+for one base name and the numeric suffix is the only thing separating them. A
+suffix is meaningful only relative to the set it was computed over, so a name
+computed over a *subset* is not the same name — a filtered view that
+disambiguated among only the objects it kept would hand out the unsuffixed
+name for one of them while invocation, resolving over the whole context, bound
+that name to another. Discovery therefore computes one canonical descriptor
+set, names included, and every scope, filter, and page is a projection of it.
+
+A corollary: presentation scopes select from that canonical set by object and
+can never widen it. `space` names one *contextual* space and its direct
+contents; contents that are not themselves in structural context (M3) are not
+advertised, because a descriptor neither dynamic-name invocation nor
+`woo_call` would accept is not an advertisement.
+
+Prose that names a tool — refusal remediations, `instructions` — must read the
+name from the canonical assignment for the same reason. Re-deriving one by
+sanitizing an id ignores the suffix and can name a different object's tool.
+The single exception is the session actor's own tools: the actor sorts first,
+so its descriptors are never the ones that carry a suffix.
+
+Names are stable for as long as the context is. Context changes (moving,
+taking, an object arriving) can re-rank a collision, which is exactly what
+`notifications/tools/list_changed` (M6) exists to announce; a client that
+re-lists on the hint never observes a shifted name.
 
 ## M3. Structural context and navigation
 
@@ -524,6 +586,13 @@ recorded reply — the original caller's receipt must survive another client's
 mistake. A submit or a recorded reply from before this field existed skips the
 check rather than guessing.
 
+The rule covers **every** recorded outcome, not only accepted ones. A terminal
+rejection is recorded under the key exactly like an accept, so serving one to a
+different request is the same confidently wrong answer — and the cheaper one to
+provoke, since any client can bank a rejection under a key it then reuses. The
+comparison therefore happens before the recorded outcome is returned, whatever
+its verdict.
+
 **Binding.** The retained outcome belongs to the actor whose turn committed
 it. A submit from a different actor under the same key still learns that its
 own submit committed nothing — that is the safety property — but receives
@@ -533,10 +602,36 @@ WebSocket turn frame too, so identical strings from different clients are
 possible and must never become a read channel.
 
 **Past the retention window.** Idempotency is a bounded-window guarantee, not
-an eternal one. The committing scope retains recorded replies for **at least
-its most recent 256 commits** (the recovery-tail window, never pruned) and at
-most 1024 total; the gateway's scope pin has the same posture. A retry
-arriving after its reply has pruned is a NEW turn by every observable
+an eternal one, and the two classes of recorded outcome are retained by
+different rules because their growth is limited by different things.
+
+- **Turns that COMMITTED** (they consumed a sequence number) are retained for
+  **at least the scope's most recent 256 commits** — the recovery-tail window,
+  never pruned — and at most 1024. The sequencer itself rate-limits this class:
+  one reply per seq.
+- **Receipts and terminal rejections** advance nothing, so they are recorded at
+  whatever head is current and the seq-ordered rule above can never age them
+  out. They are retained as a flat **most-recent-256 per scope**, oldest first.
+  A bound of this kind is not optional: a receipt is the cheapest row an actor
+  can write (one keyed act of speech), so without it any authenticated client
+  could grow authority storage without limit. Receipt pressure never evicts a
+  committed turn's reply — the quotas are separate.
+
+The resulting per-scope window is **1280 recorded replies**, each retaining at
+most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
+of insertion, in memory and in durable storage together: a prune that can lag
+its insert is the unbounded cache it was meant to prevent.
+
+**The gateway's scope pin is retained to cover that window**, counted PER SCOPE
+(2048 keys, above the 1280 a scope can retain) rather than shard-wide. The pin
+decides where a retry is routed and the recorded reply decides whether it
+executes, so a pin that expires while its reply is live would let a retry
+re-plan into a second scope and commit there — the same double execution, by a
+different door. The converse is not required: the pin is necessarily written
+before its submit (that is what makes it survive a lost response), so pins with
+no reply behind them are expected, and a pin outliving its reply is harmless.
+
+A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read
 versions, and it will execute. Clients MUST NOT treat an operation id as a
 durable receipt. Operations needing a durable, long-lived outcome record are
@@ -570,6 +665,14 @@ delivery into none. Cancellation is advisory — an unknown or already-completed
 request id is not an error — and can only ever release a wait parked under the
 same session. Without honouring it, a bounded waiter set would let a client's
 own abandoned polls refuse its next legitimate one until they timed out.
+
+A parked request is identified by its JSON-RPC id **including that id's type**.
+JSON-RPC 2.0 ids may be strings or numbers, and `1` and `"1"` are different
+ids naming different requests; a client may legitimately have both in flight.
+A cancellation matches only the request whose id is equal *and* of the same
+class, so cancelling `"1"` never releases a wait parked under `1`. Collapsing
+the two would silently return an empty, non-draining reply to a request the
+client never cancelled.
 
 **Eviction is not rare, and a silent client goes deaf.** The queue lives in
 the gateway shard's memory, and on Cloudflare an idle shard is evicted within
@@ -702,6 +805,32 @@ At most one open stream receives a given hint. A disconnect before delivery
 leaves the hint pending, while delivery is live and not resumable. Missing,
 expired, or malformed sessions are rejected before a stream is opened.
 
+**Listens are bounded per session, by eviction rather than refusal.** Each
+open listen holds a stream controller and a live 25-second timer, so the count
+per session is capped (currently 2 — Streamable HTTP gives a client one
+standalone stream, with slack for a reconnect that overlaps the stream it
+replaces). Opening a listen beyond the cap **closes the oldest one** and
+admits the new one; a GET is never refused for this reason, and there is no
+status code for it. Refusal was the wrong choice here because the excess this
+must survive is usually not abuse: an ungracefully dropped connection leaves a
+phantom listen behind — cancellation is not guaranteed to be observed
+promptly — and refusing would lock a legitimately reconnecting client out for
+up to a full listen window. A client cannot provoke more than the cap in live
+listens however many GETs it sends, and their arrival *rate* is bounded by the
+ordinary per-actor limit.
+
+What an evicted client observes is a **normal end of stream**: the response
+ends cleanly, exactly as it would at the 25-second bound, with no error event
+and no trailing data. That is deliberately indistinguishable from the bounded
+close a conforming client already handles, and the correct response to both is
+the same — reconnect after the advertised `retry` interval. It *is*
+distinguishable from a network drop, which surfaces as a transport error
+rather than an orderly EOF. A client that never opens a second listen never
+sees an eviction at all.
+
+Eviction loses nothing: a pending hint is cleared only by a delivery a stream
+actually accepted, so it survives to the next listen.
+
 The notification is a freshness hint only. Clients re-run `tools/list`; the
 current structural resolver remains the authorization boundary. No temporary
 tool-result field substitutes for the standard notification, and a client may
@@ -710,9 +839,12 @@ re-list at any time even if it missed a live hint.
 ## M7. Security and scaling invariants
 
 - API-key authentication happens before session creation.
-- A present Streamable HTTP `Origin` must exactly match the MCP endpoint's
-  request origin; headless clients may omit the header.
-- Every non-initialize method validates `Mcp-Session-Id` and its expiry.
+- A present Streamable HTTP `Origin` must be admitted by §M7.1; headless
+  clients may omit the header.
+- Every non-initialize method validates `Mcp-Session-Id` and its expiry, and
+  spends a token from the actor's rate bucket, before it is acted on. A
+  notification is a method (M1.1): "it has no `id`" is not an exemption, and
+  neither is "the server does not recognize the method".
 - Other actors' session bearers never appear in tools, relation results, or
   observations.
 - Dynamic listing and dynamic invocation use one authoritative resolver.
@@ -720,6 +852,55 @@ re-list at any time even if it missed a live hint.
 - Context work is proportional to the bounded actor/space context, never the
   installed world or all sessions.
 - Catalog identities, command words, and UI shapes do not enter the gateway.
+
+### M7.1 The `Origin` contract
+
+`POST`, `GET` and `DELETE` on `/net-api/mcp` are all gated by the same rule.
+The rule constrains browsers and only browsers: a browser writes `Origin`
+itself and a page cannot override it, so the check prevents a hostile page
+from driving a victim's browser — and any ambient credentials it holds — into
+this endpoint. It constrains no non-browser caller, which may send any header
+it likes; credentials, not `Origin`, authorize a call.
+
+**What the edge asserts.** The endpoint's public origin does not survive the
+edge → gateway hop: the edge addresses the Durable Object by its own opaque
+name, so the forwarded URL carries no public hostname. The edge therefore
+states the public origin in a dedicated internal request header. That header is
+an edge assertion, never client input: the edge strips every inbound header on
+the internal-header prefix before routing, and overwrites the value when
+forwarding. A gateway MUST use only that asserted value as its same-origin
+reference, and MUST NOT compare `Origin` against its own request URL — that
+comparison refuses every browser and admits every headless client, inverting
+the property.
+
+**What is trusted.** The asserted origin is a valid same-origin reference only
+when its own hostname is authenticated: `https:` (the hostname is proven by
+TLS), or a loopback literal host (`localhost`, `*.localhost`, `127.0.0.1`,
+`[::1]`) over either scheme. Plain `http:` on a routable name is NOT trusted,
+because under DNS rebinding a hostile page's `Host` and `Origin` agree on the
+attacker's own name and would satisfy a naive same-origin test. When no
+trustworthy reference is available, a present `Origin` is refused — the rule
+fails closed.
+
+**Admission.** A present `Origin` is admitted when, after serializing to
+scheme/host/port, it equals the trusted asserted origin; or it appears in an
+operator-configured extra-origin list, which is empty by default so no hostname
+is compiled into the runtime; or the endpoint is loopback and the origin is
+loopback, which covers a development proxy serving the page and the endpoint on
+different loopback ports. Anything else — including an unparseable value and
+the opaque `null` origin — is refused with `E_PERM` and HTTP 403. A refusal
+carries no CORS headers; this endpoint is not a cross-origin API.
+
+**Absent `Origin`.** An absent `Origin` is admitted. Streamable HTTP's normal
+clients — stdio bridges, CLI agents, server runtimes — send none, and refusing
+them would break every legitimate headless client while stopping no attacker,
+since anyone able to omit a header is equally able to send an arbitrary one.
+The asymmetry is deliberate and is the whole reason the check is worth having:
+it binds exactly the class of caller that cannot lie.
+
+Conformance for this section is exercised through the public Worker entry, so
+the URL rewrite is inside the tested path; a test that fetches the gateway
+directly cannot observe the contract.
 
 ## M8. Deferred extensions
 

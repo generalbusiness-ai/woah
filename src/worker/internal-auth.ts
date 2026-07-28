@@ -73,6 +73,14 @@ function canonical(request: Request, headers: Headers): string {
   // practical exposure is low, but we want defense in depth: any
   // header that influences scheduling is part of the canonical
   // string.
+  //
+  // `x-woo-internal-public-origin` is deliberately NOT here. It is
+  // meaningful only on the UNSIGNED public forward hop (edge →
+  // gateway DO) where there is no signature to bind it to; no signed
+  // doorway sets or reads it. Its integrity comes from
+  // sanitizePublicHeaders stripping the `x-woo-internal-` prefix off
+  // every inbound public request, plus an explicit delete-then-set in
+  // handleNetApi. See src/worker/public-origin.ts.
   const signedHeaders = [
     "x-woo-host-key",
     "x-woo-internal-session",

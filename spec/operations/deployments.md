@@ -63,6 +63,18 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
   JSON-RPC messages unchanged. It MUST NOT implement tool discovery or verb
   dispatch. (The classic in-memory `mcp:stdio:classic` host was removed with the
   classic stack.)
+  Shutdown MUST be bounded. The bridge is a supervised child process, so stdin
+  EOF, `SIGINT`, and `SIGTERM` each run one idempotent teardown and then exit
+  (`0`, `130`, `143` respectively). That teardown stops admitting new messages,
+  drains already-accepted requests for a bounded grace period, aborts whatever
+  is still in flight — each aborted request is answered with a correlated
+  JSON-RPC error rather than dropped — and only then sends the session
+  `DELETE`. The `DELETE` is a courtesy that the server's session TTL already
+  covers, so it MUST NOT be able to delay exit. No forwarded request may hold
+  the process past the teardown budget: `woo_wait` blocks for tens of seconds
+  by design, which is why the bound belongs to shutdown rather than to a
+  per-request transport timeout. See
+  [`src/mcp/net-stdio-shutdown.ts`](../../src/mcp/net-stdio-shutdown.ts).
 - **Net Cloudflare-shape smoke.** One cross-actor scenario runs on the Net smoke
   lanes before a real deploy:
   1. `npm run smoke:net-dev` — the Net worker under **real workerd** via

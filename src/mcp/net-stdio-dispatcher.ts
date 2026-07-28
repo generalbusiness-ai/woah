@@ -1,5 +1,5 @@
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import type { NetMcpStdioProxy } from "./net-stdio-proxy";
+import { hasRequestId, type NetMcpStdioProxy } from "./net-stdio-proxy";
 
 type SessionAwareProxy = Pick<NetMcpStdioProxy, "sessionReady" | "forward">;
 
@@ -15,6 +15,7 @@ type SessionAwareProxy = Pick<NetMcpStdioProxy, "sessionReady" | "forward">;
 export class NetMcpStdioDispatcher {
   private preSessionTail: Promise<void> = Promise.resolve();
   private readonly inFlight = new Set<Promise<void>>();
+  private closed = false;
 
   constructor(
     private readonly proxy: SessionAwareProxy,
@@ -22,7 +23,17 @@ export class NetMcpStdioDispatcher {
     private readonly onError: (error: unknown) => void
   ) {}
 
+  /** Stop admitting new work.
+   *
+   * Shutdown calls this first so the set `idle()` waits on cannot keep growing
+   * while it drains. It is deliberately not the same thing as closing the
+   * proxy: already-accepted requests are still allowed to finish. */
+  close(): void {
+    this.closed = true;
+  }
+
   dispatch(message: JSONRPCMessage): Promise<void> {
+    if (this.closed) return this.refuse(message);
     const waitsForSession = !this.proxy.sessionReady;
     const forward = async (): Promise<void> => {
       const reply = await this.proxy.forward(message);
@@ -44,8 +55,30 @@ export class NetMcpStdioDispatcher {
     return settled;
   }
 
-  /** Wait for all currently accepted messages before closing the HTTP session. */
+  /** Wait for all currently accepted messages before closing the HTTP session.
+   *
+   * Callers on a shutdown path must bound this wait: a request the Net endpoint
+   * never answers would otherwise make it wait forever. */
   async idle(): Promise<void> {
     await Promise.all([...this.inFlight]);
+  }
+
+  /** Answer a message that arrived after `close()`.
+   *
+   * The HTTP session is about to be deleted, so the request cannot be served.
+   * Replying beats dropping: a client that pipelined into our shutdown gets a
+   * correlated error instead of waiting on a reply that will never arrive. */
+  private async refuse(message: JSONRPCMessage): Promise<void> {
+    if (!hasRequestId(message)) return;
+    try {
+      await this.send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: { code: -32000, message: "Net MCP stdio bridge is shutting down" }
+      });
+    } catch (error) {
+      // stdout may already be closed; that is not worth a second failure.
+      this.onError(error);
+    }
   }
 }

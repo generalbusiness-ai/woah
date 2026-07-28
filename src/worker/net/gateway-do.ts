@@ -120,6 +120,7 @@ import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { identityAnchorIds, provisionAnchorSubmit } from "../../net/identity-anchor";
 import { NET_ACCOUNT_CLASS, NET_AGENT_CLASS, NET_HUMAN_CLASS } from "../../net/identity-roles";
 import { verifyInternalRequest } from "../internal-auth";
+import { mcpOriginDecision, PUBLIC_ORIGIN_HEADER } from "../public-origin";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import {
   ClientAuthError,
@@ -194,6 +195,11 @@ export type NetGatewayEnv = NetBindingsEnv & {
   /** Maximum staleness of one authority-verified API-key record. Zero forces
    * an exact RPC per request. Default: 1000ms; hard-capped at 30s. */
   NET_CREDENTIAL_TTL_MS?: string;
+  /** Extra browser origins admitted by the MCP `Origin` check, comma or
+   * whitespace separated (e.g. a second public hostname serving the client).
+   * Unset by default — the endpoint's own public origin always passes, so no
+   * hostname is compiled in. See src/worker/public-origin.ts. */
+  WOO_MCP_ALLOWED_ORIGINS?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -812,13 +818,41 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 /** Echo-dedupe LRU bound (see recentClientTurns). */
 const RECENT_CLIENT_TURN_CAP = 512;
 
-/** H2c: selection-pin retention (see pinScope) — matches the scopes'
- * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
- * outlives the reply it protects by more than the window. */
-const GATEWAY_PIN_LIMIT = 1024;
+/**
+ * H2c: selection-pin retention, PER SCOPE (see pinScope).
+ *
+ * The pin must outlive the recorded reply it protects, in the scope-sized
+ * units the scope prunes in. A scope retains at most
+ * `max(REPLY_CACHE_CAP, tailLimit) + RECEIPT_CACHE_CAP` = 1280 replies
+ * (scope.ts pruneReplies); this is that number with headroom, counted per
+ * scope rather than across the whole shard.
+ *
+ * Counting across the shard — the previous rule — meant a gateway serving
+ * several busy scopes evicted a pin while its receipt was still live at the
+ * scope. A retry then re-planned freely, and if selection landed on a
+ * DIFFERENT scope it executed a second time: the same double execution
+ * idempotency exists to prevent, reached through the routing door instead of
+ * the commit door.
+ *
+ * Headroom (2048 vs 1280) covers pins with no reply behind them. The pin is
+ * necessarily written BEFORE the submit — the whole point is to survive a
+ * submit whose outcome the gateway never learned — so keys that were pinned
+ * and then abandoned (a retryable rejection the client gave up on, a lost
+ * response) consume pin budget without ever recording a reply.
+ */
+const GATEWAY_PIN_LIMIT = 2048;
+/**
+ * Table-level ceiling across all scopes, so per-scope retention does not make
+ * the table unbounded in the number of scopes a shard touches. At ~200 bytes a
+ * row this is a few MiB of DO SQL, and it holds 32 scopes at their full
+ * per-scope window. Past it the OLDEST pins shard-wide are dropped and those
+ * keys fall back to the documented window-expiry posture (a retry re-plans and
+ * is a new turn by every observable measure).
+ */
+const GATEWAY_PIN_TABLE_LIMIT = 65536;
 /** Drain-watermark writes between retention sweeps. A sweep costs one COUNT
- * over a table bounded by GATEWAY_PIN_LIMIT; the interval keeps that off the
- * per-poll path while still bounding growth (one row per new session). */
+ * over a table bounded by GATEWAY_PIN_TABLE_LIMIT; the interval keeps that off
+ * the per-poll path while still bounding growth (one row per new session). */
 const MCP_WATERMARK_SWEEP_INTERVAL = 256;
 /** A session bearer destroys its own credential when close commits. Keep a
  * bounded gateway-local receipt so a lost close reply can still replay as
@@ -1073,11 +1107,19 @@ export class NetGatewayDO {
     // must never migrate the commit to a different scope — the pinned
     // scope may already hold the recorded reply, and a second scope would
     // double-commit the turn. Bounded (H2c): pinScope prunes to the most
-    // recent GATEWAY_PIN_LIMIT rows — the same retention posture as the
-    // scopes' reply cache, and the same documented consequence (see
+    // recent GATEWAY_PIN_LIMIT rows PER SCOPE, sized to outlive that scope's
+    // reply/receipt retention, under a shard-wide table ceiling (see
     // pinScope).
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+    );
+    // Per-scope retention needs a per-scope index, or every pinned turn pays
+    // a full-table COUNT. Idempotent, and cheap to add to an existing table.
+    // Indexed on `scope` alone: every SQLite index carries the rowid as its
+    // payload already, so `WHERE scope = ? ORDER BY rowid` is served by this
+    // one — and naming rowid in the index columns is a syntax error.
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_pin_scope ON net_gateway_pin (scope)"
     );
     // AU1.2 durable edge-event lane: refusal records buffered here and
     // drained to the audit shards (see recordEdgeAudit).
@@ -3269,7 +3311,7 @@ export class NetGatewayDO {
       // branches before the header-credential path below.
       if (url.pathname === "/net-api/mcp"
         && (request.method === "POST" || request.method === "GET" || request.method === "DELETE")) {
-        const rejectedOrigin = rejectForeignMcpOrigin(request, url);
+        const rejectedOrigin = rejectForeignMcpOrigin(request, this.env);
         if (rejectedOrigin) return rejectedOrigin;
       }
       if (request.method === "POST" && url.pathname === "/net-api/mcp") {
@@ -5112,22 +5154,8 @@ export class NetGatewayDO {
     if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
       return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
     }
-    // Notifications (no id) acknowledge with 202 and no body — the MCP
-    // handshake's notifications/initialized. `notifications/cancelled` is
-    // ACTED ON first: with a bounded waiter set, dropping it would leave a
-    // client unable to reclaim its own parked slots before their timeouts.
     if (rpc.id === undefined || rpc.id === null) {
-      if (rpc.method === "notifications/cancelled") {
-        const params = mcpRecord(rpc.params);
-        const requestId = params.requestId;
-        // Cancellation is advisory and unauthenticated beyond the session
-        // header: it can only ever release a waiter parked under THIS
-        // session id, and releasing one drains nothing.
-        if (typeof requestId === "string" || typeof requestId === "number") {
-          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", String(requestId));
-        }
-      }
-      return new Response(null, { status: 202 });
+      return await this.mcpNotification(request, rpc.method, mcpRecord(rpc.params));
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
     if (rpc.method === "tools/list") return await this.mcpToolsList(request, rpc.id, rpc.params ?? {});
@@ -5137,11 +5165,76 @@ export class NetGatewayDO {
     return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
   }
 
-  /** Streamable HTTP's optional standalone GET/SSE carrier. The listen is
+  /**
+   * Post-initialize JSON-RPC notifications (no `id`): acknowledged with 202
+   * and no body, per Streamable HTTP.
+   *
+   * AUTHENTICATED AND RATE-LIMITED FIRST (mcp.md M1.1). Every non-initialize
+   * method validates the session; a notification is a method. The blanket 202
+   * that used to precede this check meant an anonymous caller could drive
+   * `notifications/*` — including the unknown ones an evolving protocol
+   * brings — through the DO at whatever rate it liked, entirely outside the
+   * per-actor bucket, and could act on a raw `mcp-session-id` header without
+   * its expiry ever being consulted. Both are refused here now, on exactly
+   * the same terms as `tools/call`.
+   *
+   * `initialize` keeps its own path: it is a REQUEST that carries the
+   * `mcp-token` credential and mints the session this check reads.
+   */
+  private async mcpNotification(
+    request: Request,
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    // Both throws are ClientAuthError, which clientApi's catch renders as the
+    // standard client refusal envelope (401 for a rejected session bearer,
+    // 429 for E_RATE) and records as an AU1.2 edge audit. A notification has
+    // no id to correlate a JSON-RPC error against, so the HTTP status is the
+    // whole answer — and it must not be 202.
+    const actor = await this.mcpSessionActor(session);
+    this.enforceClientRate(actor, "/net-api/mcp");
+    if (method === "notifications/cancelled") {
+      const requestId = params.requestId;
+      // Now that the session is proven, cancellation still only ever releases
+      // a waiter parked under THIS session id, and releasing one drains
+      // nothing. Keyed by CLASS as well as value: JSON-RPC ids `1` and `"1"`
+      // are different ids, so `"1"` must not release a wait parked under `1`.
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        this.mcpCancelWait(session, mcpRequestKey(requestId));
+      }
+    }
+    // Unknown notification methods are still ignored — a notification carries
+    // no id to answer with `method not found`, and an evolving client must be
+    // able to send one harmlessly. It reaches here only after paying for the
+    // session check and a rate token.
+    return new Response(null, { status: 202 });
+  }
+
+  /**
+   * Streamable HTTP's optional standalone GET/SSE carrier. The listen is
    * deliberately bounded: an idle Durable Object request must not become a
    * permanent synchronous dependency. Standard clients reconnect after the
    * stream closes, while a not-yet-delivered hint remains pending in the
-   * session state and is handed to exactly one later stream. */
+   * session state and is handed to exactly one later stream.
+   *
+   * BOUNDED PER SESSION (MCP_MAX_SESSION_SSE, mcp.md M6), and bounded by
+   * REPLACEMENT rather than refusal. Admitting a listen over the cap closes
+   * the oldest one instead of rejecting the new one, because the excess this
+   * has to survive is not usually abuse: an ungracefully dropped connection
+   * leaves a phantom waiter behind — `cancel()` is not guaranteed to fire
+   * promptly — and refusing would then lock a legitimately reconnecting
+   * client out for up to a full 25-second listen window. An evicted stream
+   * ends normally (the `retry:` field already told the client to reconnect),
+   * so replacement costs a reconnect while refusal costs availability. There
+   * is consequently NO new refusal status on this path; a client cannot
+   * provoke more than MCP_MAX_SESSION_SSE live listens no matter how many
+   * GETs it sends, and their arrival RATE is what `enforceClientRate` bounds.
+   *
+   * Nothing is lost by an eviction: `listChangedPending` is only cleared by a
+   * delivery that a stream actually accepted, so a pending hint survives to
+   * the next stream.
+   */
   private async clientMcpEvents(request: Request): Promise<Response> {
     const accept = request.headers.get("accept") ?? "";
     if (!accept.toLowerCase().includes("text/event-stream")) {
@@ -5202,6 +5295,15 @@ export class NetGatewayDO {
             }
           }
         };
+        // Make room before admitting. `close()` splices the evicted waiter out
+        // of `sseWaiters` itself, so the loop always makes progress; the guard
+        // on `length` (rather than a fixed count) tolerates a waiter that
+        // closed concurrently.
+        while (state.sseWaiters.length >= MCP_MAX_SESSION_SSE) {
+          const evicted = state.sseWaiters[0];
+          evicted.close();
+          if (state.sseWaiters[0] === evicted) state.sseWaiters.shift();
+        }
         state.sseWaiters.push(waiter);
         timer = setTimeout(close, MCP_SSE_LISTEN_MS);
         gateway.mcpFlushListChanged(state);
@@ -5275,6 +5377,13 @@ export class NetGatewayDO {
           // This string is an agent's ENTIRE onboarding: many MCP clients
           // never call anything they were not pointed at. Two sentences of
           // orientation cost nothing and remove the "what now?" turn.
+          //
+          // `mcpSanitizeId(actor)__help` is the canonical name here without a
+          // lookup: mcpToolsForObjects sorts the session actor ahead of every
+          // other contextual object, so the actor's descriptors are named
+          // first and never carry a collision suffix (M2.3). Any OTHER
+          // object's tool must be read from the canonical listing instead —
+          // see mcpAdvertisedName.
           instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives. Start with ${mcpSanitizeId(actor)}__help for orientation — with no topic it returns the index. Use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
         }
       },
@@ -5333,7 +5442,7 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const drained = await this.mcpWait(session, actor, timeout, limit, String(id));
+      const drained = await this.mcpWait(session, actor, timeout, limit, mcpRequestKey(id));
       if ("refused" in drained) return this.mcpToolError(id, drained.refused);
       return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
@@ -5344,7 +5453,10 @@ export class NetGatewayDO {
     if (name === "woo_list_reachable_tools") {
       try {
         const page = this.mcpToolPage(actor, session, args);
-        this.mcpMarkToolListSeen(session, actor);
+        // Re-baseline from the canonical set the page was projected from —
+        // the same descriptors tools/list would render, so a discovery call
+        // never records a digest that disagrees with the standard listing.
+        this.mcpMarkToolListSeen(session, actor, this.mcpToolListDigest(actor, session, page.canonical, page.context));
         const includeSchema = args.include_schema === true;
         return this.mcpResult(id, {
           scope: page.scope,
@@ -5621,9 +5733,13 @@ export class NetGatewayDO {
         target,
         // The target is reachable (it was resolved from structural context)
         // but writes at its own shared scope, so presence has to move there.
+        // The tool name is read from the canonical listing rather than
+        // re-derived by sanitizing the id: with collision suffixes in play a
+        // re-derived guess can name a DIFFERENT object's tool (M2.3).
         remediation:
           `${target} is a separate shared scope from ${active ?? "your current position"}; ` +
-          `one turn cannot write both. Enter ${target} first — call ${mcpSanitizeId(target)}__enter, ` +
+          `one turn cannot write both. Enter ${target} first — call ` +
+          `${this.mcpAdvertisedName(actor, session, target, "enter") ?? `${target}:enter`}, ` +
           `or the movement verb that leads there — then retry, and re-list tools afterwards.`
       }
     };
@@ -5792,7 +5908,8 @@ export class NetGatewayDO {
     actor: string,
     timeoutMs: number,
     limit: number,
-    requestId: string
+    /** An `mcpRequestKey` value — the class-discriminated JSON-RPC id. */
+    requestKey: string
   ): Promise<{ observations: unknown[]; gap: boolean } | { refused: Record<string, unknown> }> {
     const queue = this.mcpQueues.get(session);
     // No live state at all: nothing to drain and nothing to vouch for.
@@ -5851,7 +5968,7 @@ export class NetGatewayDO {
         // reply nobody sees — at-most-once delivery turning into none.
         resolve(cancelled ? { observations: [], gap: false } : take());
       };
-      queue.waiters.push({ requestId, wake });
+      queue.waiters.push({ requestKey, wake });
     });
   }
 
@@ -5863,11 +5980,14 @@ export class NetGatewayDO {
    * would turn a client's own abandoned polls into a self-inflicted refusal.
    * Unknown ids are silently fine: the request may have completed already,
    * and a cancellation is advisory by construction.
+   *
+   * `requestKey` is an `mcpRequestKey` value, not a raw id — the numeric and
+   * string forms of the same digits are different requests.
    */
-  private mcpCancelWait(session: string, requestId: string): void {
+  private mcpCancelWait(session: string, requestKey: string): void {
     const queue = this.mcpQueues.get(session);
     if (!queue) return;
-    const index = queue.waiters.findIndex((entry) => entry.requestId === requestId);
+    const index = queue.waiters.findIndex((entry) => entry.requestKey === requestKey);
     if (index < 0) return;
     queue.waiters[index].wake(true);
   }
@@ -6068,8 +6188,32 @@ export class NetGatewayDO {
     }
   }
 
-  /** Resolve a paged discovery request against structural MCP context. The
-   * scope vocabulary changes presentation only; it never grants reachability. */
+  /**
+   * Resolve a paged discovery request against structural MCP context. The
+   * scope vocabulary changes presentation only; it never grants reachability.
+   *
+   * NAME CANONICALISATION (mcp.md M2.3). The descriptor set — **final tool
+   * names included** — is computed ONCE over the session's complete
+   * structural context, by the same producer `tools/list` and dynamic-name
+   * invocation use. Scope, `query`, and paging are pure projections of that
+   * one set.
+   *
+   * This ordering is load-bearing, not tidiness. Tool names are sanitized
+   * (`mcpSanitizeId` collapses every character outside `[A-Za-z0-9_]` to
+   * `_`), so distinct ids can share a base name — `a-b` and `a_b` both
+   * render `a_b`. Collisions are broken by a `_2`, `_3`… suffix assigned in
+   * listing order. Generating names over a FILTERED subset therefore handed
+   * out the *unsuffixed* name for whichever colliding object the filter
+   * happened to keep, while invocation — which always regenerates over the
+   * full context — bound that same name to the other object. An agent that
+   * called exactly what discovery advertised reached a different object.
+   *
+   * The scope selection is now applied to canonical descriptors, which also
+   * closes a second disagreement in the same place: `scope:"space"` used to
+   * synthesize command-shaped drafts for a target and its contents even when
+   * those objects were not in structural context, advertising descriptors
+   * that neither dynamic-name invocation nor `woo_call` would accept.
+   */
   private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
     const scope = mcpToolScope(args.scope);
     const activeScope = this.mcpActiveScope(actor, session);
@@ -6078,45 +6222,18 @@ export class NetGatewayDO {
     const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
     const cursor = mcpCursor(args.cursor);
     const context = this.mcpContextObjects(actor, session);
-    let selected = context;
-    let commandObjects = this.mcpActiveCommandContext(actor, session);
-
-    if (scope === "here") {
-      selected = new Set();
-      commandObjects = new Set();
-      if (activeScope) {
-        selected.add(activeScope);
-        commandObjects.add(activeScope);
-        for (const id of this.mcpContentsContext(activeScope, actor)) {
-          selected.add(id);
-          commandObjects.add(id);
-        }
-      }
-    } else if (scope === "object") {
-      selected = new Set();
-      if (object && context.has(object)) selected.add(object);
-      commandObjects = new Set(object && commandObjects.has(object) ? [object] : []);
-    } else if (scope === "space") {
-      selected = new Set();
-      commandObjects = new Set();
-      const target = object ?? activeScope;
-      if (target && context.has(target)) {
-        selected.add(target);
-        commandObjects.add(target);
-        for (const id of this.mcpContentsContext(target, actor)) {
-          selected.add(id);
-          commandObjects.add(id);
-        }
-      }
-    }
+    const canonical = this.mcpToolsForObjects(actor, context, this.mcpActiveCommandContext(actor, session));
+    const selected = this.mcpScopeSelection(scope, actor, activeScope, object, context);
 
     const normalized = query?.toLowerCase() ?? "";
-    const all = this.mcpToolsForObjects(actor, selected, commandObjects).filter((tool) =>
-      !normalized || tool.name.toLowerCase().includes(normalized) ||
-      tool.object.toLowerCase().includes(normalized) ||
-      tool.verb.toLowerCase().includes(normalized) ||
-      tool.description.toLowerCase().includes(normalized) ||
-      tool.aliases.some((alias) => alias.toLowerCase().includes(normalized))
+    const all = canonical.filter((tool) =>
+      selected.has(tool.object) && (
+        !normalized || tool.name.toLowerCase().includes(normalized) ||
+        tool.object.toLowerCase().includes(normalized) ||
+        tool.verb.toLowerCase().includes(normalized) ||
+        tool.description.toLowerCase().includes(normalized) ||
+        tool.aliases.some((alias) => alias.toLowerCase().includes(normalized))
+      )
     );
     const tools = all.slice(cursor, cursor + limit);
     const next = cursor + tools.length;
@@ -6129,8 +6246,38 @@ export class NetGatewayDO {
       cursor: args.cursor === undefined ? null : String(cursor),
       nextCursor: next < all.length ? String(next) : null,
       total: all.length,
-      tools
+      tools,
+      // Handed back so the caller can re-baseline the tools/list digest from
+      // the set it just computed instead of computing the whole listing twice.
+      canonical,
+      context
     };
+  }
+
+  /** Which contextual objects a presentation scope selects. Selection is by
+   * object id only — it filters the canonical descriptor set and can never
+   * add an object the session does not structurally reach. */
+  private mcpScopeSelection(
+    scope: NetMcpToolScope,
+    actor: string,
+    activeScope: string | null,
+    object: string | null,
+    context: Set<string>
+  ): Set<string> {
+    if (scope === "active") return context;
+    const out = new Set<string>();
+    if (scope === "object") {
+      if (object && context.has(object)) out.add(object);
+      return out;
+    }
+    // `here` is the active space; `space` names one contextual space (the
+    // active one by default). Both select that space plus its direct
+    // contents, intersected with structural context by the caller's filter.
+    const target = scope === "here" ? activeScope : (object ?? activeScope);
+    if (!target || !context.has(target)) return out;
+    out.add(target);
+    for (const id of this.mcpContentsContext(target, actor)) out.add(id);
+    return out;
   }
 
   /**
@@ -6259,6 +6406,16 @@ export class NetGatewayDO {
       this.mcpContextObjects(actor, session),
       this.mcpActiveCommandContext(actor, session)
     );
+  }
+
+  /** The advertised name for one (object, verb) pair in THIS session's
+   * canonical listing, or null when the pair is not advertised. Prose that
+   * names a tool must read the canonical assignment; re-deriving a name by
+   * sanitizing the id ignores collision suffixes and can therefore name a
+   * different object's tool (M2.3). */
+  private mcpAdvertisedName(actor: string, session: string, object: string, verb: string): string | null {
+    return this.mcpContextTools(actor, session)
+      .find((tool) => tool.object === object && tool.verb === verb)?.name ?? null;
   }
 
   /** The active command surface and its visible contents receive
@@ -6448,6 +6605,16 @@ export class NetGatewayDO {
     // presentation work for them too would have made every tools/list pay for
     // pages nobody is going to see.
     return drafts.map((draft) => {
+      // Sanitization is LOSSY — every character outside `[A-Za-z0-9_]`
+      // becomes `_`, so `a-b` and `a_b` share the base `a_b` — and the
+      // suffix that separates them is assigned in listing order. The
+      // assignment is therefore only meaningful relative to the set it was
+      // computed over, which is why every caller MUST pass the session's
+      // complete structural context (mcp.md M2.3): `tools/list`, the
+      // dynamic-name invocation resolver, the list digest, and
+      // `woo_list_reachable_tools` (which then projects a page out of the
+      // canonical set) all do. Naming a filtered subset would advertise a
+      // name that invocation binds to a different object.
       const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
       let name = base;
       let suffix = 2;
@@ -8206,26 +8373,52 @@ export class NetGatewayDO {
 
   /** Persist the key → scope pin; first writer wins (fix 5c).
    *
-   * H2c boundedness: the table keeps only the most recent
-   * GATEWAY_PIN_LIMIT rows (rowid order — SQLite's insertion order),
-   * pruned on insert. Consequence, documented (the reply-cache posture,
-   * scope.ts pruneReplies): a replay arriving after its pin pruned may
-   * re-plan to a different scope — but by the same retention window its
-   * recorded reply at the original scope has pruned too, so the request
-   * is a NEW turn by every observable measure: it validates fresh
-   * against the current head and read versions. Idempotency is a
-   * bounded-window guarantee, not an eternal one. */
+   * H2c boundedness, aligned with the authority's reply retention:
+   *
+   * - **per scope**, the table keeps the most recent GATEWAY_PIN_LIMIT rows
+   *   (rowid order — SQLite's insertion order). That number strictly exceeds
+   *   what one scope can retain in recorded replies and receipts (scope.ts
+   *   pruneReplies), so while a receipt is live its pin is live, and a retry
+   *   is routed back to the scope that holds the answer instead of being free
+   *   to execute at a second one;
+   * - **shard-wide**, a GATEWAY_PIN_TABLE_LIMIT ceiling keeps the table
+   *   bounded in the number of scopes.
+   *
+   * The reverse containment — a live pin always having a live receipt — is
+   * deliberately NOT an invariant. The pin is written before the submit (that
+   * is what makes it survive a lost response), so at write time there is no
+   * outcome to condition on, and a pin whose reply has pruned is harmless: the
+   * retry reaches the right scope, finds nothing recorded, and validates fresh.
+   *
+   * Consequence, documented (the reply-cache posture, scope.ts pruneReplies):
+   * a replay arriving after BOTH have pruned is a NEW turn by every observable
+   * measure — it validates fresh against the current head and read versions.
+   * Idempotency is a bounded-window guarantee, not an eternal one. */
   private pinScope(idempotencyKey: string, scope: string): void {
     this.state.storage.sql.exec(
       "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
       idempotencyKey,
       scope
     );
-    const count = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
-    if (count && Number(count.n) > GATEWAY_PIN_LIMIT) {
+    // Per-scope prune, on the (scope, rowid) index — the count and the delete
+    // both stay off a full-table scan.
+    const scoped = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE scope = ?", scope)
+    )[0];
+    if (scoped && Number(scoped.n) > GATEWAY_PIN_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_pin WHERE scope = ? AND rowid NOT IN " +
+          "(SELECT rowid FROM net_gateway_pin WHERE scope = ? ORDER BY rowid DESC LIMIT ?)",
+        scope,
+        scope,
+        GATEWAY_PIN_LIMIT
+      );
+    }
+    const total = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
+    if (total && Number(total.n) > GATEWAY_PIN_TABLE_LIMIT) {
       this.state.storage.sql.exec(
         "DELETE FROM net_gateway_pin WHERE rowid NOT IN (SELECT rowid FROM net_gateway_pin ORDER BY rowid DESC LIMIT ?)",
-        GATEWAY_PIN_LIMIT
+        GATEWAY_PIN_TABLE_LIMIT
       );
     }
   }
@@ -9820,6 +10013,20 @@ const MCP_DISCOVERY_MAX_PAGE = 256;
 const MCP_CONTEXT_WARM_FAILURE_CAP = 512;
 const MCP_CONTEXT_WARM_SUCCESS_CAP = 512;
 const MCP_SSE_LISTEN_MS = 25_000;
+/**
+ * Live standalone GET/SSE listens per session (mcp.md M6).
+ *
+ * `woo_wait` is capped per session, but each authenticated GET used to append
+ * another ~25-second waiter with no limit at all: the per-actor rate bucket
+ * alone permits on the order of 1,250 concurrent listens inside one listen
+ * window, every one of them holding a stream controller and a timer.
+ *
+ * Streamable HTTP gives a client exactly one standalone stream, so the cap is
+ * small; the slack covers a reconnect that overlaps the stream it replaces.
+ * Over the cap the OLDEST listen is CLOSED to admit the new one — see
+ * clientMcpEvents for why replacement rather than refusal.
+ */
+const MCP_MAX_SESSION_SSE = 2;
 const MCP_SSE_CONNECTED = new TextEncoder().encode("retry: 1000\n\n");
 const MCP_LIST_CHANGED_NOTIFICATION = {
   jsonrpc: "2.0",
@@ -9834,10 +10041,11 @@ type NetMcpSseWaiter = {
 type NetMcpSessionState = {
   actor: string;
   buffer: unknown[];
-  /** Parked `woo_wait` calls. Keyed by JSON-RPC request id so an explicit
-   * `notifications/cancelled` can release exactly one, and BOUNDED
-   * (MCP_MAX_SESSION_WAITS) because this is a public surface: without a cap
-   * a client could park closures and timers without limit. */
+  /** Parked `woo_wait` calls. Keyed by the class-discriminated JSON-RPC
+   * request id (`mcpRequestKey`) so an explicit `notifications/cancelled` can
+   * release exactly one, and BOUNDED (MCP_MAX_SESSION_WAITS) because this is
+   * a public surface: without a cap a client could park closures and timers
+   * without limit. */
   waiters: NetMcpWaiter[];
   ownEchoIds: Set<string>;
   /** M5.1 continuity marker. True when this gateway cannot prove that the
@@ -9848,12 +10056,15 @@ type NetMcpSessionState = {
   toolListDigest: string | null;
   listChangedDirty: boolean;
   listChangedPending: boolean;
+  /** Live standalone GET/SSE listens. Bounded by MCP_MAX_SESSION_SSE for the
+   * same reason `waiters` is: each holds a stream controller and a 25s timer.
+   * Oldest-first, so admitting one over the cap evicts from the front. */
   sseWaiters: NetMcpSseWaiter[];
 };
 
 /** One parked woo_wait. `wake(cancelled)` resolves it; a cancelled wake must
  * NOT drain, or a client that walked away would consume rows it never read. */
-type NetMcpWaiter = { requestId: string; wake: (cancelled: boolean) => void };
+type NetMcpWaiter = { requestKey: string; wake: (cancelled: boolean) => void };
 
 function mcpSessionState(actor: string): NetMcpSessionState {
   return {
@@ -9875,15 +10086,20 @@ function mcpSseMessage(message: unknown): Uint8Array {
 
 /** Streamable HTTP accepts headless clients without an Origin header. Browser
  * requests do carry one, and must be same-origin to prevent a hostile page
- * from using a locally reachable MCP server as a DNS-rebinding target. */
-function rejectForeignMcpOrigin(request: Request, target: URL): Response | null {
-  const raw = request.headers.get("origin");
-  if (raw === null) return null;
-  try {
-    if (new URL(raw).origin === target.origin) return null;
-  } catch {
-    // Malformed and opaque origins are not a trustworthy same-origin claim.
-  }
+ * from using a reachable MCP endpoint as a DNS-rebinding / cross-site target.
+ *
+ * The comparison is against the EDGE-ASSERTED public origin, never this DO's
+ * own request URL: the edge rewrites the URL to `https://do/...`, so comparing
+ * against it refused every browser and admitted every headless client — the
+ * exact inversion of the intended property. See src/worker/public-origin.ts
+ * for the header's trust model and the admission rule. */
+function rejectForeignMcpOrigin(request: Request, env: NetGatewayEnv): Response | null {
+  const decision = mcpOriginDecision({
+    origin: request.headers.get("origin"),
+    publicOrigin: request.headers.get(PUBLIC_ORIGIN_HEADER),
+    configured: env.WOO_MCP_ALLOWED_ORIGINS
+  });
+  if (decision === "allow") return null;
   return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
 }
 
@@ -9947,6 +10163,12 @@ type NetMcpToolPage = {
   nextCursor: string | null;
   total: number;
   tools: NetMcpDynamicTool[];
+  /** The complete canonical descriptor set the page was projected from, and
+   * the structural context it was computed over. Carried so the caller can
+   * re-baseline the tools/list digest without recomputing the whole listing.
+   * NOT part of the client reply. */
+  canonical: NetMcpDynamicTool[];
+  context: Set<string>;
 };
 
 function mcpRecord(value: unknown): Record<string, unknown> {
@@ -10048,6 +10270,20 @@ function mcpCursor(value: unknown): number {
  * `$nowhere` sentinel — and both mean "this session has no active space". */
 function mcpPlacedScope(location: string): string | null {
   return location && location !== "$nowhere" ? location : null;
+}
+
+/**
+ * The key a parked request is registered and cancelled under.
+ *
+ * JSON-RPC 2.0 ids are `String | Number` and the two are DISTINCT ids: `1`
+ * and `"1"` name different requests, and a client is free to have both in
+ * flight. Keying both sides by `String(id)` collapsed them, so a
+ * `notifications/cancelled` for `"1"` released — without draining — a
+ * `woo_wait` parked under `1`, silently returning an empty reply to a request
+ * its client never cancelled. Discriminating on class keeps them apart.
+ */
+function mcpRequestKey(id: number | string): string {
+  return typeof id === "number" ? `n:${id}` : `s:${id}`;
 }
 
 function mcpSanitizeId(value: string): string {

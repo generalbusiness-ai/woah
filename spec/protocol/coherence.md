@@ -280,6 +280,12 @@ request would be a confidently wrong answer, which is worse than the double
 execution the key prevents. The refusal never overwrites the recorded reply:
 the original caller's receipt outlives another client's collision.
 
+This holds for EVERY terminal recorded outcome. A terminal rejection is
+recorded under the key exactly like an accept, so the comparison MUST precede
+the return of a recorded rejection, and rejections MUST persist the fingerprint
+they answered. A recorded outcome from before the field existed skips the check
+rather than guessing agreement.
+
 The retained outcome is additionally bound to the actor that committed it.
 Idempotency keys are client-chosen on `/net-api/turn`, on the WebSocket turn
 frame, and — via the operation id — on MCP, so two clients may name the same
@@ -294,11 +300,25 @@ number, and no ordering — so an externally visible but effect-free act
 (speech) is not re-emitted by a retry. Without the opt-in the write-free path
 is unchanged.
 
-Retention is bounded and therefore so is the guarantee: replies within the
-scope's recovery-tail window are never pruned, and the cache holds a bounded
-total beyond it. A replay arriving after its reply pruned re-enters
-validation as a new turn. Per-surface client contract, including the retained
-byte ceiling and what a client is promised on retry:
+Retention is bounded and therefore so is the guarantee, under two quotas that
+reflect what limits each class of row. Replies for turns that COMMITTED are
+never pruned inside the scope's recovery-tail window and hold a bounded total
+beyond it; that carve-out is safe only because a commit consumes a sequence
+number, so the window can hold at most `tail_limit` of them. Outcomes that
+advance nothing — receipts and terminal rejections — are recorded at whatever
+head is current and are therefore permanently inside that window, so they MUST
+be bounded separately, by a flat insertion-ordered quota. Without it, an
+authenticated actor grows authority storage without limit out of repeated
+effect-free acts, and the quota MUST be enforced at insertion, memory and
+durable rows in one step.
+
+A replay arriving after its reply pruned re-enters validation as a new turn.
+Any routing state a gateway keeps to send a retry back to the scope that
+recorded its reply — a selection pin — MUST be retained to cover that scope's
+reply window; if it expires first, a retry re-plans and may commit at a second
+scope, which is the double execution this section exists to prevent. Per-surface
+client contract, including the exact windows, the retained byte ceiling and what
+a client is promised on retry:
 [mcp.md §M4.2](mcp.md#m42-retry-safety-the-operation-id).
 
 Fanout carries two distinct monotonic positions. The authority `seq` gates

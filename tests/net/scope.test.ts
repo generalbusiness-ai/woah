@@ -55,6 +55,44 @@ function propWrite(value: unknown) {
   return { cell: { kind: "prop" as const, object: "#thing", name: "n" }, value: value as never, op: "set" as const, writer: WRITER };
 }
 
+/**
+ * A keyed observation-only act (CO2.5): `direct` route, no authority effect,
+ * `retry_receipt` set. It records a RECEIPT — a reply row at the current head
+ * with no seq, no CAS, no ordering — which is exactly the row shape the
+ * seq-ordered retention rule cannot age out.
+ */
+function receiptSubmit(seq: ScopeSequencer, key: string, hash: string, fingerprint?: string): CommitSubmit {
+  const t = transcript({
+    route: "direct",
+    hash,
+    observations: [{ type: "said", text: hash }] as never
+  });
+  return {
+    ...submitFor(seq, t, key),
+    retry_receipt: true,
+    ...(fingerprint !== undefined ? { request_fingerprint: fingerprint } : {})
+  };
+}
+
+/**
+ * A TERMINALLY rejected submit (`incomplete_transcript` — never
+ * short-circuited, never retryable), so it is recorded under its key. `payload`
+ * varies the transcript so two submits under one key are genuinely different
+ * requests; `fingerprint` is what the authority actually compares.
+ */
+function incompleteSubmit(seq: ScopeSequencer, key: string, payload: string, fingerprint?: string): CommitSubmit {
+  const t = transcript({
+    writes: [propWrite(payload)],
+    hash: `incomplete-${payload}`,
+    complete: false,
+    incompleteReasons: ["missing_state"] as never
+  });
+  return {
+    ...submitFor(seq, t, key),
+    ...(fingerprint !== undefined ? { request_fingerprint: fingerprint } : {})
+  };
+}
+
 describe("commit acceptance (CO4)", () => {
   it("accepts a valid turn, advances head, exposes touched cells", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
@@ -745,6 +783,161 @@ describe("reply-cache boundedness (H2a)", () => {
       expect(reply.status).toBe("accepted");
     }
     expect(store.readReplies().length).toBe(10);
+  });
+
+  // The reviewer's probe, verbatim in shape: a scope configured to hold 3
+  // replies, ten keyed observation-only acts at the SAME head. Before the
+  // non-advancing quota all ten were retained — a receipt is recorded AT the
+  // current head, so the seq-ordered "never prune inside the recovery tail"
+  // rule can never reach it, and any actor could mint storage forever out of
+  // cheap repeated speech.
+  it("bounds same-head RECEIPTS: repeated keyed observation-only acts cannot grow the cache", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    for (let i = 0; i < 10; i += 1) {
+      const reply = seq.submit(receiptSubmit(seq, `receipt-key-${i}`, `receipt-${i}`));
+      expect(reply.status, `receipt ${i}`).toBe("accepted");
+    }
+    // No head movement at all: receipts consume no seq (CO2.5).
+    expect(seq.head().seq).toBe(0);
+    // Bounded in BOTH copies. Memory is proved through the public surface:
+    // the oldest keys no longer replay, the newest still do.
+    const durableKeys = store.readReplies().map((row) => row.key);
+    expect(durableKeys.length).toBeLessThanOrEqual(3);
+    expect(durableKeys).toContain("receipt-key-9");
+    expect(durableKeys).not.toContain("receipt-key-0");
+
+    const newest = seq.submit(receiptSubmit(seq, "receipt-key-9", "receipt-9"));
+    expect(newest.status === "accepted" && newest.replayed).toBe(true);
+    const evicted = seq.submit(receiptSubmit(seq, "receipt-key-0", "receipt-0"));
+    expect(evicted.status === "accepted" && evicted.replayed).not.toBe(true);
+    // Still bounded after that fresh record — the prune runs on EVERY
+    // insertion, so there is no window in which the cache is over quota.
+    expect(store.readReplies().length).toBeLessThanOrEqual(3);
+  });
+
+  it("bounds recorded REJECTIONS under the same quota, memory and durable in lockstep", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    for (let i = 0; i < 10; i += 1) {
+      const reply = seq.submit(incompleteSubmit(seq, `reject-key-${i}`, `reject-${i}`));
+      expect(reply.status, `reject ${i}`).toBe("rejected");
+    }
+    const durableKeys = store.readReplies().map((row) => row.key);
+    expect(durableKeys.length).toBeLessThanOrEqual(3);
+    expect(durableKeys).toContain("reject-key-9");
+    expect(durableKeys).not.toContain("reject-key-0");
+  });
+
+  it("receipt pressure never evicts an accepted commit's reply", () => {
+    // The two quotas are separate on purpose: cheap non-advancing rows are
+    // the ones an actor controls, and letting them push out advancing
+    // replies would turn a storage bound into an idempotency bypass.
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 4, receiptLimit: 2 });
+    const commit = submitFor(seq, transcript({ writes: [propWrite("kept")], hash: "kept" }), "kept-key");
+    expect(seq.submit(commit).status).toBe("accepted");
+    for (let i = 0; i < 20; i += 1) {
+      expect(seq.submit(receiptSubmit(seq, `noise-${i}`, `noise-${i}`)).status).toBe("accepted");
+    }
+    const replay = seq.submit(commit);
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+    expect(seq.head().seq).toBe(1); // never a second commit
+    expect(store.readReplies().map((row) => row.key)).toContain("kept-key");
+    // 1 advancing + at most 2 receipts.
+    expect(store.readReplies().length).toBeLessThanOrEqual(3);
+  });
+
+  it("heals an AGED cache: unmarked receipts sharing one head are reclassified and pruned", () => {
+    // What a world deployed before `replay_receipt` existed is holding right
+    // now: keyed receipts recorded at the same head, none of them marked. They
+    // must not need an operator migration to drain, and on a QUIET scope the
+    // seq cutoff can never reach them — so classification has to recover the
+    // fact from the rows themselves (one advancing reply per seq, first wins).
+    const store = new InMemoryScopeStore();
+    for (let i = 0; i < 12; i += 1) {
+      store.writeReply(`aged-${i}`, {
+        kind: "woo.net.commit_reply.v1",
+        status: "accepted",
+        scope: SCOPE,
+        head: { seq: 0, hash: "genesis" },
+        touched: [],
+        post_state_version: "v0",
+        replay_output: { actor: "#actor" }
+      } as never);
+    }
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    expect(store.readReplies().length, "rehydration alone rewrites nothing").toBe(12);
+
+    // One insertion, one pass: the quota is restored immediately, not over
+    // the next twelve turns.
+    expect(seq.submit(receiptSubmit(seq, "fresh", "fresh")).status).toBe("accepted");
+    const keys = store.readReplies().map((row) => row.key);
+    expect(keys.length).toBe(4); // 1 advancing (aged-0) + receiptLimit 3
+    expect(keys).toContain("aged-0"); // the genuine accept at seq 0 is kept
+    expect(keys).toContain("fresh");
+    expect(keys).not.toContain("aged-1");
+  });
+
+  it("rehydration rebuilds the bounded set, not a resurrected unbounded one", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    for (let i = 0; i < 10; i += 1) seq.submit(receiptSubmit(seq, `rehydrate-${i}`, `rehydrate-${i}`));
+    const rehydrated = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    const replay = rehydrated.submit(receiptSubmit(rehydrated, "rehydrate-9", "rehydrate-9"));
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+    for (let i = 0; i < 10; i += 1) rehydrated.submit(receiptSubmit(rehydrated, `after-${i}`, `after-${i}`));
+    expect(store.readReplies().length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe("one key answers one request, for REJECTIONS too (CO2.5 / M4.2)", () => {
+  it("same key + DIFFERENT payload conflicts instead of replaying the first refusal", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const first = seq.submit(incompleteSubmit(seq, "reused", "call-a", "fp-a"));
+    expect(first.status === "rejected" && first.reason).toBe("incomplete_transcript");
+    // Before the fingerprint reached the rejection path, this returned the
+    // FIRST request's `incomplete_transcript` — a confidently wrong answer
+    // about a call the authority never saw.
+    const second = seq.submit(incompleteSubmit(seq, "reused", "call-b", "fp-b"));
+    expect(second.status === "rejected" && second.reason).toBe("idempotency_conflict");
+    expect(second.status === "rejected" && second.detail?.reason).toBe("key_reused_for_different_request");
+  });
+
+  it("same key + same payload still replays the recorded rejection, fingerprint stripped", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const submit = incompleteSubmit(seq, "stable", "call-a", "fp-a");
+    expect(seq.submit(submit).status === "rejected").toBe(true);
+    const replay = seq.submit(incompleteSubmit(seq, "stable", "call-a", "fp-a"));
+    expect(replay.status === "rejected" && replay.reason).toBe("incomplete_transcript");
+    // A stored request hash is never wire output — not on accepts, not here.
+    expect((replay as Record<string, unknown>).replay_request).toBeUndefined();
+  });
+
+  it("the conflict never clobbers the recorded rejection: the original caller's retry still replays", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    expect(seq.submit(incompleteSubmit(seq, "held", "call-a", "fp-a")).status).toBe("rejected");
+    expect(seq.submit(incompleteSubmit(seq, "held", "call-b", "fp-b")).status === "rejected").toBe(true);
+    const original = seq.submit(incompleteSubmit(seq, "held", "call-a", "fp-a"));
+    expect(original.status === "rejected" && original.reason).toBe("incomplete_transcript");
+  });
+
+  it("AGED rows written before the fingerprint existed skip the check rather than guess", () => {
+    // Documented behaviour, matching the accepted path: a recorded reply with
+    // no fingerprint is not evidence of DISagreement either, so it replays.
+    // Guessing "conflict" would break every in-flight retry across the
+    // rollout; guessing "agreement" is what the field was added to stop, and
+    // the ambiguity ends as the aged rows prune.
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const aged = seq.submit(incompleteSubmit(seq, "aged", "call-a")); // no fingerprint: pre-upgrade gateway
+    expect(aged.status === "rejected" && aged.reason).toBe("incomplete_transcript");
+    const later = seq.submit(incompleteSubmit(seq, "aged", "call-b", "fp-b"));
+    expect(later.status === "rejected" && later.reason).toBe("incomplete_transcript");
+    // And the mirror case — a recorded fingerprint with a submit that has none.
+    const fresh = seq.submit(incompleteSubmit(seq, "aged-2", "call-a", "fp-a"));
+    expect(fresh.status === "rejected" && fresh.reason).toBe("incomplete_transcript");
+    const oldClient = seq.submit(incompleteSubmit(seq, "aged-2", "call-b"));
+    expect(oldClient.status === "rejected" && oldClient.reason).toBe("incomplete_transcript");
   });
 });
 

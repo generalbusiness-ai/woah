@@ -6,6 +6,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { NetMcpStdioDispatcher } from "./net-stdio-dispatcher";
 import { NetMcpStdioProxy } from "./net-stdio-proxy";
+import { createNetMcpStdioShutdown, NET_MCP_STDIO_HARD_EXIT_MS } from "./net-stdio-shutdown";
 
 async function main(): Promise<void> {
   const token = process.env.WOO_MCP_TOKEN;
@@ -31,14 +32,25 @@ async function main(): Promise<void> {
     (message) => transport.send(message),
     reportError
   );
-  let shuttingDown = false;
+  const shutdown = createNetMcpStdioShutdown({ dispatcher, proxy, transport, onError: reportError });
 
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    await dispatcher.idle();
-    await proxy.close();
-    await transport.close();
+  /** Every exit route runs the same bounded shutdown, then leaves.
+   *
+   * The explicit exit matters: the bridge holds sockets (the notification
+   * GET/SSE carrier, any aborted POST) whose teardown we cannot fully observe,
+   * and "the event loop happened to drain" is not a promptness guarantee. The
+   * watchdog covers the remaining case where shutdown itself wedges — a child
+   * that ignores SIGTERM gets SIGKILLed, which loses the session DELETE too. */
+  const exitAfterShutdown = (code: number): void => {
+    const watchdog = setTimeout(() => {
+      process.stderr.write("net MCP stdio bridge shutdown timed out; exiting\n");
+      process.exit(code);
+    }, NET_MCP_STDIO_HARD_EXIT_MS);
+    watchdog.unref();
+    void shutdown().finally(() => {
+      clearTimeout(watchdog);
+      process.exit(code);
+    });
   };
 
   // The dispatcher serializes only the pre-session prefix. After initialize,
@@ -49,9 +61,11 @@ async function main(): Promise<void> {
   transport.onerror = (error) => {
     process.stderr.write(`net MCP stdio transport error: ${errorMessage(error)}\n`);
   };
-  process.stdin.once("end", () => void shutdown());
-  process.once("SIGINT", () => void shutdown().finally(() => process.exit(130)));
-  process.once("SIGTERM", () => void shutdown().finally(() => process.exit(143)));
+  // Stdin EOF means the client is gone: nothing further can be served, and
+  // nothing is left to report to, so a clean exit is the correct response.
+  process.stdin.once("end", () => exitAfterShutdown(0));
+  process.once("SIGINT", () => exitAfterShutdown(130));
+  process.once("SIGTERM", () => exitAfterShutdown(143));
   await transport.start();
 }
 
