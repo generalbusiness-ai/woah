@@ -3,7 +3,7 @@
 // is the commit record, not a catalog write (2b); the programmer flag commits
 // through the object_lineage lineage seam; and promote/demote are tracked
 // native primitives. Driven over the real /net-api/turn doorway. Fake-DO lane.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
@@ -16,8 +16,15 @@ import { signInternalRequest } from "../../src/worker/internal-auth";
 
 const SECRET = "net-promote-test-secret";
 const EPOCH = "cat-net-promote-1";
+type TestState = {
+  state: NetScopeDurableState & NetGatewayDurableState;
+  pending(): number;
+  settle(): Promise<void>;
+  close(): void;
+};
+const testStates: TestState[] = [];
 
-function netState(name: string) {
+function netState(name: string): TestState {
   const fake = new FakeDurableObjectState(name);
   const deferred: Array<Promise<unknown>> = [];
   const state: NetScopeDurableState & NetGatewayDurableState = {
@@ -25,8 +32,25 @@ function netState(name: string) {
     waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
     storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
   };
-  return { state, settle: async () => { while (deferred.length > 0) await deferred.shift(); }, close: () => fake.close() };
+  const fixture = {
+    state,
+    pending: () => deferred.length,
+    settle: async () => { while (deferred.length > 0) await deferred.shift(); },
+    close: () => fake.close()
+  };
+  testStates.push(fixture);
+  return fixture;
 }
+
+afterEach(async () => {
+  // The last accepted turn can enqueue fanout after its reply. Drain to
+  // quiescence even when an assertion throws, then close every fake DO.
+  while (testStates.some((state) => state.pending() > 0)) {
+    for (const state of testStates) await state.settle();
+  }
+  for (const state of testStates) state.close();
+  testStates.length = 0;
+});
 
 async function clientFetch(
   gateway: NetGatewayDO,
@@ -153,6 +177,5 @@ describe("Net promote/demote over /net-api/turn (fake-DO lane)", () => {
     const afterDemote = await agentTools();
     expect(afterDemote).not.toContain(`${p}__install_verb`);
 
-    for (const st of states) st.close();
   });
 });

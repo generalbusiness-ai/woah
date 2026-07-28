@@ -39,7 +39,12 @@ function netState(name: string) {
     waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
     storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
   };
-  return { state, settle: async () => { while (deferred.length > 0) await deferred.shift(); }, close: () => fake.close() };
+  return {
+    state,
+    pending: () => deferred.length,
+    settle: async () => { while (deferred.length > 0) await deferred.shift(); },
+    close: () => fake.close()
+  };
 }
 
 /** A world shaped like the deployed one: no human, and (optionally) without the
@@ -109,7 +114,15 @@ async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef
       for (const s of [...scopeDOs.values()]) await s.alarm();
       for (const st of [...states]) await st.settle();
     },
-    close: () => { for (const st of states) st.close(); }
+    close: async () => {
+      // A final accepted repair/provision call may still own fanout/audit
+      // work after its response. Teardown is part of the fixture contract:
+      // drain all such work before closing the SQLite handles.
+      while (states.some((state) => state.pending() > 0)) {
+        for (const st of [...states]) await st.settle();
+      }
+      for (const st of states) st.close();
+    }
   };
 }
 
@@ -223,7 +236,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(out).toMatch(/"authoring_surface": "\$programmer"/);
       expect(out).toMatch(/ready/);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -261,7 +274,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(again.body?.status).toBe("empty");
       expect(verbCellSlot((await catalogCell(h, key))?.value)).toBe(slot);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -286,7 +299,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // The stored ordinal is unchanged: the authority owns it.
       expect(verbCellSlot((await catalogCell(h, key))?.value)).toBe(heldSlot);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -307,7 +320,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       }])).status).toBe(400);
       expect(await catalogCell(h, "verb_bytecode:$human:x")).toBeUndefined();
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -366,7 +379,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // No probe mutated anything: nothing was provisioned.
       expect(ready.body?.recorded_agent ?? null).toBe(null);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -457,7 +470,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect((await signedPost(h, "/net/provision-anchor", { anchor_id: "bad token" })).status).toBe(400);
       expect((await signedPost(h, "/net/provision-anchor", {})).status).toBe(400);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -493,7 +506,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(closure.cells?.find((c) => c.key === `property_cell:${account}:agent_count`)?.value?.value).toBe(0);
       expect(closure.cells?.find((c) => c.key === `property_cell:${account}:operator_provisioned_agents`)).toBeUndefined();
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -554,7 +567,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(superseded.body?.status).toBe("applied");
       expect((await catalogCell(h, key))?.value).toMatchObject({ value: "$newer_surface" });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -623,7 +636,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(rerun.body?.result?.actor_id).toBe(result.actor_id);
       expect(rerun.body?.result?.created).toBe(false);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 });

@@ -7,7 +7,7 @@
 // gateway's per-turn repairs STICKY across re-plans (PlanTurnInput.seedObjects).
 // These tests drive real outliner adds through the in-process fake-DO net
 // harness and assert bounded convergence (not merely under-budget).
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
@@ -22,11 +22,15 @@ import type { WooWorld } from "../../src/core/world";
 
 const SECRET = "net-outliner-converge-secret";
 
+const testStates: Array<{ fake: FakeDurableObjectState; deferred: Array<Promise<unknown>> }> = [];
+
 function netState(name: string): NetScopeDurableState & NetGatewayDurableState {
   const fake = new FakeDurableObjectState(name);
+  const deferred: Array<Promise<unknown>> = [];
+  testStates.push({ fake, deferred });
   return {
     id: fake.id,
-    waitUntil: (_promise: Promise<unknown>) => {},
+    waitUntil: (promise: Promise<unknown>) => { deferred.push(promise); },
     storage: {
       sql: fake.storage.sql,
       transactionSync: fake.storage.transactionSync,
@@ -35,6 +39,19 @@ function netState(name: string): NetScopeDurableState & NetGatewayDurableState {
     }
   };
 }
+
+afterEach(async () => {
+  // Fanout/adoption work can enqueue more work on a different fake DO. Drain
+  // the whole fixture to a fixed point before closing any SQLite handle, and
+  // propagate a rejected deferred task into the owning test.
+  while (testStates.some(({ deferred }) => deferred.length > 0)) {
+    for (const { deferred } of testStates) {
+      while (deferred.length > 0) await deferred.shift();
+    }
+  }
+  for (const { fake } of testStates) fake.close();
+  testStates.length = 0;
+});
 
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };
 
@@ -1275,7 +1292,8 @@ describe("Dispenser anchored-actor Acts over the Net path", () => {
     // The companion shell regression in net-relations.test.ts drives this
     // exact metadata through cluster outbox → semantic owner → peer fanout,
     // including redelivery. Keeping the gateway proof focused here avoids
-    // relying on this file's intentionally fire-and-forget waitUntil harness.
+    // duplicating that shell assertion; this fixture still drains every
+    // deferred delivery before teardown.
   });
 
   it("orders and delivers through authenticated room sequencing, with dropped-reply replay", async () => {
