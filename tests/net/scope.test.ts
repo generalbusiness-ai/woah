@@ -879,6 +879,63 @@ describe("reply-cache boundedness (H2a)", () => {
     expect(keys).not.toContain("aged-1");
   });
 
+  it("expires a recorded outcome at the shared lease, whatever the count quotas allow", () => {
+    // The count quotas bound storage; only the lease bounds AGE. A quiet scope
+    // comfortably inside its quotas would otherwise hold an outcome forever,
+    // long after every gateway pin routing a retry to it had expired — and the
+    // routing guarantee is exactly the claim that cannot happen.
+    const store = new InMemoryScopeStore();
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLimit: 100, // far above what this test records: the lease is the only active bound
+      replyLeaseMs: 60_000,
+      now: () => clock
+    });
+    expect(seq.submit(receiptSubmit(seq, "leased", "leased")).status).toBe("accepted");
+    expect(store.readReplies().length).toBe(1);
+    const withinLease = seq.submit(receiptSubmit(seq, "leased", "leased"));
+    expect(withinLease.status === "accepted" && withinLease.replayed).toBe(true);
+
+    clock += 60_001;
+    expect(seq.submit(receiptSubmit(seq, "later", "later")).status).toBe("accepted");
+    expect(store.readReplies().map((row) => row.key)).toEqual(["later"]);
+    // Past the lease the key is a NEW turn — the documented posture, now
+    // reached by a clock the gateway shares rather than by cache pressure.
+    const afterLease = seq.submit(receiptSubmit(seq, "leased", "leased"));
+    expect(afterLease.status === "accepted" && afterLease.replayed).not.toBe(true);
+  });
+
+  it("stamps a LEGACY row at hydration: it expires a lease later, not at once and not never", () => {
+    const store = new InMemoryScopeStore();
+    store.writeReply("legacy", {
+      kind: "woo.net.commit_reply.v1",
+      status: "accepted",
+      scope: SCOPE,
+      head: { seq: 0, hash: "genesis" },
+      touched: [],
+      post_state_version: "v0",
+      replay_output: { actor: "#actor" }
+    } as never);
+    let clock = 5_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLimit: 100,
+      replyLeaseMs: 60_000,
+      now: () => clock
+    });
+    // Not dropped at the instant of the upgrade — that would blank every
+    // in-flight retry the moment the lease shipped.
+    expect(seq.submit(receiptSubmit(seq, "other", "other")).status).toBe("accepted");
+    expect(store.readReplies().map((row) => row.key)).toContain("legacy");
+
+    clock += 60_001;
+    expect(seq.submit(receiptSubmit(seq, "third", "third")).status).toBe("accepted");
+    expect(store.readReplies().map((row) => row.key)).not.toContain("legacy");
+  });
+
   it("rehydration rebuilds the bounded set, not a resurrected unbounded one", () => {
     const store = new InMemoryScopeStore();
     const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });

@@ -872,6 +872,184 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
     }
   });
 
+  /**
+   * The invariant under test, stated as an assertion rather than as prose:
+   * every recorded outcome still held by an authority has a live pin routing
+   * its retry back there. If it does not, a retry re-plans and may commit at a
+   * SECOND scope — the cross-scope double execution.
+   */
+  /**
+   * The invariant under test, stated as an assertion rather than as prose: a
+   * recorded outcome still held by an authority has a live pin routing its
+   * retry back there. Without one the retry re-plans and may commit at a
+   * SECOND scope — the cross-scope double execution.
+   *
+   * Checked for named CLIENT-SUPPLIED operation ids only, which is the class
+   * the guarantee covers. Gateway-minted keys (a per-request MCP key, an
+   * internal `session-mint:` credential write) can never be reused by a
+   * client, and their selection is a deterministic function of the request, so
+   * they carry no retained-route promise.
+   */
+  const assertLiveRepliesArePinned = (f: Awaited<ReturnType<typeof fixture>>, operationIds: string[]) => {
+    const replies = new Map<string, string>();
+    for (const [scope, st] of f.scopeStates) {
+      for (const row of (st.state.storage.sql.exec(
+        "SELECT idempotency_key FROM net_scope_reply"
+      ) as { toArray(): Array<{ idempotency_key: string }> }).toArray()) {
+        replies.set(row.idempotency_key, scope);
+      }
+    }
+    const pinned = new Set(
+      (f.gatewayState.state.storage.sql.exec("SELECT idempotency_key FROM net_gateway_pin") as {
+        toArray(): Array<{ idempotency_key: string }>;
+      }).toArray().map((row) => row.idempotency_key)
+    );
+    const checked: string[] = [];
+    const orphaned: string[] = [];
+    for (const operationId of operationIds) {
+      const key = [...replies.keys()].find((candidate) => candidate.endsWith(`:${operationId}`));
+      // A reply that has already pruned carries no promise; the invariant is
+      // about outcomes the authority still holds.
+      if (key === undefined) continue;
+      checked.push(operationId);
+      if (!pinned.has(key)) orphaned.push(`${key}@${replies.get(key)}`);
+    }
+    expect(checked, "probe needs at least one live recorded reply").not.toEqual([]);
+    expect(orphaned, "recorded outcomes whose retry has lost its route").toEqual([]);
+  };
+
+  /** Bulk-load filler pins in ONE statement — 65k rows a row at a time is a
+   * minute of test time for no extra signal. */
+  const fillPins = (f: Awaited<ReturnType<typeof fixture>>, count: number, scopes: number) => {
+    f.gatewayState.state.storage.sql.exec(
+      "INSERT INTO net_gateway_pin (idempotency_key, scope) " +
+        "SELECT 'filler-' || value, 'filler_scope_' || (value % " + String(scopes) + ") FROM (" +
+        "WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < ?) " +
+        "SELECT value FROM c)",
+      count
+    );
+  };
+
+  // Reviewer probe 1. The shard-wide ceiling deletes by GLOBAL rowid and
+  // ignores scope entirely, so scopes that are each individually far below the
+  // per-scope cap can together cross it and evict the oldest pins shard-wide —
+  // live receipts and all. The per-scope guard never fires.
+  it("probe 1: many scopes below the per-scope cap still cross the shard ceiling and orphan a live receipt", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "op-probe1")).result?.isError).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+      assertLiveRepliesArePinned(f, ["op-probe1"]); // sanity: holds before pressure
+
+      // 33 scopes, ~2000 pins each: every scope is UNDER the 2048 per-scope
+      // cap, and together they cross the 65,536 shard ceiling.
+      fillPins(f, 66000, 33);
+      expect((await f.bump(f.aliceSession, "op-probe1-sweep")).result?.isError).not.toBe(true);
+      await f.settleAll();
+
+      assertLiveRepliesArePinned(f, ["op-probe1"]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  // Reviewer probe 2. The per-scope prune counts PINS, not pins with a live
+  // receipt, so keys that were pinned and then abandoned before any authority
+  // reply push out an older pin whose receipt is still live.
+  it("probe 2: same-scope ABANDONED submissions evict the pin of a live receipt", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "op-probe2")).result?.isError).not.toBe(true);
+      await f.settleAll();
+      const home = (f.gatewayState.state.storage.sql.exec(
+        "SELECT scope FROM net_gateway_pin WHERE idempotency_key LIKE '%op-probe2'"
+      ) as { toArray(): Array<{ scope: string }> }).toArray()[0]?.scope;
+      expect(home, "the first submit pinned its scope").toBeTruthy();
+      assertLiveRepliesArePinned(f, ["op-probe2"]);
+
+      // Newer keys at the SAME scope that never recorded an outcome: a client
+      // that planned and then dropped the request, or whose submit was lost.
+      f.gatewayState.state.storage.sql.exec(
+        "INSERT INTO net_gateway_pin (idempotency_key, scope) " +
+          "SELECT 'abandoned-' || value, ? FROM (" +
+          "WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < 2100) " +
+          "SELECT value FROM c)",
+        home
+      );
+      expect((await f.bump(f.aliceSession, "op-probe2-sweep")).result?.isError).not.toBe(true);
+      await f.settleAll();
+
+      assertLiveRepliesArePinned(f, ["op-probe2"]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("at capacity a new retry guarantee is REFUSED, not issued by evicting a live one", async () => {
+    // Raising the limit is not a fix and neither is eviction: dropping an
+    // unexpired guarantee turns a lost response into a silent second
+    // execution. The shard refuses instead, and says so.
+    const f = await fixture();
+    try {
+      const sql = f.gatewayState.state.storage.sql;
+      const far = Date.now() + 60 * 60_000;
+      sql.exec(
+        "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) " +
+          "SELECT 'held-' || value, 'some_scope', ?, 1 FROM (" +
+          "WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < 65536) " +
+          "SELECT value FROM c)",
+        far
+      );
+
+      const refused = await f.bump(f.aliceSession, "op-at-capacity");
+      expect(refused.result?.isError, JSON.stringify(refused).slice(0, 300)).toBe(true);
+      expect(JSON.stringify(refused)).toContain("E_RETRY_CAPACITY");
+      await f.settleAll();
+      // Refused BEFORE anything was planned or submitted: the world did not move.
+      expect(await f.hits()).toBe(0);
+
+      // The refusal is of the GUARANTEE, not of the surface: a call that asks
+      // for no retry guarantee still works while the shard is saturated.
+      const unkeyed = await f.bump(f.aliceSession);
+      expect(unkeyed.result?.isError, JSON.stringify(unkeyed).slice(0, 300)).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("minted-key pins are evictable and can never crowd out a guaranteed one", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "op-guaranteed")).result?.isError).not.toBe(true);
+      await f.settleAll();
+      assertLiveRepliesArePinned(f, ["op-guaranteed"]);
+
+      // Far more transient pins than their capacity. They are the class no
+      // client can look up, so they are the class that yields.
+      const far = Date.now() + 60 * 60_000;
+      f.gatewayState.state.storage.sql.exec(
+        "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) " +
+          "SELECT 'minted-' || value, 'some_scope', ?, 0 FROM (" +
+          "WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < 9000) " +
+          "SELECT value FROM c)",
+        far
+      );
+      expect((await f.bump(f.aliceSession, "op-guaranteed-sweep")).result?.isError).not.toBe(true);
+      await f.settleAll();
+
+      const transient = (f.gatewayState.state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 0"
+      ) as { toArray(): Array<{ n: number }> }).toArray()[0];
+      expect(Number(transient?.n)).toBeLessThanOrEqual(4096);
+      assertLiveRepliesArePinned(f, ["op-guaranteed", "op-guaranteed-sweep"]);
+    } finally {
+      await f.close();
+    }
+  });
+
   it("keyed speech records a DURABLE receipt at the authority, in the quota that bounds it", async () => {
     // The transport half of the reviewer's probe: prove that keyed
     // observation-only speech really does land as a row in the authority's
