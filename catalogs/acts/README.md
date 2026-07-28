@@ -1,6 +1,6 @@
 ---
 name: acts
-version: 0.2.0
+version: 0.2.1
 spec_version: v1
 license: MIT
 description: Acts kernel - the generic layer only. The $acts feature gives a space or catalog-owned anchored actor an internal, schema-validated, fail-closed act-emission primitive on its bound sequenced log; $projection is the base for single-writer folds with bounded cursor-paged views and incremental idempotent rebuild.
