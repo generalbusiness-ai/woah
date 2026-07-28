@@ -98,7 +98,7 @@ import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/pla
 import { replayPageQueryKey, replayPageVersion, validReplayLogPage, validReplayPageQuery, type ReplayPageQuery } from "../../net/replay-pages";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
-import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
+import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, type CommitReply, type CommitSubmit, type RejectReason, type ReplayOutput, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
@@ -429,7 +429,9 @@ type TurnResult = {
    * error, and observations, carried on an ACCEPTED reply (the gateway
    * holds the planned transcript — every transport needs the caller to
    * see what its turn did). Omitted on rejected replies (nothing
-   * committed) and on detected idempotent replays (see `replayed`);
+   * committed). On a detected idempotent replay these carry the RECORDED
+   * outcome of the execution that committed, never this round's re-plan
+   * (see `replayed` and `replay_outcome`).
    * `result`/`error` are also omitted when the transcript lacks them.
    * `error` matters: a verb that THREW still commits its (complete,
    * effect-less or partial) transcript, so an accepted reply without
@@ -443,11 +445,24 @@ type TurnResult = {
    * round's plan (CO4 step 10 rejects otherwise), so a differing digest
    * proves the commit happened on a prior request. The re-planned
    * transcript then describes a DIFFERENT execution than the one that
-   * committed, so result/observations are omitted rather than invented.
+   * committed and is never presented as the outcome; the authority's
+   * RETAINED output is (CO2.5, `replay_outcome`).
    * A replay whose re-plan converged on the identical post-state is
    * indistinguishable from (and equivalent to) a fresh accept, and
    * carries the re-planned result/observations without this flag. */
   replayed?: boolean;
+  /** CO2.5: how much of the committed execution's outcome this replay is
+   * able to show. `full` — result (when the verb returned one), error, and
+   * observations are the recorded ones. `partial` — some part existed and
+   * was not retained; `replay_omitted` names which. `none` — the authority
+   * retained no outcome for this key (a reply recorded before outcome
+   * retention shipped, or a key replayed by a different actor). A `none`
+   * replay still proves the turn committed exactly once; the client must
+   * re-read state rather than retry under a new key. Present only alongside
+   * `replayed`. */
+  replay_outcome?: "full" | "partial" | "none";
+  /** The parts of the outcome that existed but were not retained. */
+  replay_omitted?: Array<"result" | "error" | "observations">;
   /** Present (true) when the commit was ACCEPTED but the post-accept
    * warm cache-fill (installTouched) failed (fix 5a): the commit is
    * durable at the scope; the view repairs itself on the next turn via
@@ -462,6 +477,39 @@ type TurnResult = {
    * scraping the emitted metric. */
   structure?: TurnStructureReport;
 };
+
+/**
+ * CO2.5: the TurnResult fields for a detected idempotent replay.
+ *
+ * Everything here comes from the authority's RETAINED output — the caller's
+ * re-plan is never consulted, because it describes an execution that
+ * committed nothing. When the authority retained no outcome (a reply
+ * recorded before outcome retention shipped, a key replayed by a different
+ * actor, or a payload over the retention cap) the honest answer is
+ * `replay_outcome:"none"` with no result: the turn provably committed
+ * exactly once, and the client must re-read state instead of retrying under
+ * a fresh key. An absent result must never be reported as `null`, which a
+ * client would read as "the verb returned nothing".
+ */
+function replayedTurnOutput(output: ReplayOutput | undefined): {
+  replayed: true;
+  result?: EffectTranscript["result"];
+  error?: EffectTranscript["error"];
+  observations?: EffectTranscript["observations"];
+  replay_outcome: "full" | "partial" | "none";
+  replay_omitted?: Array<"result" | "error" | "observations">;
+} {
+  if (output === undefined) return { replayed: true, replay_outcome: "none", observations: [] };
+  const omitted = output.omitted ?? [];
+  return {
+    replayed: true,
+    ...(output.result !== undefined ? { result: output.result } : {}),
+    ...(output.error !== undefined ? { error: output.error } : {}),
+    observations: output.observations ?? [],
+    replay_outcome: omitted.length > 0 ? "partial" : "full",
+    ...(omitted.length > 0 ? { replay_omitted: [...omitted] } : {})
+  };
+}
 
 /**
  * D2 / CO10: per-turn structural budget counters (the CO12.3 "budget
@@ -2147,7 +2195,15 @@ export class NetGatewayDO {
           attempt,
           trace,
           ...(replayed
-            ? { replayed: true }
+            ? // CO2.5: serve the RECORDED outcome of the execution that
+              // committed. Note what this branch must never do: fall back to
+              // `planned.transcript` when the authority retained nothing.
+              // That transcript describes this round's re-plan, which
+              // committed nothing — presenting it would hand back a
+              // plausible wrong answer (acute for now()/random() turns).
+              // "Committed, outcome unavailable" is the honest reply, and
+              // replayOutcomeOf names which of the two it is.
+              replayedTurnOutput(reply.status === "accepted" ? reply.replay_output : undefined)
             : {
                 ...(planned.transcript.result !== undefined ? { result: planned.transcript.result } : {}),
                 ...(planned.transcript.error !== undefined ? { error: planned.transcript.error } : {}),
@@ -5305,6 +5361,10 @@ export class NetGatewayDO {
       }
       const resolved = this.mcpResolveCall(actor, session, object, verb);
       if ("error" in resolved) return this.mcpToolError(id, resolved.error);
+      // `woo_call` carries verb arguments positionally inside `args`, so its
+      // own argument namespace never collides with the reserved name.
+      const operation = mcpOperationId(params, args, []);
+      if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
         id,
         actor,
@@ -5313,11 +5373,14 @@ export class NetGatewayDO {
         resolved.tool.verb,
         Array.isArray(args.args) ? args.args : [],
         resolved.tool.route,
-        this.mcpTraceOf(request)
+        this.mcpTraceOf(request),
+        operation.value
       );
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
     if (dynamic) {
+      const operation = mcpOperationId(params, args, dynamic.argNames);
+      if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
         id,
         actor,
@@ -5326,7 +5389,8 @@ export class NetGatewayDO {
         dynamic.verb,
         mcpNamedArgs(dynamic, args),
         dynamic.route,
-        this.mcpTraceOf(request)
+        this.mcpTraceOf(request),
+        operation.value
       );
     }
     return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
@@ -5380,11 +5444,20 @@ export class NetGatewayDO {
     verb: string,
     args: unknown[],
     route: "direct" | "sequenced",
-    trace?: TraceContext
+    trace?: TraceContext,
+    operationId?: string | null
   ): Promise<Response> {
     try {
       const identity = await this.catalogIdentity();
-      const turnId = `mcp:${crypto.randomUUID()}`;
+      // CO2.5 / mcp.md §M4.2. A client-supplied operation id makes the turn
+      // key STABLE across retries, so a retry after a lost response replays
+      // the authority's recorded reply instead of committing a second time.
+      // Namespaced by actor: the id is client-chosen, and two agents that
+      // both pick "op-1" must not collide into each other's turns. Without
+      // an id the key is freshly minted — the pre-existing behaviour, which
+      // is safe for reads and unsafe for mutations, hence the advertisement
+      // on every tool schema.
+      const turnId = operationId ? `mcp:${actor}:${operationId}` : `mcp:${crypto.randomUUID()}`;
       const ownEchoIds = this.mcpQueues.get(session)?.ownEchoIds;
       if (ownEchoIds) {
         ownEchoIds.add(turnEchoId(turnId));
@@ -5408,14 +5481,39 @@ export class NetGatewayDO {
         result?: unknown;
         error?: unknown;
         observations?: unknown;
+        replayed?: unknown;
+        replay_outcome?: unknown;
+        replay_omitted?: unknown;
         [key: string]: unknown;
       };
       const shape = (failure: unknown): Response =>
         this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object));
       if (!turnResponse.ok) return shape(turn.error ?? turn);
       if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
+      // A replayed turn whose RECORDED outcome was an error replays that
+      // error: the verb threw, its (effect-less or partial) transcript still
+      // committed, and reporting it as success would be worse than the
+      // double-execution this whole path exists to prevent.
       if (turn.error !== undefined) return shape(turn.error);
-      return this.mcpResult(id, turn.result ?? null, this.mcpOwnTurnObservations(turn.observations, actor));
+      // CO2.5: a replay carries the committed execution's outcome plus the
+      // markers that say how much of it survived retention. `result` is
+      // omitted (not `null`) when the outcome exists but was not retained,
+      // so a client can tell "returned nothing" from "cannot show you".
+      const replay = turn.replayed === true
+        ? {
+            replayed: true as const,
+            outcome: typeof turn.replay_outcome === "string" ? turn.replay_outcome : "none",
+            ...(Array.isArray(turn.replay_omitted) ? { omitted: turn.replay_omitted } : {})
+          }
+        : undefined;
+      const resultKnown = !(replay !== undefined && turn.result === undefined && replay.outcome !== "full");
+      return this.mcpResult(
+        id,
+        turn.result ?? null,
+        this.mcpOwnTurnObservations(turn.observations, actor),
+        replay,
+        resultKnown
+      );
     } catch (err) {
       // Taxonomy throws are tool failures on this surface. The JSON-RPC
       // request must receive a tool envelope, never an HTTP transport error.
@@ -5511,19 +5609,54 @@ export class NetGatewayDO {
    *
    * The field is present only for VERB INVOCATIONS — the protocol controls
    * pass nothing, because a `woo_wait` reply carrying both its drained queue
-   * and an always-empty `observations` sibling would be actively misleading. */
-  private mcpResult(id: number | string, payload: unknown, observations?: unknown[]): Response {
+   * and an always-empty `observations` sibling would be actively misleading.
+   *
+   * `replay` (CO2.5, §M4.2) marks a result that came from the authority's
+   * RECORD of an earlier commit under the same operation id rather than from
+   * a fresh execution. It is not decoration: an agent that cannot tell the
+   * two apart will either re-run a committed mutation or believe a stale
+   * outcome. `resultKnown:false` drops `result` entirely rather than
+   * reporting `null`, and the prose block spells out the one action a client
+   * must NOT take — retry under a new id.
+   */
+  private mcpResult(
+    id: number | string,
+    payload: unknown,
+    observations?: unknown[],
+    replay?: { replayed: true; outcome: string; omitted?: unknown[] },
+    resultKnown = true
+  ): Response {
+    const notice = replay === undefined
+      ? null
+      : replay.outcome === "full"
+        ? "This is a replay: the operation had already committed under this operation_id, and this is its recorded outcome. "
+          + "It ran exactly once. Do not retry it under a new operation_id."
+        : `This is a replay: the operation had already committed under this operation_id, but its recorded outcome is `
+          + `${replay.outcome === "none" ? "not available" : "incomplete"}`
+          + `${Array.isArray(replay.omitted) && replay.omitted.length > 0 ? ` (missing: ${replay.omitted.join(", ")})` : ""}. `
+          + "It ran exactly once. Re-read state to confirm what changed. Do not retry it under a new operation_id.";
     return json({
       jsonrpc: "2.0",
       id,
       result: {
         content: [
-          { type: "text", text: JSON.stringify(payload) },
+          { type: "text", text: JSON.stringify(resultKnown ? payload : null) },
           ...(observations && observations.length > 0
             ? [{ type: "text", text: JSON.stringify({ observations }) }]
-            : [])
+            : []),
+          ...(notice ? [{ type: "text", text: notice }] : [])
         ],
-        structuredContent: { result: payload, ...(observations ? { observations } : {}) },
+        structuredContent: {
+          ...(resultKnown ? { result: payload } : {}),
+          ...(observations ? { observations } : {}),
+          ...(replay
+            ? {
+                replayed: true,
+                replay_outcome: replay.outcome,
+                ...(Array.isArray(replay.omitted) && replay.omitted.length > 0 ? { replay_omitted: replay.omitted } : {})
+              }
+            : {})
+        },
         isError: false
       }
     });
@@ -9649,6 +9782,79 @@ function mcpRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+/**
+ * The client-stable operation id for a `tools/call` (mcp.md §M4.2).
+ *
+ * TWO carriers, because neither one alone is both universal and legible:
+ *
+ * - `params._meta["woo.net/operation_id"]` is the protocol-level carrier.
+ *   `_meta` is MCP's sanctioned per-request extension point, it can never
+ *   collide with a verb's own argument names, and it survives the 2026-07-28
+ *   stateless revision — where `initialize` and the protocol session are gone
+ *   but `_meta` becomes REQUIRED on every request. It takes precedence.
+ * - `arguments.operation_id` is the legible carrier. `_meta` is invisible to
+ *   a model: nothing in `tools/list` advertises it, so an agent client would
+ *   never populate it. A declared input-schema property is the only form an
+ *   LLM client reliably fills in, and a fix nobody uses is not a fix.
+ *
+ * Collision rule: a verb that declares its OWN `operation_id` parameter owns
+ * that name. For those tools the argument stays a domain value and only
+ * `_meta` carries the operation id — the schema advertises it accordingly.
+ * `woo_call` passes verb arguments positionally inside `args`, so its own
+ * argument namespace can never collide.
+ */
+const MCP_OPERATION_ID_META = "woo.net/operation_id";
+const MCP_OPERATION_ID_ARG = "operation_id";
+/** Bounded and opaque: long enough for a UUID or a `<run>:<step>` pair, and
+ * restricted so a key can never carry structure the turn key would confuse.
+ * Runtime object ids contain no `:` (isConcreteRuntimeObjectId), so
+ * `mcp:<actor>:<operation_id>` stays injective in (actor, operation id). */
+const MCP_OPERATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+type McpOperationId =
+  | { ok: true; value: string | null }
+  | { ok: false; error: Record<string, unknown> };
+
+function mcpOperationId(
+  params: Record<string, unknown>,
+  args: Record<string, unknown>,
+  declaredArgNames: readonly string[]
+): McpOperationId {
+  const meta = mcpRecord(params._meta);
+  const fromMeta = meta[MCP_OPERATION_ID_META];
+  const fromArg = declaredArgNames.includes(MCP_OPERATION_ID_ARG) ? undefined : args[MCP_OPERATION_ID_ARG];
+  const raw = fromMeta !== undefined && fromMeta !== null ? fromMeta : fromArg;
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (typeof raw !== "string" || !MCP_OPERATION_ID_PATTERN.test(raw)) {
+    // Refuse loudly. Silently minting a fresh key for a malformed id would
+    // hand back exactly the double-execution hazard the id exists to close,
+    // while the client believed it was protected.
+    return {
+      ok: false,
+      error: {
+        code: "E_INVARG",
+        message: "operation_id must be 1-128 characters of A-Z a-z 0-9 . _ - :",
+        detail: {
+          field: MCP_OPERATION_ID_ARG,
+          reason: "invalid_operation_id",
+          carrier: fromMeta !== undefined && fromMeta !== null ? MCP_OPERATION_ID_META : MCP_OPERATION_ID_ARG
+        }
+      }
+    };
+  }
+  return { ok: true, value: raw };
+}
+
+/** The `operation_id` property advertised on a tool's input schema. */
+const MCP_OPERATION_ID_SCHEMA = {
+  type: "string",
+  description:
+    "Optional client-chosen id for THIS operation. Reuse the exact same value when you retry after a lost or "
+    + "ambiguous response: the retry is then deduplicated and returns the original outcome instead of running the "
+    + "call a second time. Use a fresh value for a genuinely new operation. Strongly recommended for anything that "
+    + "changes the world."
+} as const;
+
 function mcpToolScope(value: unknown): NetMcpToolScope {
   if (value === undefined || value === null || value === "") return "active";
   if (value === "active" || value === "here" || value === "object" || value === "space") return value;
@@ -9889,8 +10095,27 @@ function mcpNamedArgs(tool: NetMcpDynamicTool, values: Record<string, unknown>):
   return tool.argNames.map((name) => values[name] ?? null);
 }
 
+/**
+ * The protocol view of a dynamic tool. The reserved `operation_id` property
+ * is added here (never in the descriptor's own schema) so retry safety is
+ * advertised on every dynamic tool without the resolver knowing about it —
+ * and it is SKIPPED when the verb already declares a parameter of that name,
+ * because that verb owns the name and the value must reach it unchanged.
+ * Those tools still accept the id through `_meta` (see mcpOperationId).
+ */
 function mcpProtocolTool(tool: NetMcpDynamicTool): { name: string; description: string; inputSchema: Record<string, unknown> } {
-  return { name: tool.name, description: tool.description, inputSchema: tool.inputSchema };
+  if (tool.argNames.includes(MCP_OPERATION_ID_ARG)) {
+    return { name: tool.name, description: tool.description, inputSchema: tool.inputSchema };
+  }
+  const properties = mcpRecord(tool.inputSchema.properties);
+  return {
+    name: tool.name,
+    description: tool.description,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: { ...properties, [MCP_OPERATION_ID_ARG]: MCP_OPERATION_ID_SCHEMA }
+    }
+  };
 }
 
 function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record<string, unknown> {
@@ -9901,7 +10126,11 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
     aliases: tool.aliases,
     args: tool.argNames,
     description: tool.description,
-    ...(includeSchema ? { input_schema: tool.inputSchema } : {})
+    // The PROTOCOL schema, so `woo_list_reachable_tools` and `tools/list`
+    // advertise the same call surface — including the reserved
+    // `operation_id`. Handing back the raw descriptor schema here would hide
+    // retry safety from exactly the agents that discover tools this way.
+    ...(includeSchema ? { input_schema: mcpProtocolTool(tool).inputSchema } : {})
   };
 }
 
@@ -9919,7 +10148,8 @@ const MCP_TOOL_DEFS = [
       properties: {
         object: { type: "string", description: "Canonical object id. `$me` is the session actor; `$here` is the space you are in." },
         verb: { type: "string", description: "Verb name or alias." },
-        args: { type: "array", items: {}, description: "Positional arguments, in the verb's declared order." }
+        args: { type: "array", items: {}, description: "Positional arguments, in the verb's declared order." },
+        operation_id: MCP_OPERATION_ID_SCHEMA
       },
       required: ["object", "verb"]
     }

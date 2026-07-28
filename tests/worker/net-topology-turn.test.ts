@@ -87,6 +87,7 @@ type TurnBody = {
   result?: unknown;
   observations?: Array<Record<string, unknown>>;
   replayed?: boolean;
+  replay_outcome?: string;
 };
 
 describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
@@ -728,19 +729,22 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(rpcLog.filter((entry) => entry === `scope:${roomScope}/net/submit`)).toHaveLength(1);
 
     // Phase-4 item 1, idempotent replay: resubmitting turn 1's key returns
-    // the scope's RECORDED reply (CO2.5). The world moved on (counter is
-    // now 4), so this round's re-plan predicts a different post-state than
-    // the recorded accept — the gateway detects that digest mismatch,
-    // marks the reply replayed, and omits result/observations rather than
-    // presenting the re-planned execution as the committed one.
+    // the scope's RECORDED reply (CO2.5). The world moved on — the counter
+    // is now 4 — so this round's re-plan would have returned 5. That is
+    // exactly the value the caller must NOT be given: it describes an
+    // execution that committed nothing. The reply carries the RECORDED
+    // output of the turn that did commit (result 1, its own `bumped` line),
+    // which is the whole point of retry safety.
     const replay = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-t1"));
     expect(replay.reply.status).toBe("accepted");
     if (replay.reply.status === "accepted" && turn1.reply.status === "accepted") {
       expect(replay.reply.post_state_version).toBe(turn1.reply.post_state_version);
     }
     expect(replay.replayed).toBe(true);
-    expect(replay.result).toBeUndefined();
-    expect(replay.observations).toBeUndefined();
+    expect(replay.replay_outcome).toBe("full");
+    expect(replay.result).toBe(1);
+    expect(replay.result).toBe(turn1.result);
+    expect(replay.observations?.map((o) => o.type)).toContain("bumped");
 
     // Authority landed where the topology says it lives: counter at the
     // room, greeted at the cluster (after the repaired turn's adoption settles).

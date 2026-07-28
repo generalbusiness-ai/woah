@@ -174,6 +174,97 @@ describe("commit acceptance (CO4)", () => {
     expect(replay2.head).toEqual(first.head);
   });
 
+  it("a replay returns the RECORDED outcome — result, error, observations (CO2.5)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const committed = transcript({
+      writes: [propWrite("v1")],
+      observations: [{ type: "bumped", text: "the counter moved" }] as never
+    });
+    const submit = { ...submitFor(seq, committed, "outcome-1"), replay_result: 7 as never };
+    const first = seq.submit(submit);
+    // The FRESH accept stays lean: its caller holds the planned transcript,
+    // and echoing the observations back would duplicate them on the wire.
+    expect(first.status === "accepted" && first.replay_output).toBeUndefined();
+
+    const replay = seq.submit(submit);
+    expect(seq.head().seq).toBe(1); // still exactly one commit
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+    expect(replay.status === "accepted" && replay.replay_output).toEqual({
+      actor: "#actor",
+      result: 7,
+      observations: [{ type: "bumped", text: "the counter moved" }]
+    });
+  });
+
+  it("a replay of a turn whose verb THREW replays the error, not an empty success", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const threw = transcript({
+      writes: [propWrite("partial")],
+      error: { code: "E_PERM", message: "refused" } as never
+    });
+    const submit = submitFor(seq, threw, "outcome-error");
+    expect(seq.submit(submit).status).toBe("accepted"); // a throwing verb still commits
+    const replay = seq.submit(submit);
+    expect(replay.status === "accepted" && replay.replay_output?.error).toEqual({ code: "E_PERM", message: "refused" });
+  });
+
+  it("binds the retained outcome to the committing actor: a different actor replaying the key gets the verdict, never the output", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const mine = transcript({
+      writes: [propWrite("mine")],
+      observations: [{ type: "told", to: "#actor", text: "secret" }] as never
+    });
+    const submit = { ...submitFor(seq, mine, "shared-key"), replay_result: "secret" as never };
+    expect(seq.submit(submit).status).toBe("accepted");
+
+    // Idempotency keys are client-chosen on /net-api/turn and the WS turn
+    // frame, so a second actor CAN name the same string. It still learns
+    // that its own submit committed nothing — that is the safety property —
+    // but the recorded output must never become a read channel.
+    const intruder = {
+      ...submitFor(seq, transcript({ call: { actor: "#other", target: "#thing", verb: "poke", args: [], body: undefined }, writes: [propWrite("theirs")], hash: "intruder" }), "shared-key")
+    };
+    const replay = seq.submit(intruder);
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+    expect(replay.status === "accepted" && replay.replay_output).toBeUndefined();
+    expect(seq.head().seq).toBe(1);
+    // The rightful owner still gets its outcome.
+    const mineAgain = seq.submit(submit);
+    expect(mineAgain.status === "accepted" && mineAgain.replay_output?.result).toBe("secret");
+  });
+
+  it("names what it dropped when the outcome exceeds the retention cap", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const bulky = transcript({
+      writes: [propWrite("v")],
+      observations: Array.from({ length: 200 }, (_, i) => ({ type: "noise", text: `${"x".repeat(64)}-${i}` })) as never
+    });
+    const submit = { ...submitFor(seq, bulky, "bulky"), replay_result: "small" as never };
+    expect(seq.submit(submit).status).toBe("accepted");
+    const replay = seq.submit(submit);
+    const output = replay.status === "accepted" ? replay.replay_output : undefined;
+    // Observations drop first — they are the bulk, and a client can
+    // re-orient with a fresh read. The result is the part a retry cannot
+    // reconstruct, so it survives, and the loss is NAMED rather than
+    // presented as an empty observation list.
+    expect(output?.result).toBe("small");
+    expect(output?.observations).toBeUndefined();
+    expect(output?.omitted).toEqual(["observations"]);
+  });
+
+  it("marks a result that existed but was deliberately not carried", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    // The planner withholds the value (non-mutating turn, or oversized) and
+    // says so. Without the marker a replay would report `null` — which a
+    // client reads as "the verb returned nothing".
+    const submit = { ...submitFor(seq, transcript({ writes: [propWrite("v")] }), "withheld"), replay_result_omitted: true as const };
+    expect(seq.submit(submit).status).toBe("accepted");
+    const replay = seq.submit(submit);
+    const output = replay.status === "accepted" ? replay.replay_output : undefined;
+    expect(output?.result).toBeUndefined();
+    expect(output?.omitted).toEqual(["result"]);
+  });
+
   it("validates pure direct reads without advancing or caching the authority head", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "stable" } }]);

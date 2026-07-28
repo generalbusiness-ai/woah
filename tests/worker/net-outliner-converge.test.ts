@@ -56,6 +56,7 @@ type TurnBody = {
   trace: AttemptTraceEntry[];
   envelopeBytes?: number;
   replayed?: boolean;
+  replay_outcome?: string;
   result?: unknown;
   error?: { code?: string; message?: string; detail?: unknown };
   observations?: Array<Record<string, unknown>>;
@@ -1412,12 +1413,15 @@ describe("Dispenser anchored-actor Acts over the Net path", () => {
     const deliveryActSeq = replay.entries[1]!.seq;
 
     // Simulate the plug losing the HTTP reply and retrying with the same
-    // transport key. The scope returns its recorded acceptance and the
-    // gateway marks it replayed, but deliberately omits the freshly planned
-    // verb result: it cannot prove that output was the one returned by the
-    // original execution. The unchanged head proves no second domain turn
-    // or note was created. A later fresh-key retry is handled by the bounded
-    // Dispenser receipt and returns the original artifact with duplicate:true.
+    // transport key. The scope returns its recorded acceptance, the gateway
+    // marks it replayed, and — CO2.5 / M4.2 — it carries the RECORDED output
+    // of the execution that actually committed, never the freshly planned
+    // one (which describes a turn that committed nothing). So the plug
+    // learns the delivery's original result: the same note, and
+    // `duplicate:false`, because THAT is what the committed execution
+    // returned. The unchanged head proves no second domain turn or note was
+    // created. A later fresh-key retry is a different question, answered by
+    // the bounded Dispenser receipt with duplicate:true.
     const transportReplay = await turn(
       "net-dispenser-deliver-retry-frame",
       plug,
@@ -1427,7 +1431,9 @@ describe("Dispenser anchored-actor Acts over the Net path", () => {
     );
     expect(transportReplay.reply.status).toBe("accepted");
     expect(transportReplay.replayed).toBe(true);
-    expect(transportReplay.result).toBeUndefined();
+    expect(transportReplay.replay_outcome).toBe("full");
+    expect(transportReplay.result).toMatchObject({ delivered: true, duplicate: false, note });
+    expect(transportReplay.result).toEqual(delivered.result);
     expect(transportReplay.reply.head).toEqual(delivered.reply.head);
 
     const domainReplay = await turn(

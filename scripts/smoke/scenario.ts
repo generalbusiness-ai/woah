@@ -368,6 +368,54 @@ export async function runSmokeWalkthrough(
     waitMs, ctx.signal, cfg);
   });
 
+  // CO2.5 / mcp.md §M4.2 — mutation retry safety over the REAL transport.
+  //
+  // The fake-DO lane proves exactly-once on world state; what only a real
+  // lane can prove is that the carrier survives an actual HTTP round trip, a
+  // real MCP session, and real cross-DO RPC. Both actors are still standing
+  // at the pinboard from the step above, so this costs no movement.
+  //
+  // `add_note` is durable and MUTATING — the shape the operation id exists to
+  // protect. The retry simulates a client whose response was lost: identical
+  // call, identical operation id. `replayed:true` is the AUTHORITY's own
+  // statement that this round committed nothing (it looked the key up), so a
+  // second note was never minted, and the identical result proves the client
+  // recovered the original outcome rather than an empty success.
+  await step("retry safety: a repeated operation_id commits once and replays its outcome", async (ctx) => {
+    const { alice } = pair;
+    const args = {
+      object: "the_pinboard",
+      verb: "add_note",
+      args: [`idem-${runId}`, "blue", 96, 96, 200, 120],
+      operation_id: `smoke-idem-${runId}`
+    };
+    const first = await alice.callTool("woo_call", args, { signal: ctx.signal });
+    const firstBody = first?.result?.structuredContent;
+    if (first?.result?.isError) {
+      throw new Error(`add_note refused: ${JSON.stringify(firstBody).slice(0, 300)}`);
+    }
+    if (firstBody?.replayed !== undefined) {
+      throw new Error(`the first call must not be a replay: ${JSON.stringify(firstBody).slice(0, 300)}`);
+    }
+    const retry = await alice.callTool("woo_call", args, { signal: ctx.signal });
+    const retryBody = retry?.result?.structuredContent;
+    if (retry?.result?.isError) {
+      throw new Error(`the retry must not fail: ${JSON.stringify(retryBody).slice(0, 300)}`);
+    }
+    if (retryBody?.replayed !== true) {
+      throw new Error(`the retry was NOT deduplicated — it committed a second time: ${JSON.stringify(retryBody).slice(0, 300)}`);
+    }
+    if (retryBody?.replay_outcome !== "full") {
+      throw new Error(`the retry could not recover the outcome: ${JSON.stringify(retryBody).slice(0, 300)}`);
+    }
+    if (JSON.stringify(retryBody?.result) !== JSON.stringify(firstBody?.result)) {
+      throw new Error(
+        `the replay returned a DIFFERENT outcome than the committed execution: `
+        + `${JSON.stringify(firstBody?.result)} vs ${JSON.stringify(retryBody?.result)}`
+      );
+    }
+  });
+
   // Dispenser: the Acts-kernel anchored-actor adopter (the_horoscope, standing
   // on the_deck). One order/cancel round proves the typed surface end-to-end in
   // every lane: sequenced admission (`order`), the recorded fact fanning out to

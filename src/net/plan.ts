@@ -43,7 +43,7 @@ import { compactNetLiveAudience, type LiveAudience } from "./live";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
-import type { CommitSubmit, ScopeHead } from "./scope";
+import { REPLAY_OUTPUT_BYTE_CAP, type CommitSubmit, type ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
 
@@ -403,7 +403,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       transcript: wireTranscript,
       post_state_version: applied.postStateVersion,
       stamp,
-      ...(ownedReadsCompacted ? { owned_reads_compacted: true as const } : {})
+      ...(ownedReadsCompacted ? { owned_reads_compacted: true as const } : {}),
+      ...replaySubmitOutput(transcript)
     },
     selection,
     transcript,
@@ -416,6 +417,40 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         }
       : {})
   };
+}
+
+/**
+ * CO2.5: carry the verb's return value to the authority as an unhashed
+ * sibling, so a replayed submit can return the outcome of the execution that
+ * actually committed instead of an empty success.
+ *
+ * Two deliberate withholdings, both reported rather than silent:
+ *
+ * - **Non-mutating turns.** A turn with no write, create, or move changed
+ *   nothing, so re-issuing it under a fresh key is safe and costs the caller
+ *   only a round trip. Read results are also the LARGE ones (a room listing,
+ *   an ordered page), and every read envelope must keep its exact former size
+ *   against the CO7 ceiling — this rule is what guarantees no existing turn
+ *   moves closer to E_ENVELOPE.
+ * - **Oversized results**, against REPLAY_OUTPUT_BYTE_CAP.
+ *
+ * In both cases `replay_result_omitted` marks that a value existed, so the
+ * replay says "not retained" rather than reporting `null`.
+ */
+function replaySubmitOutput(
+  transcript: EffectTranscript
+): { replay_result?: EffectTranscript["result"]; replay_result_omitted?: true } {
+  if (transcript.result === undefined) return {};
+  const mutating =
+    transcript.writes.length > 0 || transcript.creates.length > 0 || transcript.moves.length > 0;
+  if (!mutating) return { replay_result_omitted: true };
+  const encoded = JSON.stringify(transcript.result);
+  // `undefined` here means "not JSON-representable" — retaining it would
+  // record a value the replay could not return faithfully.
+  if (encoded === undefined || encoded.length > REPLAY_OUTPUT_BYTE_CAP) {
+    return { replay_result_omitted: true };
+  }
+  return { replay_result: transcript.result };
 }
 
 /**
