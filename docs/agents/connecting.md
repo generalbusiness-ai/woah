@@ -39,6 +39,12 @@ The stdio process is only a framing bridge. It forwards JSON-RPC to the HTTP
 endpoint, remembers the returned session id, and closes the remote session on
 EOF. It does not create an in-process world or dispatch verbs itself.
 
+It also exits when you tell it to. Closing its stdin, or sending `SIGINT` or
+`SIGTERM`, runs one bounded teardown and then exits — a couple of seconds at
+worst, even if the Net endpoint has stopped answering. Requests still running
+at that point are cancelled and answered with a JSON-RPC error, so your client
+sees a reply instead of a truncated stream.
+
 ## What you get on connection
 
 The API key resolves to a **session + actor** pair:
@@ -71,8 +77,11 @@ new list remains the authoritative invocation surface.
 
 Closing streamable HTTP MCP with `DELETE /net-api/mcp` and the session header
 commits the same owner-sequenced close as browser logout. The stdio bridge sends
-that DELETE when stdin closes. If a process disappears without closing, the
-session expires and is reaped; reconnect with the API key and rediscover tools.
+that DELETE when stdin closes or it is signalled — as a courtesy, not a
+guarantee: it is bounded like every other shutdown step, and is skipped rather
+than waited on if the endpoint is unresponsive. If a process disappears without
+closing, the session expires and is reaped; reconnect with the API key and
+rediscover tools.
 The stdio bridge forwards GET/SSE list-change notifications as normal stdio
 JSON-RPC messages.
 Undelivered `woo_wait` observations are live, at-most-once data and do not
