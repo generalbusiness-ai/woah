@@ -13,9 +13,40 @@ import {
   normalizeDispenserObservation,
   normalizeOutlinerObservation,
   rateLimitRetrySeconds,
-  recoverDispenserOrderId
+  recoverDispenserOrderId,
+  waitFor
 } from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
+
+/** A real SmokeSession whose `woo_wait` returns the scripted batches in order
+ * (and empty batches thereafter). Using the real session — not a duck-typed
+ * stub — is the point: the observation-retention buffer under test lives on
+ * SmokeSession, so a stub would prove nothing about it. */
+async function scriptedSession(batches: readonly unknown[][]): Promise<SmokeSession> {
+  let next = 0;
+  const transport: McpTransport = async (request) => {
+    const body = request.body ? JSON.parse(String(request.body)) : {};
+    if (body.method === "initialize") {
+      return Response.json({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", instructions: "You are woo actor scripted_bob." }
+      }, { headers: { "mcp-session-id": "s_net-api-0_scripted" } });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/call" && body.params?.name === "woo_wait") {
+      const batch = batches[next] ?? [];
+      next += 1;
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { structuredContent: { result: { observations: batch, gap: false } } }
+      });
+    }
+    throw new Error(`unexpected MCP call ${JSON.stringify(body).slice(0, 200)}`);
+  };
+  return await SmokeSession.open(transport, { token: "apikey:key:secret", label: "bob", clientName: "retention-test" });
+}
 
 describe("smoke walkthrough harness", () => {
   it("uses the authenticated Net actor from initialize without probing removed native tools", async () => {
@@ -260,9 +291,20 @@ describe("smoke walkthrough harness", () => {
   });
 
   it("recovers a lost order id from the ordered fact by unique request", async () => {
-    const makeSession = (batches: unknown[][]): { label: string; calls: number; callTool(): Promise<unknown> } => ({
+    // `takeRetainedObservations` is part of the contract recoverDispenserOrderId
+    // now uses: a failed assertion leaves the ordered fact in the retention
+    // buffer, and the leak guard must look there before spending polls.
+    const makeSession = (
+      batches: unknown[][],
+      retained: Record<string, any>[] = []
+    ): { label: string; calls: number; callTool(): Promise<unknown>; takeRetainedObservations(): Record<string, any>[] } => ({
       label: "alice",
       calls: 0,
+      takeRetainedObservations(): Record<string, any>[] {
+        const held = retained.slice();
+        retained.length = 0;
+        return held;
+      },
       async callTool(): Promise<unknown> {
         const batch = batches[this.calls] ?? [];
         this.calls += 1;
@@ -281,8 +323,81 @@ describe("smoke walkthrough harness", () => {
     const miss = makeSession([[
       { type: "order_placed", block: "the_horoscope", order_id: "ord_6", request: "walkthrough-order-run0" }
     ]]);
-    const broken = { label: "bob", async callTool(): Promise<unknown> { throw new Error("session reset"); } };
+    const broken = {
+      label: "bob",
+      takeRetainedObservations: (): Record<string, any>[] => [],
+      async callTool(): Promise<unknown> { throw new Error("session reset"); }
+    };
     await expect(recoverDispenserOrderId([broken as any, miss as any], "walkthrough-order-run1", cfg)).resolves.toBeNull();
+
+    // The retained-buffer path: the fact never comes back from a poll (every
+    // batch is empty), so recovery can only succeed by reading what a failed
+    // assertion already consumed.
+    const held = makeSession([[], [], []], [
+      { type: "order_placed", block: "the_horoscope", order_id: "ord_8", request: "walkthrough-order-run2" }
+    ]);
+    await expect(recoverDispenserOrderId([held as any], "walkthrough-order-run2", cfg)).resolves.toBe("ord_8");
+  });
+
+  // Deployed-lane regression (defect: "dispenser: order reaches peer ..." failed
+  // deterministically on a WARM prod gateway while every other cross-actor step
+  // passed). `woo_wait` is at-most-once: a drained batch is gone from the
+  // gateway queue. When the ordered and terminal dispenser facts commit close
+  // enough together, the warm gateway returns BOTH in one reply — verified on
+  // https://woah1.generalbusiness.ai, where the verbose run logged
+  // "[bob] received 2 obs: order_placed,canceled" and the very next assertion
+  // reported "saw no observations". The old waitFor matched the first row and
+  // threw the rest of the batch away.
+  it("retains the rest of a woo_wait batch so a following assertion can still see it", async () => {
+    const cfg = { drainBudgetMs: 100, drainPollMs: 10 };
+    const ordered = { type: "order_placed", block: "the_horoscope", order_id: "ord_9", request: "walkthrough-order-runX" };
+    const canceled = { type: "canceled", block: "the_horoscope", order_id: "ord_9" };
+    // ONE batch carrying both facts, then nothing — exactly the warm-gateway
+    // shape. Any further poll returns empty, so a lost `canceled` can only
+    // time out.
+    const session = await scriptedSession([[ordered, canceled]]);
+
+    const first = await waitFor(
+      session,
+      (obs) => findDispenserFact(obs, ["ordered"], "the_horoscope", "ord_9") !== null,
+      1000,
+      undefined,
+      cfg
+    );
+    expect(first).toMatchObject({ type: "order_placed", order_id: "ord_9" });
+
+    const terminal = await waitFor(
+      session,
+      (obs) => findDispenserFact(obs, ["canceled", "delivered"], "the_horoscope", "ord_9") !== null,
+      1000,
+      undefined,
+      cfg
+    );
+    expect(terminal).toMatchObject({ type: "canceled", order_id: "ord_9" });
+  });
+
+  it("keeps unmatched rows in arrival order across several waits, and drops them on drain", async () => {
+    const cfg = { drainBudgetMs: 100, drainPollMs: 10 };
+    const said = { type: "said", actor: "guest_1", text: "hello" };
+    const entered = { type: "entered", actor: "guest_1", room: "the_deck" };
+    const taken = { type: "taken", actor: "guest_1", object: "the_mug" };
+    // A single batch delivering three unrelated facts. Asserting them in an
+    // order DIFFERENT from arrival order proves rows before the match survive
+    // too, not just the tail of the batch.
+    const session = await scriptedSession([[said, entered, taken]]);
+
+    expect(await waitFor(session, (o) => o.type === "taken", 1000, undefined, cfg)).toMatchObject({ type: "taken" });
+    expect(await waitFor(session, (o) => o.type === "said", 1000, undefined, cfg)).toMatchObject({ type: "said" });
+    expect(await waitFor(session, (o) => o.type === "entered", 1000, undefined, cfg)).toMatchObject({ type: "entered" });
+
+    // Retention must not outlive a drain: "everything before now is stale"
+    // has to cover rows the client is holding, or a later step could be
+    // satisfied by an earlier step's observation.
+    const stale = await scriptedSession([[said], []]);
+    await expect(waitFor(stale, (o) => o.type === "entered", 50, undefined, cfg))
+      .rejects.toThrow(/waiting for matching observation/);
+    stale.clearRetainedObservations();
+    expect(stale.takeRetainedObservations()).toEqual([]);
   });
 
   it("parses the admission-window wait only out of E_RATE_LIMIT refusals", () => {

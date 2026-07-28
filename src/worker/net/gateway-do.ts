@@ -763,6 +763,10 @@ const RECENT_CLIENT_TURN_CAP = 512;
  * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
  * outlives the reply it protects by more than the window. */
 const GATEWAY_PIN_LIMIT = 1024;
+/** Drain-watermark writes between retention sweeps. A sweep costs one COUNT
+ * over a table bounded by GATEWAY_PIN_LIMIT; the interval keeps that off the
+ * per-poll path while still bounding growth (one row per new session). */
+const MCP_WATERMARK_SWEEP_INTERVAL = 256;
 /** A session bearer destroys its own credential when close commits. Keep a
  * bounded gateway-local receipt so a lost close reply can still replay as
  * success after the session cell is expired/reaped. Same bounded-idempotency
@@ -812,6 +816,21 @@ export class NetGatewayDO {
   /** Per-subscriber outbox continuity, distinct from authority `seen`.
    * A scope head may advance without emitting a row for this gateway. */
   private readonly deliverySeen = new Map<string, number>();
+  /** M5.1: per-scope count of LIVE (direct-route) fanout bodies applied here.
+   * Live observations carry no authority sequence, so `deliverySeen` cannot
+   * see them; this counter is the continuity evidence for that half. Durable
+   * (net_gateway_scope.live_seq) because its whole job is to survive the
+   * eviction whose loss it reports. */
+  private readonly liveSeen = new Map<string, number>();
+  /** Scopes with at least one durable MCP drain watermark. Only these can be
+   * the subject of a continuity claim, so only these pay for a live-counter
+   * write — a WS-only or never-polled shard stays free on the live path. */
+  private readonly mcpWatermarkScopes = new Set<string>();
+  /** True once the watermark scope set has been loaded from storage. */
+  private mcpWatermarkScopesLoaded = false;
+  /** Drain-watermark writes since this isolate started; drives the amortized
+   * retention sweep (see recordMcpDrainWatermark). */
+  private mcpWatermarkWrites = 0;
   /**
    * Echo dedupe (Phase 4 item 3 chunk 2): turn id → the session that
    * submitted it through THIS shard's client surface. The submitting
@@ -888,11 +907,40 @@ export class NetGatewayDO {
     if (!cellColumns.some((column) => column.name === "owner_scope")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_cell ADD COLUMN owner_scope TEXT");
     }
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0)");
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0, live_seq INTEGER NOT NULL DEFAULT 0)");
     const scopeColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_scope)"));
     if (!scopeColumns.some((column) => column.name === "delivery_seen_seq")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN delivery_seen_seq INTEGER NOT NULL DEFAULT 0");
     }
+    // M5.1 continuity: `live_seq` counts LIVE (direct-route) fanout bodies this
+    // gateway has applied for a scope. Committed fanout already has
+    // `delivery_seen_seq`; live observations carry no authority sequence, so
+    // without this counter a live-only loss during an eviction would go
+    // unreported. Additive and derived — legacy rows start at 0, which reads
+    // as "no proof", and the first drain re-baselines.
+    if (!scopeColumns.some((column) => column.name === "live_seq")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN live_seq INTEGER NOT NULL DEFAULT 0");
+    }
+    // M5.1 continuity watermarks. `mcpQueues` is in-memory, so a Durable
+    // Object eviction destroys a polling agent's observation queue — and on
+    // Cloudflare an idle gateway shard is evicted within ~10s, which is well
+    // inside a turn-based agent's think time. Reporting `gap:true` on every
+    // reconstruction was therefore honest but useless: the marker fired on
+    // essentially every poll and carried no information.
+    //
+    // This table is what lets a reconstructed gateway PROVE continuity
+    // instead of assuming a break: each drain records the scope the session
+    // was listening to and the two per-scope delivery counters at that
+    // instant. If neither counter has moved when the session comes back,
+    // nothing could have been dropped for it and the reply is gap-free.
+    // Purely derived state: a missing row simply means "cannot prove", which
+    // is the old conservative answer.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_mcp_watermark (session TEXT PRIMARY KEY, scope TEXT NOT NULL, delivery_seq INTEGER NOT NULL, live_seq INTEGER NOT NULL, ts INTEGER NOT NULL)"
+    );
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_mcp_watermark_ts ON net_gateway_mcp_watermark (ts)"
+    );
     // CO13 relation mirror: roster rows (contents, session_presence)
     // received via FanoutBody.relations — the client-read primitive for
     // who/contents (GET /net/relation). SQLite-only (no memory cache):
@@ -1086,7 +1134,18 @@ export class NetGatewayDO {
         ) {
           return json({ error: { code: "E_INVARG", message: "invalid live fanout batch" } }, 400);
         }
-        for (const delivery of deliveries) this.pushLiveObservations(delivery);
+        for (const delivery of deliveries) {
+          // Continuity accounting BEFORE delivery (M5.1): a live observation
+          // aimed at a session whose queue this gateway no longer holds is
+          // lost silently, and it carries no authority sequence for a later
+          // reader to notice. Counting the body durably is the only record
+          // that anything happened in this scope while the queue was gone.
+          // Empty bodies are not events and never break a continuity claim.
+          if (Array.isArray(delivery.observations) && delivery.observations.length > 0) {
+            this.advanceLiveSeen(delivery.scope);
+          }
+          this.pushLiveObservations(delivery);
+        }
         return json({ delivered: deliveries.length });
       }
       if (request.method === "POST" && url.pathname === "/net/pull") {
@@ -2069,6 +2128,10 @@ export class NetGatewayDO {
           // gateway→scope→same-gateway RPC cycle. Deliver its local session
           // slice here, after validation returned; other shards receive the
           // scope's independent best-effort /net/live calls.
+          // Same M5.1 accounting as the /net/live route: this is the ONLY
+          // record that a live observation existed in this scope, so a
+          // reconstructed queue can still tell it missed one.
+          this.advanceLiveSeen(reply.scope);
           this.pushLiveObservations({
             scope: reply.scope,
             observations: planned.transcript.observations,
@@ -5162,7 +5225,7 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const drained = await this.mcpWait(session, timeout, limit);
+      const drained = await this.mcpWait(session, actor, timeout, limit);
       return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
     // The relation mirror can be newer than this gateway's object-cell view.
@@ -5463,13 +5526,19 @@ export class NetGatewayDO {
    * gateway can still PROVE continuity since its last drain. A pending gap
    * short-circuits the park so the agent learns to re-orient immediately
    * instead of after a full long-poll. */
-  private async mcpWait(session: string, timeoutMs: number, limit: number): Promise<{ observations: unknown[]; gap: boolean }> {
+  private async mcpWait(session: string, actor: string, timeoutMs: number, limit: number): Promise<{ observations: unknown[]; gap: boolean }> {
     const queue = this.mcpQueues.get(session);
     // No live state at all: nothing to drain and nothing to vouch for.
     if (!queue) return { observations: [], gap: true };
     const take = (): { observations: unknown[]; gap: boolean } => {
       const gap = queue.gapPending;
       queue.gapPending = false;
+      // Re-baseline the continuity proof at the exact moment the client is
+      // told what it has. Recorded on empty drains too: "you are caught up to
+      // here" is the statement a later reconstruction needs, and it is what
+      // makes an idle agent's next poll gap-free instead of perpetually
+      // suspicious.
+      this.recordMcpDrainWatermark(session, actor);
       return { observations: queue.buffer.splice(0, limit), gap };
     };
     if (queue.gapPending || queue.buffer.length > 0) return take();
@@ -5528,11 +5597,17 @@ export class NetGatewayDO {
     if (notifyOnRecover) {
       created.listChangedDirty = true;
       created.listChangedPending = true;
-      // Same signal, applied to observations: this request found a durable
-      // session with no live queue behind it, so anything fanned out before
-      // now was dropped on the floor. An `initialize` installs state
-      // explicitly (notifyOnRecover=false) and therefore starts gap-free.
-      created.gapPending = true;
+      // Observations: this request found a durable session with no live queue
+      // behind it, so anything fanned out in between was dropped on the floor
+      // — UNLESS this gateway can still prove nothing was fanned out. On
+      // Cloudflare an idle gateway shard is evicted in ~10s, far inside a
+      // turn-based agent's think time, so an unconditional gap here fired on
+      // essentially every poll and taught agents to ignore the marker. The
+      // durable drain watermark turns "I lost my queue" into the question
+      // that actually matters, "did anything happen while it was gone?".
+      // An `initialize` installs state explicitly (notifyOnRecover=false) and
+      // therefore starts gap-free without consulting a watermark at all.
+      created.gapPending = !this.mcpContinuityProven(session, actor);
     }
     this.mcpQueues.set(session, created);
     return created;
@@ -7838,6 +7913,123 @@ export class NetGatewayDO {
     }
   }
 
+  /** Scopes that carry at least one durable MCP drain watermark, loaded once
+   * per isolate. Used to keep the live-fanout counter off shards that have no
+   * continuity claim to protect. */
+  private mcpWatermarkScopeSet(): Set<string> {
+    if (this.mcpWatermarkScopesLoaded) return this.mcpWatermarkScopes;
+    for (const row of sqlRows<{ scope: string }>(
+      this.state.storage.sql.exec("SELECT DISTINCT scope FROM net_gateway_mcp_watermark")
+    )) {
+      this.mcpWatermarkScopes.add(row.scope);
+    }
+    this.mcpWatermarkScopesLoaded = true;
+    return this.mcpWatermarkScopes;
+  }
+
+  /** M5.1: the SCOPE NAME whose delivery counters govern this session's
+   * continuity — the `room:<id>` scope name, not the bare object id.
+   *
+   * `mcpActiveScope` answers in object ids; `deliverySeen`/`liveSeen` are
+   * keyed by scope names, because that is what a fanout body carries. Getting
+   * this mapping wrong does not fail loudly — it silently compares two
+   * counters that are always zero and reports continuity for everything —
+   * so both the recorder and the checker go through this one function.
+   *
+   * Returns null when the session is placeless or the anchor's lineage is not
+   * resident (a cold gateway cannot classify it). Null means "cannot prove",
+   * which degrades to the old conservative `gap:true`. */
+  private mcpDeliveryScope(actor: string, session: string): string | null {
+    const anchor = this.mcpActiveScope(actor, session);
+    if (anchor === null) return null;
+    try {
+      return this.viewClassifier(this.ensureView()).scopeOf(anchor);
+    } catch {
+      return null;
+    }
+  }
+
+  /** M5.1: count one applied LIVE fanout body for a scope, durably.
+   *
+   * Only scopes an MCP session has actually drained in are counted: the
+   * counter exists solely to break a continuity claim, and a scope with no
+   * watermark has no claim. That keeps the live delivery path free on shards
+   * carrying only sockets (which have their own reconnect semantics) or no
+   * pollers at all. */
+  private advanceLiveSeen(scope: string): void {
+    if (!this.mcpWatermarkScopeSet().has(scope)) return;
+    const next = (this.liveSeen.get(scope) ?? 0) + 1;
+    this.liveSeen.set(scope, next);
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq, live_seq) VALUES (?, 0, 0, ?) "
+      + "ON CONFLICT(scope) DO UPDATE SET live_seq = MAX(live_seq, excluded.live_seq)",
+      scope,
+      next
+    );
+  }
+
+  /** M5.1: record where a drain left this session, so a later reconstruction
+   * can prove nothing was dropped in between.
+   *
+   * Written on every reply that hands observations back to the client (and on
+   * an empty one — an empty drain is just as much a "you are caught up to
+   * here" statement). Bounded like the selection pins: only the most recent
+   * GATEWAY_PIN_LIMIT rows are kept, and a pruned row degrades to the old
+   * conservative `gap:true`, never to a false continuity claim. */
+  private recordMcpDrainWatermark(session: string, actor: string): void {
+    const scope = this.mcpDeliveryScope(actor, session);
+    if (scope === null) return; // placeless / unclassifiable: nothing to vouch for
+    this.mcpWatermarkScopeSet().add(scope);
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_mcp_watermark (session, scope, delivery_seq, live_seq, ts) VALUES (?, ?, ?, ?, ?) "
+      + "ON CONFLICT(session) DO UPDATE SET scope = excluded.scope, delivery_seq = excluded.delivery_seq, "
+      + "live_seq = excluded.live_seq, ts = excluded.ts",
+      session,
+      scope,
+      this.deliverySeen.get(scope) ?? 0,
+      this.liveSeen.get(scope) ?? 0,
+      this.host.now()
+    );
+    // A drain happens on every poll of every session, so the retention check
+    // is amortized rather than run per write: the table can only grow by one
+    // row per NEW session, so an occasional sweep keeps the same bound
+    // without paying a COUNT scan on the hot polling path.
+    this.mcpWatermarkWrites += 1;
+    if (this.mcpWatermarkWrites % MCP_WATERMARK_SWEEP_INTERVAL !== 0) return;
+    const count = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_mcp_watermark")
+    )[0];
+    if (count && Number(count.n) > GATEWAY_PIN_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_mcp_watermark WHERE rowid NOT IN "
+        + "(SELECT rowid FROM net_gateway_mcp_watermark ORDER BY ts DESC LIMIT ?)",
+        GATEWAY_PIN_LIMIT
+      );
+    }
+  }
+
+  /** M5.1: can this gateway prove the session missed nothing since its last
+   * drain? True only when a watermark exists, still names the session's
+   * current scope, and BOTH delivery counters for that scope are unchanged.
+   *
+   * Conservative in the safe direction: an advanced counter reports a gap
+   * even when the fanout in question would not have reached this session
+   * (a peer-directed `tell`, or the session's own echo). It is the honest
+   * bound on what this gateway can know after losing its queue. */
+  private mcpContinuityProven(session: string, actor: string): boolean {
+    const row = sqlRows<{ scope: string; delivery_seq: number; live_seq: number }>(
+      this.state.storage.sql.exec(
+        "SELECT scope, delivery_seq, live_seq FROM net_gateway_mcp_watermark WHERE session = ?",
+        session
+      )
+    )[0];
+    if (row === undefined) return false;
+    const scope = this.mcpDeliveryScope(actor, session);
+    if (scope === null || scope !== row.scope) return false;
+    return (this.deliverySeen.get(scope) ?? 0) === Number(row.delivery_seq)
+      && (this.liveSeen.get(scope) ?? 0) === Number(row.live_seq);
+  }
+
   /** Actor bound to a successfully closed session, if its bounded retry
    * receipt remains resident on this session-routed gateway. */
   private closedSessionActor(session: string): string | null {
@@ -9233,6 +9425,7 @@ export class NetGatewayDO {
       this.view = null;
       this.seen.clear();
       this.deliverySeen.clear();
+      this.liveSeen.clear();
     };
     try {
       const result = fn();
@@ -9256,11 +9449,12 @@ export class NetGatewayDO {
     for (const row of sqlRows<{ body: string }>(this.state.storage.sql.exec("SELECT body FROM net_gateway_cell"))) {
       view.install(JSON.parse(row.body) as Cell);
     }
-    for (const row of sqlRows<{ scope: string; seen_seq: number; delivery_seen_seq: number } & ScopeRow>(
-      this.state.storage.sql.exec("SELECT scope, seen_seq, delivery_seen_seq FROM net_gateway_scope")
+    for (const row of sqlRows<{ scope: string; seen_seq: number; delivery_seen_seq: number; live_seq: number } & ScopeRow>(
+      this.state.storage.sql.exec("SELECT scope, seen_seq, delivery_seen_seq, live_seq FROM net_gateway_scope")
     )) {
       this.seen.set(row.scope, row.seen_seq);
       this.deliverySeen.set(row.scope, row.delivery_seen_seq);
+      this.liveSeen.set(row.scope, Number(row.live_seq ?? 0));
     }
     this.view = view;
     return view;

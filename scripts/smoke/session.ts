@@ -45,6 +45,25 @@ export class SmokeSession {
   // real upstream failure.
   currentRoom: string | null = null;
 
+  // Observations this session already pulled off the server but has not yet
+  // matched. `woo_wait` delivery is AT-MOST-ONCE (spec/protocol/mcp.md §M5):
+  // a batch the client drained is gone from the gateway queue forever. A
+  // helper that filters a batch and keeps only its match therefore DESTROYS
+  // every other observation in that batch.
+  //
+  // That is not hypothetical: on the deployed worker a warm gateway delivers
+  // the dispenser's `order_placed` and `canceled` facts in ONE `woo_wait`
+  // reply, and the walkthrough's ordered-fact wait used to discard the
+  // terminal fact riding behind it — the next wait then timed out having
+  // "saw no observations". Retaining the remainder here is what makes a
+  // sequence of assertions over one observation stream correct regardless of
+  // how the server happens to batch it.
+  //
+  // Scope discipline: `drain()` clears this buffer, so "everything before
+  // this step is stale" still means exactly that, and no assertion can be
+  // satisfied by an observation from an earlier step.
+  private retained: Record<string, any>[] = [];
+
   private constructor(
     private readonly transport: McpTransport,
     readonly sessionId: string,
@@ -152,6 +171,29 @@ export class SmokeSession {
       throw new Error(`tools/call ${name} JSON-RPC error: ${JSON.stringify((body as any).error)}`);
     }
     return body;
+  }
+
+  /** Observations pulled earlier and not yet matched, oldest first. The
+   * caller must consume them through `retainObservations` so nothing is
+   * dropped twice. */
+  takeRetainedObservations(): Record<string, any>[] {
+    const pending = this.retained;
+    this.retained = [];
+    return pending;
+  }
+
+  /** Give back the observations a scan did not consume, preserving arrival
+   * order. Called with everything except the one row the scan matched. */
+  retainObservations(observations: readonly Record<string, any>[]): void {
+    if (observations.length === 0) return;
+    this.retained.push(...observations);
+  }
+
+  /** Forget retained observations. `drain()` calls this: draining declares
+   * everything observed so far stale, and that must include rows this client
+   * is holding, or a later assertion could match a previous step's event. */
+  clearRetainedObservations(): void {
+    this.retained.length = 0;
   }
 
   async close(signal?: AbortSignal): Promise<void> {

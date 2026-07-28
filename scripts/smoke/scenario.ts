@@ -435,7 +435,7 @@ export async function runSmokeWalkthrough(
     let terminalReached = false;
     try {
       orderAttempted = true;
-      const reply = await orderWithAdmissionRetry(alice, request, admissionWaitMs, ctx.signal, cfg);
+      const reply = await orderWithAdmissionRetry(alice, [bob], request, admissionWaitMs, ctx.signal, cfg);
       if (!isRecord(reply) || reply.queued !== true || typeof reply.order_id !== "string" || !reply.order_id) {
         throw new Error(`dispenser order should return {order_id, queued:true}; got ${JSON.stringify(reply).slice(0, 300)}`);
       }
@@ -1012,13 +1012,18 @@ export async function recoverDispenserOrderId(
   cfg: DrainConfig
 ): Promise<string | null> {
   for (const session of sessions) {
+    // The ordered fact may already be in this session's retention buffer: a
+    // failed assertion earlier in the step consumed the batch it rode in on
+    // (waitFor keeps what it did not match). Check that before spending polls.
+    let observations: unknown[] = session.takeRetainedObservations();
     for (let poll = 0; poll < 3; poll += 1) {
-      let observations: unknown[];
-      try {
-        const result = await session.callTool("woo_wait", { timeout_ms: cfg.drainPollMs, limit: 100 });
-        observations = waitObservationsOf(result);
-      } catch {
-        break; // this session is unusable (reset/closed); try the next one
+      if (poll > 0 || observations.length === 0) {
+        try {
+          const result = await session.callTool("woo_wait", { timeout_ms: cfg.drainPollMs, limit: 100 });
+          observations = waitObservationsOf(result);
+        } catch {
+          break; // this session is unusable (reset/closed); try the next one
+        }
       }
       for (const obs of observations) {
         if (!isRecord(obs)) continue;
@@ -1063,8 +1068,51 @@ const DEFAULT_ADMISSION_WAIT_MS = 66_000;
 // lane's ceiling means either an operator widened the block's config or the
 // lane has no room to wait; the walkthrough says so rather than stalling into
 // its watchdog.
+/** Sleep while keeping the given sessions' observation queues alive.
+ *
+ * `woo_wait` delivery is at-most-once and the queue is gateway-LOCAL live
+ * state (spec/protocol/mcp.md §M5), so a session that stops asking stops
+ * hearing: measured against the deployed worker, a gateway shard idle for
+ * ~10s is evicted and every observation fanned out to a session it held is
+ * dropped on the floor. A conforming polling client therefore keeps a wait
+ * in flight; an in-flight request is what holds the shard up (verified: a
+ * session parked across a 15s window heard the peer's line, the same session
+ * merely sleeping 15s did not, and its next reply carried `gap:true`).
+ *
+ * The walkthrough's admission window is the one place it goes quiet for tens
+ * of seconds, and it is the PEER — not the sleeping caller — whose ear has to
+ * stay open for the assertions that follow. Anything these polls collect goes
+ * into the session's retention buffer, so keeping the ear open cannot cost an
+ * observation the step is about to assert on.
+ */
+async function sleepWithOpenEars(
+  totalMs: number,
+  sessions: readonly SmokeSession[],
+  signal: AbortSignal | undefined
+): Promise<void> {
+  const deadline = Date.now() + totalMs;
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const slice = Math.min(2000, deadline - Date.now());
+    // One short parked wait per session per slice, in parallel: the request
+    // itself is the keep-alive, and the reply's rows are retained, not lost.
+    await Promise.all(sessions.map(async (session) => {
+      try {
+        const result = await session.callTool("woo_wait", { timeout_ms: slice, limit: 100 }, { signal });
+        const observations = waitObservationsOf(result).filter(isRecord);
+        session.retainObservations(observations);
+      } catch {
+        // A keep-alive poll is best-effort; the assertions below own the
+        // real failure reporting.
+      }
+    }));
+    if (sessions.length === 0) await abortableDelay(slice, signal);
+  }
+}
+
 async function orderWithAdmissionRetry(
   session: SmokeSession,
+  peers: readonly SmokeSession[],
   request: string,
   ceilingMs: number,
   signal: AbortSignal | undefined,
@@ -1081,26 +1129,16 @@ async function orderWithAdmissionRetry(
       throw new Error(`dispenser admission window (${retrySeconds}s) exceeds this lane's ${Math.floor(ceilingMs / 1000)}s wait ceiling: ${message.slice(0, 200)}`);
     }
     cfg.log?.(`    [${session.label}] dispenser admission window active; waiting ${retrySeconds + 1}s for the one retry`);
-    await sleepUnlessAborted(waitMs, signal);
+    // The peers keep polling through the window. Going silent here used to
+    // cost their gateway shard (and with it their queue), so the order's
+    // fanout landed on a shard holding nothing for them and the terminal-fact
+    // assertion below failed with "saw no observations" — a transport
+    // eviction misreported as a dispenser fanout failure.
+    await sleepWithOpenEars(waitMs, [session, ...peers], signal);
     return await session.call("the_horoscope", "order", [request], signal);
   }
 }
 
-function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    throwIfAborted(signal);
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      const reason = signal?.reason;
-      reject(reason instanceof Error ? reason : new Error("operation aborted"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
 
 // Drain pending observations from a session's wait queue so the next assertion
 // only sees events emitted after this point. The deployed fan-out can take 1–2s
@@ -1108,6 +1146,11 @@ function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 // elapses. Best-effort cleanup — errors are swallowed and must not fail a step.
 async function drain(session: SmokeSession, cfg: DrainConfig, signal?: AbortSignal): Promise<void> {
   const started = Date.now();
+  // Draining means "everything up to now is stale". That has to include rows
+  // a previous waitFor pulled but did not match and is still holding, or the
+  // retention buffer would let a later step's assertion be satisfied by an
+  // earlier step's observation.
+  session.clearRetainedObservations();
   while (Date.now() - started < cfg.drainBudgetMs) {
     try {
       throwIfAborted(signal);
@@ -1125,7 +1168,17 @@ async function drain(session: SmokeSession, cfg: DrainConfig, signal?: AbortSign
 // Poll `woo_wait` until `match` returns true for one of the observations, or the
 // cumulative timeout elapses. Polls in short increments so it stays responsive
 // when the run is healthy rather than blocking on one long wait.
-async function waitFor(
+//
+// NON-MATCHING OBSERVATIONS ARE RETAINED, NOT DISCARDED. `woo_wait` is
+// at-most-once: whatever this call drains is gone from the gateway queue. A
+// step that asserts two facts in sequence (dispenser: the ordered fact, then
+// the terminal fact) reads one observation STREAM, and the server is free to
+// batch both facts into one reply — which a warm deployed gateway does. The
+// pre-retention version matched the first fact, threw the rest of the batch
+// away, and the following waitFor then timed out with "saw no observations".
+// Handing the remainder back to the session makes the assertion sequence
+// independent of how the transport batches. See SmokeSession.retained.
+export async function waitFor(
   session: SmokeSession,
   match: (obs: Record<string, any>) => boolean,
   totalTimeoutMs: number,
@@ -1134,6 +1187,36 @@ async function waitFor(
 ): Promise<Record<string, any>> {
   const startedAt = Date.now();
   const seen: string[] = [];
+  // Rows this call took off the queue (or carried in from an earlier call)
+  // that this predicate rejected. Handed back to the session on every exit,
+  // match or timeout — they were consumed from the server either way.
+  const unmatched: Record<string, any>[] = [];
+  // Scan one batch in arrival order. On a match, the rest of the batch —
+  // before AND after the matched row — survives: a row this predicate
+  // rejected may be exactly what the NEXT waitFor is looking for.
+  const scan = (observations: readonly unknown[]): Record<string, any> | null => {
+    const records = observations.filter(isRecord);
+    for (let index = 0; index < records.length; index += 1) {
+      const obs = records[index];
+      if (match(obs)) {
+        unmatched.push(...records.slice(index + 1));
+        return obs;
+      }
+      seen.push(observationSummary(obs));
+      unmatched.push(obs);
+    }
+    return null;
+  };
+  const settle = <T>(value: T): T => {
+    session.retainObservations(unmatched);
+    return value;
+  };
+
+  // Rows an earlier waitFor pulled but did not consume come first: they are
+  // older than anything the next poll can return.
+  const carried = scan(session.takeRetainedObservations());
+  if (carried) return settle(carried);
+
   while (Date.now() - startedAt < totalTimeoutMs) {
     throwIfAborted(signal);
     const remaining = totalTimeoutMs - (Date.now() - startedAt);
@@ -1142,11 +1225,10 @@ async function waitFor(
     if (observations.length) {
       cfg.log?.(`    [${session.label}] received ${observations.length} obs: ${observations.map((o: any) => o.type).join(",")}`);
     }
-    for (const obs of observations) {
-      if (isRecord(obs)) seen.push(observationSummary(obs));
-      if (isRecord(obs) && match(obs)) return obs;
-    }
+    const matched = scan(observations);
+    if (matched) return settle(matched);
   }
+  settle(null);
   const suffix = seen.length ? `; saw ${seen.slice(-12).join("; ")}` : "; saw no observations";
   throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation${suffix}`);
 }

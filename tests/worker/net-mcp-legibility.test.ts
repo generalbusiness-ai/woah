@@ -565,9 +565,37 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     // Restart the gateway over the same durable state. The session cell
     // survives; the in-memory queue does not — exactly the case that used to
     // swallow observations with no signal at all.
+    //
+    // Losing the queue is NOT by itself a continuity break. On Cloudflare an
+    // idle gateway shard is evicted within ~10s (measured against the
+    // deployed worker), which is well inside a turn-based agent's think time,
+    // so reporting a gap for every reconstruction made the marker fire on
+    // essentially every poll and carry no information. The drain watermark
+    // recorded above lets the rebuilt gateway prove that nothing was fanned
+    // out to this scope in between — so a quiet restart is gap-FREE.
     gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
-    const afterRestart = await call(prog.session, "woo_wait", { timeout_ms: 0 });
-    expect(afterRestart.result?.structuredContent?.result?.gap, JSON.stringify(afterRestart)).toBe(true);
+    const afterQuietRestart = await call(prog.session, "woo_wait", { timeout_ms: 0 });
+    expect(
+      afterQuietRestart.result?.structuredContent?.result?.gap,
+      `a restart over a quiet scope must not claim a gap: ${JSON.stringify(afterQuietRestart).slice(0, 400)}`
+    ).toBe(false);
+
+    // ...but a restart that STRADDLES a fanout is a real break: the peer's
+    // line was delivered to a gateway holding no queue for this session, so
+    // it is gone and the agent must re-orient.
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const straddled = await call(plain.session, "woo_call", {
+      object: "the_chatroom",
+      verb: "say",
+      args: ["line said while the poller had no queue"]
+    });
+    expect(straddled.result?.isError, JSON.stringify(straddled).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const afterLostLine = await call(prog.session, "woo_wait", { timeout_ms: 0 });
+    expect(
+      afterLostLine.result?.structuredContent?.result?.gap,
+      `a fanout that landed while the queue was gone must report a gap: ${JSON.stringify(afterLostLine).slice(0, 400)}`
+    ).toBe(true);
     // The marker is one-shot: it describes the discontinuity, not a state.
     const settledWait = await call(prog.session, "woo_wait", { timeout_ms: 0 });
     expect(settledWait.result?.structuredContent?.result?.gap).toBe(false);
