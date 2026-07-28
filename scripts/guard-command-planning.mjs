@@ -65,8 +65,7 @@ function ancestor(node, predicate) {
 function isNativePlanCommandRegistration(node) {
   if (!ts.isCallExpression(node)) return false;
   const expression = node.expression;
-  if (!ts.isPropertyAccessExpression(expression) || expression.name.text !== "set") return false;
-  if (!ts.isPropertyAccessExpression(expression.expression) || expression.expression.name.text !== "nativeHandlers") return false;
+  if (!ts.isPropertyAccessExpression(expression) || expression.name.text !== "registerBuiltinNativeHandler") return false;
   const firstArg = node.arguments[0];
   return Boolean(firstArg && ts.isStringLiteral(firstArg) && firstArg.text === "plan_command");
 }
@@ -138,7 +137,7 @@ if (helperCalls.length !== 1) {
 }
 for (const call of helperCalls) {
   if (!ancestor(call, isNativePlanCommandRegistration)) {
-    failures.push(`${location(worldAst, call)}: planCommandForSpace may only be called inside nativeHandlers.set("plan_command", ...)`);
+    failures.push(`${location(worldAst, call)}: planCommandForSpace may only be called inside registerBuiltinNativeHandler("plan_command", ...)`);
   }
 }
 

@@ -584,15 +584,22 @@ bytecode-to-bytecode calls so write-frame validation can prove which verb frame
 performed each mutation. Production transcripts fold that data into both the
 read set and the `vm` block.
 
-A tracked native contract with a non-empty `writes` list MUST declare its
-failure discipline. A `single_authority` primitive uses `rollback`. A
-`cross_authority_saga` primitive uses `idempotent_progress` and names its
-durable protocol; declaring this category does not create a saga runner.
-`live_only` work uses `best_effort` and cannot declare authoritative writes.
+Every substrate-owned native handler is registered as `read_only`,
+`authoritative`, or `live_only`. Every authoritative or live-only handler MUST
+have a failure contract, whether or not its transcript is complete enough for
+Net admission. A `single_authority` primitive uses `rollback`.
+`durable_progress` and `cross_authority_saga` primitives use
+`idempotent_progress` and name their durable recovery protocol; declaring the
+cross-authority category does not create a saga runner. `live_only` work uses
+`best_effort` and cannot declare authoritative writes.
 Failure-prone transport callbacks are listed as `post_commit` work: they run
 after acceptance, are absent from domain effects, and cannot change the turn
-outcome. The contract registry is guarded so adding a mutating tracked native
-without this declaration fails validation.
+outcome. The fast guard derives the built-in handler vocabulary and mutation
+class from `registerBuiltinNativeHandler` call sites, rejects direct unclassified
+registrations, and cross-checks the complete vocabulary against the failure
+contracts. Transcript tracking remains a separate eligibility decision:
+declaring rollback behavior for an untracked handler does not make it
+commit-eligible on Net.
 
 Transcript values MAY be omitted when the receiver already has the matching
 content-addressed state page. Validation still needs either the value or a
