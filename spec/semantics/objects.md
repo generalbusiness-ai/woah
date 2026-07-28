@@ -179,6 +179,44 @@ This decouples object creation from any singleton bottleneck. Creation rate is b
 
 Routing is implicit: the ULID *is* the persistent host's name. See [../reference/cloudflare.md §R1.1](../reference/cloudflare.md#r11-routing) for the v1 mapping.
 
+### 5.5.1 Mint-time id grammar
+
+**Status: implemented.** Object ids are **opaque** to every layer that stores,
+routes, or reads them: persistence, cell keys, the Net wire, the Directory, and
+every read/call path treat an id as a string with no internal structure. That
+does not change.
+
+At the moment an id is **minted**, one reservation applies: a new id may not
+contain `.`. The DSL's bare ref literal ends at the first character outside
+`[A-Za-z0-9_-]`, so `#foo.bar` means "property `bar` of object `foo`"
+([language.md §7.3](language.md#73-expressions)); an id holding a dot is
+expressible in source only through the quoted form `#"foo.bar"`. Minting more
+such ids would grow a class of object that ordinary source cannot name.
+
+Scope and rationale:
+
+- The rule binds **mints only** — the runtime's own ids are machine-generated
+  and never trip it, so in practice it constrains ids that arrive from outside
+  the runtime, which today means a catalog manifest's `local_name` and
+  `seed_hooks.as` (both become object ids verbatim).
+- It does **not** bind reads, calls, routing, or **restore**. A world may
+  already hold a dotted id — minted before this rule, or by a third-party
+  catalog — and such objects keep working unchanged. Identity import and world
+  adoption reconstruct them as-is; refusing there would strand a restorable
+  world. The quoted ref form is what keeps them addressable from source, so no
+  migration is required and none is offered.
+- Refusal is `E_INVARG` naming the offending character and the reason, since a
+  catalog author has no other way to learn the constraint.
+- The Net protocol separately reserves `:` as its compound cell-key delimiter
+  and enforces that at the transport boundary. That is a wire-format rule, not
+  a mint rule, and the two are deliberately not merged.
+
+Nothing else about an id is reserved, so ids collide freely with host-language
+property names — `__proto__` and `constructor` are legal object ids. Any map
+**keyed by object id** must therefore be built as a data-keyed map per
+[values.md §V6.2](values.md#v62-maps-keyed-by-data-normative); an id-keyed map
+built on an ordinary host object silently loses those entries.
+
 ### 5.6 The Directory
 
 The Directory host is a singleton holding small, read-mostly tables:

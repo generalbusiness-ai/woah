@@ -150,7 +150,14 @@ The set of types treated as direct messages is **closed and explicit** in v1 —
 
 Future additions (`whispered`, `paged`, `pm`) require a spec amendment so all transports update in lockstep. Catalogs that want directed semantics for a non-listed type today should set `to`/`from` and use the `told` type; otherwise the observation broadcasts to the audience space's full session audience.
 
-> **Sequenced-call caveat (v1).** Directed observations are routed to recipients only when they flow through a *direct* call's live-event broadcast path. Observations embedded in an `applied` frame from a sequenced call are broadcast to the space's audience as a unit, so a directed observation inside one would leak to the full room session audience. In practice no v1 catalog verb emits directed observations (`text`, `told`) inside a sequenced call — all `tell()`-style chat affordances (`:take`, `:drop`, `:give`, `:inventory`, `:home`, `:set_description`) are direct. New sequenced verbs that need directed text should `dispatch(target, "tell", [text])` rather than emit `text` observations themselves; if a future feature requires both sequencing *and* directed observations, the broadcast layer needs a separate filter to split directed observations out of the applied frame before fan-out.
+**Directed routing holds on the sequenced path too (normative).** An `applied` frame from a sequenced call carries its observations as a unit and, on a sharded deployment, carries *no* per-observation audience vector: each receiving relay re-resolves the frame's audience from its own presence mirror. The two audience rules that are intrinsic to the observation survive that round trip, and every relay MUST apply both before delivering to a carrier:
+
+1. a directed observation (§12.7.1) reaches only its named recipients — `to`/`from` for `told`, `target` for `text`;
+2. a self-addressed `looked`/`who` payload reaches only its `to`.
+
+Everything else broadcasts to the sessions present in the frame's scope. Sequenced verbs *do* emit directed observations in practice — `$exit:move` sends the mover its second-person `leave_msg` with `tell()` before broadcasting the room's third-person `left` — so treating an applied frame as an undifferentiated broadcast leaks one actor's private line to every session in the room. Client-side re-filtering is not a substitute: a transport that hands raw observations to an agent (the MCP wait queue) does none, so the rule is server-side or it does not exist. The implementation is `observationReachesActor` in `src/core/types.ts`, applied by the core direct path (`observationAudienceActors`, `appliedFrameAudience`) and by the gateway's committed fanout (`pushScopedObservations`).
+
+Note the asymmetry this creates for the *submitter*: its own directed echo is not re-delivered through fanout (the submitting session is skipped by the turn-id/echo dedupe) — the submitter receives its observations on the turn reply. Other sessions of the same actor do receive it through fanout.
 
 #### 12.7.2 Receiver behavior
 

@@ -1,14 +1,18 @@
 import {
   assertMap,
+  assertMintableObjectId,
   assertObj,
   assertString,
   cloneValue,
+  dataKeyedMap,
   freezeTinyBytecode,
   isDeeplyFrozen,
   directedRecipients,
   isErrorValue,
+  observationReachesActor,
   valuesEqual,
   type AppliedFrame,
+  type CompileDiagnostic,
   type DirectLiveAudience,
   type DirectResultFrame,
   type ErrorFrame,
@@ -1813,9 +1817,22 @@ export class WooWorld {
     location?: ObjRef | null;
     anchor?: ObjRef | null;
     flags?: WooObject["flags"];
+    /** Reconstructing an object that already exists somewhere else (identity
+     * import, world adoption) rather than minting a new one. The id was chosen
+     * by whatever world produced it — possibly before the reservation below —
+     * and refusing it here would strand a restorable world. Ordinary hydration
+     * (importWorld, Net cell application) writes `objects` directly and never
+     * reaches this method at all. */
+    restoring?: boolean;
   }): WooObject {
     const existing = this.objects.get(input.id);
     if (existing) return existing;
+    // The single mint seam. Every path that introduces a NEW object — the
+    // `create` builtin, actor/account provisioning, guest seeding, catalog
+    // install (`local_name` / `seed_hooks.as` become ids verbatim, so a
+    // third-party manifest is the one genuinely unconstrained source) —
+    // funnels through here.
+    if (!input.restoring) assertMintableObjectId(input.id);
     const now = Date.now();
     const obj: WooObject = {
       id: input.id,
@@ -2006,7 +2023,11 @@ export class WooWorld {
     }
     if (value && typeof value === "object") {
       const src = value as Record<string, WooValue>;
-      const out: Record<string, WooValue> = {};
+      // Rebuilds a Woo map from ITS OWN keys, which are arbitrary author data.
+      // A plain `{}` target would swallow a `__proto__` entry on the way
+      // through, so scrubbing one tombstone out of a map could silently drop
+      // an unrelated key (values.md §V6).
+      const out: Record<string, WooValue> = dataKeyedMap();
       let changed = false;
       for (const [key, entry] of Object.entries(src)) {
         if (typeof entry === "string" && this.tombstones.has(entry)) {
@@ -5957,7 +5978,13 @@ export class WooWorld {
   }
 
   async scopedObjectSummaries(actor: ObjRef, objRefs: ObjRef[], memo: HostOperationMemo = createHostOperationMemo()): Promise<Record<ObjRef, ScopedObjectSummary>> {
-    const out: Record<ObjRef, ScopedObjectSummary> = {};
+    // Keyed by OBJECT ID, which is a data key space, not a safe property
+    // namespace: `out["__proto__"] = summary` on a normal object sets the
+    // prototype instead of adding an entry, so an object legitimately named
+    // `__proto__` reports `hasOwn:false` and vanishes from `Object.keys` —
+    // silently missing from every look, roster, and describe that reads this
+    // map (values.md §V6).
+    const out: Record<ObjRef, ScopedObjectSummary> = dataKeyedMap<ScopedObjectSummary>();
     const remoteByHost = new Map<string, ObjRef[]>();
     for (const objRef of objRefs) {
       const host = await this.remoteHostForObject(objRef, memo);
@@ -6668,6 +6695,21 @@ export class WooWorld {
     };
   }
 
+  /** Upgrade the compiler's generic objref hint into a "did you mean" once the
+   * world can confirm the symbol really is an object id. The compiler has no
+   * world access, so it can only offer the general rule; eval is the surface
+   * where an agent types a freshly-created id (`obj_human_2_1:ping()`) and
+   * needs to be told the literal form is `#obj_human_2_1`. A sparse view that
+   * has not warmed the object simply keeps the generic hint — never a claim
+   * that the id does not exist. */
+  private sharpenEvalDiagnostics(diagnostics: CompileDiagnostic[]): CompileDiagnostic[] {
+    return diagnostics.map((diagnostic) => {
+      const symbol = diagnostic.symbol;
+      if (!symbol || !this.objects.has(symbol)) return diagnostic;
+      return { ...diagnostic, hint: `${symbol} is an object; address it with the objref literal — did you mean #${symbol}?` };
+    });
+  }
+
   async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(ctx.actor, surfaceClass);
     const options = progOptions(opts);
@@ -6682,7 +6724,7 @@ export class WooWorld {
     const wrapped = `verb :_eval() rxd {\n  ${body}\n}`;
     const compiled = compileVerb(wrapped);
     if (!compiled.ok || !compiled.bytecode) {
-      return { ok: false, dry_run: dryRun, diagnostics: compiled.diagnostics as unknown as WooValue };
+      return { ok: false, dry_run: dryRun, diagnostics: this.sharpenEvalDiagnostics(compiled.diagnostics) as unknown as WooValue };
     }
     if (dryRun) return { ok: true, dry_run: true, diagnostics: [] };
     // The wrapper verb is not persisted. Run it directly with the actor as
@@ -10784,12 +10826,33 @@ export class WooWorld {
     // delivery projections, matching the direct-observation path. Local stale
     // projection rows are excluded so accepted-frame fanout cannot deliver a
     // destination-room event to a session that already moved away.
-    const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
-    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) sessionSet.add(sessionId);
-    const sessions = Array.from(sessionSet);
+    const sessionActors = new Map<string, ObjRef | null>();
+    const projected = this.presenceSessionsIn(space);
+    for (const sessionId of this.sessionTableAudienceIn(space).sessions) {
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? null);
+    }
+    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) {
+      if (sessionActors.has(sessionId)) continue;
+      sessionActors.set(sessionId, this.sessions.get(sessionId)?.actor ?? projected?.get(sessionId) ?? null);
+    }
+    const sessions = Array.from(sessionActors.keys());
+    if (observations.length === 0) {
+      return { audienceSessions: sessions.length > 0 ? sessions : undefined };
+    }
+    // The observation-intrinsic audience rules (directed `told`/`text`,
+    // self-addressed `looked`/`who`) apply to committed frames too: a
+    // sequenced verb that emits `tell()` must not broadcast the recipient's
+    // second-person line to the whole room. Delivery lanes that re-resolve
+    // presence themselves apply the same predicate (see gateway-do
+    // pushScopedObservations); keeping it here means the frame's own audience
+    // hint never contradicts what the transports do.
+    const perObservation = observations.map((observation) =>
+      sessions.filter((sessionId) => observationReachesActor(observation, sessionActors.get(sessionId) ?? null))
+    );
+    const union = Array.from(new Set(perObservation.flat()));
     return {
-      audienceSessions: sessions.length > 0 ? sessions : undefined,
-      observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
+      audienceSessions: union.length > 0 ? union : undefined,
+      observationSessionAudiences: perObservation
     };
   }
 
@@ -12203,7 +12266,8 @@ export class WooWorld {
     if (Array.isArray(target)) {
       const ids = target.filter((item): item is ObjRef => typeof item === "string");
       const { summaries } = await this.objectSummariesForLook(ctx, ids);
-      const out: Record<string, WooValue> = {};
+      // Object-id keys again — same rule as scopedObjectSummaries above.
+      const out: Record<string, WooValue> = dataKeyedMap();
       for (const [id, summary] of summaries) out[id] = summary as unknown as WooValue;
       return out as unknown as WooValue;
     }
@@ -13733,7 +13797,10 @@ function cloneImportedPlainData<T>(value: T): T {
   // isolation contract it needs for cached snapshots.
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map((item) => cloneImportedPlainData(item)) as T;
-  const out: Record<string, unknown> = {};
+  // Keys here are object ids, property names, and arbitrary Woo map keys —
+  // all data. Copying into a plain `{}` loses a `__proto__` entry (the setter
+  // swallows it), so a world could lose data simply by being imported.
+  const out: Record<string, unknown> = dataKeyedMap<unknown>();
   for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
   return out as T;
 }

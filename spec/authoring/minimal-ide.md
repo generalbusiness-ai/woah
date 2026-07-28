@@ -321,6 +321,8 @@ Compile diagnostics have a stable shape:
   severity: "error" | "warning" | "info",
   code: str,
   message: str,
+  hint?: str,      // remediation sentence, safe to show verbatim
+  symbol?: str,    // the offending source symbol, when there is one
   span?: {
     line: int,
     column: int,
@@ -329,6 +331,14 @@ Compile diagnostics have a stable shape:
   }
 }
 ```
+
+`hint` carries the *remediation*, not a restatement of the error: the
+compiler supplies the generic rule (an unknown identifier is told that object
+ids are written `#<id>`), and a caller with world knowledge may sharpen it —
+`$programmer:eval` turns that into "did you mean `#<id>`?" once it confirms the
+world holds that object. A surface that renders diagnostics MUST render `hint`
+when present; dropping it leaves the author exactly where the bare error did.
+`symbol` exists so such a caller does not have to re-parse `message`.
 
 Span positions are 1-based for `line` / `end_line` and 0-based for `column` /
 `end_column`. Columns are Unicode code-point offsets in the NFC-normalized

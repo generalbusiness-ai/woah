@@ -12,7 +12,7 @@ Either way, it sees the surface's tools on itself; there is no separate
 ```
 $player
   └─ $builder       (shape: create, chparent, recycle, set_property, inspect, search)
-       └─ $programmer (code: install_verb, set_verb_info, edit_verb, eval, trace, ...)
+       └─ $programmer (code: install_verb, set_verb_info, edit_verb, eval, ...)
 
 agent_42 isa $agent          (kind stays put)
 agent_42.features = [$programmer]   (surface composed on)
@@ -130,7 +130,7 @@ Programmer inherits everything from `$builder`, then adds:
 | `edit_verb(id, descriptor, opts?)` | Door into `the_verb_editor` room. See [verb-editor.md](verb-editor.md). |
 | `eval(source, opts?)` | Compile and run woocode under your `progr`. See [eval.md](eval.md). |
 | `force_recycle(id, opts?)` | Wizard-only forced recycle (children/contents/reserved). See [../wizard/recycle.md](../wizard/recycle.md). |
-| `trace(id, verb_name, opts?)` | Next-N invocations source-span trace. v1.1; currently `E_NOT_IMPLEMENTED`. |
+| `trace(id, verb_name, opts?)` | Next-N invocations source-span trace. **Not implemented and deliberately not tool-exposed** — advertising a tool that can only raise is a trap, so it appears in no `tools/list`. Until it lands, debug with `list_verb` (exact source), `eval` (run an expression under your own authority), and the `trace` frames every raised error carries (`{obj, verb, definer, line, column}`). |
 
 **Chat commands:**
 

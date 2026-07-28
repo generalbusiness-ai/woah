@@ -1015,6 +1015,15 @@ One write path per fact (CO9), concretized:
   idempotency key), used only by the receiving gateway to skip the submitting
   session, and public `echo_id`, a domain-separated SHA-256 digest of that key.
   The raw replay credential must never appear on a client-visible frame.
+  Presence membership selects the *candidate* carriers; the receiving shard
+  then applies the observation-intrinsic audience rules of
+  [events.md §12.7.1](../semantics/events.md#1271-directed-observation-types-v1)
+  to each candidate — a directed `told`/`text` reaches only its named
+  recipient, a self-addressed `looked`/`who` only its `to`. A committed frame
+  carries no audience vector to lean on, so this filter is not optional: it is
+  the only thing keeping a `tell()` emitted inside a sequenced verb off every
+  bystander's carrier, and no client-side filtering may be assumed (an MCP
+  wait queue delivers raw observations to an agent).
 
 ## CO14. Session authority and authentication
 

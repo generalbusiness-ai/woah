@@ -3,6 +3,7 @@ import {
   assertObj,
   assertString,
   cloneValue,
+  hasOwnMapKey,
   isErrorValue,
   type ErrorValue,
   type Message,
@@ -571,7 +572,12 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         case "MAP_GET": {
           const key = assertString(pop());
           const map = assertMap(pop());
-          if (!(key in map)) throw wooError("E_PROPNF", `map key not found: ${key}`);
+          // OWN keys only (values.md §V6). `key in map` would answer for the
+          // host prototype chain, so `{}.constructor` returned a JavaScript
+          // function and `{}["__proto__"]` an object — neither expressible as
+          // a Woo value. A key the map does not own is absent, and absent has
+          // always meant E_PROPNF.
+          if (!hasOwnMapKey(map, key)) throw wooError("E_PROPNF", `map key not found: ${key}`);
           push(map[key]);
           break;
         }
@@ -592,7 +598,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           } else {
             const map = assertMap(collection);
             const mapKey = assertString(key);
-            if (!(mapKey in map)) throw wooError("E_PROPNF", `map key not found: ${mapKey}`);
+            // Own keys only — same rule as MAP_GET; `m["constructor"]` and
+            // `m.constructor` must agree, and both must miss.
+            if (!hasOwnMapKey(map, mapKey)) throw wooError("E_PROPNF", `map key not found: ${mapKey}`);
             push(map[mapKey]);
           }
           break;
@@ -770,7 +778,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       return;
     }
     if (haystack !== null && typeof haystack === "object" && !Array.isArray(haystack)) {
-      push(typeof needle === "string" && needle in haystack);
+      // `"constructor" in {}` answered true against the host prototype chain,
+      // contradicting the read ops above: membership and lookup must agree on
+      // what a map contains (values.md §V6).
+      push(typeof needle === "string" && hasOwnMapKey(haystack, needle));
       return;
     }
     throw wooError("E_TYPE", "IN requires list or map haystack", haystack);
@@ -793,7 +804,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const collection = builtinArgs[0];
         const key = builtinArgs[1];
         if (Array.isArray(collection)) return collection.some((value) => valuesEqual(value, key));
-        if (collection !== null && typeof collection === "object") return typeof key === "string" && key in collection;
+        // `has(m, k)` is the builtin spelling of `k in m` and answers
+        // identically — own keys only (values.md §V6).
+        if (collection !== null && typeof collection === "object") return typeof key === "string" && hasOwnMapKey(collection, key);
         return false;
       }
       case "typeof":

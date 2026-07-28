@@ -33,6 +33,29 @@ The programmer-surface verb. It:
 After this call, your reachable tool list shifts to include the
 editor verbs.
 
+### When the door is shut: `E_EDITOR_UNAVAILABLE`
+
+```
+E_EDITOR_UNAVAILABLE: the verb editor 'the_verb_editor' is not readable
+in this world, so edit_verb cannot open a buffer; install_verb and
+list_verb still work.
+```
+
+This is an *environment* failure, not something you did wrong, and no
+permission fixes it. The editor object is seeded by the prog catalog's
+`create_instance` hook, so it is unreachable in exactly two situations:
+
+- the world was installed before that hook existed and never upgraded —
+  an operator reinstalls/upgrades the prog catalog;
+- the world is a deployed Net world whose stored `$programmer:edit_verb`
+  page predates the `authority.prefetch` declaration that warms the
+  editor, so the shard cannot read it — an operator runs
+  `npm run repair:net-definitions -- <worker> '$programmer:edit_verb'`
+  (this is the post-deploy step on the deploy checklist).
+
+Until then, `install_verb` (whole-source install) and `list_verb` (read
+the current source) cover the same ground with more typing.
+
 ## Editor session verbs
 
 While you're in the editor:
