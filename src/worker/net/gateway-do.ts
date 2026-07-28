@@ -5440,6 +5440,11 @@ export class NetGatewayDO {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
 
     if (name === "woo_wait") {
+      // M4.3: the advertised schema is enforced before anything else happens.
+      // Silently defaulting a wrong-typed `timeout_ms` made a client that
+      // passed "5000" park for one second and believe it had parked for five.
+      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (refusal) return this.mcpToolError(id, refusal);
       const timeout = typeof args.timeout_ms === "number" ? Math.min(Math.max(args.timeout_ms, 0), 25_000) : 1000;
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
@@ -5453,6 +5458,12 @@ export class NetGatewayDO {
     // invocation so the advertised set and the accepted set remain equal.
     await this.warmMcpContext(actor, session);
     if (name === "woo_list_reachable_tools") {
+      // M4.3. The `scope` enum is now refused by the same validator every
+      // other tool uses, so the refusal names the field and the allowed set
+      // instead of arriving as a bare thrown message. mcpToolScope still
+      // guards the internal contract for non-transport callers.
+      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (refusal) return this.mcpToolError(id, refusal);
       try {
         const page = this.mcpToolPage(actor, session, args);
         // Re-baseline from the canonical set the page was projected from —
@@ -5477,9 +5488,27 @@ export class NetGatewayDO {
       }
     }
     if (name === "woo_call") {
-      const requested = typeof args.object === "string" ? args.object : "";
-      const verb = typeof args.verb === "string" ? args.verb : "";
-      if (!requested || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
+      // M4.3, gate 1: woo_call's OWN schema — `object`/`verb` required
+      // strings, `args` an array. This replaced a coercing presence check
+      // that reported a non-string `object` as "missing" and silently turned
+      // a non-array `args` into an empty list, dispatching the verb with no
+      // arguments instead of saying the payload was malformed.
+      const controlRefusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      if (controlRefusal) return this.mcpToolError(id, controlRefusal);
+      const requested = args.object as string;
+      const verb = args.verb as string;
+      if (!requested || !verb) {
+        return this.mcpToolError(id, {
+          code: "E_INVARG",
+          message: "woo_call: \"object\" and \"verb\" must be non-empty",
+          detail: {
+            reason: "empty_required_argument",
+            tool: name,
+            field: requested ? "verb" : "object",
+            remediation: "name a reachable object id (or $me/$here) and a verb on its dispatch chain"
+          }
+        });
+      }
       // `$me`/`$here` are the forms every user doc uses for "the session
       // actor" and "the space I am in". They resolved nowhere, so each of
       // those documented examples refused. They are transport-level session
@@ -5502,6 +5531,18 @@ export class NetGatewayDO {
       }
       const resolved = this.mcpResolveCall(actor, session, object, verb);
       if ("error" in resolved) return this.mcpToolError(id, resolved.error);
+      // M4.3, gate 2: the resolved verb's own declared parameters. `woo_call`
+      // cannot advertise them — its schema describes a free-form list — but
+      // once the verb is resolved its `arg_spec` is in hand, and it is the
+      // SAME input the advertised dynamic `inputSchema` is derived from.
+      const positional = Array.isArray(args.args) ? args.args : [];
+      const argRefusal = mcpValidatePositionalArguments(
+        resolved.tool.object,
+        resolved.tool.verb,
+        resolved.tool.argSpec,
+        positional
+      );
+      if (argRefusal) return this.mcpToolError(id, argRefusal);
       // `woo_call` carries verb arguments positionally inside `args`, so its
       // own argument namespace never collides with the reserved name.
       const operation = mcpOperationId(params, args, []);
@@ -5512,7 +5553,7 @@ export class NetGatewayDO {
         session,
         resolved.tool.object,
         resolved.tool.verb,
-        Array.isArray(args.args) ? args.args : [],
+        positional,
         resolved.tool.route,
         this.mcpTraceOf(request),
         operation.value
@@ -5520,6 +5561,11 @@ export class NetGatewayDO {
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
     if (dynamic) {
+      // M4.3: validate against `mcpProtocolTool`'s schema — the exact object
+      // `tools/list` advertised for this tool, reserved `operation_id`
+      // included — so the accepted set and the advertised set are one thing.
+      const refusal = mcpValidateNamedArguments(name, mcpProtocolTool(dynamic).inputSchema, args);
+      if (refusal) return this.mcpToolError(id, refusal);
       const operation = mcpOperationId(params, args, dynamic.argNames);
       if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
@@ -10500,6 +10546,261 @@ function mcpSchemaForHint(raw: string): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Argument validation for `tools/call` (mcp.md §M4.3).
+ *
+ * We advertise an `inputSchema` for every tool and, until this landed,
+ * checked nothing against it: a missing property silently became `null` and a
+ * wrong-typed one reached verb dispatch unchanged, so the schema a model
+ * reads was decorative. Everything below runs BEFORE the turn is planned —
+ * a refused call emits no observation and writes no cell.
+ *
+ * This is deliberately NOT a JSON Schema engine. It implements exactly the
+ * vocabulary our own advertisements can contain — `type`, `enum`, `anyOf`,
+ * and `required` — which covers everything `mcpInputSchema` derives from an
+ * `arg_spec` (type hints, `command.args_from` shapes) plus the hand-written
+ * stable-control schemas. Deliberately NOT supported, because no
+ * advertisement can express them: nested object/array element schemas
+ * (`items` is always `{}`), `additionalProperties`, `format`, numeric or
+ * length bounds, `pattern`, `oneOf`/`allOf`/`not`, and `$ref`. A schema
+ * fragment this validator does not understand constrains NOTHING rather than
+ * refusing, so a richer future advertisement can never start rejecting calls
+ * that were valid before the validator learned about it.
+ */
+type McpArgRefusal = { code: string; message: string; detail: Record<string, unknown> };
+
+/** True when `value` satisfies the shallow schema fragment. An empty or
+ * unrecognized fragment accepts everything — see the fail-open rule above. */
+function mcpSchemaAccepts(schema: Record<string, unknown>, value: unknown): boolean {
+  if (Array.isArray(schema.anyOf)) {
+    return schema.anyOf.some((branch) => mcpSchemaAccepts(mcpRecord(branch), value));
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => allowed === value)) return false;
+  const type = typeof schema.type === "string" ? schema.type : "";
+  switch (type) {
+    case "string": return typeof value === "string";
+    case "boolean": return typeof value === "boolean";
+    // JSON has one number type; `integer` is the narrower assertion. Both
+    // reject the non-finite values JSON cannot carry anyway.
+    case "integer": return typeof value === "number" && Number.isInteger(value);
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "object": return typeof value === "object" && value !== null && !Array.isArray(value);
+    case "array": return Array.isArray(value);
+    case "null": return value === null;
+    default: return true;
+  }
+}
+
+/** What a refusal should say the parameter had to be. */
+function mcpSchemaExpectation(schema: Record<string, unknown>): string {
+  if (Array.isArray(schema.anyOf)) {
+    const branches = schema.anyOf
+      .map((branch) => mcpSchemaExpectation(mcpRecord(branch)))
+      .filter((text) => text !== "any");
+    if (branches.length > 0) return branches.join(" or ");
+    return "any";
+  }
+  if (Array.isArray(schema.enum)) return `one of ${schema.enum.map((value) => JSON.stringify(value)).join(", ")}`;
+  return typeof schema.type === "string" && schema.type ? schema.type : "any";
+}
+
+/** The JSON type name to report back for a rejected value. */
+function mcpJsonTypeOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  return typeof value;
+}
+
+/**
+ * Validate a named-argument object against the schema that was advertised
+ * for it. Used for the stable controls (schema straight out of
+ * `MCP_TOOL_DEFS`) and for dynamic `<object>__<verb>` tools (schema straight
+ * out of `mcpProtocolTool`), so the validator and the advertisement are the
+ * same object and cannot drift.
+ *
+ * STRICTNESS: required-presence and type agreement are enforced; **unknown
+ * properties are ignored, not rejected.** Our advertised schemas do not set
+ * `additionalProperties: false`, so JSON Schema's own reading of them permits
+ * extras — rejecting what we advertise as permitted would be a fresh
+ * disagreement, and real MCP clients do decorate `arguments`. The failure
+ * mode that matters, a misspelled parameter name, is still caught: the
+ * correctly spelled parameter is then missing, and the refusal lists the
+ * unrecognized properties so the typo is diagnosable.
+ */
+function mcpValidateNamedArguments(
+  tool: string,
+  schema: Record<string, unknown>,
+  values: Record<string, unknown>
+): McpArgRefusal | null {
+  const properties = mcpRecord(schema.properties);
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((value): value is string => typeof value === "string")
+    : [];
+  const requiredSet = new Set(required);
+  // `undefined` is not a JSON value, but a hand-built client object can carry
+  // it; treat it as absent rather than as a value that fails every type.
+  const supplied = (name: string) =>
+    Object.prototype.hasOwnProperty.call(values, name) && values[name] !== undefined;
+  const missing = required.filter((name) => !supplied(name));
+  if (missing.length > 0) {
+    const field = missing[0];
+    const expected = mcpSchemaExpectation(mcpRecord(properties[field]));
+    // Only computed on the refusal path: an accepted call must not pay for it.
+    const unknown = Object.keys(values).filter((name) => !(name in properties));
+    return {
+      code: "E_INVARG",
+      message: `${tool}: missing required argument "${field}" (${expected})`,
+      detail: {
+        reason: "missing_required_argument",
+        tool,
+        field,
+        missing,
+        expected,
+        required,
+        ...(unknown.length > 0 ? { unknown_properties: unknown } : {}),
+        remediation: unknown.length > 0
+          ? `supply "${field}" as ${expected}; these supplied properties are not parameters of this tool and were ignored: `
+            + `${unknown.map((name) => `"${name}"`).join(", ")} — check for a misspelling`
+          : `supply "${field}" as ${expected}; this tool requires ${required.map((name) => `"${name}"`).join(", ")}`
+      }
+    };
+  }
+  // Advertisement order, not client order: the refusal a client sees for a
+  // given bad payload must not depend on JSON key ordering.
+  for (const [name, declared] of Object.entries(properties)) {
+    if (!supplied(name)) continue;
+    const value = values[name];
+    // `null` on an OPTIONAL parameter means "not supplied". It is exactly
+    // what mcpNamedArgs substitutes for an absent property, so refusing the
+    // transport's own encoding of absence would be incoherent.
+    if (value === null && !requiredSet.has(name)) continue;
+    const declaredSchema = mcpRecord(declared);
+    if (mcpSchemaAccepts(declaredSchema, value)) continue;
+    const expected = mcpSchemaExpectation(declaredSchema);
+    return {
+      code: "E_INVARG",
+      message: `${tool}: argument "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      detail: {
+        reason: "argument_type_mismatch",
+        tool,
+        field: name,
+        expected,
+        received: mcpJsonTypeOf(value),
+        remediation: `pass "${name}" as ${expected}`
+      }
+    };
+  }
+  return null;
+}
+
+/**
+ * Validate `woo_call`'s positional `args` list against the resolved verb's
+ * own `arg_spec` — the same input `mcpInputSchema` turns into the advertised
+ * `inputSchema`, so a verb that is also advertised is checked identically
+ * through both doors.
+ *
+ * RESIDUAL, stated in mcp.md §M4.3: a page whose `arg_spec` carries no
+ * declaration list at all declares no arity this gateway could check. That is
+ * the `(dobj, prep, iobj)` command-header form, whose parameters are bound
+ * from parsed command tokens rather than declared positionally, and any aged
+ * page written before `arg_spec` carried one. Those calls pass through
+ * unexamined; the alternative — assuming zero parameters — would refuse every
+ * legitimate command-shaped call.
+ */
+function mcpValidatePositionalArguments(
+  object: string,
+  verb: string,
+  argSpec: Record<string, unknown>,
+  values: unknown[]
+): McpArgRefusal | null {
+  if (!Array.isArray(argSpec.args) && !Array.isArray(argSpec.params)) return null;
+  const derived = mcpInputSchema(argSpec);
+  const properties = mcpRecord(derived.schema.properties);
+  const required = Array.isArray(derived.schema.required)
+    ? (derived.schema.required as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+  const requiredSet = new Set(required);
+  const target = `${object}:${verb}`;
+  // Optional markers are not guaranteed to be trailing (`["a?", "b"]` is
+  // expressible), so the minimum arity is one past the LAST required
+  // position, not the count of required names.
+  let minimum = 0;
+  derived.args.forEach((name, index) => {
+    if (requiredSet.has(name)) minimum = index + 1;
+  });
+  if (values.length < minimum) {
+    const field = derived.args[values.length] ?? derived.args[derived.args.length - 1] ?? "";
+    const expected = mcpSchemaExpectation(mcpRecord(properties[field]));
+    return {
+      code: "E_INVARG",
+      message:
+        `${target}: missing required argument #${values.length + 1} "${field}" (${expected}) — `
+        + `the verb takes at least ${minimum} argument${minimum === 1 ? "" : "s"}, received ${values.length}`,
+      detail: {
+        reason: "missing_required_argument",
+        obj: object,
+        name: verb,
+        field,
+        position: values.length,
+        expected,
+        declared: derived.args,
+        minimum_arity: minimum,
+        received_arity: values.length,
+        remediation: `pass args in the declared order (${derived.args.join(", ")})`
+      }
+    };
+  }
+  if (values.length > derived.args.length) {
+    return {
+      code: "E_INVARG",
+      message:
+        `${target}: too many arguments — the verb declares ${derived.args.length} `
+        + `(${derived.args.join(", ") || "none"}), received ${values.length}`,
+      detail: {
+        reason: "too_many_arguments",
+        obj: object,
+        name: verb,
+        declared: derived.args,
+        maximum_arity: derived.args.length,
+        received_arity: values.length,
+        remediation: derived.args.length > 0
+          ? `pass at most ${derived.args.length} args, in the declared order (${derived.args.join(", ")})`
+          : "this verb takes no arguments; pass an empty args list"
+      }
+    };
+  }
+  for (const [index, name] of derived.args.entries()) {
+    if (index >= values.length) break;
+    const value = values[index];
+    // Same absence rule as the named path: `null` in an optional slot is how
+    // "not supplied" is spelled positionally.
+    if (value === null && !requiredSet.has(name)) continue;
+    const declaredSchema = mcpRecord(properties[name]);
+    if (mcpSchemaAccepts(declaredSchema, value)) continue;
+    const expected = mcpSchemaExpectation(declaredSchema);
+    return {
+      code: "E_INVARG",
+      message: `${target}: argument #${index + 1} "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      detail: {
+        reason: "argument_type_mismatch",
+        obj: object,
+        name: verb,
+        field: name,
+        position: index,
+        expected,
+        received: mcpJsonTypeOf(value),
+        declared: derived.args,
+        remediation: `pass args[${index}] ("${name}") as ${expected}`
+      }
+    };
+  }
+  return null;
+}
+
+/** Map the validated named-argument object onto the verb's positional list.
+ * An absent OPTIONAL parameter becomes `null` here; an absent REQUIRED one
+ * can no longer reach this point (mcpValidateNamedArguments refused it). */
 function mcpNamedArgs(tool: NetMcpDynamicTool, values: Record<string, unknown>): unknown[] {
   return tool.argNames.map((name) => values[name] ?? null);
 }
@@ -10598,3 +10899,15 @@ const MCP_TOOL_DEFS = [
     }
   }
 ] as const;
+
+/**
+ * The advertised input schema of each stable control, keyed by tool name.
+ *
+ * Projected from `MCP_TOOL_DEFS` itself rather than restated, so the object
+ * `tools/call` validates against IS the object `tools/list` published. A
+ * second, hand-maintained copy would be a new drift surface — exactly the bug
+ * this validation exists to close for dynamic tools.
+ */
+const MCP_CONTROL_SCHEMAS: Record<string, Record<string, unknown>> = Object.fromEntries(
+  MCP_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema as unknown as Record<string, unknown>])
+);
