@@ -68,7 +68,7 @@
   "src/core/world.ts": {
     "$account": 4,
     "$actor": 25,
-    "$agent": 17,
+    "$agent": 16,
     "$ambiguous_match": 2,
     "$block": 3,
     "$builder": 3,
@@ -78,7 +78,7 @@
     "$help": 1,
     "$help_db_main": 1,
     "$horoscope_note": 1,
-    "$human": 14,
+    "$human": 13,
     "$loop_class": 1,
     "$match": 1,
     "$note": 1,
