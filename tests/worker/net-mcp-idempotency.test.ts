@@ -157,6 +157,24 @@ async function fixture() {
     expect(read.result?.isError, JSON.stringify(read).slice(0, 400)).not.toBe(true);
     return read.result?.structuredContent?.result as number;
   };
+  /** Drain a session's queue and return every observation seen. */
+  const drain = async (session: string): Promise<Record<string, any>[]> => {
+    const seen: Record<string, any>[] = [];
+    for (;;) {
+      const waited = await call(session, "woo_wait", { timeout_ms: 0, limit: 100 });
+      const batch = waited.result?.structuredContent?.result?.observations ?? [];
+      if (batch.length === 0) return seen;
+      seen.push(...batch);
+    }
+  };
+  const say = async (session: string, text: string, operationId?: string) =>
+    await call(session, "woo_call", {
+      object: "the_chatroom",
+      verb: "say",
+      args: [text],
+      ...(operationId ? { operation_id: operationId } : {})
+    });
+
   const bump = async (session: string, operationId?: string, viaMeta = false) =>
     viaMeta
       ? await call(session, "woo_call", { object: "the_mug", verb: "bump", args: [] }, { "woo.net/operation_id": operationId })
@@ -169,7 +187,7 @@ async function fixture() {
 
   return {
     alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv,
-    mcp, call, hits, bump, settleAll,
+    mcp, call, hits, bump, say, drain, settleAll,
     close: () => { for (const st of states) st.close(); }
   };
 }
@@ -318,6 +336,175 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(bobs.result?.structuredContent?.replayed).toBeUndefined();
       expect(bobs.result?.structuredContent?.result).toBe(2);
       expect(await f.hits()).toBe(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 1. `say` is `persistence:"live"` — a DIRECT turn that writes no
+  // authority cell. The scope classifies that as a pure read and does not
+  // cache it, so before the receipt a retry re-emitted the line to every
+  // peer. The advertised schema promises deduplication for anything that
+  // changes the world, and speech changes what peers perceive.
+  it("an observation-only act is deduplicated: the PEER hears it exactly once", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.bobSession); // presence noise from session mint
+      const text = "retry-safety-line";
+      const first = await f.say(f.aliceSession, text, "speak-1");
+      expect(first.result?.isError, JSON.stringify(first).slice(0, 400)).not.toBe(true);
+      expect(first.result?.structuredContent?.replayed).toBeUndefined();
+      await f.settleAll();
+
+      // Response lost; the client retries the identical call.
+      const retry = await f.say(f.aliceSession, text, "speak-1");
+      await f.settleAll();
+
+      // The assertion that matters, and deliberately FIRST so it is the one
+      // that fires when the receipt regresses: BOB, the peer, heard the line
+      // exactly once.
+      const heard = await f.drain(f.bobSession);
+      const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
+      expect(lines.length, `peer heard ${lines.length} copies: ${JSON.stringify(heard).slice(0, 500)}`).toBe(1);
+      expect(retry.result?.structuredContent?.replayed).toBe(true);
+      expect(retry.result?.structuredContent?.replay_outcome).toBe("full");
+    } finally {
+      f.close();
+    }
+  });
+
+  it("an unkeyed observation-only act still re-emits: the receipt is the client's opt-in", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.bobSession);
+      const text = "unkeyed-line";
+      // No operation id. This is the pre-existing, write-free path that the
+      // browser's per-turn minted keys depend on — the scope records nothing
+      // and the second call is genuinely a second act, not a lost retry.
+      await f.say(f.aliceSession, text);
+      await f.settleAll();
+      await f.say(f.aliceSession, text);
+      await f.settleAll();
+      const heard = await f.drain(f.bobSession);
+      const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
+      expect(lines.length).toBe(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 2. A key answers ONE request. Reusing it for a different call
+  // used to return the first call's reply as though it were this call's —
+  // a confidently wrong answer, worse than the double execution keys prevent.
+  it("refuses key reuse for a DIFFERENT call, with its own conflict code", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "reuse-1")).result?.structuredContent?.result).toBe(1);
+      await f.settleAll();
+
+      const conflict = async (args: Record<string, unknown>) => {
+        const response = await f.call(f.aliceSession, "woo_call", { ...args, operation_id: "reuse-1" });
+        await f.settleAll();
+        return response;
+      };
+      // Changed ARGUMENTS.
+      const changedArgs = await conflict({ object: "the_mug", verb: "bump", args: ["extra"] });
+      expect(changedArgs.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT", detail: { reason: "operation_id_reused" } } }
+      });
+      // The refusal must not leak the original call it collided with.
+      expect(JSON.stringify(changedArgs.result)).not.toContain("hits");
+      // Changed VERB.
+      expect((await conflict({ object: "the_mug", verb: "hits_now", args: [] })).result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+      // Changed TARGET.
+      expect((await conflict({ object: "the_chatroom", verb: "look", args: [] })).result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+
+      // The conflicts changed nothing, and — critically — did not clobber
+      // the receipt: the ORIGINAL call still replays its recorded outcome.
+      expect(await f.hits()).toBe(1);
+      const original = await f.bump(f.aliceSession, "reuse-1");
+      expect(original.result?.structuredContent?.replayed).toBe(true);
+      expect(original.result?.structuredContent?.result).toBe(1);
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("an ALIAS of the same verb is the same request, not a conflict", async () => {
+    const f = await fixture();
+    try {
+      // `go` carries movement aliases; the MCP resolver maps an alias to the
+      // canonical verb before the turn is built, so both spellings must
+      // fingerprint identically. A conflict here would break every client
+      // that retried using a different spelling than its first attempt.
+      const listed = await f.mcp(
+        { jsonrpc: "2.0", id: 4242, method: "tools/list", params: {} },
+        { "mcp-session-id": f.aliceSession }
+      );
+      const aliased = (listed.body?.result?.tools ?? []).length > 0;
+      expect(aliased).toBe(true);
+      // `look` on the chatroom is reachable by its canonical name and by the
+      // alias the catalog declares for it (`l`), if present.
+      const canonical = await f.call(f.aliceSession, "woo_call", {
+        object: "the_chatroom", verb: "look", args: [], operation_id: "alias-1"
+      });
+      expect(canonical.result?.isError, JSON.stringify(canonical).slice(0, 300)).not.toBe(true);
+      await f.settleAll();
+      const viaAlias = await f.call(f.aliceSession, "woo_call", {
+        object: "the_chatroom", verb: "l", args: [], operation_id: "alias-1"
+      });
+      await f.settleAll();
+      // Either the alias resolves (then it replays cleanly) or the world has
+      // no such alias (then it is a plain verb miss) — but it must NEVER be
+      // an idempotency conflict, which would mean the fingerprint keyed on
+      // the client's spelling instead of the resolved call.
+      const error = viaAlias.result?.structuredContent?.error;
+      expect(error?.code).not.toBe("E_IDEMPOTENCY_CONFLICT");
+      if (!viaAlias.result?.isError) {
+        expect(viaAlias.result?.structuredContent?.replayed).toBe(true);
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  it("the fingerprint is durable: a COLD gateway still detects key reuse", async () => {
+    const f = await fixture();
+    try {
+      expect((await f.bump(f.aliceSession, "cold-conflict")).result?.structuredContent?.result).toBe(1);
+      await f.settleAll();
+      // The conflict check lives at the authority and rides the stored reply
+      // row, so a gateway that lost every byte of in-isolate memory still
+      // refuses. An in-memory check would pass this call straight through.
+      const revived = new NetGatewayDO(f.gatewayState.state, f.gatewayEnv);
+      const response = await revived.fetch(new Request("https://do/net-api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", "mcp-session-id": f.aliceSession },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 9100,
+          method: "tools/call",
+          params: {
+            name: "woo_call",
+            arguments: { object: "the_mug", verb: "bump", args: ["different"], operation_id: "cold-conflict" }
+          }
+        })
+      }));
+      const body = await response.json() as Record<string, any>;
+      await f.settleAll();
+      expect(body.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
+      });
+      expect(await f.hits()).toBe(1);
     } finally {
       f.close();
     }

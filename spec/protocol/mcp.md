@@ -445,14 +445,24 @@ The retry's own re-plan is NEVER presented as the outcome. It describes an
 execution that committed nothing, and for a turn reading `now()` or `random()`
 it would be a plausible wrong answer.
 
-**What the promise does not cover.** A turn that touched no authority cell,
-wrote no projection, armed no schedule, and recorded no untracked effect is an
-authority-validated READ, not a commit: the scope does not cache its reply
-(§CO4), so a retry re-executes it and no `replayed` marker appears. This is by
-construction and is safe for state — there is none to duplicate — but a
-`persistence:"live"` verb that only emits observations, such as room speech,
-falls in this class: retrying it will emit the line again. Duplicate-sensitive
-effects must be durable, which is what makes them cacheable.
+**Effect-free but visible turns are covered too.** A turn that touches no
+authority cell is an authority-validated READ and the scope does not cache its
+reply (§CO4) — that is what keeps concurrent view refreshes from becoming
+storage writes on an unchanged scope. But such a turn can still be externally
+VISIBLE: a `persistence:"live"` verb like room speech emits to every peer while
+writing nothing. Deduplicating only durable mutations would make the advertised
+promise false for exactly that case, since speech changes what peers perceive.
+
+So a submit carrying a client-named key records a **receipt** — the reply, and
+nothing else. The head does not advance, no sequence number is consumed, and
+nothing is ordered, so speech still never contends. A retry then replays the
+receipt, and the live carrier is not re-run: the peer hears the line once.
+
+The receipt is the client's explicit opt-in, never inferred from the presence
+of a key. An MCP `operation_id` sets it; on `/net-api/turn` and the WebSocket
+turn frame it is `retry_safe:true` alongside the key. Clients that mint a fresh
+key per turn and never reuse it — the browser does — keep the write-free path
+they have always had.
 
 `replay_outcome` names how much survived:
 
@@ -473,6 +483,34 @@ dropped first (the client can re-orient with a read) and the loss is named.
 Return values are retained for MUTATING turns only — a turn that wrote
 nothing is safe to re-issue under a fresh id, and read results are the large
 ones, which must not grow the CO7 commit envelope.
+
+**One key answers one request.** A recorded reply carries a canonical
+fingerprint of the request it answered: a hash over `{actor, target, verb,
+args, route}`. Reusing an operation id for a **different** call is refused with
+`E_IDEMPOTENCY_CONFLICT` (`detail.reason:"operation_id_reused"`) and commits
+nothing. This is not an argument-validation error and must not be reported as
+one — the client's arguments are fine; what is wrong is the id, and only a
+distinct code tells the client which of the two to change. The refusal never
+echoes the original call: the holder of a colliding key must not learn what it
+collided with.
+
+The fingerprint canonicalisation is normative:
+
+- object keys are sorted before hashing, so structurally equal argument maps
+  agree regardless of property order on the wire;
+- the call is the **resolved** one — `$me`/`$here` and verb **aliases** are
+  resolved before the turn is built, so two spellings of one call agree and
+  MUST NOT conflict;
+- `session` is excluded: the same actor retrying from another session is the
+  same operation;
+- the planning anchor is excluded: a turn that MOVED the actor re-plans from
+  the new room and must still replay cleanly.
+
+The fingerprint is stored with the reply at the authority, so the check holds
+across gateway eviction and scope restart. A conflict never overwrites the
+recorded reply — the original caller's receipt must survive another client's
+mistake. A submit or a recorded reply from before this field existed skips the
+check rather than guessing.
 
 **Binding.** The retained outcome belongs to the actor whose turn committed
 it. A submit from a different actor under the same key still learns that its

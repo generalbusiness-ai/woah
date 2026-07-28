@@ -313,6 +313,13 @@ type TurnRequest = {
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
+  /** CO2.5: the CLIENT chose this key and expects retry semantics. Set by an
+   * MCP `operation_id` and by `retry_safe:true` on /net-api/turn; NOT set
+   * for a gateway-minted key, nor for the browser's per-turn ids, which are
+   * unique by construction and would only add a storage write per turn. It
+   * makes an effect-free but externally visible turn (speech) record a
+   * receipt so its retry cannot emit the act a second time. */
+  retry_receipt?: boolean;
   /** DEPRECATED-FOR-PRODUCTION topology overrides (lane/test fixtures
    * only — CO15 forbids request-supplied topology on the production
    * path). When ALL THREE are absent the gateway derives everything:
@@ -4837,10 +4844,18 @@ export class NetGatewayDO {
     }, planningScope);
     // Client retries reuse their supplied idempotency key (CO2.5); an
     // unkeyed request gets a fresh turn identity.
-    const key =
+    const suppliedKey =
       typeof body.idempotency_key === "string" && body.idempotency_key.length > 0
         ? body.idempotency_key
-        : `napi:${randomHex(12)}`;
+        : null;
+    const key = suppliedKey ?? `napi:${randomHex(12)}`;
+    // CO2.5 receipt opt-in. Supplying a key is NOT the signal on its own:
+    // the browser mints a fresh uuid per turn (net-feed.ts) and never reuses
+    // it, so treating that as an opt-in would add a storage write to every
+    // view refresh — exactly the cost the effect-free direct path avoids.
+    // `retry_safe` is the explicit statement "this key is stable and I will
+    // reuse it"; MCP sets it from an `operation_id`.
+    const retryReceipt = suppliedKey !== null && body.retry_safe === true;
     // Echo dedupe (item 3 chunk 2): recorded BEFORE the submit leaves —
     // the committing scope's outbox drain races the turn reply, so a
     // post-reply registration could let the fanout push arrive first and
@@ -4897,7 +4912,8 @@ export class NetGatewayDO {
       trace,
       planningScope,
       catalog_epoch: epoch,
-      idempotency_key: key
+      idempotency_key: key,
+      ...(retryReceipt ? { retry_receipt: true } : {})
     });
     // H1: keep this gateway subscribed to the scope the session is NOW
     // present in — its activeScope AFTER any transition this turn folded
@@ -5469,7 +5485,19 @@ export class NetGatewayDO {
       }
       const turnResponse = await this.clientTurn(
         actor,
-        { target: object, verb, args, route, session, idempotency_key: turnId },
+        {
+          target: object,
+          verb,
+          args,
+          route,
+          session,
+          idempotency_key: turnId,
+          // CO2.5: an operation id is a promise the client will reuse this
+          // key, so an effect-free but externally visible turn (speech)
+          // records a receipt and its retry cannot emit the act twice. The
+          // minted fallback key sets nothing — it is never reused.
+          ...(operationId ? { retry_safe: true } : {})
+        },
         identity.epoch,
         // AU2 MCP carrier (threaded from mcpToolsCall, which holds the
         // request): an MCP agent framework that emits traceparent joins
@@ -5542,6 +5570,25 @@ export class NetGatewayDO {
     if (!failure || typeof failure !== "object" || Array.isArray(failure)) return failure;
     const record = failure as Record<string, unknown>;
     const code = typeof record.code === "string" ? record.code : typeof record.reason === "string" ? record.reason : "";
+    // CO2.5 / M4.2: key reuse for a DIFFERENT call. This needs its own code,
+    // not a generic argument error: the client's arguments are fine — what
+    // is wrong is that it reused an operation id, and only a specific code
+    // tells it which of the two to change. Nothing about the original call
+    // is echoed; the holder of a colliding key must not learn it.
+    if (code === "idempotency_conflict") {
+      const detail = mcpRecord(record.detail);
+      return {
+        code: "E_IDEMPOTENCY_CONFLICT",
+        message: "this operation_id was already used for a different call",
+        detail: {
+          ...detail,
+          reason: "operation_id_reused",
+          remediation:
+            "if you meant to retry the earlier call, send it again UNCHANGED under this operation_id; "
+            + "if this is a new operation, give it a new operation_id"
+        }
+      };
+    }
     if (code !== "E_SCOPE_SPLIT") return failure;
     const active = this.mcpActiveScope(actor, session);
     if (target === active) return failure; // already standing in the target
@@ -8792,6 +8839,7 @@ export class NetGatewayDO {
       classifier,
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
+      ...(request.retry_receipt === true ? { retryReceipt: true } : {}),
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
       // Repaired objects ride into the seed slice so a re-plan keeps the
       // cells a prior round pulled (see PlanTurnInput.seedObjects).
