@@ -1180,8 +1180,14 @@ The operation derives these facts:
 - `retired_at` implies the authentication tombstone, a cleared programmer
   state/surface, and revocation of the current pointed credential at the
   durable retirement time;
-- a live mutually attested AP11 agent carries the programmer flag, wizard flag,
-  and published programmer surface.
+- a live mutually attested AP11 agent that never completed the wizard step may
+  finish its programmer flag, wizard flag, and published programmer surface;
+  the ledger is provisioning-time evidence, not current authorization. In
+  particular, `wizard = true` with `programmer = false` proves that AP11
+  completed and a later explicit demotion preserved the wizard bit (§AP11.7),
+  so repair reports a conflict and never re-promotes it. A later reversible
+  deactivation/suspension is likewise a conflict rather than permission for
+  repair to reactivate.
 
 Every other disagreement is a conflict and suppresses the whole apply. This
 includes malformed features, missing registry objects, wrong owners/authority
@@ -1195,12 +1201,26 @@ Dry-run and apply execute the same pure plan. Both CLIs default to dry-run and
 require an explicit `--apply` on the reviewed second invocation. The internal
 method requires exactly one mode, so an omitted boolean can never become an
 implicit apply. A Net apply is one ordered owner event and one Durable Object
-SQLite transaction; a local SQLite apply holds `BEGIN IMMEDIATE` across
-load/plan/apply and nests the mutation in `ObjectRepository.savepoint`. The
-local CLI opens only an existing current Woo database, verifying that fact on
-the same handle before migration code can run. Replays return `empty`. Actual
-repairs advance ordinary property/cell versions; the operation never rewrites a
-version to make a historical failed attempt disappear.
+SQLite transaction.
+
+The local SQLite CLI is an **offline operation**, including dry-run. Every live
+`LocalSQLiteRepository` holds a cooperative per-world owner lease for its
+lifetime; the CLI requires the exclusive lease before it opens the database
+and refuses with a stopped-server diagnostic while any owner process remains
+alive. This closes the boundary that a SQL lock cannot: a running server may
+hold newer state in memory while no transaction is open, then overwrite an
+otherwise successful repair on its next flush. PID-stamped shared-owner leases
+left by a crashed process are reclaimed only after that process is no longer
+alive. The fixed-name exclusive marker is never guessed stale automatically:
+after an interrupted repair, an operator verifies its recorded PID is gone and
+removes the marker explicitly, avoiding a race in which one repair contender
+could delete another's newly acquired marker.
+After exclusive ownership is established, the CLI holds `BEGIN IMMEDIATE`
+across load/plan/apply and nests mutation in `ObjectRepository.savepoint`.
+The same handle verifies an existing current Woo database before migration
+code can run. Replays return `empty`. Actual repairs advance ordinary
+property/cell versions; the operation never rewrites a version to make a
+historical failed attempt disappear.
 
 Inspection is capped at 1,024 source members and at 1,024 distinct members of
 the one addressed authority. Neither adapter scans a scope or object table: both
@@ -1227,7 +1247,10 @@ npm run repair:local-account-state -- \
 
 After reviewing a conflict-free plan, repeat the same command with `--apply`.
 Candidate arguments expand inspection only; they do not authorize recycling or
-provide replacement values.
+provide replacement values. Stop every process serving or otherwise holding
+the named local world before either command; the lease check refuses instead of
+reporting a stale diagnostic or an apply that a live in-memory world could
+later overwrite.
 
 The Net form accepts the same repeatable candidate option:
 
