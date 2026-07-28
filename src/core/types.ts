@@ -392,6 +392,12 @@ export type MetricEvent =
   | { kind: "serialized_world_materialized"; scope: ObjRef; seq: number; reason: string; ms: number; objects: number; sessions: number; logs: number }
   | { kind: "shadow_gateway_apply_step"; phase: "capture_runtime" | "export_world" | "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "apply_serialized" | "import_world" | "restore_runtime" | "total"; scope: ObjRef; route: string; ms: number; objects: number; properties: number; sessions: number; logs: number; creates: number; writes: number }
   | { kind: "shadow_transcript_anomaly"; scope: ObjRef; route: string; reason: "contents_remove_without_move"; object: ObjRef; id?: string }
+  // Failed-turn rollout corpus and enforcement decision. `counts` has a
+  // closed effect-category vocabulary and `reasons` a closed classifier
+  // vocabulary; the classifier report contains no object ids, property names,
+  // values, observation payloads, or error text. The surrounding operational
+  // metric still names the authority `scope`, like other scope metrics.
+  | { kind: "failed_transcript_effects"; scope: ObjRef; route: string; policy: "not_failed" | "observe" | "enforce"; generation: number | null; valid: boolean; reason: string; reasons: string[]; counts: Record<string, number> }
   | { kind: "shadow_open_executable_seed_bytes"; scope: ObjRef; node: string; bytes: number; pages: number; inline_pages: number; status: "ok" | "warn" }
   | { kind: "v2_open_step"; phase: string; scope?: ObjRef; node?: string; actor?: ObjRef; route?: string; method?: string; path?: string; what?: string; reason?: string; ms: number; status: "ok" | "error"; count?: number; bytes?: number; transfer_mode?: string; executable_transfer_cache?: "hit" | "miss"; full_save?: boolean; error?: string; error_detail?: string }
   | { kind: "v2_open"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; executable_transfer_cache?: "hit" | "miss"; executable_transfer_bytes?: number; executable_transfer_pages?: number; executable_transfer_inline_pages?: number; preseeded_objects?: number; full_save?: boolean; error?: string; error_detail?: string }

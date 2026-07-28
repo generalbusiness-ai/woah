@@ -35,6 +35,10 @@ import {
 import { AUTHORITY_SOURCE_RANK } from "./authority-slice";
 import { PLANNING_TRACKED_PAGES, planningCellKey } from "./planning-world";
 import type { AuthorityPageSource } from "./shadow-state-pages";
+import {
+  classifyFailedTranscriptEffects,
+  type FailedTranscriptEffectsReport
+} from "./failed-transcript-effects";
 
 export type ShadowScopeHead = {
   kind: "woo.scope_head.shadow.v1";
@@ -83,6 +87,7 @@ export type ShadowCommitConflict = {
     | "nondeterministic"
     | "incomplete_transcript"
     | "scope_mismatch"
+    | "invalid_error_effects"
     | "post_state_mismatch";
   errors: string[];
   receipt: ShadowCommitReceipt;
@@ -243,7 +248,8 @@ const PRE_APPLY_REJECT_REASONS: ReadonlySet<ShadowCommitConflict["reason"]> = ne
   "stale_head",
   "scope_mismatch",
   "permission_denied",
-  "read_version_mismatch"
+  "read_version_mismatch",
+  "invalid_error_effects"
 ]);
 
 // Build (and conditionally cache) the conflict for a rejected commit. Shared by
@@ -307,6 +313,20 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
   const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
   const preStateHash = transcriptTouchedStateHashWithReader(beforeReader, submit.transcript);
+  const failureEffects = classifyFailedTranscriptEffects(submit.transcript, {
+    ownsSequencingSpace:
+      submit.transcript.route === "sequenced" &&
+      scope.scope === (submit.transcript.space ?? submit.transcript.scope)
+  });
+  if (failureEffects.policy !== "not_failed") {
+    // The rollout corpus is diagnostic. Metrics failure cannot participate in
+    // the authoritative commit decision.
+    try {
+      submit.metric?.(failedTranscriptEffectsMetric(scope.scope, failureEffects));
+    } catch {
+      // Best effort by contract.
+    }
+  }
 
   // P1.1 pre-apply rejection gate. Every commit error EXCEPT post_state_mismatch
   // is knowable from the pre-state: `shadowCommitEnvelopeErrors` (stale_head /
@@ -323,6 +343,9 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   // `commitShadowCommitScopeState` below installs it), so skipping it on a
   // rejection has no state side-effect.
   const envelopeErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
+  if (failureEffects.policy === "enforce" && !failureEffects.valid) {
+    envelopeErrors.push(`invalid_error_effects:${failureEffects.reasons.join(",")}`);
+  }
   const writeAuthorityErrors = validateShadowWriteAuthorityIndex(
     serializedAuthorityIndexFromState(stateBefore),
     submit.transcript
@@ -2056,11 +2079,29 @@ function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): { obje
 function shadowConflictReason(errors: string[]): ShadowCommitConflict["reason"] {
   if (errors.some((error) => error.startsWith("stale_head"))) return "stale_head";
   if (errors.some((error) => error.startsWith("scope_mismatch"))) return "scope_mismatch";
+  if (errors.some((error) => error.startsWith("invalid_error_effects"))) return "invalid_error_effects";
   if (errors.some((error) => error.startsWith("permission_denied"))) return "permission_denied";
   if (errors.some((error) => error.startsWith("post_state_mismatch"))) return "post_state_mismatch";
   if (errors.some((error) => error.startsWith("incomplete"))) return "incomplete_transcript";
   if (errors.some((error) => error.includes("version mismatch") || error.includes("value mismatch"))) return "read_version_mismatch";
   return "nondeterministic";
+}
+
+function failedTranscriptEffectsMetric(
+  scope: ObjRef,
+  report: FailedTranscriptEffectsReport
+): Extract<MetricEvent, { kind: "failed_transcript_effects" }> {
+  return {
+    kind: "failed_transcript_effects",
+    scope,
+    route: report.route,
+    policy: report.policy,
+    generation: report.generation,
+    valid: report.valid,
+    reason: report.reasons[0] ?? "valid",
+    reasons: report.reasons,
+    counts: report.counts
+  };
 }
 
 function sameShadowHead(a: ShadowScopeHead, b: ShadowScopeHead): boolean {

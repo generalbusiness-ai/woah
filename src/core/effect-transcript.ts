@@ -105,6 +105,17 @@ export type TranscriptUntrackedEffect = {
 
 export type EffectTranscript = {
   kind: "woo.effect_transcript.shadow.v1";
+  /**
+   * Producer capability for failed-turn effect hygiene. Generation 1 means
+   * the producer has recorder rollback and guarantees a failed transcript
+   * contains only the sequencer-owned allocation envelope plus its canonical
+   * error outcome. Absent is legacy/observe-only during rolling deployment.
+   *
+   * This field lives in the transcript body, so every existing canonical
+   * body-hash path includes it automatically. The base recorder deliberately
+   * does not stamp it until its rollback correction lands.
+   */
+  failureEffectsGeneration?: 1;
   id?: string;
   route: TurnStart["route"];
   scope: ObjRef;
@@ -376,6 +387,24 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     ...withoutHash,
     hash: hashSource(stableJson(withoutHash as unknown as WooValue))
   };
+}
+
+/**
+ * Stamp the clean failed-effect capability and re-address the complete
+ * transcript body. Kept as a generic helper so net-layer extensions survive
+ * unchanged; callers opt in only after their recorder has the matching
+ * rollback semantics.
+ */
+export function withFailureEffectsGeneration<T extends EffectTranscript>(
+  transcript: T,
+  generation: 1
+): T {
+  const { hash: _priorHash, ...body } = transcript;
+  const marked = { ...body, failureEffectsGeneration: generation };
+  return {
+    ...marked,
+    hash: hashSource(stableJson(marked as unknown as WooValue))
+  } as T;
 }
 
 export function validateTranscriptAgainstSerializedWorld(serializedBefore: SerializedWorld, transcript: EffectTranscript): TranscriptValidation {

@@ -399,6 +399,7 @@ type EffectTranscript = {
   observations: WooObservation[];
   result?: WooValue;
   error?: WooError;
+  failureEffectsGeneration?: 1;
   complete: boolean;
   incomplete_reasons?: string[];
   pre_state_hash?: Hash;
@@ -425,6 +426,25 @@ validation path, never `TranscriptWrite` entries under a fabricated `op`.
 Unlike writes, they are **not** in the `post_state_hash` preimage: the
 digest covers touched authority cells, and the pending queue is a separate
 row family the planner does not hold. See CO16.2.
+
+`failureEffectsGeneration` is an optional producer capability and part of
+the canonically hashed transcript body. Generation 1 promises that a failed
+direct transcript carries no effects, and that a failed sequenced transcript
+carries only its sequencing-space owner's exact `next_seq` allocation
+read/write pair plus the canonical `$error` observation. Reads, state probes,
+logical inputs, and dispatch proofs may remain because they do not mutate
+domain state. Every create, behavior write, move, recycle, session transition,
+projection write, schedule, cancellation, domain observation, result, or
+untracked effect violates that promise. A sequencing allocation at any
+non-owner violates it as well.
+
+Authorities classify every failed transcript into fixed-vocabulary effect
+counts and reasons without recording world values or observation/error
+payloads. During rolling deployment, an absent or unknown generation is
+observe-only. A complete generation-1 violation rejects terminally as
+`invalid_error_effects`; it is neither retried nor applied. Producers MUST NOT
+stamp generation 1 until their failed-turn recorder rollback satisfies this
+grammar.
 
 ## CO4. Commit validation
 
