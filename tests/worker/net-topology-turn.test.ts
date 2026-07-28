@@ -98,7 +98,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     const world = createWorld();
     const session = world.auth("guest:net-topology");
     const actor = session.actor;
-    world.object(actor).flags.programmer = true;
+    world.setObjectFlags("$wiz", actor, { programmer: true });
     world.createObject({ id: "topo_room", name: "Topo Room", parent: "$space", owner: actor });
     world.createObject({ id: "topo_box", name: "Topo Box", parent: "$thing", owner: actor, anchor: "topo_room", location: "topo_room" });
     world.defineProperty("topo_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });

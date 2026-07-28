@@ -441,7 +441,7 @@ describe("outliner add over the net path converges", () => {
     // eject_item drives _detach_item, whose kids read uses the FULL
     // ordered_children projection — the children repair branch.
     const p = ((await seqCall(world, "r2-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
-    world.object(actor).flags.wizard = true;
+    world.setObjectFlags("$wiz", actor, { wizard: true });
     let failures = 0;
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
       intercept: async (_scope, path) => {
@@ -462,7 +462,7 @@ describe("outliner add over the net path converges", () => {
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
     const p = ((await seqCall(world, "r2p-seed-p", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
-    world.object(actor).flags.wizard = true;
+    world.setObjectFlags("$wiz", actor, { wizard: true });
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
       intercept: async (_scope, path) =>
         path === "/net/ordered-children" ? new Response("injected outage", { status: 500 }) : null
@@ -536,7 +536,7 @@ describe("outliner add over the net path converges", () => {
     // eject_item is outliner-owner-or-wizard; grant the actor wizard so the
     // turn is permitted and exercises the pure recycle->_detach projection path
     // (unlike remove_item, eject does NOT pre-capture the projections).
-    world.object(actor).flags.wizard = true;
+    world.setObjectFlags("$wiz", actor, { wizard: true });
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     const eject = await verbTurn(gateway, gatewayEnv, ctx, "eject-p", "eject_item", [p]);
     expect(eject.reply.status, `attempts=${eject.attempt} trace=${JSON.stringify(eject.trace)}`).toBe("accepted");
