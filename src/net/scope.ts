@@ -69,6 +69,7 @@ import {
 import type { TraceContext } from "./trace";
 import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
+import { verbCellSlot } from "./verb-slots";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
@@ -583,6 +584,17 @@ export class ScopeSequencer {
     cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>
   ): OperatorDefinitionRepair {
     return this.orderedOperatorRepair("operator_seed_property_repair", cells, []);
+  }
+
+  /** Signed operator repair for aged verb-slot data (CO4.7). The Worker shell
+   * derives each replacement page from this scope's OWN verb cells — assigning
+   * the ordinals implied by the resolution order every node already computes
+   * (src/net/verb-slots.ts) — so nothing an operator sends chooses a slot.
+   * Same ordered-event contract as the rest of the family. */
+  operatorRepairVerbSlots(
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>
+  ): OperatorDefinitionRepair {
+    return this.orderedOperatorRepair("operator_verb_slot_repair", cells, []);
   }
 
   /** Shared ordered-commit body for the signed operator repair family:
@@ -1125,6 +1137,69 @@ export class ScopeSequencer {
           { kind: "lifecycle", object: create.object } as TranscriptCell
         ]);
       }
+    }
+
+    // Verb-slot allocation guard (CO4.7). A verb's `slot` is a durable
+    // per-object ordinal, and the object's authority is the only node that
+    // knows the whole set. A sparse planner holds at most the turn's slice, so
+    // its allocation is a HINT — exactly the position the object-id allocator
+    // is in above, and the answer is the same shape: let the planner propose,
+    // and have the owner refuse a proposal its own state contradicts.
+    //
+    // Two rules, both derived from the pre-state this scope holds:
+    //   - a write to an EXISTING page must keep that page's slot. Nothing may
+    //     move a verb; a slot an agent already holds must stay valid.
+    //   - a NEW page must take exactly the current allocation floor
+    //     (max slot + 1). This is what serializes concurrent appends: two
+    //     turns that both planned slot N against the same pre-state cannot
+    //     both be right, so the second is rejected and replans at N+1.
+    //
+    // Both reject as read_version_mismatch naming the object's verb cells, so
+    // the gateway's repair refreshes them into the planning view and ONE
+    // re-plan converges. Cost is O(the object's own cells) via the store's
+    // object index — never a scan of the scope.
+    //
+    // A page with no recorded slot is aged data (authored before this rule, or
+    // repaired-but-not-yet); it is not enforced against, only counted, so an
+    // unrepaired world keeps working and merely allocates above its own mess.
+    // A RENAME is a remove + a set under the new name in one transcript, and it
+    // must keep the verb where it is — the page is the same verb. Collect the
+    // ordinals this transcript vacates so the new-page rule can recognize one.
+    const vacatedVerbSlots = new Map<string, Set<number>>();
+    for (const write of submit.transcript.writes) {
+      if (write.cell.kind !== "verb" || write.op !== "remove") continue;
+      const held = verbCellSlot(this.store.get(cellKey("verb_bytecode", write.cell.object, write.cell.name))?.value);
+      if (held === null) continue;
+      const slots = vacatedVerbSlots.get(write.cell.object) ?? new Set<number>();
+      slots.add(held);
+      vacatedVerbSlots.set(write.cell.object, slots);
+    }
+    for (const write of submit.transcript.writes) {
+      if (write.cell.kind !== "verb" || write.op === "remove") continue;
+      const object = write.cell.object;
+      if (this.options.owns && !this.options.owns(object)) continue; // the owner enforces its own
+      const proposed = verbCellSlot(write.value);
+      if (proposed === null) continue; // slotless write: nothing to check
+      const existing = this.store.get(cellKey("verb_bytecode", object, write.cell.name));
+      if (existing !== undefined) {
+        const held = verbCellSlot(existing.value);
+        if (held === null || held === proposed) continue;
+        return this.reject(submit, "read_version_mismatch", {
+          verb_slot_moved: { object, verb: write.cell.name, held, proposed }
+        }, [{ kind: "verb", object, name: write.cell.name } as TranscriptCell]);
+      }
+      if (vacatedVerbSlots.get(object)?.has(proposed) === true) continue; // rename in place
+      let floor = 1;
+      const pages: TranscriptCell[] = [];
+      for (const cell of this.store.cellsForObject(object)) {
+        if (cell.kind !== "verb_bytecode" || typeof cell.name !== "string") continue;
+        floor = Math.max(floor, (verbCellSlot(cell.value) ?? 0) + 1);
+        pages.push({ kind: "verb", object, name: cell.name } as TranscriptCell);
+      }
+      if (proposed === floor) continue;
+      return this.reject(submit, "read_version_mismatch", {
+        verb_slot_stale: { object, verb: write.cell.name, floor, proposed }
+      }, pages);
     }
 
     // CO16.2: schedule/cancellation effects are validated by the SCOPE, on

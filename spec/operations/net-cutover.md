@@ -220,6 +220,17 @@ replaced, operator-edited keys and malformed stored values are left untouched.
 Changed cells commit as one ordered operator event — advanced owner head,
 authoritative stamps, one tail entry — and refan to subscribers; an unchanged
 replay returns `empty` without touching the head.
+The verb-slot repair (`npm run repair:net-verb-slots -- <worker> [scope ...]
+[--all-seeded] [--dry-run] [--object <id>]`) is the third data repair, for aged
+worlds whose verb pages share an ordinal
+([coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)).
+Addressed at the scopes that own the objects, not at the catalog: the operator
+names scopes, and each scope derives its candidates from its OWN
+`verb_bytecode` cells, capped per request with `remaining` reported. Nothing in
+the request body chooses a slot — the assignment is the `(slot, name)` order the
+system already resolves in, so the repair changes no dispatch, and an object
+whose ordinals are already distinct (gaps included) is declined, which is what
+makes replays `empty`.
 The trust model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 

@@ -143,7 +143,17 @@ The authoring-facing contract for compile/install, expected-version conflicts,
 and diagnostics is in [../authoring/minimal-ide.md](../authoring/minimal-ide.md).
 Verb descriptors follow [objects.md §9.1](objects.md#91-lookup): name-based
 descriptors resolve to the first matching local slot, and integer descriptors
-name a 1-based local slot directly.
+name a verb's stored SLOT ORDINAL — the value `verb_info` reports, not a
+position in the local list. The two differ once a verb has been deleted,
+because deletion leaves its ordinal vacant.
+
+`add_verb(obj, info)` appends: the new verb takes `max(local slot) + 1`, above
+every verb the object currently defines, and never an ordinal a delete freed.
+Under Net planning the object's authority validates that choice before commit
+([../protocol/coherence.md §CO4.7](../protocol/coherence.md#co47-verb-slot-allocation)),
+so a node that could not see the whole verb set gets a retryable refusal rather
+than a colliding slot. `delete_verb(obj, descriptor)` does not renumber the
+survivors.
 
 `create(parent, owner_or_options?)` creates a new persistent object with the
 supplied parent. If the second argument is an object reference, it is the owner;

@@ -161,10 +161,14 @@ remains the bitset defined in [objects.md §4](../semantics/objects.md#4-objects
 }
 ```
 
-`slot` is the 1-based position of the verb in `definer`'s local ordered verb
-list. Names are not unique: multiple slots may share the same `name` and differ
-by aliases or `arg_spec`. Name-based authoring updates the first matching slot
-unless the caller supplies an explicit slot descriptor.
+`slot` is the verb's durable ordinal within `definer`'s local verb list — a
+stored value, not an array position, so it survives deletions of other verbs and
+may leave gaps ([../semantics/objects.md §9.1](../semantics/objects.md#91-lookup)).
+Names are not unique at the object-model level: multiple slots may share the same
+`name` and differ by aliases or `arg_spec`, though the authoring surfaces refuse
+to create a duplicate. Name-based authoring updates the first matching slot
+unless the caller supplies an explicit slot descriptor, and it never MOVES the
+verb it updates.
 
 `VerbInfo` extends `VerbSummary`:
 

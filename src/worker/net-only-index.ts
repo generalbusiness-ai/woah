@@ -278,9 +278,9 @@ async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Pr
   const verb = parts[3];
   const allowed =
     parts[1] === "scope" && parts.length === 4 && Boolean(name) &&
-    ((request.method === "POST" && (verb === "seed" || verb === "activate" || verb === "repair-relations" || verb === "repair-contents" || verb === "repair-definitions" || verb === "repair-seed-properties")) || (request.method === "GET" && verb === "head"));
+    ((request.method === "POST" && (verb === "seed" || verb === "activate" || verb === "repair-relations" || verb === "repair-contents" || verb === "repair-definitions" || verb === "repair-seed-properties" || verb === "repair-verb-slots")) || (request.method === "GET" && verb === "head"));
   if (!allowed) {
-    return json({ error: { code: "E_INVARG", message: "expected a signed net install probe, scope seed, activate, repair-relations, repair-contents, repair-definitions, repair-seed-properties, or head operation" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected a signed net install probe, scope seed, activate, repair-relations, repair-contents, repair-definitions, repair-seed-properties, repair-verb-slots, or head operation" } }, 404);
   }
   try {
     const stub = resolveNetDestination(env, `scope:${name}`);

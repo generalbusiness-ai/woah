@@ -329,13 +329,19 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const tooShort = await call(prog.session, "woo_call", { object: progAgent, verb: "@con", args: [widget] });
     expect(errorOf(tooShort).code, JSON.stringify(tooShort).slice(0, 300)).toBe("E_VERBNF");
 
-    // ---- Net-authored collisions fail CLOSED, not arbitrarily -----------
+    // ---- Net-authored collisions resolve in SLOT order ------------------
     // Two verbs authored over Net on one object, both carrying the same alias
-    // pattern. Verb slots authored over Net are all `1` (the sparse planning
-    // world materializes only the page being written, so every append lands
-    // in an empty verb array), so the object's own dispatch order is
-    // undefined — there is no right verb to pick. Refusing is the answer;
-    // picking whichever name sorted first is how this class of bug hides.
+    // pattern.
+    //
+    // This case used to assert the fail-closed refusal, because every verb
+    // authored over Net landed on `slot: 1` and the object therefore had no
+    // dispatch order of its own to reproduce. That substrate defect is fixed
+    // (notes/2026-07-27-net-verb-slots.md): Net authoring now allocates real
+    // ordinals, so the ordered branch below is reachable for authored verbs
+    // and the answer must match the world dispatcher's — the oracle at the top
+    // of this file. The refusal itself is still live and still tested, against
+    // an AGED world whose pages really do share a slot; see the aged-world
+    // case after this test.
     const authorCollision = async (label: string, names: [string, string]): Promise<string> => {
       const made = await call(prog.session, "woo_call", { object: progAgent, verb: "create", args: ["$thing", { name: label }] });
       await settleAll();
@@ -363,21 +369,29 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     };
 
     const collided = await authorCollision("SlotProbeZA", ["z_first", "a_second"]);
-    // Documents the underlying substrate defect this refusal is protecting
-    // against: if Net authoring ever assigns real slots, this expectation
-    // fails and the ordered branch becomes reachable for authored verbs.
+    // The authored pages carry the ordinals the AUTHORITY committed, in
+    // authoring order — not the array positions of whatever slice each turn
+    // happened to plan against.
     const authoredSlots = (gateway as any).ensureView()
       .cellsForObject(collided)
       .filter((cell: { kind: string }) => cell.kind === "verb_bytecode")
-      .map((cell: { value: { slot?: number } }) => cell.value?.slot);
-    expect(authoredSlots.length).toBe(2);
-    expect(new Set(authoredSlots).size, "Net authoring now assigns distinct verb slots").toBe(1);
+      .map((cell: { name?: string; value: { slot?: number } }) => [cell.name, cell.value?.slot]);
+    expect(Object.fromEntries(authoredSlots), "Net authoring did not allocate distinct verb slots")
+      .toEqual({ z_first: 1, a_second: 2 });
 
-    const ambiguous = await call(prog.session, "woo_call", { object: collided, verb: "x", args: [] });
+    // Slot 1 sorts alphabetically LAST, so an alphabetical resolver answers
+    // `a_second` here. The world dispatcher answers `z_first` (the oracle at
+    // the top of this file), and so must MCP.
+    const ordered = await call(prog.session, "woo_call", { object: collided, verb: "x", args: [] });
     await settleAll();
-    expect(ambiguous.result?.isError, JSON.stringify(ambiguous).slice(0, 400)).toBe(true);
-    expect(errorOf(ambiguous).detail?.reason).toBe("verb_order_unavailable");
-    expect(errorOf(ambiguous).detail?.candidates).toEqual(["a_second", "z_first"]);
+    expect(ordered.result?.isError, JSON.stringify(ordered).slice(0, 400)).not.toBe(true);
+    expect(ordered.result?.structuredContent?.result, "an authored alias collision did not resolve in slot order").toBe("z_first");
+
+    // The reverse arrangement, so no fixed alphabetical rule can satisfy both.
+    const reversed = await authorCollision("SlotProbeAZ", ["a_first", "z_second"]);
+    const reversedCall = await call(prog.session, "woo_call", { object: reversed, verb: "x", args: [] });
+    await settleAll();
+    expect(reversedCall.result?.structuredContent?.result).toBe("a_first");
 
     // Naming either verb exactly is unambiguous and still runs it.
     const exactSecond = await call(prog.session, "woo_call", { object: collided, verb: "a_second", args: [] });
@@ -569,9 +583,10 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
   // answer. The expected names are pinned independently by the world-dispatch
   // oracle above; this asserts MCP agrees with it.
   //
-  // Authored in the PRE-INSTALL world so the slots are real (1 and 2). Verbs
-  // authored over Net all land on slot 1 — see the fail-closed case in the
-  // main test — which is a different situation with a different right answer.
+  // Authored in the PRE-INSTALL world so the slots are real (1 and 2). Net
+  // authoring produces real ordinals too (see the authored-collision case in
+  // the main test); the one arrangement that still has NO answer is an aged
+  // world whose pages share a slot, covered by the case after this one.
   it("resolves a same-definer alias collision to the same verb the world dispatcher runs", async () => {
     const old = createWorld();
     const caller = "guest_1"; // a seeded guest from the demo catalogs
@@ -680,6 +695,139 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
 
     // Exact names still reach exactly their own verb.
     expect((await call("slot_probe_za", "a_second")).result?.structuredContent?.result).toBe("a_second");
+
+    for (const st of states) await st.settle();
+    for (const st of states) st.close();
+  });
+
+  // The fail-closed branch (M2.1 `verb_order_unavailable`), against the world
+  // shape that actually produces it: an AGED Net world.
+  //
+  // Until 2026-07-27 every verb authored over Net was committed on `slot: 1`,
+  // and any metadata edit demoted a live verb to slot 1 as well
+  // (notes/2026-07-27-net-verb-slots.md). Authoring is fixed, but the
+  // committed cells of worlds authored before the fix still hold those
+  // duplicates until `repair:net-verb-slots` runs, so the refusal is not
+  // hypothetical and must not be deleted along with the defect. It is
+  // constructed here by seeding the aged cell image directly, which is exactly
+  // what such a world contains: two pages, one ordinal.
+  //
+  // Two pages claiming one slot leave the AUTHORITATIVE object with no defined
+  // order either, so there is no right verb to pick and refusing is the honest
+  // answer. Naming a verb exactly stays unambiguous and still runs.
+  it("refuses an aged world's duplicate-slot alias collision instead of guessing", async () => {
+    const old = createWorld();
+    const caller = "guest_1";
+    old.ensureApiKey("$wiz", caller, "aged-key", "aged-secret", "aged");
+    const room = old.propOrNull("$system", "guest_initial_room") as string;
+    old.moveObject(caller, room);
+    old.createObject({ id: "aged_probe", name: "aged_probe", parent: "$thing", owner: "$wiz" });
+    old.moveObject("aged_probe", room);
+    for (const name of ["z_first", "a_second"]) {
+      old.addVerbForActor("$wiz", "aged_probe", { name, owner: "$wiz", perms: "rxd", aliases: ["x*"] });
+      old.setVerbCodeForActor("$wiz", "aged_probe", name, `verb :${name}() rxd { return "${name}"; }`);
+    }
+
+    // Age the image: collapse both pages onto slot 1, the way the pre-fix Net
+    // authoring path committed them.
+    const serialized = old.exportWorld();
+    const aged = serialized.objects.find((obj) => obj.id === "aged_probe");
+    expect(aged, "probe object missing from the export").toBeTruthy();
+    for (const verb of aged!.verbs) verb.slot = 1;
+
+    const cells = cellsFromSerialized(serialized);
+    const partitions = partitionCells(cells);
+    const relations = partitionInstallRelations(cells);
+    const epoch = "cat-net-mcp-legibility-aged-slots";
+    partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
+
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    let gateway: NetGatewayDO;
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable destination ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, scopeCells] of partitions) {
+      const st = netState(`aged-slots-scope-${scope}`);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: epoch, cells: scopeCells, relations: relations.get(scope) ?? [] })
+      });
+      expect((await instance.fetch(await signInternalRequest(scopeEnv, request))).ok, `seed ${scope}`).toBe(true);
+      states.push(st);
+      scopeDOs.set(scope, instance);
+    }
+    const gatewayState = netState("aged-slots-gateway");
+    states.push(gatewayState);
+    gateway = new NetGatewayDO(gatewayState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: resolve,
+      NET_GATEWAY_SELF: "gateway:net-api"
+    } as NetGatewayEnv);
+
+    let nextId = 300;
+    const mcp = async (body: Rpc, headers: Record<string, string> = {}) => {
+      const response = await gateway.fetch(new Request("https://do/net-api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body)
+      }));
+      const text = await response.text();
+      return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) as Record<string, any> : null };
+    };
+    const init = await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, { "mcp-token": "apikey:aged-key:aged-secret" });
+    expect(init.status, JSON.stringify(init.body)).toBe(200);
+    const session = init.headers.get("mcp-session-id") as string;
+    await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": session });
+    const call = async (object: string, verb: string) =>
+      (await mcp(
+        { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "woo_call", arguments: { object, verb, args: [] } } },
+        { "mcp-session-id": session }
+      )).body as Record<string, any>;
+
+    const errorOf = (envelope: Record<string, any>) => envelope.result?.structuredContent?.error ?? {};
+    const ambiguous = await call("aged_probe", "x");
+    for (const st of states) await st.settle();
+    expect(ambiguous.result?.isError, JSON.stringify(ambiguous).slice(0, 400)).toBe(true);
+    expect(errorOf(ambiguous).detail?.reason).toBe("verb_order_unavailable");
+    expect(errorOf(ambiguous).detail?.candidates).toEqual(["a_second", "z_first"]);
+
+    // Exact names are unaffected by the ambiguity.
+    expect((await call("aged_probe", "z_first")).result?.structuredContent?.result).toBe("z_first");
+    expect((await call("aged_probe", "a_second")).result?.structuredContent?.result).toBe("a_second");
+
+    // ---- and the deploy-day cure: repair:net-verb-slots -----------------
+    // The operator op renumbers the duplicated pages into the order every node
+    // already resolves — slot, then name — so the refusal lifts and the
+    // answer is the one the WORLD dispatcher was already giving. For a world
+    // whose pages all collapsed onto slot 1 that is the alphabetical one:
+    // `a_second`, NOT the verb authored first. The authoring order is not
+    // recorded anywhere and the repair does not invent it
+    // (src/net/verb-slots.ts).
+    const owning = scopeDOs.get(CATALOG_SCOPE) as NetScopeDO;
+    const repaired = await owning.fetch(await signInternalRequest(scopeEnv, new Request("https://do/net/repair-verb-slots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objects: ["aged_probe"] })
+    })));
+    expect(repaired.ok, await repaired.clone().text()).toBe(true);
+    expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", objects: ["aged_probe"] });
+    for (const st of states) await st.settle();
+    for (const scope of scopeDOs.values()) await scope.alarm();
+    for (const st of states) await st.settle();
+
+    const resolved = await call("aged_probe", "x");
+    for (const st of states) await st.settle();
+    expect(resolved.result?.isError, JSON.stringify(resolved).slice(0, 400)).not.toBe(true);
+    expect(resolved.result?.structuredContent?.result, "the repair did not lift the refusal").toBe("a_second");
 
     for (const st of states) await st.settle();
     for (const st of states) st.close();

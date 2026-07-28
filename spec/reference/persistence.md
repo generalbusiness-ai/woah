@@ -70,7 +70,8 @@ CREATE TABLE property_value (
 -- splitting them across columns saves nothing and complicates round-tripping.
 CREATE TABLE verb (
   object_id    TEXT NOT NULL,
-  slot         INTEGER NOT NULL,   -- 1-based local verb position
+  slot         INTEGER NOT NULL,   -- durable per-object ordinal (objects.md 9.1);
+                                   -- allocated max+1, never reused, gaps allowed
   name         TEXT NOT NULL,
   aliases      TEXT NOT NULL,      -- JSON list
   owner        TEXT NOT NULL,
