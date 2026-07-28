@@ -220,7 +220,21 @@ async function fixture() {
       scopeDOs.set(scope, new NetScopeDO(st.state, scopeEnv));
     },
     mcp, call, hits, bump, say, complain, drain, settleAll,
-    close: () => { for (const st of states) st.close(); }
+    close: async () => {
+      let deferredFailure: unknown;
+      try {
+        // A final read can enqueue fanout after the assertion that consumed
+        // its reply. Drain every waitUntil/alarm pass before closing SQLite so
+        // late failures become test failures instead of post-test console
+        // noise against an already-closed database.
+        await settleAll();
+      } catch (err) {
+        deferredFailure = err;
+      } finally {
+        for (const st of states) st.close();
+      }
+      if (deferredFailure !== undefined) throw deferredFailure;
+    }
   };
 }
 
@@ -262,7 +276,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(notice).toContain("ran exactly once");
       expect(notice).toContain("Do not retry it under a new operation_id");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -297,7 +311,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(body.result?.structuredContent?.result).toBe(1);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -312,7 +326,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(second.result?.structuredContent?.replayed).toBeUndefined();
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -325,7 +339,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -351,7 +365,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(mixed.result?.structuredContent?.replayed).toBe(true);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -369,7 +383,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(bobs.result?.structuredContent?.result).toBe(2);
       expect(await f.hits()).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -401,7 +415,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(retry.result?.structuredContent?.replayed).toBe(true);
       expect(retry.result?.structuredContent?.replay_outcome).toBe("full");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -421,7 +435,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       const lines = heard.filter((obs) => obs?.type === "said" && String(obs.text ?? "").includes(text));
       expect(lines.length).toBe(2);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -466,7 +480,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(original.result?.structuredContent?.result).toBe(1);
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -504,7 +518,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
         expect(viaAlias.result?.structuredContent?.replayed).toBe(true);
       }
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -538,7 +552,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       });
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -572,7 +586,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(replayedLines.filter((obs) => obs?.type === "$error")).toHaveLength(1);
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -593,7 +607,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -653,7 +667,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       );
       expect(delivered).toEqual([{ type: "kept" }]);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -668,7 +682,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(after.result?.isError).not.toBe(true);
       expect(after.result?.structuredContent?.result?.observations).toEqual([]);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -698,7 +712,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(listed2.length).toBeGreaterThan(0);
       expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toBe("string");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });
@@ -762,7 +776,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(2); // op-pinned once, op-sweep once. Never three.
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -787,7 +801,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(1);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -818,7 +832,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       expect(await f.hits()).toBe(2);
       expect(pins(f).find((row) => row.idempotency_key.endsWith("op-expired"))?.scope).toBe(pinned!.scope);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -861,7 +875,7 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       await f.settleAll();
       expect(rowsFor("%op-say-%").length).toBe(4);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });
