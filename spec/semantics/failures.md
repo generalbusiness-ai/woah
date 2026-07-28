@@ -64,9 +64,17 @@ The space-level failure rules in [space.md §S3](space.md#s3-failure-rules-norma
 
 1. **Pre-sequence failures (validate, authorize)** do not advance `seq`. From other observers' view, the call did not happen.
 2. **Post-sequence failures (behavior raises, ticks/memory/wall-time exhausted)** do advance `seq`. The message stays in the log; mutations and observations from the failed body are rolled back; an `applied` frame carries a single `$error` observation.
-3. **Cross-cluster mutations from inside a verb body are not in the rollback scope.** Authors of call-handler verbs avoid them; if used, they must be idempotent, and partial failures may leave torn state across hosts.
+3. **Direct behavior failure** has the same single-authority rollback boundary. It returns `op:"error"` rather than consuming a sequence, and commits no property/version, lineage, lifecycle, creation, placement, session, schedule, projection, audit, or observation effect from the failed body.
+4. **Cross-cluster mutations from inside a verb body are not in the rollback scope.** A coupled operation MUST refuse before its first mutation unless it declares a concrete saga with a stable operation id, durable step markers, idempotent retry, convergence rules, and terminal repair. Merely calling the remote steps "idempotent" does not make the parent behavior atomic. No general saga runner is implied; absent a named protocol, refusal is the supported behavior.
 
 These rules together preserve replay determinism: the log is faithful, the rolled-back state is recoverable, and observers see one coherent story.
+
+Failure-prone transport work belongs after acceptance. A session-ended
+notification, socket closure, or other host callback runs only after the
+authoritative behavior result and persistence are ready. It is best-effort:
+failure is measured and may be retried by its owning transport, but it MUST NOT
+turn an accepted mutation into a behavior error or appear as a domain effect in
+the turn transcript.
 
 ---
 
@@ -83,7 +91,12 @@ The invariants in [hosts.md §3.4](../protocol/hosts.md#34-host-rpc-invariants) 
 
 The failure-mode table above maps these to concrete observables. Two follow-up notes:
 
-**Receiver-side state torn by mid-call crash.** When a host crashes mid-verb-body, mutations within the host's atomic boundary that *did* commit before the crash are durable; mutations that hadn't committed are lost. The originator sees `E_TIMEOUT`; the target host's next access reveals whatever did or didn't commit. This is the "torn state" that authors of cross-cluster handlers must bound — typically by structuring mutations so partial completion is forward-progress (mark step N done before starting step N+1) rather than partial corruption.
+**Receiver-side state torn by mid-call crash.** When a receiver operation
+independently reaches its authoritative commit before the host crashes, that
+accepted transaction is durable; an uncommitted receiver behavior is rolled
+back. The originator may still see `E_TIMEOUT` and cannot roll back a receiver
+transaction that was already accepted. This is the cross-authority "torn
+state" that a named saga must bound with durable progress and idempotent retry.
 
 **Duplicate-reply suppression.** A duplicate reply with a known `correlation_id` is dropped silently. There is no notification to the originator that a duplicate was suppressed; from the originator's view, the original reply is what arrived.
 

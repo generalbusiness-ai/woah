@@ -284,6 +284,10 @@ export type CallContext = {
   observations: Observation[];
   observe(event: Observation): void;
   deferHostEffect?(effect: DeferredHostEffect): void;
+  /** Queue host-only work until the authoritative behavior result is ready.
+   * Unlike deferHostEffect, these callbacks are never serialized into a turn
+   * transcript: they notify local transports about an already-accepted fact. */
+  deferPostAccept?(label: string, effect: () => void | Promise<void>): void;
   onSessionsEnded?(sessions: Session[]): void | Promise<void>;
   hostMemo?: HostOperationMemo;
   /** Per-call set of `${obj}->${target}` markers used by movetoChecked to
@@ -485,6 +489,17 @@ type BehaviorSavepoint = {
   sessionCounter: number;
   guestFreePool: Set<ObjRef>;
   persistence: PersistenceDirtyState;
+};
+
+type ObjectFlagPlan = {
+  target: ObjRef;
+  changes: Record<string, { from: boolean; to: boolean }>;
+  reconcileAuthorSurface: boolean;
+};
+
+type PostAcceptEffect = {
+  label: string;
+  run: () => void | Promise<void>;
 };
 
 type VerbEditorSession = {
@@ -3525,8 +3540,7 @@ export class WooWorld {
   /** Wizard-only: mint an apikey bound to any $actor descendant. */
   createApiKey(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to create api keys", { actor });
-    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    this.assertApiKeyTarget(target);
     return this.createApiKeyRecord(actor, target, label, "create_api_key");
   }
 
@@ -3583,8 +3597,7 @@ export class WooWorld {
    * This is the path catalog code (e.g. `$block:mint_apikey`) uses so blocks
    * can be configured by their creator without wizard escalation. */
   createApiKeyForOwner(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
-    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
-    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    this.assertApiKeyTarget(target);
     if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
       throw wooError("E_PERM", "owner-mint requires the calling actor to own the target", { actor, target });
     }
@@ -3592,19 +3605,7 @@ export class WooWorld {
   }
 
   private createApiKeyRecord(actor: ObjRef, target: ObjRef, label: string | null, auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
-    const authorityRoot = this.authorityAnchorRoot(target);
-    // n1 ids have one intentionally narrow routing grammar: catalog seed
-    // roots route to `catalog`; concrete actor roots route to their cluster.
-    // Refuse every other anchor shape instead of reproducing CO15's full
-    // class classifier in core. In particular, an actor anchored under a
-    // room must not mint an id that falsely names `cluster:<room>`.
-    if (!authorityRoot.startsWith("$") && !this.isActorDescendant(authorityRoot)) {
-      throw wooError(
-        "E_LINEAGE",
-        "apikey authority root must be catalog identity or an $actor descendant",
-        { actor: target, authority_root: authorityRoot }
-      );
-    }
+    const authorityRoot = this.assertApiKeyAuthorityRoot(target);
     const id = routedApiKeyId(authorityRoot, target, randomHex(16));
     const secret = randomHex(32);
     const salt = randomHex(16);
@@ -3626,6 +3627,38 @@ export class WooWorld {
     // catalog mutation that Net correctly refuses for ordinary turns.
     this.setProp(target, "api_keys", map as WooValue);
     return { id, secret, actor: target, label, created_at };
+  }
+
+  /**
+   * Validate every graph invariant that routed-key construction can reject.
+   * Rotation calls this before revoking the old credential; issuance repeats
+   * it at its public boundary so the invariant has one definition.
+   */
+  private assertApiKeyIssuable(target: ObjRef): void {
+    this.assertApiKeyTarget(target);
+    this.assertApiKeyAuthorityRoot(target);
+  }
+
+  private assertApiKeyTarget(target: ObjRef): void {
+    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
+    if (!this.isActorDescendant(target)) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+  }
+
+  private assertApiKeyAuthorityRoot(target: ObjRef): ObjRef {
+    const authorityRoot = this.authorityAnchorRoot(target);
+    // n1 ids have one intentionally narrow routing grammar: catalog seed
+    // roots route to `catalog`; concrete actor roots route to their cluster.
+    // Refuse every other anchor shape instead of reproducing CO15's full
+    // class classifier in core. In particular, an actor anchored under a
+    // room must not mint an id that falsely names `cluster:<room>`.
+    if (!authorityRoot.startsWith("$") && !this.isActorDescendant(authorityRoot)) {
+      throw wooError(
+        "E_LINEAGE",
+        "apikey authority root must be catalog identity or an $actor descendant",
+        { actor: target, authority_root: authorityRoot }
+      );
+    }
+    return authorityRoot;
   }
 
   private touchApiKeyLastSeen(id: string, actor: ObjRef | null): void {
@@ -4199,8 +4232,21 @@ export class WooWorld {
       const quota = Number(this.propOrNull(account, "agent_quota") ?? 0);
       const count = Number(this.propOrNull(account, "agent_count") ?? 0);
       if (count >= quota) throw wooError("E_QUOTA_EXCEEDED", "agent quota exceeded", { account, quota, count });
-      if (programmer) this.assertProgrammerAgentQuota(account);
-      const { actor } = this.provisionActorInternal("$agent", human, { ...attrs, name, purpose }, human);
+      const agentClass: ObjRef = "$agent";
+      if (programmer) {
+        this.assertProgrammerAgentQuota(account);
+        // A fresh agent inherits both its feature-list default and its kind
+        // verbs from the agent class. Validate that prospective shape before an
+        // object id is allocated: attachProgrammerSurface performs the same
+        // checks after creation, but a collision there used to strand an
+        // unregistered, credential-less actor.
+        const surface = this.programmerSurface();
+        if (surface) {
+          this.featureList(agentClass);
+          this.assertSurfaceComposable(agentClass, surface);
+        }
+      }
+      const { actor } = this.provisionActorInternal(agentClass, human, { ...attrs, name, purpose }, human);
       if (programmer) {
         // Kind stays in ancestry ($agent); the authoring surface is composed on
         // as a feature (plan §4.1). Flag + feature + quota all mutate in this
@@ -4699,9 +4745,12 @@ export class WooWorld {
       const currently = this.object(actor).flags.programmer === true;
       const transition = currently !== programmer;
       const surface = this.programmerSurface();
-      // Preflight composability before any mutation: a promote onto a kind that
-      // shadows a surface verb refuses with nothing changed, and a surface that
-      // a bypass attached to such a kind is caught here too.
+      // Surface reconciliation reads the existing feature list in both
+      // directions. Validate its shape before lineage or quota mutation, then
+      // retain the independent collision preflight for promotion. The
+      // reconciliation reads it again during apply, but no ordinary validation
+      // failure remains reachable after the first write.
+      const featuresBefore = surface && this.canCarryFeatures(actor) ? this.featureList(actor) : [];
       if (programmer && surface) this.assertSurfaceComposable(actor, surface);
       if (transition) {
         if (programmer) this.assertProgrammerAgentQuota(account);
@@ -4722,7 +4771,7 @@ export class WooWorld {
       }
       // Surface reconciliation is unconditional so partial legacy state heals.
       // A repair without a flag transition is itself auditable.
-      const hadSurface = surface ? this.featureList(actor).includes(surface) : false;
+      const hadSurface = surface ? featuresBefore.includes(surface) : false;
       this.reconcileProgrammerSurface(actor, programmer);
       const hasSurface = surface ? this.featureList(actor).includes(surface) : false;
       if (!transition && hadSurface !== hasSurface) {
@@ -4732,6 +4781,9 @@ export class WooWorld {
 
     private rotateAgentKey(human: ObjRef, agent: ObjRef, force: boolean): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
       this.assertOwnedAgent(human, agent);
+      // Key construction can reject a corrupt anchor graph. Prove replacement
+      // viability before revoking the currently usable credential.
+      this.assertApiKeyIssuable(agent);
       const oldKey = this.propOrNull(agent, "api_key_id");
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(human, oldKey, force);
       const key = this.createApiKeyForOwner(human, agent, String(this.propOrNull(agent, "name") ?? agent));
@@ -5532,6 +5584,7 @@ export class WooWorld {
       ...(options.scheduled ? { scheduled: options.scheduled } : {})
     };
     const deferredHostEffects: DeferredHostEffect[] = [];
+    const postAcceptEffects: PostAcceptEffect[] = [];
     let result: WooValue = null;
     let mutated = false;
     const dispatchCtx: CallContext = {
@@ -5553,6 +5606,7 @@ export class WooWorld {
       observations,
       hostMemo: options.hostMemo,
       onSessionsEnded: options.onSessionsEnded,
+      deferPostAccept: (label, effect) => postAcceptEffects.push({ label, run: effect }),
       observe: (event) => {
         const observation = { ...event, source: event.source ?? target };
         this.recordTurnEvent({ kind: "observe", observation });
@@ -5593,6 +5647,7 @@ export class WooWorld {
     // self-hosted spaces is stale.
     const crossHostAudience = (dispatchCtx as { crossHostAudience?: DirectLiveAudience }).crossHostAudience;
     const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(options.audience, observations);
+    this.runPostAcceptEffects(postAcceptEffects);
     this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: options.audience, observations: observations.length, ms: Date.now() - options.startedAt, status: "ok" });
     return {
       op: "result",
@@ -5936,6 +5991,7 @@ export class WooWorld {
         this.callDepth -= 1;
       }
     }
+
     if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0) {
       if (typeof result === "string" && result.length > maxChars) {
         throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
@@ -5951,6 +6007,39 @@ export class WooWorld {
       }
     }
     return result;
+  }
+
+  /**
+   * Start host-only callbacks after behavior persistence and response
+   * enrichment have succeeded. They are intentionally not awaited: transport
+   * notification latency and failure cannot rewrite an accepted domain result.
+   * Both synchronous throws and asynchronous rejections are converted into the
+   * same bounded metric, so best-effort does not mean invisible.
+   */
+  private runPostAcceptEffects(effects: PostAcceptEffect[]): void {
+    for (const effect of effects) {
+      const startedAt = Date.now();
+      try {
+        Promise.resolve(effect.run()).then(
+          () => this.recordMetric({ kind: "post_accept_effect", effect: effect.label, ms: Date.now() - startedAt, status: "ok" }),
+          (err) => this.recordMetric({
+            kind: "post_accept_effect",
+            effect: effect.label,
+            ms: Date.now() - startedAt,
+            status: "error",
+            error: normalizeError(err).code
+          })
+        );
+      } catch (err) {
+        this.recordMetric({
+          kind: "post_accept_effect",
+          effect: effect.label,
+          ms: Date.now() - startedAt,
+          status: "error",
+          error: normalizeError(err).code
+        });
+      }
+    }
   }
 
   state(actor?: ObjRef): WorldSnapshot {
@@ -10621,6 +10710,17 @@ export class WooWorld {
    */
   setObjectFlags(actor: ObjRef, target: ObjRef, flags: Record<string, unknown>): WooObject["flags"] {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to set object flags", { actor, target });
+    const plan = this.prepareObjectFlagPlan(target, flags);
+    return this.applyObjectFlagPlan(actor, plan);
+  }
+
+  /**
+   * Validate a lineage/surface flag transition without changing either.
+   * Callers that also maintain accounting can finish all of their reads and
+   * quota checks before applying this plan, keeping the shared flag path from
+   * drifting back into validate-after-write ordering.
+   */
+  private prepareObjectFlagPlan(target: ObjRef, flags: Record<string, unknown>): ObjectFlagPlan {
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
     const allowed = new Set(["wizard", "programmer", "fertile"]);
     const obj = this.object(target);
@@ -10636,17 +10736,33 @@ export class WooWorld {
       if (prev === raw) continue;
       changes[key] = { from: prev, to: raw };
     }
+    const reconcileAuthorSurface = Boolean(changes.programmer || changes.wizard);
+    if (reconcileAuthorSurface && this.canCarryFeatures(target)) {
+      const surface = this.programmerSurface();
+      if (surface) {
+        // Both attach and remove consume this list. Shape validation belongs in
+        // prepare even when the desired state is false.
+        this.featureList(target);
+        const willAuthor =
+          (changes.programmer?.to ?? (before.programmer === true)) ||
+          (changes.wizard?.to ?? (before.wizard === true));
+        if (willAuthor && (changes.programmer?.to === true || changes.wizard?.to === true)) {
+          this.assertSurfaceComposable(target, surface);
+        }
+      }
+    }
+    return { target, changes, reconcileAuthorSurface };
+  }
+
+  private applyObjectFlagPlan(actor: ObjRef, plan: ObjectFlagPlan): WooObject["flags"] {
+    const obj = this.object(plan.target);
+    const { target, changes } = plan;
     if (Object.keys(changes).length === 0) return { ...obj.flags };
     // The authoring surface must resolve on any actor that can author — a
     // programmer OR a wizard (a wizard bypasses the surface CHECK but still
     // needs the verbs to RESOLVE on itself). Preflight composability before
     // touching anything if either flag is going true, so a shadowing kind
     // refuses with the flag left false.
-    const willAuthor = (changes.programmer?.to ?? (before.programmer === true)) || (changes.wizard?.to ?? (before.wizard === true));
-    if (willAuthor && (changes.programmer?.to === true || changes.wizard?.to === true)) {
-      const surface = this.programmerSurface();
-      if (surface && this.canCarryFeatures(target)) this.assertSurfaceComposable(target, surface);
-    }
     // Pass 2 — apply. The programmer/wizard flags and the authoring surface
     // travel together, so a flag flip reconciles the surface too and this path
     // can never leave an author-capable actor without a resolvable surface, nor
@@ -10659,7 +10775,7 @@ export class WooWorld {
         (obj.flags as Record<string, boolean>)[key] = change.to;
       }
     });
-    if (changes.programmer || changes.wizard) {
+    if (plan.reconcileAuthorSurface) {
       this.reconcileProgrammerSurface(target, obj.flags.programmer === true || obj.flags.wizard === true);
     }
     // Deliberately still recordWizardAction. `$system:set_actor_flag`, the only
@@ -11548,7 +11664,10 @@ export class WooWorld {
       const id = String(args[0] ?? "");
       if (!id) throw wooError("E_INVARG", "revoke_api_key requires an id");
       const result = this.revokeApiKeyWithClosedSessions(ctx.actor, id);
-      if (result.closedSessions.length > 0) return Promise.resolve(ctx.onSessionsEnded?.(result.closedSessions)).then(() => result.revoked);
+      if (result.closedSessions.length > 0 && ctx.onSessionsEnded) {
+        const notify = ctx.onSessionsEnded;
+        ctx.deferPostAccept?.("sessions_ended:revoke_api_key", () => notify(result.closedSessions));
+      }
       return result.revoked;
     });
     this.nativeHandlers.set("list_api_keys", (ctx) => {
@@ -11570,6 +11689,9 @@ export class WooWorld {
     this.nativeHandlers.set("rotate_api_key", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to rotate api keys", { actor: ctx.actor });
       const agent = assertObj(args[0]);
+      // createApiKey performs the same check, but it must happen before the old
+      // credential is revoked on this prepare-then-apply path.
+      this.assertApiKeyIssuable(agent);
       const oldKey = this.propOrNull(agent, "api_key_id");
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(ctx.actor, oldKey, args[1] === true);
       const key = this.createApiKey(ctx.actor, agent, String(this.propOrNull(agent, "name") ?? agent));
@@ -11589,7 +11711,10 @@ export class WooWorld {
         closedSessions.push(...this.closeSessionsForActor(target));
       }
       this.recordWizardAction(ctx.actor, "actor_deactivated", { actor: target, reason: typeof args[1] === "string" ? args[1] : null });
-      if (closedSessions.length > 0) return Promise.resolve(ctx.onSessionsEnded?.(closedSessions)).then(() => true);
+      if (closedSessions.length > 0 && ctx.onSessionsEnded) {
+        const notify = ctx.onSessionsEnded;
+        ctx.deferPostAccept?.("sessions_ended:deactivate_actor", () => notify(closedSessions));
+      }
       return true;
     });
     this.nativeHandlers.set("reactivate_actor", (ctx, args) => {
@@ -11640,6 +11765,10 @@ export class WooWorld {
       const flag = String(args[1] ?? "");
       const value = args[2];
       if (typeof value !== "boolean") throw wooError("E_TYPE", "flag value must be boolean", value);
+      // Prepare the shared lineage/surface transition before touching the
+      // account counter. In particular, malformed feature state must reject
+      // here rather than after set_actor_flag has consumed or returned quota.
+      const flagPlan = this.prepareObjectFlagPlan(target, { [flag]: value });
       if (flag === "programmer" && value === true && this.inheritsFrom(target, "$agent")) {
         const owner = this.propOrNull(target, "owner");
         if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
@@ -11657,7 +11786,7 @@ export class WooWorld {
           this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
         }
       }
-      return this.setObjectFlags(ctx.actor, target, { [flag]: value }) as unknown as WooValue;
+      return this.applyObjectFlagPlan(ctx.actor, flagPlan) as unknown as WooValue;
     });
     this.nativeHandlers.set("set_quota", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set quotas", { actor: ctx.actor });

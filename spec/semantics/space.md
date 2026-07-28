@@ -71,7 +71,12 @@ The six questions of failure semantics, answered:
 1. **Validation failure (steps 1, 2).** `seq` does not advance. The caller receives `op: "error"` with the err. No log entry. No applied frame. From other observers' perspective, the call did not happen.
 2. **Behavior failure (step 8).** `seq` was already assigned at step 3; the message stays in the log. Mutations from step 5 are rolled back atomically. Any observations emitted before the failure are also discarded — emit is part of the rolled-back set. The applied frame is delivered with a single error observation in `observations`.
 3. **Partial mutations across the anchor cluster.** Rolled back atomically. Anchor placement ([objects.md §4.1](objects.md#41-anchor-and-atomicity-scope)) is what makes this possible — the cluster is one host, one transaction.
-4. **Mutations outside the anchor cluster.** A call from inside step 5 to an object on a different host is a cross-host RPC; it is *not* in the rollback scope. Authors of call-handler verbs should avoid them. If they must, use idempotent operations and accept that partial failure may leave torn state across hosts.
+4. **Mutations outside the anchor cluster.** A call from inside step 5 to an
+   object on a different host is a cross-host RPC; it is *not* in the rollback
+   scope. A coupled operation must refuse before its first mutation unless it
+   defines a concrete saga with a stable operation id, durable progress
+   markers, idempotent retry, convergence, and terminal repair. No generic saga
+   is provided by this rule.
 5. **Replay determinism.** Behaviors must be deterministic given `(message, target_state, anchor_cluster_state)`. Reads of `now()`, `random()`, or non-anchored-object state break replay. Replaying the log must produce the same materialized state.
 6. **Failure observation shape.** An err value (V7) emitted as an observation alongside the applied frame:
 

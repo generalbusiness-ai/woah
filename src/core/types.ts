@@ -376,6 +376,7 @@ export type MetricEvent =
   | { kind: "subscribers_write"; space: ObjRef; size: number; delta: number }
   | { kind: "applied"; space: ObjRef; seq: number; verb: string; ms: number }
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }
+  | { kind: "post_accept_effect"; effect: string; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }

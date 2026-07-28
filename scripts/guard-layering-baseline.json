@@ -67,7 +67,7 @@
   },
   "src/core/world.ts": {
     "$account": 4,
-    "$actor": 26,
+    "$actor": 25,
     "$agent": 17,
     "$ambiguous_match": 2,
     "$block": 3,
