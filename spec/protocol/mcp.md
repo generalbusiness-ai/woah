@@ -445,6 +445,15 @@ The retry's own re-plan is NEVER presented as the outcome. It describes an
 execution that committed nothing, and for a turn reading `now()` or `random()`
 it would be a plausible wrong answer.
 
+**What the promise does not cover.** A turn that touched no authority cell,
+wrote no projection, armed no schedule, and recorded no untracked effect is an
+authority-validated READ, not a commit: the scope does not cache its reply
+(§CO4), so a retry re-executes it and no `replayed` marker appears. This is by
+construction and is safe for state — there is none to duplicate — but a
+`persistence:"live"` verb that only emits observations, such as room speech,
+falls in this class: retrying it will emit the line again. Duplicate-sensitive
+effects must be durable, which is what makes them cacheable.
+
 `replay_outcome` names how much survived:
 
 | value | meaning |
