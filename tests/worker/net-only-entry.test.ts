@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import worker, { type NetOnlyEnv } from "../../src/worker/net-only-index";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetScopeDO, type NetScopeDurableState } from "../../src/worker/net/scope-do";
-import { signInternalRequest } from "../../src/worker/internal-auth";
+import { signInternalRequest, verifyInternalRequest } from "../../src/worker/internal-auth";
 import { routedApiKeyId } from "../../src/core/api-key-id";
 
 function netState(name: string): { state: NetScopeDurableState; close: () => void } {
@@ -127,6 +127,101 @@ describe("net-only Worker entry", () => {
     })), env);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", actor: "$wiz", id });
     close();
+  });
+
+  it("keeps account repair internal-signed and forwards only addressing facts to the named authority", async () => {
+    const forwarded: Array<{ url: string; body: unknown }> = [];
+    const env: NetOnlyEnv = {
+      WOO_INTERNAL_SECRET: "net-only-account-repair-secret",
+      NET_RESOLVE: (destination: string) => {
+        if (destination !== "scope:cluster:human_repair") {
+          throw new Error(`unexpected destination ${destination}`);
+        }
+        return {
+          fetch: async (request: Request) => {
+            await verifyInternalRequest(env, request.clone());
+            forwarded.push({ url: request.url, body: await request.clone().json() });
+            return new Response(JSON.stringify({
+              ok: true,
+              kind: "woo.account_state_repair.v1",
+              status: "would_apply",
+              dry_run: true,
+              changed: ["property_cell:account_repair:agent_count"],
+              conflicts: []
+            }), { headers: { "content-type": "application/json" } });
+          }
+        } as unknown as ReturnType<NonNullable<NetOnlyEnv["NET_RESOLVE"]>>;
+      }
+    };
+    const body = {
+      authority_scope: "cluster:human_repair",
+      account: "account_repair",
+      human: "human_repair",
+      candidates: [],
+      dry_run: true
+    };
+    const unsigned = await worker.fetch(new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }), env);
+    expect(unsigned.status).toBe(401);
+    expect(forwarded).toEqual([]);
+
+    const repaired = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    })), env);
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    expect(forwarded).toEqual([{
+      url: "https://do/net/repair-account-state",
+      body
+    }]);
+
+    // The edge never accepts a catalog/global target or a body without the
+    // concrete account family; malformed addressing reaches no authority.
+    const malformed = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ authority_scope: "catalog", account: "account_repair" })
+    })), env);
+    expect(malformed.status).toBe(400);
+    expect(forwarded).toHaveLength(1);
+    for (const invalidBody of [null, 7, [], "account_repair"]) {
+      const invalid = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(invalidBody)
+      })), env);
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({
+        error: { code: "E_INVARG" }
+      });
+    }
+    expect(forwarded).toHaveLength(1);
+
+    // A missing/malformed dry_run must never be interpreted as apply, and
+    // the value-free contract rejects fields that could look like operator
+    // instructions to a future implementation.
+    const implicitApply = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        authority_scope: "cluster:human_repair",
+        account: "account_repair",
+        human: "human_repair",
+        candidates: []
+      })
+    })), env);
+    expect(implicitApply.status).toBe(400);
+    const inventedValue = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, agent_count: 4 })
+    })), env);
+    expect(inventedValue.status).toBe(400);
+    expect(forwarded).toHaveLength(1);
   });
 
   it("forwards the AP11 wizard provisioning op to a gateway shard, freshly signed", async () => {

@@ -308,7 +308,7 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
     return json({ error: { code: "E_NOSESSION", message: `net-operator requires a signed internal request: ${errorMessage(error)}` } }, 401);
   }
   if (request.method !== "POST") {
-    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor}" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor,account/repair}" } }, 404);
   }
   // AP11.9. Like wizard provisioning this is gateway-shaped (it builds a
   // genesis submit and then self-subscribes), so it is routed to a shard by its
@@ -363,8 +363,58 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
       return publicError(error);
     }
   }
+  // Historical native-exception repair is authority-shaped: it may inspect
+  // only the explicitly addressed account cluster, and the Scope DO derives
+  // every replacement from its owned cells. The edge forwards only bounded
+  // candidate IDs, never replacement values, and freshly signs the one
+  // authority hop.
+  if (url.pathname === "/net-operator/account/repair") {
+    try {
+      const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);
+      const text = new TextDecoder().decode(bytes);
+      const parsedBody = JSON.parse(text) as unknown;
+      const body = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+        ? parsedBody as {
+            authority_scope?: unknown;
+            account?: unknown;
+            human?: unknown;
+            candidates?: unknown;
+            dry_run?: unknown;
+          }
+        : {};
+      const bodyKeys = Object.keys(body);
+      if (
+        bodyKeys.some((key) => !["authority_scope", "account", "human", "candidates", "dry_run"].includes(key)) ||
+        typeof body.authority_scope !== "string" ||
+        !body.authority_scope.startsWith("cluster:") ||
+        typeof body.account !== "string" ||
+        !body.account ||
+        typeof body.human !== "string" ||
+        !body.human ||
+        !Array.isArray(body.candidates) ||
+        body.candidates.length > 256 ||
+        body.candidates.some((candidate) => typeof candidate !== "string" || !candidate) ||
+        typeof body.dry_run !== "boolean"
+      ) {
+        return json({
+          error: {
+            code: "E_INVARG",
+            message: "account repair requires cluster authority_scope, account, human, bounded candidates, and boolean dry_run"
+          }
+        }, 400);
+      }
+      const stub = resolveNetDestination(env, `scope:${body.authority_scope}`);
+      return await stub.fetch(await signInternalRequest(env, new Request("https://do/net/repair-account-state", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: text
+      })));
+    } catch (error) {
+      return publicError(error);
+    }
+  }
   if (url.pathname !== "/net-operator/credentials/ensure") {
-    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor}" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected POST /net-operator/{credentials/ensure,wizard/provision,identity/anchor,account/repair}" } }, 404);
   }
   try {
     const bytes = await readLimitedBody(request, MAX_JSON_BODY_BYTES);

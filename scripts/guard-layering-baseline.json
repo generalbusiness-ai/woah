@@ -99,6 +99,11 @@
     "$agent": 2,
     "$programmer": 2
   },
+  "src/net/identity-roles.ts": {
+    "$account": 1,
+    "$agent": 1,
+    "$human": 1
+  },
   "src/net/install.ts": {
     "$actor": 1,
     "$guest": 3,
@@ -125,10 +130,10 @@
     "$account": 1
   },
   "src/worker/net/gateway-do.ts": {
-    "$account": 5,
-    "$agent": 3,
+    "$account": 4,
+    "$agent": 2,
     "$guest": 1,
-    "$human": 6,
+    "$human": 5,
     "$room": 1,
     "$space": 2
   }
