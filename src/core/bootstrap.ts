@@ -1146,8 +1146,7 @@ function seedUniversal(world: WooWorld): void {
   world.createObject({ id: "$space", name: "$space", parent: "$sequenced_log", owner: "$wiz" });
   world.createObject({ id: "$thing", name: "$thing", parent: "$root", owner: "$wiz" });
   if (world.object("$thing").flags.fertile !== true) {
-    world.object("$thing").flags.fertile = true;
-    world.markObjectChanged("$thing");
+    world.setCatalogObjectFlags("$thing", { fertile: true });
   }
   world.createObject({ id: "$catalog", name: "$catalog", parent: "$thing", owner: "$wiz" });
   world.createObject({ id: "$catalog_registry", name: "$catalog_registry", parent: "$space", owner: "$wiz" });
@@ -1477,8 +1476,7 @@ function seedGuests(world: WooWorld): void {
     const target = fieldName && fieldName !== id ? fieldName : `Guest ${match[1]}`;
     if (propValue !== target) world.setProp(id, "name", target);
     if (!fieldName || fieldName === id) {
-      obj.name = target;
-      world.markObjectChanged(id);
+      world.setObjectName(id, target);
     }
   }
 }
@@ -1531,24 +1529,11 @@ function seedProp(world: WooWorld, obj: ObjRef, name: string, value: WooValue): 
 }
 
 function removeSeedProperty(world: WooWorld, obj: ObjRef, name: string): void {
-  const target = world.object(obj);
-  const removedDef = target.propertyDefs.delete(name);
-  const removedValue = target.properties.delete(name);
-  const removedVersion = target.propertyVersions.delete(name);
-  const changed = removedDef || removedValue || removedVersion;
-  if (changed) world.markObjectChanged(obj);
+  world.deleteProp(obj, name);
 }
 
 function reparentSeed(world: WooWorld, obj: ObjRef, parent: ObjRef): void {
-  const target = world.object(obj);
-  if (target.parent === parent) return;
-  const oldParent = target.parent;
-  if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(obj);
-  target.parent = parent;
-  world.object(parent).children.add(obj);
-  world.markObjectChanged(obj);
-  if (oldParent && world.objects.has(oldParent)) world.markObjectChanged(oldParent);
-  world.markObjectChanged(parent);
+  world.migrationSetObjectParent(obj, parent);
 }
 
 function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; readsRoomPresence?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {

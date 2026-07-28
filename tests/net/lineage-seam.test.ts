@@ -165,7 +165,7 @@ describe("lineage-mutation seam: recorder, apply, and parity", () => {
     // Two sibling classes the agent can be reparented between. The owner drives
     // the reparent through an authored verb calling the chparent builtin.
     const base = createWorldFromSerialized(structuredClone(serialized), { persist: false });
-    base.object(human).flags.programmer = true; // chparent is a programmer builtin
+    base.setCatalogObjectFlags(human, { programmer: true }); // chparent is a programmer builtin
     base.createObject({ id: "seam_kindA", name: "KindA", parent: "$thing", owner: human });
     base.createObject({ id: "seam_kindB", name: "KindB", parent: "$thing", owner: human });
     base.createObject({ id: "seam_item", name: "Item", parent: "seam_kindA", owner: human });
@@ -221,7 +221,7 @@ describe("lineage-mutation seam: recorder, apply, and parity", () => {
     // would make a raw flag-bypass silently commit over Net; this guards that.
     const g = await genesis();
     // A wizard actor to invoke the $system native.
-    g.world.object(g.human).flags.wizard = true;
+    g.world.setCatalogObjectFlags(g.human, { wizard: true });
     const prov = (await g.world.directCall("seam-prov", g.human, g.human, "create_agent", ["FlagBot", "", false])) as unknown as {
       result: { actor_id: string };
     };

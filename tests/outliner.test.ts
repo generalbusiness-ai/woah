@@ -648,7 +648,7 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     // Inject a non-existent ref into contents. This is exactly the shape
     // the user observed in their persistent-store db.
-    world.object("the_outline").contents.add("obj_the_outline_stale");
+    world.mirrorContents("the_outline", "obj_the_outline_stale", true);
 
     // `add` must still succeed and `list_items` must still enumerate cleanly.
     const a = await addItem(world, session.actor, "after-stale");

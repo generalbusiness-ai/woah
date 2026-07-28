@@ -89,9 +89,8 @@ describe("authoring", () => {
     const world = createWorld();
     const builder = world.auth("guest:builder");
     const other = world.auth("guest:other-builder-test");
-    const builderObj = world.object(builder.actor);
-    builderObj.owner = builder.actor;
-    builderObj.flags.programmer = true;
+    world.migrationSetObjectOwner(builder.actor, builder.actor);
+    world.setCatalogObjectFlags(builder.actor, { programmer: true });
 
     expect((await world.directCall("builder-enter", builder.actor, "the_chatroom", "enter", [])).op).toBe("result");
     expect((await world.directCall("other-enter", other.actor, "the_chatroom", "enter", [])).op).toBe("result");
@@ -114,7 +113,7 @@ describe("authoring", () => {
 
     const descDef = world.object(lamp).propertyDefs.get("description");
     expect(descDef).toBeTruthy();
-    if (descDef) descDef.perms = "w";
+    if (descDef) world.defineProperty(lamp, { ...descDef, perms: "w" });
     definePropertyVersionedAs(world, builder.actor, lamp, "rub_count", 0, "r", null, "int");
     expect(() => installVerbAs(world, other.actor, lamp, "steal", `verb :steal() rx { return true; }`, null)).toThrow();
     const installed = installVerbAs(world, builder.actor, lamp, "rub", `verb :rub() rx {
@@ -166,8 +165,8 @@ describe("authoring", () => {
     if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
     expect(world.getProp("perm_box", "secret")).toBe("sealed");
 
-    world.object(actor).owner = actor;
-    world.object(actor).flags.programmer = true;
+    world.migrationSetObjectOwner(actor, actor);
+    world.setCatalogObjectFlags(actor, { programmer: true });
     const owned = world.createAuthoredObject(actor, { parent: "$thing", name: "Owned Probe" });
     expect(installVerbAs(world, actor, owned, "try_escalate", `verb :try_escalate() rxd {
   set_task_perms("$wiz");
@@ -183,11 +182,10 @@ describe("authoring", () => {
     const programmer = world.auth("guest:prog-reader");
     const programmerNoBit = world.auth("guest:prog-reader-nobit");
     const other = world.auth("guest:prog-reader-other");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
-    world.object(programmerNoBit.actor).owner = programmerNoBit.actor;
-    world.object(other.actor).owner = other.actor;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
+    world.migrationSetObjectOwner(programmerNoBit.actor, programmerNoBit.actor);
+    world.migrationSetObjectOwner(other.actor, other.actor);
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
     world.chparentAuthoredObject("$wiz", programmerNoBit.actor, "$programmer");
     world.chparentAuthoredObject("$wiz", other.actor, "$builder");
@@ -332,9 +330,8 @@ describe("authoring", () => {
     const world = createWorld();
     world.setProp("$system", "guest_initial_room", null);
     const programmer = world.auth("guest:verb-editor-absent");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
     const baseCreated = await world.directCall("absent-editor-base", programmer.actor, programmer.actor, "create", ["$thing", { name: "Editor Base" }]);
     expect(baseCreated.op).toBe("result");
@@ -343,7 +340,16 @@ describe("authoring", () => {
     // A world installed before the prog catalog's create_instance seed hook
     // (or one whose sparse view has not warmed the editor) has no readable
     // editor object at all.
-    expect(world.objects.delete("the_verb_editor")).toBe(true);
+    const withoutEditor = world.exportWorld();
+    withoutEditor.objects = withoutEditor.objects
+      .filter((object) => object.id !== "the_verb_editor")
+      .map((object) => ({
+        ...object,
+        children: object.children.filter((id) => id !== "the_verb_editor"),
+        contents: object.contents.filter((id) => id !== "the_verb_editor")
+      }));
+    world.importWorld(withoutEditor);
+    expect(world.objects.has("the_verb_editor")).toBe(false);
 
     const refused = await world.directCall("absent-editor-open", programmer.actor, programmer.actor, "edit_verb", [base, "title", {}]);
     expect(refused.op).toBe("error");
@@ -369,9 +375,8 @@ describe("authoring", () => {
     // Living Room.
     world.setProp("$system", "guest_initial_room", null);
     const programmer = world.auth("guest:verb-editor");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
     expect(world.object("the_verb_editor").location).toBe("$nowhere");
     expect(world.isDescendantOf("$nowhere", "$space")).toBe(false);
@@ -471,9 +476,8 @@ describe("authoring", () => {
     const world = createWorld();
     world.setProp("$system", "guest_initial_room", null);
     const programmer = world.auth("guest:verb-owner-gate");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
 
     const created = await world.directCall("owner-gate-create", programmer.actor, programmer.actor, "create", ["$thing", { name: "Gate Base" }]);
@@ -544,9 +548,8 @@ describe("authoring", () => {
     const world = createWorld();
     world.setProp("$system", "guest_initial_room", null);
     const programmer = world.auth("guest:verb-override");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
 
     // A class the programmer owns, carrying `greet`; a child instance that
@@ -646,9 +649,8 @@ describe("authoring", () => {
   it("rejects non-wizard programmer attempting to set or chparent verb owner to another principal", async () => {
     const world = createWorld();
     const programmer = world.auth("guest:owner-attack");
-    const actorObj = world.object(programmer.actor);
-    actorObj.owner = programmer.actor;
-    actorObj.flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
 
     const baseCreated = await world.directCall("attack-base", programmer.actor, programmer.actor, "create", ["$thing", { name: "Attack Base" }]);

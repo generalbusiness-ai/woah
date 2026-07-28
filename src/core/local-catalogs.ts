@@ -785,11 +785,9 @@ function runPinboardDanglingPinsRepairMigration(world: WooWorld, names: readonly
 
 function repairPinboardDanglingPins(world: WooWorld, board: ObjRef): void {
   const boardObj = world.object(board);
-  let contentsChanged = false;
   for (const id of Array.from(boardObj.contents)) {
     if (world.objects.has(id)) continue;
-    boardObj.contents.delete(id);
-    contentsChanged = true;
+    world.mirrorContents(board, id, false);
   }
 
   const layout = mapValue(world.propOrNull(board, "layout"));
@@ -804,7 +802,6 @@ function repairPinboardDanglingPins(world: WooWorld, board: ObjRef): void {
   }
 
   if (nextLayout) world.setProp(board, "layout", nextLayout);
-  if (contentsChanged) world.markObjectChanged(board);
 }
 
 function runDropSessionIdPropertyMigration(world: WooWorld): void {

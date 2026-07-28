@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createWorld } from "../src/core/bootstrap";
+import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import {
   nativePrimitiveContract,
   nativePrimitiveContractDisciplineErrors
@@ -132,16 +132,25 @@ describe("native handler prepare/apply failure boundaries", () => {
   });
 
   it("preflights the prospective $agent surface before consuming an object id", async () => {
-    const world = createWorld();
+    let world = createWorld();
     const baseline = createWorld();
     const current = await provisionHuman(world, "native-create-collision@woo.dev");
     const control = await provisionHuman(baseline, "native-create-control@woo.dev");
     const beforeIds = Object.keys(world.state().objects).sort();
     const beforeActors = world.propOrNull(current.account, "actors");
-    const surfaceVerb = world.object("$programmer").verbs.find((verb) => verb.name === "eval");
+    // Corruption fixtures must enter through a serialized authority boundary:
+    // public object views are deliberately detached and cannot poison the live
+    // graph. Model the aged bad world, then cold-load it.
+    const corrupted = world.exportWorld();
+    const surfaceVerb = corrupted.objects
+      .find((object) => object.id === "$programmer")
+      ?.verbs.find((verb) => verb.name === "eval");
     if (!surfaceVerb) throw new Error("$programmer:eval fixture missing");
-    const injectedCollision = { ...surfaceVerb, owner: "$agent" };
-    world.object("$agent").verbs.push(injectedCollision);
+    const injectedCollision = { ...structuredClone(surfaceVerb), owner: "$agent" };
+    const agentClass = corrupted.objects.find((object) => object.id === "$agent");
+    if (!agentClass) throw new Error("$agent fixture missing");
+    agentClass.verbs.push(injectedCollision);
+    world = createWorldFromSerialized(corrupted);
 
     const refused = await world.directCall(
       "native-create-collision",
@@ -158,23 +167,31 @@ describe("native handler prepare/apply failure boundaries", () => {
     expect(world.propOrNull(current.account, "agent_count")).toBe(0);
     expect(world.propOrNull(current.account, "programmer_agent_count")).toBe(0);
 
-    world.object("$agent").verbs = world.object("$agent").verbs.filter(
-      (verb) => verb !== injectedCollision
+    const healed = world.exportWorld();
+    const healedAgentClass = healed.objects.find((object) => object.id === "$agent");
+    if (!healedAgentClass) throw new Error("$agent fixture missing after refusal");
+    healedAgentClass.verbs = healedAgentClass.verbs.filter(
+      (verb) => !(verb.name === injectedCollision.name && verb.owner === "$agent")
     );
+    world = createWorldFromSerialized(healed);
     const afterRefusal = await createAgent(world, current.human, "after-refusal", true);
     const withoutRefusal = await createAgent(baseline, control.human, "control", true);
     expect(afterRefusal).toBe(withoutRefusal);
   });
 
   it("preflights replacement-key routing before revoking the current key", async () => {
-    const world = createWorld();
+    let world = createWorld();
     const { human } = await provisionHuman(world, "native-rotate@woo.dev");
     const agent = await createAgent(world, human, "native-rotate", false);
     const keyId = world.propOrNull(agent, "api_key_id") as string;
     const keyBefore = structuredClone(
       (world.propOrNull(agent, "api_keys") as Record<string, unknown>)[keyId]
     );
-    world.object(agent).anchor = "the_chatroom";
+    const corrupted = world.exportWorld();
+    const agentRow = corrupted.objects.find((object) => object.id === agent);
+    if (!agentRow) throw new Error("agent fixture missing");
+    agentRow.anchor = "the_chatroom";
+    world = createWorldFromSerialized(corrupted);
 
     const frame = await humanAgentCall(world, human, "rotate_agent_key", agent);
 

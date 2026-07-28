@@ -17,7 +17,7 @@ export async function moveActorTo(
   actor: string,
   target: string,
   options: { requestId?: string; sessionId?: string } = {}
-): Promise<DirectResultFrame | ErrorFrame> {
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
   return world.directCall(options.requestId ?? `move-${actor}-${target}`, actor, actor, "moveto", [target], { sessionId: options.sessionId });
 }
 

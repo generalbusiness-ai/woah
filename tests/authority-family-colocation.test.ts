@@ -22,8 +22,8 @@ async function legacyFamily() {
   };
   const agent = prov.result.actor_id;
   // Simulate a PRE-anchoring family: strip the anchors new provisioning sets.
-  world.object(account).anchor = null;
-  world.object(agent).anchor = null;
+  world.migrationSetObjectAnchor(account, null);
+  world.migrationSetObjectAnchor(agent, null);
   return { world, human, account, agent };
 }
 
@@ -73,7 +73,7 @@ describe("authority-family co-location repair (local-boot)", () => {
     // A re-introduced legacy family is NOT re-walked once the ledger is applied
     // (run-once semantics; the direct repair remains available for an explicit
     // re-repair). This documents the ledger gate.
-    world.object(account).anchor = null;
+    world.migrationSetObjectAnchor(account, null);
     runHostScopedDataMigrations(world);
     expect(world.object(account).anchor).toBeNull();
   });

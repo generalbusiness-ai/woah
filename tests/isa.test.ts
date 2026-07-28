@@ -9,8 +9,8 @@ describe("isa", () => {
   it("walks the parent chain and returns boolean", async () => {
     const world = createWorld();
     const auth = world.auth("guest:isa-check");
-    world.object(auth.actor).owner = auth.actor;
-    world.object(auth.actor).flags.programmer = true;
+    world.migrationSetObjectOwner(auth.actor, auth.actor);
+    world.setCatalogObjectFlags(auth.actor, { programmer: true });
     const sub = world.createAuthoredObject(auth.actor, { parent: "$thing", name: "Sub" });
     const grand = world.createAuthoredObject(auth.actor, { parent: sub, name: "Grand" });
     installVerbAs(world, auth.actor, auth.actor, "check", `verb :check(obj, ancestor) rxd {
@@ -49,8 +49,8 @@ describe("isa", () => {
     home.setExecutorContext(bridge);
     remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     const auth = home.auth("guest:remote-isa-check");
-    home.object(auth.actor).owner = auth.actor;
-    home.object(auth.actor).flags.programmer = true;
+    home.migrationSetObjectOwner(auth.actor, auth.actor);
+    home.setCatalogObjectFlags(auth.actor, { programmer: true });
     remote.createObject({ id: "remote_sub", parent: "$thing", owner: "$wiz" });
     remote.createObject({ id: "remote_grand", parent: "remote_sub", owner: "$wiz" });
     installVerbAs(home, auth.actor, auth.actor, "remote_check", `verb :remote_check(obj, ancestor) rxd {

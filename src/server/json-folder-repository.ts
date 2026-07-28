@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { SerializedObject, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "../core/repository";
 import { wooError, type ObjRef } from "../core/types";
 
@@ -51,14 +52,60 @@ export class JsonFolderWorldRepository implements WorldRepository {
   }
 
   save(world: SerializedWorld): void {
-    dumpSerializedWorldToJsonFolder(world, this.folder);
+    // Publish a complete immutable generation with one atomic manifest
+    // pointer rename. The repository root and prior manifest remain readable
+    // throughout construction; a crash before rename sees the old generation,
+    // and a crash after rename sees the complete new one.
+    const generations = join(this.folder, "generations");
+    mkdirSync(generations, { recursive: true });
+    const generation = mkdtempSync(join(generations, "gen-"));
+    const generationRelative = `generations/${basename(generation)}`;
+    const temporaryManifest = join(this.folder, `.manifest-${randomUUID()}.json`);
+    let published = false;
+    try {
+      const manifest = dumpSerializedWorldToJsonFolder(world, generation);
+      const publishedManifest: JsonFolderManifest = {
+        ...manifest,
+        objects: manifest.objects.map((item) => ({
+          ...item,
+          file: `${generationRelative}/${item.file}`
+        })),
+        logs: manifest.logs.map((item) => ({
+          ...item,
+          file: `${generationRelative}/${item.file}`
+        })),
+        snapshots: manifest.snapshots.map((item) => ({
+          ...item,
+          file: `${generationRelative}/${item.file}`
+        })),
+        sessions_file: manifest.sessions_file
+          ? `${generationRelative}/${manifest.sessions_file}`
+          : null,
+        tasks_file: manifest.tasks_file
+          ? `${generationRelative}/${manifest.tasks_file}`
+          : null
+      };
+      writeJson(temporaryManifest, publishedManifest);
+      renameSync(temporaryManifest, join(this.folder, "manifest.json"));
+      published = true;
+    } catch (err) {
+      rmSync(temporaryManifest, { force: true });
+      if (!published) rmSync(generation, { recursive: true, force: true });
+      throw err;
+    }
+    // Retain prior immutable generations. A separate reader may have consumed
+    // the previous manifest but not yet opened every referenced row; deleting
+    // that generation immediately would violate old-or-new visibility despite
+    // the atomic pointer. Bounded, reader-aware GC is an operations concern.
   }
 
   saveSpaceSnapshot(snapshot: SpaceSnapshotRecord): void {
     const world = this.load();
     if (!world) return;
     world.snapshots = world.snapshots.filter((item) => !(item.space_id === snapshot.space_id && item.seq === snapshot.seq));
-    world.snapshots.push(snapshot);
+    // Repositories own their rows by value. Retaining the caller's object here
+    // would let a later mutation rewrite the pending dump before serialization.
+    world.snapshots.push(structuredClone(snapshot));
     this.save(world);
   }
 

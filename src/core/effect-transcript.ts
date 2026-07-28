@@ -202,7 +202,6 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const observations: Observation[] = [];
   const logicalInputs: Array<{ name: string; value: WooValue }> = [];
   const untrackedEffects: TranscriptUntrackedEffect[] = [];
-  let turnFinishedOk = false;
   const incompleteReasons = new Set<string>();
   let result: WooValue | undefined;
   let error: ErrorValue | undefined;
@@ -339,7 +338,6 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         });
         break;
       case "turn_finish":
-        turnFinishedOk = event.ok;
         if (event.ok) result = event.result;
         else error = event.error;
         break;
@@ -367,13 +365,11 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     writes,
     creates,
     moves,
-    ...(turnFinishedOk && recycles.length > 0 ? { recycles } : {}),
-    // Only a turn that finished OK arms or cancels anything: a failed turn
-    // must not leave a timer behind (CO16.2 — a rejected turn arms nothing).
-    ...(turnFinishedOk && schedules.size > 0 ? { schedules: [...schedules.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
-    ...(turnFinishedOk && cancellations.size > 0 ? { cancellations: [...cancellations.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+    ...(recycles.length > 0 ? { recycles } : {}),
+    ...(schedules.size > 0 ? { schedules: [...schedules.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+    ...(cancellations.size > 0 ? { cancellations: [...cancellations.values()].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
     ...(sessionScopeTransition ? { sessionScopeTransition } : {}),
-    ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
+    ...(projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
     logicalInputs,
     untrackedEffects,

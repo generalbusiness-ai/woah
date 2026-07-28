@@ -101,10 +101,12 @@ describe("bounded historical account-state repair", () => {
       expect(dry.patches.some((patch) => "before" in patch || "after" in patch)).toBe(false);
       expect((world.propOrNull(agent, "api_keys") as Record<string, any>)[keyId].revoked_at == null).toBe(true);
 
-      // Throw after SQLite has executed the first property upsert. The
-      // repository SAVEPOINT must roll it back while withMutationSavepoint
-      // restores the same in-memory snapshot.
-      repo.failProperty = "deactivated_at";
+      // The lineage patch makes the agent a whole-object write, so fail on a
+      // later account-property upsert. SQLite has already accepted the repaired
+      // agent row and earlier account cells inside the SAVEPOINT; the injected
+      // error must roll all of them back while withMutationSavepoint restores
+      // the same in-memory journal.
+      repo.failProperty = "agent_count";
       expect(() => world.repairAccountState(account, { apply: true })).toThrow(/injected repair write failure/);
       expect(world.propOrNull(agent, "deactivated_at")).toBeNull();
       expect(world.object(agent).flags.programmer).toBe(true);

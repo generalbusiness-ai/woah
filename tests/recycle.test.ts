@@ -7,9 +7,8 @@ describe("recycle", () => {
   function builderActor(world: ReturnType<typeof createWorld>) {
     const session = world.auth("guest:builder-recycle");
     const actor = session.actor;
-    const obj = world.object(actor);
-    obj.owner = actor;
-    obj.flags.programmer = true;
+    world.migrationSetObjectOwner(actor, actor);
+    world.setCatalogObjectFlags(actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", actor, "$builder");
     return { session, actor };
   }
@@ -17,7 +16,7 @@ describe("recycle", () => {
   function wizActor(world: ReturnType<typeof createWorld>) {
     const session = world.auth("guest:wiz-recycle");
     const actor = session.actor;
-    world.object(actor).owner = actor;
+    world.migrationSetObjectOwner(actor, actor);
     // Grant authority through the supported API so the authoring surface is
     // composed onto the actor — a wizard resolves builder/programmer verbs via
     // the surface feature, not via $wiz ancestry (which instances don't inherit).
@@ -123,7 +122,7 @@ describe("recycle", () => {
     const world = createWorld();
     const { actor } = builderActor(world);
     const parent = world.createAuthoredObject(actor, { parent: "$thing", name: "Parent" });
-    world.object(parent).flags.fertile = true;
+    world.setCatalogObjectFlags(parent, { fertile: true });
     const child = world.createAuthoredObject(actor, { parent, name: "Child" });
     expect(world.object(parent).children.has(child)).toBe(true);
 
@@ -136,9 +135,9 @@ describe("recycle", () => {
     const world = createWorld();
     const { actor } = builderActor(world);
     const grand = world.createAuthoredObject(actor, { parent: "$thing", name: "Grand" });
-    world.object(grand).flags.fertile = true;
+    world.setCatalogObjectFlags(grand, { fertile: true });
     const middle = world.createAuthoredObject(actor, { parent: grand, name: "Middle" });
-    world.object(middle).flags.fertile = true;
+    world.setCatalogObjectFlags(middle, { fertile: true });
     const child = world.createAuthoredObject(actor, { parent: middle, name: "Child" });
     expect(world.object(child).parent).toBe(middle);
     expect(world.object(grand).children.has(middle)).toBe(true);
@@ -163,7 +162,7 @@ describe("recycle", () => {
     // location is the source of truth; contents is a cache that may drift.
     world.moveAuthoredObject(actor, item, container);
     expect(world.object(container).contents.has(item)).toBe(true);
-    world.object(item).location = elsewhere;
+    world.setCatalogObjectLocation(item, elsewhere);
 
     await recycleVia(world, actor, container, { force: true });
     expect(world.objects.has(container)).toBe(false);
@@ -277,7 +276,7 @@ describe("recycle", () => {
     // delete the session entry directly to model the same condition.
     const secondary = world.auth("guest:soon-stale");
     const secondaryActor = secondary.actor;
-    world.sessions.delete(secondary.id);
+    world.markSessionClosed(secondary.id);
     expect(world.hasLiveSessions(secondaryActor)).toBe(false);
 
     // Wizard (or owner) recycles the unbound actor without force; engine
@@ -291,7 +290,7 @@ describe("recycle", () => {
     const world = createWorld();
     const { actor: ownerActor } = builderActor(world);
     const stranger = world.auth("guest:stranger");
-    world.object(stranger.actor).owner = stranger.actor;
+    world.migrationSetObjectOwner(stranger.actor, stranger.actor);
     world.chparentAuthoredObject("$wiz", stranger.actor, "$builder");
 
     const leaf = world.createAuthoredObject(ownerActor, { parent: "$thing", name: "Leaf" });
@@ -304,7 +303,7 @@ describe("recycle", () => {
     const { actor: wiz } = wizActor(world);
 
     const klass = world.createAuthoredObject(wiz, { parent: "$thing", name: "Recyclable Class" });
-    world.object(klass).flags.fertile = true;
+    world.setCatalogObjectFlags(klass, { fertile: true });
     const installed = installVerbAs(world, wiz, klass, "recycle",
       `verb :recycle() rx {\n  observe({ "type": "recycled", "obj": this });\n  return 0;\n}`,
       null
@@ -335,9 +334,9 @@ describe("recycle", () => {
     const { actor: wiz } = wizActor(world);
 
     const klass = world.createAuthoredObject(wiz, { parent: "$thing", name: "Base Class" });
-    world.object(klass).flags.fertile = true;
+    world.setCatalogObjectFlags(klass, { fertile: true });
     const sub = world.createAuthoredObject(wiz, { parent: klass, name: "Sub Class" });
-    world.object(sub).flags.fertile = true;
+    world.setCatalogObjectFlags(sub, { fertile: true });
     installVerbAs(world, wiz, klass, "recycle",
       `verb :recycle() rx {\n  observe({ "type": "recycled", "obj": this });\n  return 0;\n}`,
       null
@@ -390,7 +389,7 @@ describe("recycle", () => {
 
     // Tombstone b directly to simulate a missed step-10 sweep, then run
     // the wizard janitor.
-    world.tombstones.add(b);
+    world.migrationSetTombstone(b, true);
     const cleared = world.reconcileTombstoneRefsInSystem();
     expect(cleared).toContain("link_b");
     expect(world.getProp("$system", "link_b")).toBeNull();
@@ -503,8 +502,8 @@ describe("recycle", () => {
     const world = createWorld();
     const { actor: wiz } = wizActor(world);
     const programmer = world.auth("guest:programmer");
-    world.object(programmer.actor).owner = programmer.actor;
-    world.object(programmer.actor).flags.programmer = true;
+    world.migrationSetObjectOwner(programmer.actor, programmer.actor);
+    world.setCatalogObjectFlags(programmer.actor, { programmer: true });
     world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
 
     const klass = world.createAuthoredObject(wiz, { parent: "$thing", name: "Class" });
@@ -520,9 +519,8 @@ describe("recycle", () => {
     // Guest promoted to $builder (programmer + reparented). The catalog
     // gives them access to $builder:recycle as an inherited verb.
     const guest = world.auth("guest:builder-attacker").actor;
-    const obj = world.object(guest);
-    obj.owner = guest;
-    obj.flags.programmer = true;
+    world.migrationSetObjectOwner(guest, guest);
+    world.setCatalogObjectFlags(guest, { programmer: true });
     world.chparentAuthoredObject("$wiz", guest, "$builder");
 
     // A $wiz-owned target the guest has no claim on.
@@ -550,9 +548,8 @@ describe("recycle", () => {
     // non-wizard caller.
     const session = world.auth("guest:builder-smuggle");
     const builder = session.actor;
-    const obj = world.object(builder);
-    obj.owner = builder;
-    obj.flags.programmer = true;
+    world.migrationSetObjectOwner(builder, builder);
+    world.setCatalogObjectFlags(builder, { programmer: true });
     world.chparentAuthoredObject("$wiz", builder, "$builder");
     expect(world.hasLiveSessions(builder)).toBe(true);
 
@@ -587,7 +584,7 @@ describe("recycle", () => {
 
     // Tombstone a directly (without going through recycle, so the
     // post-commit sweep doesn't fire) and then run the janitor.
-    world.tombstones.add(a);
+    world.migrationSetTombstone(a, true);
     const cleared = world.reconcileTombstoneRefsInSystem();
     expect(cleared).toContain("ref_list");
     expect(cleared).toContain("ref_map");
@@ -600,7 +597,7 @@ describe("recycle", () => {
     const { actor: wiz } = wizActor(world);
 
     const klass = world.createAuthoredObject(wiz, { parent: "$thing", name: "Class with handler" });
-    world.object(klass).flags.fertile = true;
+    world.setCatalogObjectFlags(klass, { fertile: true });
     installVerbAs(world, wiz, klass, "recycle",
       `verb :recycle() rx { observe({ "type": "force_recycle_handler", "obj": this }); return 0; }`,
       null
@@ -626,11 +623,11 @@ describe("recycle", () => {
     const { actor: wiz } = wizActor(world);
 
     const grand = world.createAuthoredObject(wiz, { parent: "$thing", name: "Grand" });
-    world.object(grand).flags.fertile = true;
+    world.setCatalogObjectFlags(grand, { fertile: true });
     installVerbAs(world, wiz, grand, "label", "verb :label() rx { return \"grand\"; }", null);
 
     const middle = world.createAuthoredObject(wiz, { parent: grand, name: "Middle" });
-    world.object(middle).flags.fertile = true;
+    world.setCatalogObjectFlags(middle, { fertile: true });
     installVerbAs(world, wiz, middle, "label", "verb :label() rx { return \"middle\"; }", null);
 
     const inst = world.createAuthoredObject(wiz, { parent: middle, name: "Instance" });
@@ -671,7 +668,7 @@ describe("recycle", () => {
     const { actor: wiz } = wizActor(world);
 
     const klass = world.createAuthoredObject(wiz, { parent: "$thing", name: "Raising Class" });
-    world.object(klass).flags.fertile = true;
+    world.setCatalogObjectFlags(klass, { fertile: true });
     const installed = installVerbAs(world, wiz, klass, "recycle",
       `verb :recycle() rx { raise { code: "E_INVARG", message: "handler said no", value: this }; }`,
       null
@@ -709,7 +706,7 @@ describe("recycle", () => {
       const world = createWorld();
       const { actor } = builderActor(world);
       const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
-      world.object(klass).flags.fertile = true;
+      world.setCatalogObjectFlags(klass, { fertile: true });
       const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
 
       // Force-recycle the class while the instance still points at it.
@@ -719,7 +716,7 @@ describe("recycle", () => {
       // dangling, then recycling with force, then re-pointing inst at the
       // tombstoned id.
       await recycleVia(world, actor, klass, { force: true });
-      world.object(inst).parent = klass;
+      world.migrationSetObjectParent(inst, klass);
 
       // inheritsFrom must NOT throw. It returns false because the chain
       // can't reach the queried ancestor through a tombstoned intermediate.
@@ -734,10 +731,10 @@ describe("recycle", () => {
       const world = createWorld();
       const { actor } = builderActor(world);
       const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
-      world.object(klass).flags.fertile = true;
+      world.setCatalogObjectFlags(klass, { fertile: true });
       const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
       await recycleVia(world, actor, klass, { force: true });
-      world.object(inst).parent = klass;
+      world.migrationSetObjectParent(inst, klass);
 
       // Property lookup walks the (broken) chain and surfaces a clean
       // "property not defined" rather than blowing up on the tombstone.
@@ -753,15 +750,14 @@ describe("recycle", () => {
       const world = createWorld();
       const { actor } = builderActor(world);
       const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
-      world.object(klass).flags.fertile = true;
+      world.setCatalogObjectFlags(klass, { fertile: true });
       const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
 
       // Recycle the class without going through the user-callable surface
       // (its pre-flight guards descendants). For the test we splice the
       // tombstone in by hand to model the cross-host failure mode.
-      world.objects.delete(klass);
-      world.tombstones.add(klass);
-      world.object(inst).parent = klass;
+      world.migrationRecycleObject(klass);
+      world.migrationSetObjectParent(inst, klass);
 
       // No verb 'doesnotexist' anywhere; the walk stops at the tombstone
       // and surfaces E_VERBNF, not E_OBJNF.
@@ -777,13 +773,12 @@ describe("recycle", () => {
       const world = createWorld();
       const { actor } = builderActor(world);
       const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
-      world.object(klass).flags.fertile = true;
+      world.setCatalogObjectFlags(klass, { fertile: true });
       const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
 
       // Splice in a tombstoned-class state.
-      world.objects.delete(klass);
-      world.tombstones.add(klass);
-      world.object(inst).parent = klass;
+      world.migrationRecycleObject(klass);
+      world.migrationSetObjectParent(inst, klass);
 
       // Repair: rewrite parent to $thing. Idempotent: a second call returns false.
       expect(world.migrationSetObjectParent(inst, "$thing")).toBe(true);
@@ -803,7 +798,7 @@ describe("recycle", () => {
 
       // Old parent: a never-present id (simulates a remote-class tombstone the
       // local host has no stub for). New parent: also absent locally.
-      world.object(inst).parent = "$absent_old";
+      world.migrationSetObjectParent(inst, "$absent_old");
       expect(() => world.migrationSetObjectParent(inst, "$absent_new")).not.toThrow();
       expect(world.object(inst).parent).toBe("$absent_new");
     });

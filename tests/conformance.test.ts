@@ -64,6 +64,14 @@ function message(actor: string, target: string, verb: string, args: WooValue[] =
   return { actor, target, verb, args };
 }
 
+/** Model a transport-lifecycle loss that removed only the session row while
+ * leaving durable presence mirrors behind. */
+function forgetSessionRow(world: WooWorld, sessionId: string): void {
+  const serialized = world.exportWorld();
+  serialized.sessions = serialized.sessions.filter((session) => session.id !== sessionId);
+  world.importWorld(serialized);
+}
+
 async function callInDubspace(
   world: ReturnType<typeof createWorld>,
   sessionId: string,
@@ -261,13 +269,14 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const world = harness.world;
       const session = world.auth("guest:conf-touch-renew");
       const now = Date.now();
-      session.expiresAt = now + 10_000;
+      world.migrationSetSessionState(session.id, { expiresAt: now + 10_000 });
 
       world.touchSessionInput(session.id, now);
 
-      expect(session.lastInputAt).toBe(now);
-      expect(session.expiresAt).toBeGreaterThan(now + 4 * 60_000);
-      const renewed = session.expiresAt;
+      const renewedSession = world.sessions.get(session.id)!;
+      expect(renewedSession.lastInputAt).toBe(now);
+      expect(renewedSession.expiresAt).toBeGreaterThan(now + 4 * 60_000);
+      const renewed = renewedSession.expiresAt;
       const restarted = harness.restart();
       expect(restarted.sessions.get(session.id)?.expiresAt).toBe(renewed);
     } finally {
@@ -514,8 +523,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         roomB.setExecutorContext(roomBBridge);
 
         roomA.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-        home.sessions.get(session.id)!.activeScope = "the_chatroom";
-        roomA.ensureSessionForActor(session.id, actor, "guest").activeScope = "the_chatroom";
+        home.migrationSetSessionState(session.id, { activeScope: "the_chatroom" });
+        roomA.ensureSessionForActor(session.id, actor, "guest");
+        roomA.migrationSetSessionState(session.id, { activeScope: "the_chatroom" });
         home.setActorPresence(actor, "the_chatroom", true);
       roomA.setActorPresence(actor, "the_chatroom", true);
       roomA.setSpaceSubscriber("the_chatroom", actor, true);
@@ -526,8 +536,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const witness = witnessSession.actor;
       routes.set(witness, "home");
       roomA.createObject({ id: witness, name: witness, parent: "$guest", owner: "$wiz" });
-      home.sessions.get(witnessSession.id)!.activeScope = "the_chatroom";
-      roomA.ensureSessionForActor(witnessSession.id, witness, "guest").activeScope = "the_chatroom";
+      home.migrationSetSessionState(witnessSession.id, { activeScope: "the_chatroom" });
+      roomA.ensureSessionForActor(witnessSession.id, witness, "guest");
+      roomA.migrationSetSessionState(witnessSession.id, { activeScope: "the_chatroom" });
       roomA.setSpaceSubscriber("the_chatroom", witness, true, witnessSession.id);
 
       const moveEffects: DeferredHostEffect[] = [];
@@ -562,7 +573,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         }
 
         const tubEffects: DeferredHostEffect[] = [];
-        roomB.ensureSessionForActor(session.id, actor, "guest").activeScope = "the_deck";
+        roomB.ensureSessionForActor(session.id, actor, "guest");
+        roomB.migrationSetSessionState(session.id, { activeScope: "the_deck" });
         const enterTub = await roomB.directCall("enter-tub", actor, "the_hot_tub", "enter", [], {
           sessionId: session.id,
           deferHostEffect: (effect) => tubEffects.push(effect)
@@ -662,7 +674,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setProp("conf_batch_room", "features", ["$conversational"]);
       for (const actor of [live1, live2, live3]) {
         home.setActorPresence(actor, "conf_batch_room", true);
-        home.object(actor).location = "conf_batch_room";
+        home.setCatalogObjectLocation(actor, "conf_batch_room");
       }
 
       const who = await roomHost.directCall("batch-who", live1, "conf_batch_room", "who", []);
@@ -702,7 +714,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setProp("conf_batch_fail_room", "subscribers", [live]);
       roomHost.setProp("conf_batch_fail_room", "features", ["$conversational"]);
       home.setActorPresence(live, "conf_batch_fail_room", true);
-      home.object(live).location = "conf_batch_fail_room";
+      home.setCatalogObjectLocation(live, "conf_batch_fail_room");
 
       // Simulate the home host being unreachable. Roster construction should
       // not consult the legacy subscriber mirror at all, so no remote lookup
@@ -748,8 +760,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       home.setActorPresence(watcher, "conf_scrub_room", true);
         // Isolation setup: this test is only about presence/subscriber mirror
         // repair, so location is direct-mutated instead of going through :enter.
-        home.object(watcher).location = "conf_scrub_room";
-        home.sessions.get(watcherSession.id)!.activeScope = "conf_scrub_room";
+        home.setCatalogObjectLocation(watcher, "conf_scrub_room");
+        home.migrationSetSessionState(watcherSession.id, { activeScope: "conf_scrub_room" });
 
       const staleWho = await roomHost.directCall("stale-who", stale, "conf_scrub_room", "who", []);
       expect(staleWho.op).toBe("result");
@@ -781,8 +793,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const expiredAuth = world.auth("guest:conf-session-scrub-expired");
       const expired = world.sessions.get(expiredAuth.id);
       if (!expired) throw new Error("expected expired session in table");
-      expired.expiresAt = Date.now() - 60_000;
-      expired.lastDetachAt = Date.now() - 60_000;
+      world.migrationSetSessionState(expired.id, {
+        expiresAt: Date.now() - 60_000,
+        lastDetachAt: Date.now() - 60_000
+      });
       // Pre-populate: live row, expired-in-table row, malformed row, and
       // `legacy:` placeholder.
       world.setProp("conf_session_scrub_room", "session_subscribers", [
@@ -797,8 +811,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         "guest_blank"
       ]);
       world.setActorPresence(live.actor, "conf_session_scrub_room", true);
-      world.object(live.actor).location = "conf_session_scrub_room";
-      world.sessions.get(live.id)!.activeScope = "conf_session_scrub_room";
+      world.setCatalogObjectLocation(live.actor, "conf_session_scrub_room");
+      world.migrationSetSessionState(live.id, { activeScope: "conf_session_scrub_room" });
 
       const audience = await world.directCall("conf-session-audience", live.actor, "conf_session_scrub_room", "live_audience", []);
       expect(audience.op).toBe("result");
@@ -815,8 +829,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(beforeReap.map((row) => row.session)).toContain(reapedSession);
       const reapedRecord = world.sessions.get(reapedSession);
       if (reapedRecord) {
-        reapedRecord.expiresAt = Date.now() - 60_000;
-        reapedRecord.lastDetachAt = Date.now() - 60_000;
+        world.migrationSetSessionState(reapedSession, {
+          expiresAt: Date.now() - 60_000,
+          lastDetachAt: Date.now() - 60_000
+        });
       }
       world.reapExpiredSessions();
       const afterReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
@@ -842,14 +858,14 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       world.setSpaceSubscriber("conf_vanished_room", watcher.actor, true, watcher.id);
       world.setSpaceSubscriber("conf_vanished_room", stale.actor, true, stale.id);
       world.setActorPresence(watcher.actor, "conf_vanished_room", true);
-      world.object(watcher.actor).location = "conf_vanished_room";
-      world.sessions.get(watcher.id)!.activeScope = "conf_vanished_room";
-      world.object(stale.actor).location = "conf_vanished_room";
-      world.sessions.get(stale.id)!.activeScope = "conf_vanished_room";
+      world.setCatalogObjectLocation(watcher.actor, "conf_vanished_room");
+      world.migrationSetSessionState(watcher.id, { activeScope: "conf_vanished_room" });
+      world.setCatalogObjectLocation(stale.actor, "conf_vanished_room");
+      world.migrationSetSessionState(stale.id, { activeScope: "conf_vanished_room" });
 
       // Both subscribers in place, then the stale actor's session vanishes
       // out from under the world without a clean reap. `.location` stays.
-      world.sessions.delete(stale.id);
+      forgetSessionRow(world, stale.id);
       expect(world.object(stale.actor).location).toBe("conf_vanished_room");
       expect((world.getProp("conf_vanished_room", "subscribers") as ObjRef[]).sort()).toEqual([watcher.actor, stale.actor].sort());
 
@@ -893,11 +909,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       if (!roomHost.objects.has(actor)) roomHost.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
       roomHost.setActorPresence(actor, "conf_remote_room", true);
 
-      home.object(actor).location = "conf_remote_room";
-      home.sessions.get(session.id)!.activeScope = "conf_remote_room";
+      home.setCatalogObjectLocation(actor, "conf_remote_room");
+      home.migrationSetSessionState(session.id, { activeScope: "conf_remote_room" });
       home.setActorPresence(actor, "conf_remote_room", true);
       home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
-      home.object("conf_home_widget").location = "conf_remote_room";
+      home.setCatalogObjectLocation("conf_home_widget", "conf_remote_room");
       home.setProp("conf_home_widget", "aliases", ["widget"]);
       home.addVerb("conf_home_widget", {
         kind: "native",
@@ -1015,7 +1031,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       await world.directCall("enter-live-chat", live.actor, "the_chatroom", "enter", []);
       // Simulate a missed transport lifecycle close: the session row vanished,
       // but guest location and room presence rows were left durable.
-      world.sessions.delete(stale.id);
+      forgetSessionRow(world, stale.id);
       expect((world.getProp("the_chatroom", "subscribers") as ObjRef[]).sort()).toEqual([live.actor, stale.actor].sort());
 
       const result = world.purgeInactiveGuests();
@@ -1043,11 +1059,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       // Reproduce the prod failure shape: the member's authoritative location
       // points at the room, but the room's derived contents row is missing it
       // and still names objects that are absent or no longer in the room.
-      const room = world.object("conf_repair_room");
-      room.contents.clear();
-      room.contents.add("conf_repair_missing_guest");
-      room.contents.add("conf_repair_departed");
-      world.object("$nowhere").contents.add("conf_repair_departed");
+      world.mirrorContents("conf_repair_room", "conf_repair_mug", false);
+      world.mirrorContents("conf_repair_room", "conf_repair_missing_guest", true);
+      world.mirrorContents("conf_repair_room", "conf_repair_departed", true);
+      world.mirrorContents("$nowhere", "conf_repair_departed", true);
       world.markObjectChanged("conf_repair_room");
       world.markObjectChanged("$nowhere");
 
@@ -1080,8 +1095,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const now = Date.now();
       const staleSession = world.sessions.get(stale.id);
       expect(staleSession).toBeDefined();
-      staleSession!.started = now - 120_000;
-      staleSession!.expiresAt = now + 180_000;
+      world.migrationSetSessionState(stale.id, {
+        started: now - 120_000,
+        expiresAt: now + 180_000
+      });
 
       const result = world.purgeInactiveGuests(now, { staleGuestSessionMs: 60_000 });
       expect(result.stale_guest_sessions).toEqual([stale.id]);
@@ -1109,7 +1126,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
 
       // Simulate the production failure mode: the physical room contents mirror
       // still names an old guest, but its session row has gone away.
-      world.sessions.delete(stale.id);
+      forgetSessionRow(world, stale.id);
       expect(world.contentsOf("the_chatroom")).toContain(stale.actor);
 
       const roster = await world.directCall("roster-stale-contents", live.actor, "the_chatroom", "room_roster", [], { sessionId: live.id });

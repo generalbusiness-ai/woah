@@ -44,7 +44,7 @@ async function moveActorTo(
   actor: string,
   target: string,
   options: { requestId?: string; sessionId?: string } = {}
-): Promise<DirectResultFrame | ErrorFrame> {
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
   const requestId = options.requestId ?? `move-${actor}-${target}`;
   return world.directCall(requestId, actor, actor, "moveto", [target], { sessionId: options.sessionId });
 }
@@ -88,7 +88,7 @@ async function dispenserCall(
   block: string,
   verb: "order" | "deliver" | "cancel",
   args: unknown[]
-): Promise<DirectResultFrame | ErrorFrame> {
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
   const session = Array.from(world.sessions.values()).find((candidate) => candidate.actor === actor);
   if (!session) throw new Error(`missing session for dispenser actor ${actor}`);
   const logSpace = world.object(block).location;
@@ -112,7 +112,7 @@ async function dispenserProduce(
   name: string,
   text: string,
   description: string | null = null
-): Promise<DirectResultFrame | ErrorFrame> {
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
   const prepared = await world.directCall(`${requestId}-prepare`, actor, block, "prepare_artifact", [
     orderId,
     name,
@@ -129,6 +129,22 @@ function worldVerb(world: ReturnType<typeof createWorld>, object: string, name: 
   const verb = world.ownVerbExact(object, name);
   expect(verb, `${object}:${name} should exist`).toBeDefined();
   return verb!;
+}
+
+/** Model an older serialized world that genuinely never contained these rows.
+ * Going through importWorld keeps the strict mutation-token boundary intact;
+ * direct Map deletion would be an authority escape, not a faithful fixture. */
+function forgetSerializedObjects(world: ReturnType<typeof createWorld>, ids: Iterable<string>): void {
+  const removed = new Set(ids);
+  const serialized = world.exportWorld();
+  serialized.objects = serialized.objects
+    .filter((object) => !removed.has(object.id))
+    .map((object) => ({
+      ...object,
+      children: object.children.filter((id) => !removed.has(id)),
+      contents: object.contents.filter((id) => !removed.has(id))
+    }));
+  world.importWorld(serialized);
 }
 
 function installHelpDependency(world: ReturnType<typeof createWorld>) {
@@ -900,9 +916,9 @@ describe("local catalogs", () => {
       const toRemove = ["exit_living_room_outline", "exit_living_room_dubspace", "exit_deck_pinboard"];
       for (const id of toRemove) {
         expect(world.objects.has(id)).toBe(true); // confirm present before removal
-        world.objects.delete(id);
-        expect(world.objects.has(id)).toBe(false);
       }
+      forgetSerializedObjects(world, toRemove);
+      for (const id of toRemove) expect(world.objects.has(id)).toBe(false);
       // Remove the migration marker so the migration re-runs.
       const ledger = (world.getProp("$system", "applied_migrations") as string[])
         .filter((id) => id !== MIGRATION_ID);
@@ -1485,7 +1501,7 @@ describe("local catalogs", () => {
     // Inject a stale ref. contentsOf surfaces the underlying Set, so the
     // DSL `contents(this)` will yield it; `isa` then throws E_OBJNF when
     // it tries to resolve the id, which is exactly the prod failure mode.
-    world.object("the_chatroom").contents.add("the_outline_stale");
+    world.mirrorContents("the_chatroom", "the_outline_stale", true);
 
     const look = await world.directCall("stale-look", session.actor, "the_chatroom", "look", []);
     expect(look.op).toBe("result");
@@ -1507,7 +1523,7 @@ describe("local catalogs", () => {
 
     const enteredChat = await world.directCall("stale-roster-chat-enter", session.actor, "the_chatroom", "enter", []);
     expect(enteredChat.op).toBe("result");
-    world.object("the_chatroom").contents.add(stale);
+    world.mirrorContents("the_chatroom", stale, true);
     const originalIsa = world.isDescendantOfChecked.bind(world);
     world.isDescendantOfChecked = ((...args: Parameters<typeof world.isDescendantOfChecked>) => {
       const [obj, ancestor, memo] = args;
@@ -1929,7 +1945,7 @@ describe("local catalogs", () => {
     const session = world.auth("guest:pinboard-stale");
     const entered = await moveActorTo(world, session.actor, "the_pinboard", { requestId: "pinboard-stale-moveto", sessionId: session.id });
     expect(entered.op).toBe("result");
-    world.object("the_pinboard").contents.add("the_pinboard_stale");
+    world.mirrorContents("the_pinboard", "the_pinboard_stale", true);
 
     const look = await world.directCall("pinboard-stale-look", session.actor, "the_pinboard", "look", []);
     expect(look.op).toBe("result");
@@ -1960,7 +1976,7 @@ describe("local catalogs", () => {
     const stale = "obj_the_pinboard_missing";
     const nonNote = "obj_the_pinboard_not_note";
     world.createObject({ id: nonNote, name: "not a note", parent: "$thing", owner: "$wiz", location: "$nowhere" });
-    world.object("the_pinboard").contents.add(stale);
+    world.mirrorContents("the_pinboard", stale, true);
     world.setProp("the_pinboard", "layout", {
       ...(world.getProp("the_pinboard", "layout") as Record<string, WooValue>),
       [stale]: { x: 12, y: 24, w: 180, h: 110, z: 99 },
@@ -2359,17 +2375,10 @@ describe("local catalogs", () => {
     const trimmed = registry.filter((record) => record.alias !== "note" && record.catalog !== "note" && record.alias !== "help" && record.catalog !== "help");
     world.setProp("$catalog_registry", "installed_catalogs", trimmed as unknown as Parameters<typeof world.setProp>[2]);
     world.setProp("$system", "help_dbs", []);
-    // Tear $note out of the world the way an old-deploy world that never had
-    // it would look. We can't recycle: $pin descends from $note, so removing
-    // by parent is unsafe. Instead, simulate the prior state by walking the
-    // map directly — the test exercises the install/migrate path that should
-    // restore $note as $pin's ancestor.
-    const noteObj = world.objects.get("$note");
-    if (noteObj) {
-      const noteParent = noteObj.parent ? world.objects.get(noteObj.parent) : null;
-      if (noteParent) noteParent.children.delete("$note");
-      world.objects.delete("$note");
-    }
+    // Tear $note out of the serialized prior state. We cannot recycle it
+    // because $pin descends from $note; a direct authoritative Map edit would
+    // also bypass the mutation token this regression is meant to preserve.
+    forgetSerializedObjects(world, ["$note"]);
     expect(world.objects.has("$note")).toBe(false);
     const migrations = (world.getProp("$system", "applied_migrations") as string[])
       .filter((id) => id !== "2026-05-02-pinboard-v02-repair");
@@ -2730,7 +2739,7 @@ describe("local catalogs", () => {
     expect(installed.ok).toBe(true);
     const layoutDef = world.object("$pinboard").propertyDefs.get("layout");
     expect(layoutDef).toBeDefined();
-    world.object("$pinboard").propertyDefs.set("layout", { ...layoutDef!, perms: "rw" });
+    world.defineProperty("$pinboard", { ...layoutDef!, perms: "rw" });
     const before = world.getProp("$system", "applied_migrations") as string[];
     expect(before.some((id) => id.startsWith("local-catalog-schema:pinboard:"))).toBe(true);
 
@@ -2975,11 +2984,11 @@ describe("local catalogs", () => {
     }
 
     const dubspaceCommandVerbBpm = await world.directCall("command-verb-dubspace-bpm", first.actor, "the_dubspace", "command", ["bpm 146"]);
-    expect(dubspaceCommandVerbBpm.op).toBe("result");
-    if (dubspaceCommandVerbBpm.op === "result") {
-      expect(dubspaceCommandVerbBpm.result).toMatchObject({
-        op: "applied",
-        message: { target: "the_dubspace", verb: "set_tempo", args: ["146"] },
+    expect(dubspaceCommandVerbBpm.op).toBe("applied");
+    if (dubspaceCommandVerbBpm.op === "applied") {
+      expect(dubspaceCommandVerbBpm).toMatchObject({
+        id: "command-verb-dubspace-bpm",
+        message: { actor: first.actor, target: "the_dubspace", verb: "set_tempo", args: ["146"] },
         observations: [expect.objectContaining({ type: "tempo_changed", target: "drum_1", bpm: 146 })]
       });
     }
@@ -3617,7 +3626,7 @@ describe("local catalogs", () => {
     }
 
     const secondSession = world.sessions.get(second.id);
-    if (secondSession) secondSession.lastInputAt = Date.now() - 1_000_000;
+    if (secondSession) world.migrationSetSessionState(second.id, { lastInputAt: Date.now() - 1_000_000 });
     const namedSleeping = await world.command("lambda-who-sleeping", first.id, "the_chatroom", `@who ${second.actor}`);
     expect(namedSleeping.op).toBe("result");
     if (namedSleeping.op === "result") {
@@ -3659,7 +3668,7 @@ describe("local catalogs", () => {
     await world.directCall("roster-chat-first", first.actor, "the_chatroom", "enter", []);
     await world.directCall("roster-chat-second", second.actor, "the_chatroom", "enter", []);
     const secondSession = world.sessions.get(second.id);
-    if (secondSession) secondSession.lastInputAt = Date.now() - 1_000_000;
+    if (secondSession) world.migrationSetSessionState(second.id, { lastInputAt: Date.now() - 1_000_000 });
 
     const chatRoster = await world.directCall("roster-chat", first.actor, "the_chatroom", "room_roster", []);
     expect(chatRoster.op).toBe("result");
@@ -3670,7 +3679,7 @@ describe("local catalogs", () => {
       ]));
     }
     if (!secondSession) throw new Error("second roster session missing");
-    secondSession.rosterVisible = false;
+    world.migrationSetSessionState(second.id, { rosterVisible: false });
     const hiddenChatRoster = await world.directCall("roster-chat-hidden", first.actor, "the_chatroom", "room_roster", []);
     expect(hiddenChatRoster.op).toBe("result");
     if (hiddenChatRoster.op === "result") {
@@ -3684,8 +3693,8 @@ describe("local catalogs", () => {
     if (mixedChatRoster.op === "result") {
       expect((mixedChatRoster.result as Array<{ id: string }>).map((row) => row.id)).toContain(second.actor);
     }
-    world.sessions.delete(visibleSibling.id);
-    delete secondSession.rosterVisible;
+    world.markSessionClosed(visibleSibling.id);
+    world.migrationSetSessionState(second.id, { rosterVisible: true });
 
     const chatAudience = await world.directCall("audience-chat", first.actor, "the_chatroom", "live_audience", []);
     expect(chatAudience.op).toBe("result");
@@ -3765,7 +3774,7 @@ describe("local catalogs", () => {
 
     // Push lastInputAt back 65s and look again — should report "staring off."
     const session = world.sessions.get(guest.id)!;
-    session.lastInputAt = Date.now() - 65_000;
+    world.migrationSetSessionState(guest.id, { lastInputAt: Date.now() - 65_000 });
     const staring = await world.directCall("idle-look-staring", actor, actor, "look_self", []);
     expect(staring.op).toBe("result");
     if (staring.op === "result") {
@@ -3786,8 +3795,8 @@ describe("local catalogs", () => {
     // Multi-session for one actor: detached + active. Idle reflects the active.
     const secondSession = world.createSessionForActor(actor, "guest");
     world.attachSocket(secondSession.id, "ws-idle-a-2");
-    secondSession.lastInputAt = Date.now() - 5_000; // active session is 5s idle
-    session.lastInputAt = Date.now() - 600_000; // first session is 10min stale
+    world.migrationSetSessionState(secondSession.id, { lastInputAt: Date.now() - 5_000 }); // active session is 5s idle
+    world.migrationSetSessionState(session.id, { lastInputAt: Date.now() - 600_000 }); // first session is 10min stale
     world.detachSocket(session.id, "ws-idle-a"); // first session has no live socket
     expect(world.actorIsConnected(actor)).toBe(true); // second session is still attached
     const idleAcrossSessions = (Date.now() - world.actorLastInputAt(actor)!) / 1_000;
@@ -3804,7 +3813,7 @@ describe("local catalogs", () => {
     // there's no socket and no recent input on any transport, so the actor
     // reads as sleeping.
     for (const s of world.sessions.values()) {
-      if (s.actor === actor) s.lastInputAt = Date.now() - 6 * 60_000;
+      if (s.actor === actor) world.migrationSetSessionState(s.id, { lastInputAt: Date.now() - 6 * 60_000 });
     }
     expect(world.actorIsConnected(actor)).toBe(false);
     const sleeping = await world.directCall("idle-look-sleeping", actor, actor, "look_self", []);
@@ -3839,8 +3848,7 @@ describe("local catalogs", () => {
       "2026-05-01-chat-three-room-demo",
       "2026-05-01-chat-observation-output"
     ]);
-    world.object("the_chatroom").name = "Lobby";
-    world.setProp("the_chatroom", "name", "Lobby");
+    world.setObjectName("the_chatroom", "Lobby");
     world.setProp("the_chatroom", "description", "The first runnable chat room.");
     world.setProp("the_chatroom", "next_seq", 37);
     world.setProp("the_chatroom", "subscribers", ["guest_1"]);
@@ -3852,11 +3860,7 @@ describe("local catalogs", () => {
     }`, null).ok).toBe(true);
     expect(world.ownVerb("$chatroom", "southeast")).not.toBeNull();
     expect(world.ownVerb("$chatroom", "go")).not.toBeNull();
-    for (const id of ["the_lamp", "the_towel", "the_mug"]) {
-      const obj = world.objects.get(id);
-      if (obj?.location && world.objects.has(obj.location)) world.object(obj.location).contents.delete(id);
-      world.objects.delete(id);
-    }
+    forgetSerializedObjects(world, ["the_lamp", "the_towel", "the_mug"]);
 
     installLocalCatalogs(world, ["chat", "demoworld"]);
 
@@ -3909,10 +3913,8 @@ describe("local catalogs", () => {
       "2026-05-01-agent-tool-exposure-repair",
       "2026-05-01-chat-navigation-tool-exposure"
     ]);
-    world.object("the_deck").contents.delete("the_towel");
-    world.object("the_towel").location = "$nowhere";
-    world.object("the_towel").properties.delete("home");
-    world.object("$nowhere").contents.add("the_towel");
+    world.setCatalogObjectLocation("the_towel", "$nowhere");
+    world.deleteProp("the_towel", "home");
 
     installLocalCatalogs(world, ["chat", "demoworld"]);
 
@@ -4009,8 +4011,7 @@ describe("local catalogs", () => {
     // Reset to before the cockatoo migration ran
     world.setProp("$system", "applied_migrations", ["2026-04-30-source-catalog-verbs", "2026-04-30-catalog-placement-metadata"]);
     // Pretend the cockatoo never existed in this world
-    world.objects.delete("the_cockatoo");
-    world.objects.delete("$cockatoo");
+    forgetSerializedObjects(world, ["the_cockatoo", "$cockatoo"]);
     expect(world.objects.has("$cockatoo")).toBe(false);
     expect(world.objects.has("the_cockatoo")).toBe(false);
 
@@ -5157,8 +5158,8 @@ describe("local catalogs", () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["demoworld"]);
 
-      world.object("the_weather").anchor = "the_chatroom";
-      world.object("the_chatroom").contents.add("the_weather");
+      world.migrationSetObjectAnchor("the_weather", "the_chatroom");
+      world.mirrorContents("the_chatroom", "the_weather", true);
       world.setProp("the_weather", "host_placement", null);
 
       installLocalCatalogs(world, []);
@@ -5467,8 +5468,8 @@ describe("local catalogs", () => {
       // transcript to refresh session_presence. Keep its object labels aligned
       // with the properties changed directly above; the Net rename relation
       // derivation has separate coverage.
-      world.object(looker).name = "Looker McLook";
-      world.object(witness).name = "Witness McSee";
+      world.setObjectName(looker, "Looker McLook");
+      world.setObjectName(witness, "Witness McSee");
       const enterLooker = await world.directCall("enter-looker", looker, "the_chatroom", "enter", []);
       const enterWitness = await world.directCall("enter-witness", witness, "the_chatroom", "enter", []);
       expect(enterLooker.op).toBe("result");

@@ -1007,16 +1007,7 @@ function applyCatalogSchemaPlanStep(
         world.chparentAuthoredObject(context.actor, step.object, parent);
       }
       if (world.objects.has(step.object)) {
-        let flagsChanged = false;
-        const target = world.object(step.object);
-        for (const [flag, expected] of Object.entries(catalogObjectFlags(step.def.flags))) {
-          if (typeof expected !== "boolean") continue;
-          const actual = (target.flags as Record<string, boolean | undefined>)[flag] === true;
-          if (actual === expected) continue;
-          (target.flags as Record<string, boolean>)[flag] = expected;
-          flagsChanged = true;
-        }
-        if (flagsChanged) world.markObjectChanged(step.object);
+        world.setCatalogObjectFlags(step.object, catalogObjectFlags(step.def.flags));
       }
       setDescriptionIfEmpty(world, step.object, catalogDescription(step.def.description, step.object, manifest.name));
       return;
@@ -1156,32 +1147,13 @@ function reconcileSeedObject(
   const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
   const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
   assertCatalogSeedPlacement(world, id, parent, anchor);
-  const changedObjects = new Set<ObjRef>();
-  const markChanged = (objRef: ObjRef | null | undefined): void => {
-    if (objRef && world.objects.has(objRef)) changedObjects.add(objRef);
-  };
-  if (obj.parent !== parent) {
-    const oldParent = obj.parent;
-    if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(id);
-    obj.parent = parent;
-    world.object(parent).children.add(id);
-    markChanged(oldParent);
-    markChanged(parent);
-    markChanged(id);
-  }
-  if (obj.owner !== actor) {
-    obj.owner = actor;
-    markChanged(id);
-  }
-  if (obj.anchor !== anchor) {
-    obj.anchor = anchor;
-    markChanged(id);
-  }
+  world.setCatalogObjectLineage(id, {
+    name: hook.name ?? obj.name,
+    owner: actor,
+    parent,
+    anchor
+  });
   if (hook.name) {
-    if (obj.name !== hook.name) {
-      obj.name = hook.name;
-      markChanged(id);
-    }
     if (world.propOrNull(id, "name") !== hook.name) world.setProp(id, "name", hook.name);
   }
   if (hook.description) {
@@ -1200,22 +1172,11 @@ function reconcileSeedObject(
   }
   const strandedInNowhere = rehomeNowhereSeedObjects && obj.location === "$nowhere" && location !== null && location !== "$nowhere";
   if (obj.location !== location && (!obj.location || !world.objects.has(obj.location) || strandedInNowhere)) {
-    const oldLocation = obj.location;
-    if (oldLocation && world.objects.has(oldLocation)) world.object(oldLocation).contents.delete(id);
-    obj.location = location;
-    if (location && world.objects.has(location)) world.object(location).contents.add(id);
-    markChanged(oldLocation);
-    markChanged(location);
-    markChanged(id);
+    world.setCatalogObjectLocation(id, location);
   } else if (obj.location && world.objects.has(obj.location)) {
-    const container = world.object(obj.location);
-    if (!container.contents.has(id)) {
-      container.contents.add(id);
-      markChanged(obj.location);
-    }
+    world.setCatalogObjectLocation(id, obj.location);
   }
   applyCatalogSeedHostPlacement(world, id, parent);
-  for (const objRef of changedObjects) world.markObjectChanged(objRef);
 }
 
 function assertCatalogSeedPlacement(world: WooWorld, id: ObjRef, parent: ObjRef, anchor: ObjRef | null): void {
@@ -1370,11 +1331,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
 }
 
 function dropStaleOwnVerbs(world: WooWorld, objRef: ObjRef, manifestVerbNames: Set<string>): void {
-  const obj = world.object(objRef);
-  const next = obj.verbs.filter((verb) => manifestVerbNames.has(verb.name)).map((verb, index) => ({ ...verb, slot: index + 1 }));
-  if (next.length === obj.verbs.length) return;
-  obj.verbs = next;
-  touchObject(world, objRef);
+  world.retainCatalogOwnVerbs(objRef, manifestVerbNames);
 }
 
 function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, version: number, allowImplementationHints: boolean): VerbDef {
@@ -1841,24 +1798,7 @@ function classAndDescendants(world: WooWorld, classRef: ObjRef): ObjRef[] {
 }
 
 function renamePropertyLocal(world: WooWorld, objRef: ObjRef, from: string, to: string): void {
-  const obj = world.object(objRef);
-  const def = obj.propertyDefs.get(from);
-  if (def) {
-    if (!obj.propertyDefs.has(to)) obj.propertyDefs.set(to, { ...def, name: to, version: def.version + 1 });
-    obj.propertyDefs.delete(from);
-  }
-  if (obj.properties.has(from)) {
-    if (!obj.properties.has(to)) obj.properties.set(to, obj.properties.get(from)!);
-    obj.properties.delete(from);
-  }
-  if (obj.propertyVersions.has(from)) {
-    if (!obj.propertyVersions.has(to)) obj.propertyVersions.set(to, obj.propertyVersions.get(from)! + 1);
-    obj.propertyVersions.delete(from);
-  }
-  if (from === "subscribers" || from === "session_subscribers" || to === "subscribers" || to === "session_subscribers") {
-    world.invalidatePresenceIndex();
-  }
-  touchObject(world, objRef);
+  world.renameCatalogProperty(objRef, from, to);
 }
 
 function dropPropertyLocal(world: WooWorld, objRef: ObjRef, name: string): void {
@@ -1872,22 +1812,11 @@ function dropPropertyLocal(world: WooWorld, objRef: ObjRef, name: string): void 
 }
 
 function renameVerbLocal(world: WooWorld, objRef: ObjRef, from: string, to: string): void {
-  const obj = world.object(objRef);
-  const index = obj.verbs.findIndex((verb) => verb.name === from);
-  const verb = index >= 0 ? obj.verbs[index] : null;
-  if (!verb) return;
-  if (!obj.verbs.some((item) => item.name === to)) {
-    obj.verbs[index] = { ...verb, name: to, version: verb.version + 1 };
-  } else {
-    obj.verbs.splice(index, 1);
-  }
-  obj.verbs = obj.verbs.map((item, slotIndex) => ({ ...item, slot: slotIndex + 1 }));
-  touchObject(world, objRef);
+  world.renameCatalogVerb(objRef, from, to);
 }
 
 function touchObject(world: WooWorld, objRef: ObjRef): void {
-  world.object(objRef).modified = Date.now();
-  world.persist();
+  world.markObjectChanged(objRef);
 }
 
 function migrationStepId(step: CatalogMigrationStep, index: number): string {
@@ -2242,14 +2171,11 @@ function recordCatalogInstall(world: WooWorld, record: InstalledCatalogRecord): 
   if (world.objects.has("$catalog")) {
     if (!world.objects.has(id)) world.createObject({ id, name: record.alias, parent: "$catalog", owner: record.owner });
     else {
-      const obj = world.object(id);
-      obj.name = record.alias;
-      obj.owner = record.owner;
-      if (obj.parent !== "$catalog") {
-        if (obj.parent && world.objects.has(obj.parent)) world.object(obj.parent).children.delete(id);
-        obj.parent = "$catalog";
-        world.object("$catalog").children.add(id);
-      }
+      world.setCatalogObjectLineage(id, {
+        name: record.alias,
+        owner: record.owner,
+        parent: "$catalog"
+      });
     }
     setDescriptionIfEmpty(world, id, `Installed catalog record for ${record.alias}. It records provenance, version, created class objects, and seeded instances for local introspection.`);
     world.setProp(id, "catalog_name", record.catalog);

@@ -474,8 +474,10 @@ describe("turn recorder", () => {
   it("checks session roster visibility against readable session authority", () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-roster-authority");
-    session.activeScope = "the_chatroom";
-    session.rosterVisible = false;
+    world.migrationSetSessionState(session.id, {
+      activeScope: "the_chatroom",
+      rosterVisible: false
+    });
     const before = world.exportWorld();
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",

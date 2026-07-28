@@ -206,9 +206,9 @@ async function buildHarness(
     null
   );
   expect(welcome.ok).toBe(true);
-  const welcomeVerb = world.object("ws_annex").verbs.find((verb) => verb.name === "welcome");
-  if (!welcomeVerb) throw new Error("welcome verb missing after install");
-  welcomeVerb.skip_presence_check = true;
+  if (!world.migrationSetVerbExecutionMetadata("ws_annex", "welcome", { skipPresenceCheck: true })) {
+    throw new Error("welcome verb missing after install");
+  }
   world.createObject({ id: "ws_wave_box", name: "Wave Box", parent: "$thing", owner: actor, anchor: "ws_annex", location: "ws_annex" });
   world.defineProperty("ws_wave_box", { name: "waves", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
   const wave = installVerb(
@@ -251,10 +251,10 @@ async function buildHarness(
     null
   );
   expect(speak.ok).toBe(true);
-  const speakVerb = world.object("ws_wave_box").verbs.find((verb) => verb.name === "speak");
-  if (!speakVerb) throw new Error("speak verb missing after install");
-  speakVerb.direct_callable = true;
-  expect(speakVerb.direct_callable).toBe(true);
+  if (!world.migrationSetVerbExecutionMetadata("ws_wave_box", "speak", { directCallable: true })) {
+    throw new Error("speak verb missing after install");
+  }
+  expect(world.object("ws_wave_box").verbs.find((verb) => verb.name === "speak")?.direct_callable).toBe(true);
   const speakExceptSubmitter = installVerb(
     world,
     "ws_wave_box",
@@ -268,12 +268,12 @@ async function buildHarness(
     null
   );
   expect(speakExceptSubmitter.ok).toBe(true);
-  const speakExceptSubmitterVerb = world.object("ws_wave_box").verbs.find(
-    (verb) => verb.name === "speak_except_submitter"
-  );
-  if (!speakExceptSubmitterVerb) throw new Error("speak_except_submitter verb missing after install");
-  speakExceptSubmitterVerb.direct_callable = true;
-  expect(speakExceptSubmitterVerb.direct_callable).toBe(true);
+  if (!world.migrationSetVerbExecutionMetadata("ws_wave_box", "speak_except_submitter", { directCallable: true })) {
+    throw new Error("speak_except_submitter verb missing after install");
+  }
+  expect(
+    world.object("ws_wave_box").verbs.find((verb) => verb.name === "speak_except_submitter")?.direct_callable
+  ).toBe(true);
   // A third room for the "present elsewhere" push case: a session that
   // transitioned HERE must receive nothing from an annex-scope fanout.
   world.createObject({ id: "ws_side", name: "WS Side Room", parent: "$space", owner: actor });
@@ -288,9 +288,9 @@ async function buildHarness(
     null
   );
   expect(sideWelcome.ok).toBe(true);
-  const sideWelcomeVerb = world.object("ws_side").verbs.find((verb) => verb.name === "welcome");
-  if (!sideWelcomeVerb) throw new Error("side welcome verb missing after install");
-  sideWelcomeVerb.skip_presence_check = true;
+  if (!world.migrationSetVerbExecutionMetadata("ws_side", "welcome", { skipPresenceCheck: true })) {
+    throw new Error("side welcome verb missing after install");
+  }
   const placed = await world.directCall("ws-genesis-place", actor, actor, "moveto", ["ws_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-ws-test");

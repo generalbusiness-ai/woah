@@ -108,6 +108,12 @@ export type SeedWorld = SerializedWorld & {
 
 export interface WorldRepository {
   load(): SerializedWorld | null;
+  /**
+   * Atomically publish one complete world generation. If this method throws,
+   * a fresh `load()` MUST still return the previously accepted generation;
+   * partial candidate rows must never become visible. Once the new generation
+   * is visible, cleanup failure must not make `save()` throw.
+   */
   save(world: SerializedWorld): void;
   saveSpaceSnapshot?(snapshot: SpaceSnapshotRecord): void;
   latestSpaceSnapshot?(space: ObjRef): SpaceSnapshotRecord | null;

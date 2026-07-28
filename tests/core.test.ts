@@ -65,10 +65,8 @@ describe("woo core", () => {
     const { world, session, actor } = authedWorld();
     const other = world.auth("guest:builtin-other");
     const observer = world.auth("guest:builtin-observer");
-    world.sessions.get(observer.id)!.activeScope = "the_deck";
-    world.object(observer.actor).location = "the_deck";
-    world.object("the_chatroom").contents.delete(observer.actor);
-    world.object("the_deck").contents.add(observer.actor);
+    world.migrationSetSessionState(observer.id, { activeScope: "the_deck" });
+    world.setCatalogObjectLocation(observer.actor, "the_deck");
     await world.directCall("builtin-actor-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id });
     await world.directCall("builtin-other-enter", other.actor, "the_chatroom", "enter", [], { sessionId: other.id });
     world.setProp("the_chatroom", "session_subscribers", [
@@ -526,7 +524,10 @@ describe("woo core", () => {
     expect(installVerb(world, "tick_collector", "names", "verb :names(actors) rxd {\n  return collect_prop(actors, \"name\");\n}", null).ok).toBe(true);
     const verb = world.ownVerbExact("tick_collector", "names");
     if (!verb || verb.kind !== "bytecode") throw new Error("expected bytecode verb");
-    verb.bytecode.max_ticks = 8;
+    world.addVerb("tick_collector", {
+      ...verb,
+      bytecode: { ...verb.bytecode, max_ticks: 8 }
+    });
 
     const result = await world.directCall("collect-prop-ticks", actor, "tick_collector", "names", [["tick_actor_1", "tick_actor_2", "tick_actor_3"]]);
     expect(result.op).toBe("error");
@@ -552,8 +553,8 @@ describe("woo core", () => {
     remote.setProp("remote_lamp", "description", "A lamp hosted on a different object host.");
     remote.createObject({ id: "remote_mug", name: "Remote Mug", parent: "$thing", owner: "$wiz" });
     remote.setProp("remote_mug", "description", "A mug hosted beside the lamp.");
-    home.object("the_chatroom").contents.add("remote_lamp");
-    home.object("the_chatroom").contents.add("remote_mug");
+    home.mirrorContents("the_chatroom", "remote_lamp", true);
+    home.mirrorContents("the_chatroom", "remote_mug", true);
 
     const entered = await home.directCall(undefined, actor, "the_chatroom", "enter", []);
     expect(entered.op).toBe("result");
@@ -1076,19 +1077,19 @@ describe("woo core", () => {
     const staleWorld = createWorld();
     const session = staleWorld.auth("guest:merge-host-seed");
     // Receiver-side mutations to the receiver-hosted room.
-    staleWorld.object("the_chatroom").name = "Lobby";
-    staleWorld.setProp("the_chatroom", "name", "Lobby");
+    staleWorld.setObjectName("the_chatroom", "Lobby");
     staleWorld.setProp("the_chatroom", "subscribers", [session.actor]);
     staleWorld.setProp("the_chatroom", "next_seq", 42);
     // Missing-from-stored case: receiver lost some hosted objects.
-    staleWorld.objects.delete("the_lamp");
-    staleWorld.objects.delete("the_mug");
-    staleWorld.objects.delete("the_dubspace");
-    staleWorld.object("the_chatroom").contents.delete("the_lamp");
-    staleWorld.object("the_chatroom").contents.delete("the_dubspace");
-
     const fresh = createWorld().exportWorld();
-    const staleScoped = nonEmptyHostScopedWorld(staleWorld.exportWorld(), "the_chatroom");
+    const staleSerialized = staleWorld.exportWorld();
+    const missing = new Set(["the_lamp", "the_mug", "the_dubspace"]);
+    staleSerialized.objects = staleSerialized.objects
+      .filter((obj) => !missing.has(obj.id))
+      .map((obj) => obj.id === "the_chatroom"
+        ? { ...obj, contents: obj.contents.filter((id) => !missing.has(id)) }
+        : obj);
+    const staleScoped = nonEmptyHostScopedWorld(staleSerialized, "the_chatroom");
     const freshScoped = nonEmptyHostScopedWorld(fresh, "the_chatroom");
     expect(staleScoped).not.toBeNull();
     expect(freshScoped).not.toBeNull();
@@ -1167,13 +1168,13 @@ describe("woo core", () => {
 
   it("HS2.1: receiver-hosted subjects with stored entries are skipped (gateway-side mutations do not stomp receiver state)", () => {
     const stored = createWorld();
-    stored.object("the_chatroom").name = "Receiver Lobby";
+    stored.setObjectName("the_chatroom", "Receiver Lobby");
     const storedSlice = nonEmptyHostScopedWorld(stored.exportWorld(), "the_chatroom");
     expect(storedSlice).not.toBeNull();
 
     // Build a divergent seed by mutating the gateway's view.
     const gateway = createWorld();
-    gateway.object("the_chatroom").name = "Gateway Living Room";
+    gateway.setObjectName("the_chatroom", "Gateway Living Room");
     const seed = gateway.buildHostSeedForDelivery("the_chatroom");
 
     const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_chatroom");
@@ -1189,10 +1190,10 @@ describe("woo core", () => {
 
     // Pick a class verb both worlds share. Mutate aliases on gateway
     // only — leaving source unchanged so source_hash matches.
-    const noteOnGateway = gateway.object("$note").verbs.find((v) => v.name === "read");
+    const noteOnGateway = gateway.ownVerbExact("$note", "read");
     expect(noteOnGateway).toBeDefined();
     if (!noteOnGateway) return;
-    noteOnGateway.aliases = [...(noteOnGateway.aliases ?? []), "rd"];
+    gateway.addVerb("$note", { ...noteOnGateway, aliases: [...(noteOnGateway.aliases ?? []), "rd"] });
 
     const seed = gateway.buildHostSeedForDelivery("the_pinboard");
     const merged = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
@@ -1208,10 +1209,13 @@ describe("woo core", () => {
     const stored = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
     expect(stored).not.toBeNull();
 
-    const noteOnGateway = gateway.object("$note").verbs.find((v) => v.name === "read");
+    const noteOnGateway = gateway.ownVerbExact("$note", "read");
     expect(noteOnGateway).toBeDefined();
     if (!noteOnGateway) return;
-    noteOnGateway.arg_spec = { ...noteOnGateway.arg_spec, command: { dobj: "this", prep: ["with"], iobj: "string" } };
+    gateway.addVerb("$note", {
+      ...noteOnGateway,
+      arg_spec: { ...noteOnGateway.arg_spec, command: { dobj: "this", prep: ["with"], iobj: "string" } }
+    });
 
     const seed = gateway.buildHostSeedForDelivery("the_pinboard");
     const merged = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
@@ -1260,7 +1264,7 @@ describe("woo core", () => {
 
     const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
     expect(storedSlice).not.toBeNull();
-    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const seed = structuredClone(gateway.buildHostSeedForDelivery("the_pinboard"));
     const sysSeedIdx = seed.objects.findIndex((o) => o.id === "$system");
     const sysSeed = { ...seed.objects[sysSeedIdx] };
     sysSeed.propertyVersions = sysSeed.propertyVersions.map(([n, v]) => n === "extra_attr" ? [n, v + 100] as [string, number] : [n, v]);
@@ -1375,7 +1379,12 @@ describe("woo core", () => {
     const first = gateway.buildHostSeedForDeliveryWithDigest("the_pinboard");
     const second = gateway.buildHostSeedForDeliveryWithDigest("the_pinboard");
     expect(first.digest).toBe(second.digest);
-    expect(first.seed).toBe(second.seed);
+    expect(first.seed).toEqual(second.seed);
+    expect(Object.isFrozen(first.seed)).toBe(true);
+    expect(() => {
+      first.seed.objects[0]!.name = "cache poison";
+    }).toThrow();
+    expect(gateway.buildHostSeedForDeliveryWithDigest("the_pinboard").seed).toEqual(second.seed);
     expect(first.digest).toMatch(/^[0-9a-f]{64}$/); // SHA-256 hex
   });
 
@@ -1410,7 +1419,7 @@ describe("woo core", () => {
   it("HS1: seed digest changes when world content changes", () => {
     const gateway = createWorld();
     const before = gateway.buildHostSeedForDeliveryWithDigest("the_chatroom").digest;
-    gateway.object("the_chatroom").name = "Renamed Chatroom";
+    gateway.setObjectName("the_chatroom", "Renamed Chatroom");
     gateway.setProp("the_chatroom", "next_seq", (Number(gateway.getProp("the_chatroom", "next_seq") ?? 0)) + 1);
     const after = gateway.buildHostSeedForDeliveryWithDigest("the_chatroom").digest;
     expect(after).not.toBe(before);
@@ -1500,7 +1509,7 @@ describe("woo core", () => {
     // Gateway recycles an id the satellite never imported — its slice
     // has no stub for the_doomed_id. The merge must NOT propagate;
     // otherwise every satellite would store every gateway-side recycle.
-    gateway.tombstones.add("obj_world_doomed_irrelevant_1");
+    gateway.migrationSetTombstone("obj_world_doomed_irrelevant_1", true);
     const seed = gateway.buildHostSeedForDelivery("the_pinboard");
     expect(seed.tombstones).toContain("obj_world_doomed_irrelevant_1");
 
@@ -1516,7 +1525,7 @@ describe("woo core", () => {
     // Gateway recycles $wiz (in this test we just stuff its id into
     // tombstones to simulate the post-recycle state without removing
     // it from gateway's objects, which the test doesn't need).
-    gateway.tombstones.add("$wiz");
+    gateway.migrationSetTombstone("$wiz", true);
 
     const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
     expect(storedSlice).not.toBeNull();
@@ -1635,18 +1644,24 @@ describe("woo core", () => {
     expect(nestedMarker(exported.snapshots.find((item) => item.hash === "isolation")!.state)).toBe("before");
 
     const liveRoot = reloaded.object("$root");
-    const liveVerb = liveRoot.verbs.find((item) => item.name === "isolate_import");
-    const liveByteVerb = liveRoot.verbs.find((item) => item.name === "isolate_bytecode");
+    const liveVerb = reloaded.ownVerbExact("$root", "isolate_import");
+    const liveByteVerb = reloaded.ownVerbExact("$root", "isolate_bytecode");
     expect(liveVerb).toBeTruthy();
     expect(liveByteVerb?.kind).toBe("bytecode");
     if (!liveVerb || liveByteVerb?.kind !== "bytecode") return;
-    liveRoot.flags.programmer = true;
-    setNestedMarker(liveRoot.propertyDefs.get("isolation_default")!.defaultValue, "after-world");
-    setNestedMarker(liveRoot.properties.get("isolation_value")!, "after-world");
-    liveVerb.aliases[0] = "after-world";
-    setNestedMarker(liveVerb.arg_spec.command, "after-world");
-    setNestedMarker(liveVerb.line_map, "after-world");
-    liveVerb.calls![0].name = "after-world";
+    reloaded.setCatalogObjectFlags("$root", { programmer: true });
+    reloaded.defineProperty("$root", {
+      ...liveRoot.propertyDefs.get("isolation_default")!,
+      defaultValue: { nested: { marker: "after-world" } }
+    });
+    reloaded.setProp("$root", "isolation_value", { nested: { marker: "after-world" } });
+    reloaded.addVerb("$root", {
+      ...liveVerb,
+      aliases: ["after-world"],
+      arg_spec: { command: { nested: { marker: "after-world" } } },
+      line_map: { nested: { marker: "after-world" } },
+      calls: [{ name: "after-world", this_call: true }]
+    });
     // Bytecode is immutable and shared by reference across worlds, so the live
     // world holds a deeply-frozen object: an in-place mutation throws instead of
     // silently editing a peer world that shares the same source. (Mutable verb
@@ -1654,12 +1669,12 @@ describe("woo core", () => {
     expect(Object.isFrozen(liveByteVerb.bytecode)).toBe(true);
     expect(() => setNestedMarker(liveByteVerb.bytecode.ops[0][1], "after-world")).toThrow();
     expect(() => setNestedMarker(liveByteVerb.bytecode.literals[0], "after-world")).toThrow();
-    setNestedMarker(liveRoot.eventSchemas.get("isolation_event")!, "after-world");
+    reloaded.defineEventSchema("$root", "isolation_event", { nested: { marker: "after-world" } });
     const liveLog = reloaded.logs.get("$nowhere")![0];
-    setNestedMarker(liveLog.message.args[0], "after-world");
-    setNestedMarker(liveLog.observations[0].payload, "after-world");
-    setNestedMarker(liveLog.error!.value!, "after-world");
-    setNestedMarker(reloaded.snapshots.find((item) => item.hash === "isolation")!.state, "after-world");
+    expect(() => setNestedMarker(liveLog.message.args[0], "after-world")).toThrow();
+    expect(() => setNestedMarker(liveLog.observations[0].payload, "after-world")).toThrow();
+    expect(() => setNestedMarker(liveLog.error!.value!, "after-world")).toThrow();
+    expect(() => setNestedMarker(reloaded.snapshots.find((item) => item.hash === "isolation")!.state, "after-world")).toThrow();
 
     expect(root.flags.programmer).toBe(false);
     expect(nestedMarker(defaultDef.defaultValue)).toBe("after-input");
@@ -1823,8 +1838,8 @@ describe("woo core", () => {
     expect(firstDescribe).toBeTruthy();
     if (!firstDescribe) return;
 
-    firstRoot.flags.wizard = true;
-    firstDescribe.aliases.push("cache_poison");
+    first.setCatalogObjectFlags("$root", { wizard: true });
+    first.addVerb("$root", { ...firstDescribe, aliases: [...firstDescribe.aliases, "cache_poison"] });
 
     const secondRoot = createWorld({ catalogs: false }).object("$root");
     const secondDescribe = secondRoot.verbs.find((verb) => verb.name === "describe");
@@ -2187,8 +2202,8 @@ describe("woo core", () => {
     const primary = world.auth("guest:primary-tie");
     const actor = primary.actor;
     const earlierId = world.ensureSessionForActor("session-0000-primary-tie", actor, "guest");
-    primary.started = 1234;
-    earlierId.started = 1234;
+    world.migrationSetSessionState(primary.id, { started: 1234 });
+    world.migrationSetSessionState(earlierId.id, { started: 1234 });
 
     expect(world.primarySessionForActor(actor)?.id).toBe("session-0000-primary-tie");
   });
@@ -2218,8 +2233,8 @@ describe("woo core", () => {
     });
     home.addVerb("emitter", { ...nativeVerb("emit_remote", "emit_remote_room"), direct_callable: true, skip_presence_check: true });
     remote.setSpaceSubscriber("remote_room", actor, true, primary.id);
-    home.sessions.get(primary.id)!.activeScope = "remote_room";
-    home.sessions.get(secondary.id)!.activeScope = "the_chatroom";
+    home.migrationSetSessionState(primary.id, { activeScope: "remote_room" });
+    home.migrationSetSessionState(secondary.id, { activeScope: "the_chatroom" });
 
     const result = await home.directCall("remote-session-audience", actor, "emitter", "emit_remote", [], { sessionId: secondary.id });
 
@@ -2257,9 +2272,9 @@ describe("woo core", () => {
     const oldest = world.createSessionForActor(actor, "bearer");
     const middle = world.ensureSessionForActor("session-primary-promotion-middle", actor, "bearer");
     const newest = world.ensureSessionForActor("session-primary-promotion-newest", actor, "bearer");
-    oldest.started = 100;
-    middle.started = 200;
-    newest.started = 300;
+    world.migrationSetSessionState(oldest.id, { started: 100 });
+    world.migrationSetSessionState(middle.id, { started: 200 });
+    world.migrationSetSessionState(newest.id, { started: 300 });
 
     expect((await world.directCall("primary-promotion-oldest-enter", actor, "the_chatroom", "enter", [], { sessionId: oldest.id })).op).toBe("result");
     expect((await moveActorTo(world, actor, "the_dubspace", { requestId: "primary-promotion-middle-move", sessionId: middle.id })).op).toBe("result");
@@ -2267,7 +2282,7 @@ describe("woo core", () => {
     expect(world.primarySessionForActor(actor)?.id).toBe(oldest.id);
     expect(world.object(actor).location).toBe("the_chatroom");
 
-    oldest.expiresAt = Date.now() - 1;
+    world.migrationSetSessionState(oldest.id, { expiresAt: Date.now() - 1 });
     expect(world.reapExpiredSessions()).toEqual([oldest.id]);
     expect(world.primarySessionForActor(actor)?.id).toBe(middle.id);
     expect(world.object(actor).location).toBe("the_dubspace");
@@ -2279,7 +2294,7 @@ describe("woo core", () => {
     const world = createWorld();
     const session = world.auth("guest:attached");
     world.attachSocket(session.id, "ws-1");
-    session.expiresAt = Date.now() - 1;
+    world.migrationSetSessionState(session.id, { expiresAt: Date.now() - 1 });
 
     expect(world.sessionAlive(session.id)).toBe(true);
     expect(world.reapExpiredSessions()).toEqual([]);
@@ -2295,8 +2310,8 @@ describe("woo core", () => {
     expect(world.reapExpiredSessions(Date.now())).toEqual([]);
     expect(metrics.filter((event) => event.kind === "session_reap")).toEqual([]);
 
-    first.expiresAt = 1;
-    second.expiresAt = 1;
+    world.migrationSetSessionState(first.id, { expiresAt: 1 });
+    world.migrationSetSessionState(second.id, { expiresAt: 1 });
     expect(world.reapExpiredSessions(2).sort()).toEqual([first.id, second.id].sort());
     const reaps = metrics.filter((event) => event.kind === "session_reap");
     expect(reaps).toHaveLength(1);
@@ -2313,7 +2328,7 @@ describe("woo core", () => {
     const world = createWorld();
     const session = world.auth("guest:long-attached");
     world.attachSocket(session.id, "ws-1");
-    session.expiresAt = Date.now() - 1;
+    world.migrationSetSessionState(session.id, { expiresAt: Date.now() - 1 });
 
     world.detachSocket(session.id, "ws-1");
 
@@ -2335,7 +2350,7 @@ describe("woo core", () => {
     const takeLamp = await world.directCall("take-lamp-before-reap", actor, "the_chatroom", "take", ["lamp"]);
     expect(takeLamp.op).toBe("result");
     expect(world.object("the_lamp").location).toBe(actor);
-    world.object(actor).contents.add("missing_inventory_ref");
+    world.mirrorContents(actor, "missing_inventory_ref", true);
     world.setProp(actor, "description", "temporary guest description");
     world.setProp(actor, "aliases", ["temp"]);
     world.setProp(actor, "focus_list", ["the_dubspace"]);
@@ -2389,8 +2404,14 @@ describe("woo core", () => {
     const { world, session, actor } = authedWorld();
     const msg = message(actor, "the_dubspace", "set_control", ["delay_1", "wet", 0.91]);
     const first = await callInDubspace(world, session.id, "same-id", msg);
+    const canonical = structuredClone(first);
+    if (first.op === "applied") {
+      first.message.args[2] = 0.12;
+      first.observations.push({ type: "poisoned_retry_view" });
+    }
     const second = await callInDubspace(world, session.id, "same-id", msg);
-    expect(first).toEqual(second);
+    expect(second).not.toBe(first);
+    expect(second).toEqual(canonical);
     expect(world.replay("the_dubspace", 1, 10)).toHaveLength(1);
   });
 
@@ -2558,7 +2579,7 @@ describe("woo core", () => {
     world.setProp("owned_space", "next_seq", 1);
     world.setSpaceSubscriber("owned_space", session.actor, true, session.id);
     world.setProp("owned_space", "last_snapshot_seq", 0);
-    world.sessions.get(session.id)!.activeScope = "owned_space";
+    world.migrationSetSessionState(session.id, { activeScope: "owned_space" });
 
     const add = await world.call("add-feature", session.id, "owned_space", message(session.actor, "owned_space", "add_feature", ["owned_feature"]));
     expect(add.op).toBe("applied");
@@ -2587,7 +2608,7 @@ describe("woo core", () => {
     world.setProp("owned_chat_space", "next_seq", 1);
     world.setSpaceSubscriber("owned_chat_space", session.actor, true, session.id);
     world.setProp("owned_chat_space", "last_snapshot_seq", 0);
-    world.sessions.get(session.id)!.activeScope = "owned_chat_space";
+    world.migrationSetSessionState(session.id, { activeScope: "owned_chat_space" });
 
     const add = await world.call("add-conversational", session.id, "owned_chat_space", message(session.actor, "owned_chat_space", "add_feature", ["$conversational"]));
     expect(add.op).toBe("applied");

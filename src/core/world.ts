@@ -5,6 +5,7 @@ import {
   assertString,
   cloneValue,
   dataKeyedMap,
+  deepFreezePlainValue,
   freezeTinyBytecode,
   isDeeplyFrozen,
   directedRecipients,
@@ -27,6 +28,7 @@ import {
   type RemoteToolRequest,
   type Session,
   type SpaceLogEntry,
+  type TinyBytecode,
   type VerbDef,
   type WooObject,
   type WooValue,
@@ -34,6 +36,7 @@ import {
 } from "./types";
 import type { ObjectRepository, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
 import { runTinyVm } from "./tiny-vm";
+import { commandPlanTransfer, isCommandPlanTransfer, type CommandPlanTransfer } from "./command-plan-transfer";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import {
   deriveCustomerAttribution,
@@ -264,7 +267,7 @@ export type HermesConnectResult = {
 };
 
 type CommandOptions = {
-  deferHostEffect?: (effect: DeferredHostEffect) => void;
+  deferHostEffect?: (effect: DeferredHostEffect) => unknown;
 };
 
 type ObjectMatchOptions = {
@@ -470,7 +473,7 @@ export type DirectCallOptions = {
   forceDirect?: boolean;
   forceReason?: string;
   sessionId?: string | null;
-  deferHostEffect?: (effect: DeferredHostEffect) => void;
+  deferHostEffect?: (effect: DeferredHostEffect) => unknown;
   onSessionsEnded?: (sessions: Session[]) => void | Promise<void>;
 };
 
@@ -482,20 +485,38 @@ type DirectDispatchFrameOptions = {
   audience: ObjRef | null;
   hostMemo: HostOperationMemo;
   initialObservations?: Observation[];
-  deferHostEffect?: (effect: DeferredHostEffect) => void;
+  deferHostEffect?: (effect: DeferredHostEffect) => unknown;
   onSessionsEnded?: (sessions: Session[]) => void | Promise<void>;
+};
+
+type AppliedCallOptions = {
+  /** Proof-only reads/dispatch selected by a terminal direct wrapper. They are
+   * injected into the target after its turn_start and before target behavior,
+   * so validation sees the decisions which selected this command without a
+   * second recorder envelope. */
+  transferredProofEvents?: TurnRecorderEvent[];
 };
 
 type WooRepository = WorldRepository & Partial<ObjectRepository>;
 
-type BehaviorSavepoint = {
-  objects: Map<ObjRef, WooObject>;
-  sessions: Map<string, Session>;
-  snapshots: SpaceSnapshotRecord[];
+type BehaviorUndoScope = {
+  undos: Array<() => void>;
+  /** Non-proof recorder vocabulary observed in this behavior. Kept as a
+   * compact classifier rather than cloning every hot-path event. */
+  terminalTransferDisallowedKinds: Set<TurnRecorderEvent["kind"]>;
+  acceptance: Array<() => void>;
+  objects: Set<ObjRef>;
+  sessions: Set<string>;
+  logs: Set<ObjRef>;
   tombstones: Set<ObjRef>;
+  guestFreePool: Set<ObjRef>;
+  snapshots: boolean;
+  createdThisRun: Set<ObjRef>;
+  orderedEdgeWritesThisRun: Set<ObjRef>;
+  roomRosterProjections: Map<ObjRef, WooValue[] | undefined>;
+  subscriberScrubAt: Map<ObjRef, number | undefined>;
   objectCounter: number;
   sessionCounter: number;
-  guestFreePool: Set<ObjRef>;
   persistence: PersistenceDirtyState;
 };
 
@@ -509,6 +530,637 @@ type PostAcceptEffect = {
   label: string;
   run: () => void | Promise<void>;
 };
+
+/**
+ * Put a real Proxy in front of Map/Set subclasses. Overriding `.set()` and
+ * `.add()` alone is bypassable with `Map.prototype.set.call(collection, ...)`;
+ * a Proxy has no Map/Set internal slot, so those prototype calls are rejected.
+ * Ordinary method access is rebound to the internal-slot-bearing target.
+ */
+function protectBehaviorCollection<T extends object>(
+  target: T,
+  assertMutation: () => void
+): T {
+  let proxy: T;
+  proxy = new Proxy(target, {
+    get: (inner, property) => {
+      const value = Reflect.get(inner, property, inner);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const result = Reflect.apply(value, inner, args);
+        return result === inner ? proxy : result;
+      };
+    },
+    set: (inner, property, value) => {
+      assertMutation();
+      return Reflect.set(inner, property, value, inner);
+    },
+    deleteProperty: (inner, property) => {
+      assertMutation();
+      return Reflect.deleteProperty(inner, property);
+    },
+    defineProperty: (inner, property, descriptor) => {
+      assertMutation();
+      return Reflect.defineProperty(inner, property, descriptor);
+    },
+    setPrototypeOf: (inner, prototype) => {
+      assertMutation();
+      return Reflect.setPrototypeOf(inner, prototype);
+    },
+    preventExtensions: () => {
+      assertMutation();
+      return false;
+    }
+  });
+  return proxy;
+}
+
+/**
+ * Exact inverse-operation containers. Reads and scans are ordinary operations;
+ * each mutation records only its own inverse, so abort restores the same live
+ * container identity in reverse order and cost is proportional to writes.
+ */
+class BehaviorMutationMap<K, V> extends Map<K, V> {
+  private readonly nodes = new Map<K, { key: K; prev: K | null; next: K | null }>();
+  private head: K | null = null;
+  private tail: K | null = null;
+
+  constructor(
+    private readonly beforeMutation: (undo: () => void, key?: K) => void,
+    private readonly prepare: (value: V) => V = (value) => value,
+    entries?: Iterable<readonly [K, V]>,
+    private readonly assertMutation: (key?: K) => void = () => undefined
+  ) {
+    super();
+    if (entries) this.initialize(entries);
+    return protectBehaviorCollection(this, () => this.assertMutation());
+  }
+
+  /**
+   * Populate without recording mutations. The behavior-value wrapper uses
+   * this after registering an empty destination in its identity cache, so
+   * self-referential/shared input graphs cannot recurse before the wrapper is
+   * discoverable.
+   */
+  initialize(entries: Iterable<readonly [K, V]>): void {
+    for (const [key, value] of entries) this.rawSet(key, value);
+  }
+
+  override get(key: K): V | undefined {
+    const value = super.get(key);
+    if (value === undefined && !super.has(key)) return undefined;
+    const prepared = this.prepare(value as V);
+    // Lazy wrapper installation is representation-only: it preserves the
+    // logical value and must not enter the behavior undo log.
+    if (prepared !== value) super.set(key, prepared);
+    return prepared;
+  }
+
+  private rawSet(key: K, value: V): void {
+    if (super.has(key)) {
+      super.set(key, value);
+      return;
+    }
+    super.set(key, value);
+    const node = { key, prev: this.tail, next: null as K | null };
+    if (this.tail !== null) this.nodes.get(this.tail)!.next = key;
+    else this.head = key;
+    this.tail = key;
+    this.nodes.set(key, node);
+  }
+
+  private rawDelete(key: K): boolean {
+    const node = this.nodes.get(key);
+    if (!node) return false;
+    if (node.prev !== null) this.nodes.get(node.prev)!.next = node.next;
+    else this.head = node.next;
+    if (node.next !== null) this.nodes.get(node.next)!.prev = node.prev;
+    else this.tail = node.prev;
+    this.nodes.delete(key);
+    return super.delete(key);
+  }
+
+  private rawRestore(node: { key: K; prev: K | null; next: K | null }, value: V): void {
+    if (super.has(node.key)) return;
+    super.set(node.key, value);
+    this.nodes.set(node.key, node);
+    if (node.prev !== null) this.nodes.get(node.prev)!.next = node.key;
+    else this.head = node.key;
+    if (node.next !== null) this.nodes.get(node.next)!.prev = node.key;
+    else this.tail = node.key;
+  }
+
+  private rawClear(): void {
+    super.clear();
+    this.nodes.clear();
+    this.head = null;
+    this.tail = null;
+  }
+
+  override set(key: K, value: V): this {
+    this.assertMutation(key);
+    // Detach the row shell synchronously. Descendants remain lazy, but a
+    // caller retaining `value` can no longer mutate the authoritative row
+    // through that alias after this method returns.
+    const prepared = this.prepare(value);
+    const present = super.has(key);
+    const before = super.get(key);
+    this.beforeMutation(() => {
+      if (present) super.set(key, before as V);
+      else this.rawDelete(key);
+    }, key);
+    // Supported ingress seams isolate caller-owned values before insertion.
+    // Keep the stored row raw until first read so loading a large world does
+    // not allocate wrappers for rows the turn never touches.
+    this.rawSet(key, prepared);
+    return this;
+  }
+
+  override delete(key: K): boolean {
+    this.assertMutation(key);
+    const node = this.nodes.get(key);
+    if (!node) return false;
+    const beforeNode = { ...node };
+    const before = super.get(key);
+    this.beforeMutation(() => {
+      this.rawRestore(beforeNode, before as V);
+    }, key);
+    return this.rawDelete(key);
+  }
+
+  override clear(): void {
+    // Refuse an unsupported raw bulk mutation before walking the container.
+    // A permitted clear necessarily touches every member and may capture them.
+    this.assertMutation();
+    if (super.size === 0) return;
+    const before = Array.from(this.entries());
+    this.beforeMutation(() => {
+      this.rawClear();
+      for (const [key, value] of before) this.rawSet(key, value);
+    });
+    this.rawClear();
+  }
+
+  override *keys(): MapIterator<K> {
+    let cursor = this.head;
+    while (cursor !== null) {
+      yield cursor;
+      cursor = this.nodes.get(cursor)?.next ?? null;
+    }
+  }
+
+  override *values(): MapIterator<V> {
+    for (const key of this.keys()) yield this.get(key) as V;
+  }
+
+  override *entries(): MapIterator<[K, V]> {
+    for (const key of this.keys()) yield [key, this.get(key) as V];
+  }
+
+  override [Symbol.iterator](): MapIterator<[K, V]> {
+    return this.entries();
+  }
+
+  override forEach(
+    callbackfn: (value: V, key: K, map: Map<K, V>) => void,
+    thisArg?: unknown
+  ): void {
+    for (const [key, value] of this.entries()) callbackfn.call(thisArg, value, key, this);
+  }
+}
+
+class BehaviorMutationSet<T> extends Set<T> {
+  private readonly nodes = new Map<T, { value: T; prev: T | null; next: T | null }>();
+  private head: T | null = null;
+  private tail: T | null = null;
+
+  constructor(
+    private readonly beforeMutation: (undo: () => void, value?: T) => void,
+    values?: Iterable<T>,
+    private readonly assertMutation: (value?: T) => void = () => undefined,
+    private readonly prepare: (value: T) => T = (value) => value
+  ) {
+    super();
+    if (values) this.initialize(values);
+    return protectBehaviorCollection(this, () => this.assertMutation());
+  }
+
+  initialize(values: Iterable<T>): void {
+    for (const value of values) this.rawAppend(this.prepare(value));
+  }
+
+  private rawAppend(value: T): void {
+    if (super.has(value)) return;
+    super.add(value);
+    const node = { value, prev: this.tail, next: null as T | null };
+    if (this.tail !== null) this.nodes.get(this.tail)!.next = value;
+    else this.head = value;
+    this.tail = value;
+    this.nodes.set(value, node);
+  }
+
+  private rawDelete(value: T): boolean {
+    const node = this.nodes.get(value);
+    if (!node) return false;
+    if (node.prev !== null) this.nodes.get(node.prev)!.next = node.next;
+    else this.head = node.next;
+    if (node.next !== null) this.nodes.get(node.next)!.prev = node.prev;
+    else this.tail = node.prev;
+    this.nodes.delete(value);
+    return super.delete(value);
+  }
+
+  private rawRestore(node: { value: T; prev: T | null; next: T | null }): void {
+    if (super.has(node.value)) return;
+    super.add(node.value);
+    this.nodes.set(node.value, node);
+    if (node.prev !== null) this.nodes.get(node.prev)!.next = node.value;
+    else this.head = node.value;
+    if (node.next !== null) this.nodes.get(node.next)!.prev = node.value;
+    else this.tail = node.value;
+  }
+
+  override add(value: T): this {
+    this.assertMutation(value);
+    const prepared = this.prepare(value);
+    const present = super.has(prepared);
+    if (present) return this;
+    this.beforeMutation(() => {
+      this.rawDelete(prepared);
+    }, prepared);
+    this.rawAppend(prepared);
+    return this;
+  }
+
+  override delete(value: T): boolean {
+    this.assertMutation(value);
+    const node = this.nodes.get(value);
+    if (!node) return false;
+    const before = { ...node };
+    this.beforeMutation(() => {
+      this.rawRestore(before);
+    }, value);
+    return this.rawDelete(value);
+  }
+
+  override clear(): void {
+    // Validate before the O(n) preimage. Raw native clear is unsupported and
+    // must fail in constant time; a permitted clear touches all n members.
+    this.assertMutation();
+    if (super.size === 0) return;
+    const before = Array.from(this.values());
+    this.beforeMutation(() => {
+      this.rawClear();
+      for (const value of before) this.rawAppend(value);
+    });
+    this.rawClear();
+  }
+
+  private rawClear(): void {
+    super.clear();
+    this.nodes.clear();
+    this.head = null;
+    this.tail = null;
+  }
+
+  override *values(): SetIterator<T> {
+    let cursor = this.head;
+    while (cursor !== null) {
+      yield cursor;
+      cursor = this.nodes.get(cursor)?.next ?? null;
+    }
+  }
+
+  override keys(): SetIterator<T> {
+    return this.values();
+  }
+
+  override *entries(): SetIterator<[T, T]> {
+    for (const value of this.values()) yield [value, value];
+  }
+
+  override [Symbol.iterator](): SetIterator<T> {
+    return this.values();
+  }
+
+  override forEach(
+    callbackfn: (value: T, value2: T, set: Set<T>) => void,
+    thisArg?: unknown
+  ): void {
+    for (const value of this.values()) callbackfn.call(thisArg, value, value, this);
+  }
+}
+
+function behaviorMutationArray<T>(
+  values: readonly T[],
+  beforeMutation: (undo: () => void) => void,
+  prepare: (value: T) => T = (value) => value,
+  assertMutation: () => void = () => undefined,
+  register?: (proxy: T[], target: T[]) => void
+): T[] {
+  const target: T[] = [];
+  const truncatedDescriptors = (nextLength: unknown): Array<[string, PropertyDescriptor]> => {
+    if (
+      typeof nextLength !== "number" ||
+      !Number.isInteger(nextLength) ||
+      nextLength < 0 ||
+      nextLength >= target.length
+    ) return [];
+    const deleted: Array<[string, PropertyDescriptor]> = [];
+    for (const ownKey of Reflect.ownKeys(target)) {
+      if (typeof ownKey !== "string") continue;
+      const key = ownKey;
+      if (!/^(0|[1-9]\d*)$/.test(key) || Number(key) < nextLength) continue;
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+      if (descriptor) deleted.push([key, descriptor]);
+    }
+    return deleted;
+  };
+  const restoreTruncated = (
+    beforeLength: number,
+    deleted: Array<[string, PropertyDescriptor]>
+  ): void => {
+    Reflect.set(target, "length", beforeLength);
+    for (const [key, descriptor] of deleted) Reflect.defineProperty(target, key, descriptor);
+  };
+  const preparedAt = (property: PropertyKey): T | undefined => {
+    if (typeof property !== "string" || !/^(0|[1-9]\d*)$/.test(property)) return undefined;
+    const index = Number(property);
+    if (!Number.isSafeInteger(index) || index >= target.length) return undefined;
+    const value = target[index];
+    const prepared = prepare(value);
+    if (prepared !== value) target[index] = prepared;
+    return prepared;
+  };
+  const proxy = new Proxy(target, {
+    get: (target, property, receiver) => {
+      const prepared = preparedAt(property);
+      return prepared === undefined
+        ? Reflect.get(target, property, receiver)
+        : prepared;
+    },
+    getOwnPropertyDescriptor: (target, property) => {
+      preparedAt(property);
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    set: (target, property, value) => {
+      assertMutation();
+      // Array rows are ownership boundaries too: prepare the inserted shell
+      // now, while leaving its descendants lazy.
+      const prepared = property === "length" ? value : prepare(value);
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      const beforeLength = target.length;
+      const truncated = property === "length" ? truncatedDescriptors(prepared) : [];
+      beforeMutation(() => {
+        if (descriptor) Reflect.defineProperty(target, property, descriptor);
+        else {
+          Reflect.deleteProperty(target, property);
+          // Defining a new numeric index extends an array before the engine's
+          // separate length trap runs. Restore the old length as part of this
+          // index inverse or abort leaves a sparse hole (`[null]` on export).
+          Reflect.set(target, "length", beforeLength);
+        }
+        restoreTruncated(beforeLength, truncated);
+      });
+      return Reflect.set(target, property, prepared);
+    },
+    deleteProperty: (target, property) => {
+      assertMutation();
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      beforeMutation(() => {
+        if (descriptor) Reflect.defineProperty(target, property, descriptor);
+      });
+      return Reflect.deleteProperty(target, property);
+    },
+    defineProperty: (target, property, descriptor) => {
+      assertMutation();
+      const before = Reflect.getOwnPropertyDescriptor(target, property);
+      const beforeLength = target.length;
+      const truncated = property === "length" && "value" in descriptor
+        ? truncatedDescriptors(descriptor.value)
+        : [];
+      beforeMutation(() => {
+        if (before) Reflect.defineProperty(target, property, before);
+        else Reflect.deleteProperty(target, property);
+        restoreTruncated(beforeLength, truncated);
+      });
+      const prepared = "value" in descriptor && property !== "length"
+        ? { ...descriptor, value: prepare(descriptor.value) }
+        : descriptor;
+      return Reflect.defineProperty(target, property, prepared);
+    },
+    setPrototypeOf: (target, prototype) => {
+      assertMutation();
+      const before = Reflect.getPrototypeOf(target);
+      beforeMutation(() => {
+        Reflect.setPrototypeOf(target, before);
+      });
+      return Reflect.setPrototypeOf(target, prototype);
+    },
+    preventExtensions: () => {
+      assertMutation();
+      return false;
+    }
+  });
+  // Cache the empty wrapper before preparing members. This makes cycles
+  // finite and preserves shared identity in the authoritative graph.
+  register?.(proxy, target);
+  for (const value of values) target.push(value);
+  return proxy;
+}
+
+function behaviorMutationRecord<T extends object>(
+  value: T,
+  beforeMutation: (undo: () => void) => void,
+  prepare: (value: unknown, property: PropertyKey) => unknown = (item) => item,
+  assertMutation: () => void = () => undefined
+): T {
+  const preparedProperty = (target: T, property: PropertyKey): unknown => {
+    const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+    if (!descriptor || !("value" in descriptor)) return Reflect.get(target, property);
+    const prepared = prepare(descriptor.value, property);
+    if (prepared !== descriptor.value) {
+      Reflect.defineProperty(target, property, { ...descriptor, value: prepared });
+    }
+    return prepared;
+  };
+  return new Proxy(value, {
+    get: (target, property) => preparedProperty(target, property),
+    getOwnPropertyDescriptor: (target, property) => {
+      preparedProperty(target, property);
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    set: (target, property, next) => {
+      assertMutation();
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      beforeMutation(() => {
+        if (descriptor) Reflect.defineProperty(target, property, descriptor);
+        else Reflect.deleteProperty(target, property);
+      });
+      return Reflect.set(target, property, prepare(next, property));
+    },
+    deleteProperty: (target, property) => {
+      assertMutation();
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      beforeMutation(() => {
+        if (descriptor) Reflect.defineProperty(target, property, descriptor);
+      });
+      return Reflect.deleteProperty(target, property);
+    },
+    defineProperty: (target, property, descriptor) => {
+      assertMutation();
+      const before = Reflect.getOwnPropertyDescriptor(target, property);
+      beforeMutation(() => {
+        if (before) Reflect.defineProperty(target, property, before);
+        else Reflect.deleteProperty(target, property);
+      });
+      const prepared = "value" in descriptor
+        ? { ...descriptor, value: prepare(descriptor.value, property) }
+        : descriptor;
+      return Reflect.defineProperty(target, property, prepared);
+    },
+    setPrototypeOf: (target, prototype) => {
+      assertMutation();
+      const before = Reflect.getPrototypeOf(target);
+      beforeMutation(() => {
+        Reflect.setPrototypeOf(target, before);
+      });
+      return Reflect.setPrototypeOf(target, prototype);
+    },
+    preventExtensions: () => {
+      assertMutation();
+      // Freezing/sealing is irreversible inside an inverse-operation journal.
+      // Refuse before the target becomes non-extensible.
+      return false;
+    }
+  });
+}
+
+type BehaviorValueContext = "generic" | "woo_object" | "verb_array" | "verb";
+
+function behaviorMutationValue<T>(
+  value: T,
+  beforeMutation: (undo: () => void) => void,
+  cache: WeakMap<object, unknown>,
+  assertMutation: () => void = () => undefined,
+  context: BehaviorValueContext = "generic"
+): T {
+  // Only values frozen through our recursive freezer are safe to share
+  // without a mutation proxy. A caller can shallow-freeze a container while
+  // leaving mutable children behind, so Object.isFrozen is not sufficient.
+  if (value === null || typeof value !== "object" || isDeeplyFrozen(value)) return value;
+  if (Object.isFrozen(value)) {
+    // A shallow-frozen Woo map cannot be re-pointed at proxies for its mutable
+    // children. Detach it from the caller and journal a mutable plain-data
+    // clone instead; the original frozen wrapper is no longer authoritative.
+    return behaviorMutationValue(
+      cloneValue(value as unknown as WooValue) as unknown as T,
+      beforeMutation,
+      cache,
+      assertMutation,
+      context
+    );
+  }
+  const cached = cache.get(value);
+  if (cached) return cached as T;
+  if (value instanceof Map) {
+    const wrapped = new BehaviorMutationMap(
+      beforeMutation,
+      (item) => behaviorMutationValue(item, beforeMutation, cache, assertMutation),
+      undefined,
+      assertMutation
+    );
+    // Register before preparing entries: a Map can legally contain itself.
+    cache.set(value, wrapped);
+    cache.set(wrapped, wrapped);
+    wrapped.initialize(value);
+    return wrapped as T;
+  }
+  if (value instanceof Set) {
+    const wrapped = new BehaviorMutationSet(
+      beforeMutation,
+      undefined,
+      assertMutation,
+      (item) => behaviorMutationValue(item, beforeMutation, cache, assertMutation)
+    );
+    cache.set(value, wrapped);
+    cache.set(wrapped, wrapped);
+    wrapped.initialize(value);
+    return wrapped as T;
+  }
+  if (Array.isArray(value)) {
+    return behaviorMutationArray(
+      value,
+      beforeMutation,
+      (item) => behaviorMutationValue(
+        item,
+        beforeMutation,
+        cache,
+        assertMutation,
+        context === "verb_array" ? "verb" : "generic"
+      ),
+      assertMutation,
+      (wrapped, target) => {
+        cache.set(value, wrapped);
+        cache.set(target, wrapped);
+        cache.set(wrapped, wrapped);
+      }
+    ) as unknown as T;
+  }
+  // Never rewrite the caller's record in place. Catalog manifests and import
+  // payloads are commonly reused to build more than one world; installing
+  // proxies into those inputs leaks callbacks from the first world and makes
+  // every later world wrap a Proxy-of-Proxy. The eventual symptom is unbounded
+  // JSProxy::GetOwnPropertyDescriptor recursion. A detached target also gives
+  // us somewhere to register the wrapper before recursive descent.
+  const source = value as Record<PropertyKey, unknown>;
+  const prototype = Reflect.getPrototypeOf(source);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("authoritative Woo data cannot contain a non-plain record");
+  }
+  const target = Object.create(prototype) as Record<PropertyKey, unknown>;
+  const wrapped = behaviorMutationRecord(
+    target,
+    beforeMutation,
+    (item, property) => context === "verb" && property === "bytecode"
+      ? item
+      : behaviorMutationValue(
+        item,
+        beforeMutation,
+        cache,
+        assertMutation,
+        context === "woo_object" && property === "verbs" ? "verb_array" : "generic"
+      ),
+    assertMutation
+  );
+  cache.set(value, wrapped);
+  cache.set(target, wrapped);
+  cache.set(wrapped, wrapped);
+  for (const key of Reflect.ownKeys(source)) {
+    if (typeof key === "symbol") {
+      throw new TypeError("authoritative Woo data cannot contain symbol keys");
+    }
+    const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+    if (!descriptor) continue;
+    if (!("value" in descriptor)) {
+      // Do not execute caller-owned accessors while importing authority.
+      throw new TypeError("authoritative Woo data cannot contain accessors");
+    }
+    if (!descriptor.enumerable) {
+      throw new TypeError("authoritative Woo data cannot contain non-enumerable fields");
+    }
+    // Nested containers are wrapped on first read. Ingress seams clone
+    // caller-owned values before they reach this row, so retaining the raw
+    // child here is safe and removes full-graph work from world construction.
+    Reflect.defineProperty(target, key, {
+      value: descriptor.value,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  }
+  return wrapped as T;
+}
 
 type VerbEditorSession = {
   actor: ObjRef;
@@ -541,6 +1193,7 @@ type PersistenceDirtyState = {
   dirtySessions: Set<string>;
   deletedSessions: Set<string>;
   dirtyTombstones: Set<ObjRef>;
+  dirtySnapshots: Map<string, SpaceSnapshotRecord>;
   dirtyCounters: boolean;
   dirty: boolean;
 };
@@ -570,18 +1223,81 @@ export class WooWorld {
   // All effect recording/versioning/apply operations go through this
   // interface; src/net/ supplies an alternative implementation later.
   private readonly effects: TurnEffects = createV2TurnEffects();
-  objects = new Map<ObjRef, WooObject>();
-  sessions = new Map<string, Session>();
-  logs = new Map<ObjRef, SpaceLogEntry[]>();
-  snapshots: SpaceSnapshotRecord[] = [];
+  private behaviorUndoScopes: BehaviorUndoScope[] = [];
+  private lastBehaviorUndoStats: {
+    objects: number;
+    sessions: number;
+    tombstones: number;
+    guestPool: number;
+    snapshots: number;
+  } | null = null;
+  private behaviorObjectProxies = new WeakMap<object, WooObject>();
+  private behaviorSessionProxies = new WeakMap<object, Session>();
+  private behaviorLogProxies = new WeakMap<object, SpaceLogEntry[]>();
+  private behaviorSnapshotProxies = new WeakMap<object, SpaceSnapshotRecord>();
+  private behaviorJournalRestoring = 0;
+  private behaviorMutationPermit = 0;
+  private behaviorJournalAccepting = 0;
+  objects = new BehaviorMutationMap<ObjRef, WooObject>(
+    (undo, id) => this.recordBehaviorUndo(undo, "objects", id),
+    (object) => this.prepareBehaviorObject(object),
+    undefined,
+    (id) => this.assertBehaviorMutationPermitted("objects", id)
+  );
+  sessions = new BehaviorMutationMap<string, Session>(
+    (undo, id) => this.recordBehaviorUndo(undo, "sessions", id),
+    (session) => this.prepareBehaviorSession(session),
+    undefined,
+    (id) => this.assertBehaviorMutationPermitted("sessions", id)
+  );
+  logs = new BehaviorMutationMap<ObjRef, SpaceLogEntry[]>(
+    (undo, id) => this.recordBehaviorUndo(undo, "logs", id),
+    (entries) => this.prepareBehaviorLog(entries),
+    undefined,
+    (id) => this.assertBehaviorMutationPermitted("logs", id)
+  );
+  private snapshotRows: SpaceSnapshotRecord[] = behaviorMutationArray<SpaceSnapshotRecord>(
+    [],
+    (undo) => this.recordBehaviorUndo(undo, "snapshots"),
+    (value) => this.prepareBehaviorSnapshot(value),
+    () => this.assertBehaviorMutationPermitted("snapshots")
+  );
+  get snapshots(): SpaceSnapshotRecord[] {
+    return this.snapshotRows;
+  }
+  set snapshots(rows: SpaceSnapshotRecord[]) {
+    this.assertOutsideBehaviorMutation("snapshots replacement");
+    const isolated = cloneImportedPlainData(rows);
+    this.snapshotRows = behaviorMutationArray(
+      isolated,
+      (undo) => this.recordBehaviorUndo(undo, "snapshots"),
+      (value) => this.prepareBehaviorSnapshot(value),
+      () => this.assertBehaviorMutationPermitted("snapshots")
+    );
+  }
   private nativeHandlers = new Map<string, NativeHandler>();
   private idempotency = new Map<string, { at: number; frame: AppliedFrame | ErrorFrame }>();
+  // A terminal direct wrapper disappears when it transfers into a sequenced
+  // turn. Keep the accepted top-level outcome at the ingress boundary so an
+  // exact retry never re-enters that now-state-dependent wrapper before
+  // callNow's target-turn cache can answer. The binding includes the live
+  // actor/session/frame tuple, while requestFingerprint prevents an unrelated
+  // direct request which reused the frame id from reading this outcome.
+  private terminalTransferIdempotency = new Map<string, {
+    at: number;
+    requestFingerprint: string;
+    frame: AppliedFrame | ErrorFrame;
+  }>();
   private objectCounter = 1;
   private sessionCounter = 1;
   private persistencePaused = 0;
   // Defers whole-world fallback saves while grouped in-memory mutations settle.
   // ObjectRepository-backed worlds persist each touched slice directly.
   private persistenceDeferred = 0;
+  // A behavior savepoint may span awaits, so it cannot hold a synchronous
+  // repository transaction open. While its surrounding call has persistence
+  // paused, even persist(true) remains deferred until behavior acceptance.
+  private behaviorSavepointDepth = 0;
   private persistenceDirty = false;
   private dirtyObjects = new Set<ObjRef>();
   private deletedObjects = new Set<ObjRef>();
@@ -589,10 +1305,15 @@ export class WooWorld {
   private dirtySessions = new Set<string>();
   private deletedSessions = new Set<string>();
   private dirtyTombstones = new Set<ObjRef>();
+  private dirtySnapshots = new Map<string, SpaceSnapshotRecord>();
   private dirtyCounters = false;
   // Tombstoned ULIDs from `recycle()`. Distinct from `objects` having no row,
   // which can also mean "never existed". Per spec/semantics/recycle.md §RC3.9.
-  tombstones = new Set<ObjRef>();
+  tombstones = new BehaviorMutationSet<ObjRef>(
+    (undo, id) => this.recordBehaviorUndo(undo, "tombstones", id),
+    undefined,
+    (id) => this.assertBehaviorMutationPermitted("tombstones", id)
+  );
   // Invalidation token for externally visible state. It is bumped on every
   // path that could change `state(actor)` (object/property/session/task/counter
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
@@ -603,7 +1324,11 @@ export class WooWorld {
    * entries (cheap: just a counter compare on lookup). */
   private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld; digest: string }> = new Map();
   private callDepth = 0;
-  private guestFreePool = new Set<ObjRef>();
+  private guestFreePool = new BehaviorMutationSet<ObjRef>(
+    (undo, id) => this.recordBehaviorUndo(undo, "guestFreePool", id),
+    undefined,
+    (id) => this.assertBehaviorMutationPermitted("guestFreePool", id)
+  );
   private objectRepository: ObjectRepository | null;
   private incrementalPersistenceEnabled = false;
   private executorContext: ExecutorContext | null;
@@ -754,18 +1479,22 @@ export class WooWorld {
   }
 
   setTurnRecorder(recorder: TurnRecorder | null): void {
+    this.assertOutsideBehaviorMutation("setTurnRecorder");
     this.turnRecorder = recorder;
   }
 
   installRoomRosterProjection(room: ObjRef, rows: readonly Record<string, unknown>[]): void {
+    this.assertOutsideBehaviorMutation("installRoomRosterProjection");
     this.roomRosterProjections.set(room, cloneImportedPlainData(rows) as WooValue[]);
   }
 
   setRequireRoomRosterProjection(required: boolean): void {
+    this.assertOutsideBehaviorMutation("setRequireRoomRosterProjection");
     this.requireRoomRosterProjection = required;
   }
 
   setRecordAuthoringCellWrites(enabled: boolean): void {
+    this.assertOutsideBehaviorMutation("setRecordAuthoringCellWrites");
     this.recordAuthoringCellWrites = enabled;
   }
 
@@ -842,6 +1571,7 @@ export class WooWorld {
     if (from) {
       const source = this.roomRosterProjections.get(from);
       if (source) {
+        this.recordTransientRoomRosterPrior(from);
         this.roomRosterProjections.set(from, source.filter((value) =>
           !(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, WooValue>).player === session.actor)
         ));
@@ -849,6 +1579,7 @@ export class WooWorld {
     }
     const destination = this.roomRosterProjections.get(to);
     if (destination === undefined) return;
+    this.recordTransientRoomRosterPrior(to);
     const withoutActor = destination.filter((value) =>
       !(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, WooValue>).player === session.actor)
     );
@@ -870,6 +1601,15 @@ export class WooWorld {
     } as unknown as WooValue]);
   }
 
+  /** Capture the first pre-scope row for a planning-only roster projection.
+   * Replacement is O(1): transition code never mutates the old array in place,
+   * so the exact prior reference remains a safe inverse until commit/abort. */
+  private recordTransientRoomRosterPrior(room: ObjRef): void {
+    const scope = this.behaviorUndoScopes.at(-1);
+    if (!scope || scope.roomRosterProjections.has(room)) return;
+    scope.roomRosterProjections.set(room, this.roomRosterProjections.get(room));
+  }
+
   // ── Owner-computed ordered-children projection ─────────────────────────
   // The ordering analogue of the room roster: net planning fetches the
   // bounded ordered list of a parent's children from the room authority and
@@ -878,6 +1618,7 @@ export class WooWorld {
   // ephemeral planning world holds these; they never persist or export.
 
   installOrderedChildrenProjection(container: ObjRef, parent: ObjRef | null, rows: readonly Record<string, unknown>[]): void {
+    this.assertOutsideBehaviorMutation("installOrderedChildrenProjection");
     this.orderedChildrenProjections.set(
       orderedProjectionKey(container, parent),
       cloneImportedPlainData(rows) as WooValue[]
@@ -885,6 +1626,7 @@ export class WooWorld {
   }
 
   setRequireOrderedChildrenProjection(required: boolean): void {
+    this.assertOutsideBehaviorMutation("setRequireOrderedChildrenProjection");
     this.requireOrderedChildrenProjection = required;
   }
 
@@ -951,6 +1693,7 @@ export class WooWorld {
   }
 
   installOrderedNeighborsProjection(container: ObjRef, query: OrderedNeighborsQuery, value: Record<string, unknown>): void {
+    this.assertOutsideBehaviorMutation("installOrderedNeighborsProjection");
     this.orderedNeighborsProjections.set(
       orderedNeighborsQueryKey(container, query),
       cloneImportedPlainData(value) as WooValue
@@ -963,6 +1706,7 @@ export class WooWorld {
    * the native replay shape (`{seq, ts, actor, message, observations,
    * applied_ok, error?}`). Planning-only, like the ordering projections. */
   installReplayPageProjection(space: ObjRef, from: number, limit: number, entries: readonly Record<string, unknown>[]): void {
+    this.assertOutsideBehaviorMutation("installReplayPageProjection");
     this.replayPageProjections.set(
       replayPageQueryKey({ space, from, limit }),
       cloneImportedPlainData(entries) as WooValue[]
@@ -970,6 +1714,7 @@ export class WooWorld {
   }
 
   setRequireReplayPageProjection(required: boolean): void {
+    this.assertOutsideBehaviorMutation("setRequireReplayPageProjection");
     this.requireReplayPageProjection = required;
   }
 
@@ -1061,6 +1806,18 @@ export class WooWorld {
     return { known: false };
   }
 
+  private noteCreatedThisRun(objRef: ObjRef): void {
+    if (this.createdThisRun.has(objRef)) return;
+    this.createdThisRun.add(objRef);
+    this.behaviorUndoScopes.at(-1)?.createdThisRun.add(objRef);
+  }
+
+  private noteOrderedEdgeWriteThisRun(objRef: ObjRef, prior: PriorOrderingMembership): void {
+    if (this.orderedEdgeWritesThisRun.has(objRef)) return;
+    this.orderedEdgeWritesThisRun.set(objRef, prior);
+    this.behaviorUndoScopes.at(-1)?.orderedEdgeWritesThisRun.add(objRef);
+  }
+
   /** A same-run edge writer's CURRENT edge, or null when the child is
    * recycled/absent or its edge is cleared/malformed. */
   private currentOrderedEdge(child: ObjRef): OrderedEdgeValue | null {
@@ -1115,18 +1872,21 @@ export class WooWorld {
   // Only the sparse gateway planning path supplies this; everything else leaves
   // it null and the destination check is skipped.
   setPlanningCellProvenance(provenance: PlanningWorldProvenance | null): void {
+    this.assertOutsideBehaviorMutation("setPlanningCellProvenance");
     this.planningCellProvenance = provenance;
   }
 
   // CA11.2: enable the opt-in movement-destination owner-repair check (gateway
   // path only — see `enforceMovementOwnerRepair`).
   setEnforceMovementOwnerRepair(enforce: boolean): void {
+    this.assertOutsideBehaviorMutation("setEnforceMovementOwnerRepair");
     this.enforceMovementOwnerRepair = enforce;
   }
 
   // Enable the sparse-gateway contents-read repair check. Kept separate from
   // movement repair because command matching can fail before a move is attempted.
   setEnforceResolutionOwnerRepair(enforce: boolean): void {
+    this.assertOutsideBehaviorMutation("setEnforceResolutionOwnerRepair");
     this.enforceResolutionOwnerRepair = enforce;
   }
 
@@ -1154,6 +1914,7 @@ export class WooWorld {
    * See spec/protocol/v2-turn-network.md §VTN10.1.
    */
   setShadowExecutionGuard(active: boolean): void {
+    this.assertOutsideBehaviorMutation("setShadowExecutionGuard");
     this.shadowExecutionGuardActive = active;
   }
 
@@ -1195,7 +1956,31 @@ export class WooWorld {
   private async withTurnRecording<T>(turn: TurnStart, fn: (active: ActiveTurnRecorder) => Promise<T>): Promise<T> {
     const recorder = this.turnRecorder;
     if (!recorder) {
-      return await fn(this.activeTurnRecorder ?? { event: () => undefined });
+      // Scheduling identity/budget is turn state even when no diagnostic
+      // recorder is installed. Bypassing this reset made ordinary direct calls
+      // share one lifetime budget and clock, eventually failing the 33rd
+      // scheduled call with E_QUOTA while recorder-enabled Net planning worked.
+      const previousScheduleCount = this.turnScheduleCount;
+      const previousScheduleClock = this.turnScheduleClock;
+      const previousScheduleToken = this.turnScheduleToken;
+      this.turnScheduleCount = 0;
+      this.turnScheduleClock = null;
+      this.turnScheduleToken = turn.id
+        ?? hashSource(`${turn.scope}:${turn.seq}:${turn.actor}:${turn.target}:${turn.verb}:${JSON.stringify(turn.args ?? [])}`);
+      try {
+        return await fn(this.activeTurnRecorder ?? {
+          event: () => undefined,
+          beginBehaviorScope: () => undefined,
+          commitBehaviorScope: () => undefined,
+          abortBehaviorScope: () => undefined,
+          currentBehaviorEvents: () => [],
+          discardTurn: () => undefined
+        });
+      } finally {
+        this.turnScheduleCount = previousScheduleCount;
+        this.turnScheduleClock = previousScheduleClock;
+        this.turnScheduleToken = previousScheduleToken;
+      }
     }
     const previous = this.activeTurnRecorder;
     const previousWriter = this.currentTurnWriter;
@@ -1220,7 +2005,32 @@ export class WooWorld {
       active.event({ kind: "turn_finish", ok: true, result: result as WooValue });
       return result;
     } catch (err) {
-      active.event({ kind: "turn_finish", ok: false, error: normalizeError(err) });
+      if (isCommandPlanTransfer(err)) {
+        // The outer direct wrapper is provisional. Its behavior scope has
+        // already rolled back while unwinding here; remove the recorder shell
+        // without manufacturing a failed turn, then let directCallNow install
+        // the target as the sole effective turn.
+        active.discardTurn();
+        throw err;
+      }
+      const error = normalizeError(err);
+      // A sequenced error is an envelope outcome, not a behavior observation.
+      // Record it only after the behavior scope has aborted so it survives
+      // beside the pre-scope sequence allocation while every pre-error
+      // observation is discarded.
+      if (turn.route === "sequenced") {
+        active.event({
+          kind: "observe",
+          observation: {
+            type: "$error",
+            code: error.code,
+            message: error.message ?? error.code,
+            value: error.value ?? null,
+            trace: error.trace ?? []
+          }
+        });
+      }
+      active.event({ kind: "turn_finish", ok: false, error });
       throw err;
     } finally {
       this.activeTurnRecorder = previous;
@@ -1405,7 +2215,22 @@ export class WooWorld {
   }
 
   private recordTurnEvent(event: TurnRecorderEvent): void {
-    this.activeTurnRecorder?.event(this.recordedEventWithWriter(event));
+    const recorded = this.recordedEventWithWriter(event);
+    // Keep only the negative classifier needed by terminal transfer. When a
+    // diagnostic recorder exists it already owns detached proof events; local
+    // no-recorder worlds still reject every non-proof vocabulary kind without
+    // paying to clone all reads on the ordinary direct-call hot path.
+    const behavior = this.behaviorUndoScopes.at(-1);
+    if (
+      behavior &&
+      recorded.kind !== "cell_read" &&
+      recorded.kind !== "prop_read" &&
+      recorded.kind !== "dispatch" &&
+      recorded.kind !== "state_probe"
+    ) {
+      behavior.terminalTransferDisallowedKinds.add(recorded.kind);
+    }
+    this.activeTurnRecorder?.event(recorded);
   }
 
   /** Record one verb page in the same line-map-free shape bridge.ts stores in
@@ -1455,7 +2280,7 @@ export class WooWorld {
   /** Full property-definition cells use `replace`/`delete`, distinct from an
    * ordinary value assignment (`set`) or inherited-value clear (`remove`). */
   private authoredPropertyCellValue(objRef: ObjRef, name: string): WooValue | null {
-    const object = this.object(objRef);
+    const object = this.objectLive(objRef);
     const def = object.propertyDefs.get(name);
     const hasValue = object.properties.has(name);
     if (!def && !hasValue) return null;
@@ -1471,7 +2296,7 @@ export class WooWorld {
       kind: "cell_read",
       cell: { kind: "prop", object: objRef, name },
       value,
-      version: value === null ? "absent" : String(this.object(objRef).propertyVersions.get(name) ?? 0)
+      version: value === null ? "absent" : String(this.objectLive(objRef).propertyVersions.get(name) ?? 0)
     });
   }
 
@@ -1573,7 +2398,7 @@ export class WooWorld {
    * pipeline, not by a runtime turn transcript.
    */
   private mutateLineage(objRef: ObjRef, mutate: () => void): void {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const priorVersion = this.effects.shadowStructuralCellVersion("lifecycle", obj);
     this.recordTurnEvent({
       kind: "cell_read",
@@ -1581,7 +2406,7 @@ export class WooWorld {
       version: priorVersion,
       value: this.lineageSemantic(obj)
     });
-    mutate();
+    this.withBehaviorMutationPermit(mutate);
     const nextVersion = this.effects.shadowStructuralCellVersion("lifecycle", obj);
     this.recordTurnEvent({
       kind: "cell_write",
@@ -1620,6 +2445,7 @@ export class WooWorld {
   }
 
   setLogicalInputsForReplay(inputs: Array<{ name: string; value: WooValue }>): void {
+    this.assertOutsideBehaviorMutation("setLogicalInputsForReplay");
     const queued = new Map<string, WooValue[]>();
     for (const input of inputs) {
       const list = queued.get(input.name) ?? [];
@@ -1654,23 +2480,26 @@ export class WooWorld {
   }
 
   enableIncrementalPersistence(): void {
+    this.assertOutsideBehaviorMutation("enableIncrementalPersistence");
     if (!this.objectRepository) return;
     this.incrementalPersistenceEnabled = true;
     // Rehydrate tombstones from the persistence layer so dangling-ref
     // checks survive process restart. Per spec/reference/persistence.md
     // §14.2.1.
-    for (const id of this.objectRepository.loadTombstones()) {
-      this.tombstones.add(id);
-    }
+    this.withBehaviorMutationPermit(() => {
+      for (const id of this.objectRepository!.loadTombstones()) this.tombstones.add(id);
+    });
   }
 
   discardPendingPersistence(): void {
+    this.assertOutsideBehaviorMutation("discardPendingPersistence");
     this.dirtyObjects.clear();
     this.deletedObjects.clear();
     this.dirtyProperties.clear();
     this.dirtySessions.clear();
     this.deletedSessions.clear();
     this.dirtyTombstones.clear();
+    this.dirtySnapshots.clear();
     this.dirtyCounters = false;
     this.persistenceDirty = false;
   }
@@ -1680,13 +2509,16 @@ export class WooWorld {
   }
 
   markObjectChanged(objRef: ObjRef): void {
-    const obj = this.object(objRef);
-    obj.modified = Date.now();
-    this.persistObject(objRef);
-    this.persist();
+    this.withBehaviorMutationPermit(() => {
+      const obj = this.objectLive(objRef);
+      obj.modified = Date.now();
+      this.persistObject(objRef);
+      this.persist();
+    });
   }
 
   setExecutorContext(bridge: ExecutorContext | null): void {
+    this.assertOutsideBehaviorMutation("setExecutorContext");
     this.executorContext = bridge;
   }
 
@@ -1695,6 +2527,7 @@ export class WooWorld {
    * fall back to "host" — those modes never share chains across hosts so
    * collision is impossible there. */
   setChainOriginPrefix(prefix: string): void {
+    this.assertOutsideBehaviorMutation("setChainOriginPrefix");
     this.chainOriginPrefix = prefix;
   }
 
@@ -1713,6 +2546,7 @@ export class WooWorld {
   // without re-running the verb. Called by core at known hot points. No-op
   // when no hook is set.
   setMetricsHook(hook: ((event: MetricEvent) => void) | null): void {
+    this.assertOutsideBehaviorMutation("setMetricsHook");
     this.metricsHook = hook;
   }
 
@@ -1773,7 +2607,7 @@ export class WooWorld {
     while (cursor && !seen.has(cursor)) {
       if (rawHostPlacement(cursor) === "self") return cursor;
       seen.add(cursor);
-      cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+      cursor = this.objects.has(cursor) ? this.objectLive(cursor).anchor : null;
     }
     return DEFAULT_OBJECT_HOST;
   }
@@ -1819,6 +2653,7 @@ export class WooWorld {
   // seeded by bootstrap with these handler names; this method just plugs in
   // the implementation.
   registerNativeHandler(name: string, handler: NativeHandler): void {
+    this.assertOutsideBehaviorMutation("registerNativeHandler");
     this.nativeHandlers.set(name, handler);
   }
 
@@ -1848,6 +2683,11 @@ export class WooWorld {
      * reaches this method at all. */
     restoring?: boolean;
   }): WooObject {
+    const stored = this.withBehaviorMutationPermit(() => this.createObjectPermitted(input));
+    return this.cloneObjectView(stored);
+  }
+
+  private createObjectPermitted(input: Parameters<WooWorld["createObject"]>[0]): WooObject {
     const existing = this.objects.get(input.id);
     if (existing) return existing;
     // The single mint seam. Every path that introduces a NEW object — the
@@ -1864,7 +2704,7 @@ export class WooWorld {
       owner: input.owner ?? "$wiz",
       location: input.location ?? null,
       anchor: input.anchor ?? null,
-      flags: input.flags ?? {},
+      flags: cloneImportedPlainData(input.flags ?? {}),
       created: now,
       modified: now,
       propertyDefs: new Map(),
@@ -1879,7 +2719,7 @@ export class WooWorld {
     // R1: a planning world knows its own creates, so an ordering read under a
     // created parent synthesizes from this run's edge writes with no fetch,
     // and a created child's pre-write membership is known-empty.
-    if (this.requireOrderedChildrenProjection) this.createdThisRun.add(obj.id);
+    if (this.requireOrderedChildrenProjection) this.noteCreatedThisRun(obj.id);
     if (obj.parent) this.objects.get(obj.parent)?.children.add(obj.id);
     if (obj.location) this.objects.get(obj.location)?.contents.add(obj.id);
     this.persistObject(obj.id);
@@ -1887,12 +2727,15 @@ export class WooWorld {
     if (obj.location) this.persistObject(obj.location);
     this.persist();
     this.recordTurnEvent(this.effects.objectCreateEvent(obj));
-    return obj;
+    // `objects.set` detaches and wraps the row so caller-owned construction
+    // records never become authoritative by alias. Return that stored row;
+    // handing out `obj` here would be a raw, non-journaled mutation bypass.
+    return this.objectLive(obj.id);
   }
 
   canAuthorObject(actor: ObjRef, objRef: ObjRef): boolean {
-    const actorObj = this.object(actor);
-    const target = this.object(objRef);
+    const actorObj = this.objectLive(actor);
+    const target = this.objectLive(objRef);
     return actorObj.flags.wizard === true || (actorObj.flags.programmer === true && target.owner === actor);
   }
 
@@ -1901,7 +2744,14 @@ export class WooWorld {
     throw wooError("E_PERM", `${actor} cannot author ${objRef}`, { actor, obj: objRef });
   }
 
+  /** Caller-facing object reads are detached snapshots. Runtime code uses the
+   * private live accessor below so a returned row can never become an
+   * unjournaled mutation capability merely because it crossed an API seam. */
   object(id: ObjRef): WooObject {
+    return this.cloneObjectView(this.objectLive(id));
+  }
+
+  private objectLive(id: ObjRef): WooObject {
     const obj = this.objects.get(id);
     if (!obj) {
       // VTN10.1: under a sparse guarded shadow executor, an absent id is
@@ -1928,7 +2778,7 @@ export class WooWorld {
    *
    * Callers that walk the parent chain (verb resolution, property
    * inheritance, ancestry enumeration, etc.) MUST use this helper rather
-   * than `this.object(current)`. A single dangling intermediate ref —
+   * than `this.objectLive(current)`. A single dangling intermediate ref —
    * e.g. an instance whose ancestor class was recycled out from under it
    * — would otherwise throw E_OBJNF and break unrelated dispatch on any
    * caller that touched the broken instance. Treating dangling
@@ -2074,9 +2924,20 @@ export class WooWorld {
   }
 
   defineProperty(obj: ObjRef, def: Omit<PropertyDef, "version"> & { version?: number }): PropertyDef {
+    return this.withBehaviorMutationPermit(() => this.definePropertyPermitted(obj, def));
+  }
+
+  private definePropertyPermitted(obj: ObjRef, def: Omit<PropertyDef, "version"> & { version?: number }): PropertyDef {
     this.assertOrdinaryPropertyName(def.name);
-    const target = this.object(obj);
-    const property: PropertyDef = { ...def, version: def.version ?? 1 };
+    const target = this.objectLive(obj);
+    const property: PropertyDef = {
+      ...def,
+      defaultValue: cloneValue(def.defaultValue),
+      ...(def.presenceProjection
+        ? { presenceProjection: cloneImportedPlainData(def.presenceProjection) }
+        : {}),
+      version: def.version ?? 1
+    };
     target.propertyDefs.set(property.name, property);
     if (!target.properties.has(property.name)) {
       target.properties.set(property.name, cloneValue(property.defaultValue));
@@ -2112,8 +2973,12 @@ export class WooWorld {
    * propertyDefs.version (separate counter), so this change does not
    * affect that contract. */
   private setPropLocal(objRef: ObjRef, name: string, value: WooValue): boolean {
+    return this.withBehaviorMutationPermit(() => this.setPropLocalPermitted(objRef, name, value));
+  }
+
+  private setPropLocalPermitted(objRef: ObjRef, name: string, value: WooValue): boolean {
     this.assertOrdinaryPropertyName(name);
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const before = obj.properties.get(name);
     const hadValue = obj.properties.has(name);
     const beforeVersion = this.propertyVersionForRecording(objRef, name);
@@ -2139,7 +3004,7 @@ export class WooWorld {
     // overlay reads the CURRENT value at answer time, so only the original
     // pre-state matters for relevance. No-op equal writes returned above.
     if (this.requireOrderedChildrenProjection && name === ORDERED_EDGE_PROP && !this.orderedEdgeWritesThisRun.has(objRef)) {
-      this.orderedEdgeWritesThisRun.set(objRef, this.priorOrderingMembership(objRef, hadValue, before));
+      this.noteOrderedEdgeWriteThisRun(objRef, this.priorOrderingMembership(objRef, hadValue, before));
     }
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
@@ -2178,7 +3043,7 @@ export class WooWorld {
   }
 
   private presenceProjectionForProperty(objRef: ObjRef, name: string): PresenceProjectionDef | null {
-    return this.presenceProjectionForObjectRecord(this.object(objRef), name);
+    return this.presenceProjectionForObjectRecord(this.objectLive(objRef), name);
   }
 
   isPresenceProjectionProperty(objRef: ObjRef, name: string): boolean {
@@ -2295,7 +3160,9 @@ export class WooWorld {
   private setSessionActiveScope(session: Session, activeScope: ObjRef): boolean {
     if (session.activeScope === activeScope) return false;
     if (this.sessionActiveScopeIndexBuilt) this.unindexSessionActiveScope(session);
-    session.activeScope = activeScope;
+    this.withBehaviorMutationPermit(() => {
+      session.activeScope = activeScope;
+    });
     if (this.sessionActiveScopeIndexBuilt) this.indexSessionActiveScope(session);
     return true;
   }
@@ -2306,8 +3173,82 @@ export class WooWorld {
   }
 
   deleteProp(objRef: ObjRef, name: string): boolean {
+    return this.withBehaviorMutationPermit(() => this.deletePropPermitted(objRef, name));
+  }
+
+  /**
+   * Rename one locally-defined catalog property while preserving its value
+   * and version lineage. Structural catalog migrations run inside the same
+   * rollback boundary as behavior, so they must not reach through `object()`
+   * and mutate the authoritative Maps directly. Keeping this operation here
+   * makes the full rename one journaled unit and keeps incremental persistence
+   * aware of both the removed and replacement property rows.
+   */
+  renameCatalogProperty(objRef: ObjRef, from: string, to: string): boolean {
+    this.assertOrdinaryPropertyName(from);
+    this.assertOrdinaryPropertyName(to);
+    if (from === to) return false;
+    const obj = this.objectLive(objRef);
+    const def = obj.propertyDefs.get(from);
+    const hadValue = obj.properties.has(from);
+    const value = obj.properties.get(from);
+    const hadVersion = obj.propertyVersions.has(from);
+    const version = obj.propertyVersions.get(from);
+    if (!def && !hadValue && !hadVersion) return false;
+    const wasPresenceProjection =
+      this.presenceProjectionForObjectRecord(obj, from) !== null ||
+      this.presenceProjectionForObjectRecord(obj, to) !== null;
+
+    this.withBehaviorMutationPermit(() => {
+      if (def && !obj.propertyDefs.has(to)) {
+        obj.propertyDefs.set(to, { ...def, name: to, version: def.version + 1 });
+      }
+      if (hadValue && !obj.properties.has(to)) obj.properties.set(to, value as WooValue);
+      if (hadVersion && !obj.propertyVersions.has(to)) {
+        obj.propertyVersions.set(to, (version as number) + 1);
+      }
+      obj.propertyDefs.delete(from);
+      obj.properties.delete(from);
+      obj.propertyVersions.delete(from);
+      obj.modified = Date.now();
+    });
+    this.deletePersistedProperty(objRef, from);
+    if (
+      obj.propertyDefs.has(to) ||
+      obj.properties.has(to) ||
+      obj.propertyVersions.has(to)
+    ) {
+      this.persistProperty(objRef, to);
+    }
+    this.persistObject(objRef);
+    if (wasPresenceProjection) this.invalidatePresenceIndex();
+    this.persist();
+    return true;
+  }
+
+  /** Atomic catalog-migration rename for an own verb slot. */
+  renameCatalogVerb(objRef: ObjRef, from: string, to: string): boolean {
+    const obj = this.objectLive(objRef);
+    const index = obj.verbs.findIndex((verb) => verb.name === from);
+    if (index < 0) return false;
+    this.withBehaviorMutationPermit(() => {
+      const verb = obj.verbs[index]!;
+      if (!obj.verbs.some((item) => item.name === to)) {
+        obj.verbs[index] = { ...verb, name: to, version: verb.version + 1 };
+      } else {
+        obj.verbs.splice(index, 1);
+      }
+      obj.verbs = obj.verbs.map((item, slotIndex) => ({ ...item, slot: slotIndex + 1 }));
+      obj.modified = Date.now();
+    });
+    this.persistObject(objRef);
+    this.persist();
+    return true;
+  }
+
+  private deletePropPermitted(objRef: ObjRef, name: string): boolean {
     this.assertOrdinaryPropertyName(name);
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const wasPresenceProjection = this.presenceProjectionForObjectRecord(obj, name) !== null;
     const hadDef = obj.propertyDefs.delete(name);
     const hadValue = obj.properties.delete(name);
@@ -2375,7 +3316,7 @@ export class WooWorld {
       isGuest: (obj) => chainReaches(obj, "$guest"),
       prop: (obj, name) => {
         try {
-          return this.propOrNull(obj, name);
+          return this.propOrNullLive(obj, name);
         } catch {
           return null;
         }
@@ -2386,7 +3327,11 @@ export class WooWorld {
   }
 
   getProp(objRef: ObjRef, name: string): WooValue {
-    const obj = this.object(objRef);
+    return cloneValue(this.getPropLive(objRef, name));
+  }
+
+  private getPropLive(objRef: ObjRef, name: string): WooValue {
+    const obj = this.objectLive(objRef);
     const value = readObjectPropertyValue({
       object: obj,
       name,
@@ -2417,7 +3362,11 @@ export class WooWorld {
    * renumbered live verbs down to 1. See notes/2026-07-27-net-verb-slots.md.
    */
   addVerb(objRef: ObjRef, verb: VerbDef, options: { append?: boolean; slot?: number } = {}): VerbDef {
-    const obj = this.object(objRef);
+    return this.withBehaviorMutationPermit(() => this.addVerbPermitted(objRef, verb, options));
+  }
+
+  private addVerbPermitted(objRef: ObjRef, verb: VerbDef, options: { append?: boolean; slot?: number }): VerbDef {
+    const obj = this.objectLive(objRef);
     const parsedPerms = normalizeVerbPerms(verb.perms, verb.direct_callable === true);
     const existingIndex = this.findOwnVerbIndex(obj, verb.name);
     const slot =
@@ -2428,7 +3377,17 @@ export class WooWorld {
           : existingIndex >= 0
             ? obj.verbs[existingIndex].slot ?? this.nextVerbSlot(obj)
             : this.nextVerbSlot(obj);
-    const normalized = { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable, slot } as VerbDef;
+    const normalized = {
+      ...verb,
+      aliases: [...verb.aliases],
+      arg_spec: cloneImportedPlainData(verb.arg_spec),
+      line_map: cloneImportedPlainData(verb.line_map),
+      ...(verb.calls ? { calls: cloneImportedPlainData(verb.calls) } : {}),
+      perms: parsedPerms.perms,
+      direct_callable: parsedPerms.directCallable,
+      slot,
+      ...(verb.kind === "bytecode" ? { bytecode: importBytecode(verb.bytecode) } : {})
+    } as VerbDef;
     // The page being replaced is the one that holds this slot (an explicit
     // slot rebinds that position) or, by default, the same-named own page.
     // `append` never replaces: it is how the substrate installs an additional
@@ -2452,7 +3411,7 @@ export class WooWorld {
     this.bumpMutationVersion();
     this.persistObject(objRef);
     this.persist();
-    return normalized;
+    return obj.verbs.find((entry) => entry.slot === slot)!;
   }
 
   /** Removing a verb LEAVES ITS SLOT VACANT. Renumbering the survivors would
@@ -2462,7 +3421,11 @@ export class WooWorld {
    * descriptor an agent already holds. Gaps are the honest primitive; only
    * relative ORDER is load-bearing (spec/semantics/core.md §C7.4). */
   removeVerb(objRef: ObjRef, name: string): boolean {
-    const obj = this.object(objRef);
+    return this.withBehaviorMutationPermit(() => this.removeVerbPermitted(objRef, name));
+  }
+
+  private removeVerbPermitted(objRef: ObjRef, name: string): boolean {
+    const obj = this.objectLive(objRef);
     const before = obj.verbs.length;
     obj.verbs = obj.verbs.filter((verb) => verb.name !== name);
     if (obj.verbs.length === before) return false;
@@ -2477,15 +3440,162 @@ export class WooWorld {
     // Keep both name surfaces in sync: WooObject.name (SerializedObject /
     // ScopedObjectSummary) and the inherited "name" property (woocode
     // `this.name`). Different consumers read different surfaces.
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     // `name` lives in the object_lineage cell (and, separately, the inherited
     // "name" property below). Route the lineage-field change through the seam
     // so a Net @rename records the lineage write, not only the property write —
     // otherwise the two name surfaces diverge over Net.
-    this.mutateLineage(objRef, () => { obj.name = name; });
-    obj.modified = Date.now();
+    this.mutateLineage(objRef, () => {
+      obj.name = name;
+      obj.modified = Date.now();
+    });
     this.persistObject(objRef);
     this.setProp(objRef, "name", name);
+  }
+
+  /**
+   * Replace the substrate lineage fields used by catalog installation.
+   * Catalog records are ordinary objects, and an update can run inside a
+   * sequenced behavior turn; routing the replacement through mutateLineage
+   * keeps it journaled and emits the single lifecycle-cell replacement that
+   * the Net planner needs. This deliberately does not synchronize the
+   * inherited `name` property: catalog records historically keep that
+   * separately through their seed/property hooks.
+   */
+  setCatalogObjectLineage(
+    objRef: ObjRef,
+    fields: { name: string; owner: ObjRef; parent: ObjRef; anchor?: ObjRef | null }
+  ): void {
+    const obj = this.objectLive(objRef);
+    const anchor = fields.anchor === undefined ? obj.anchor : fields.anchor;
+    if (obj.name === fields.name && obj.owner === fields.owner && obj.parent === fields.parent && obj.anchor === anchor) return;
+    const oldParent = obj.parent;
+    this.mutateLineage(objRef, () => {
+      if (oldParent !== fields.parent) {
+        if (oldParent && this.objects.has(oldParent)) this.objectLive(oldParent).children.delete(objRef);
+        if (this.objects.has(fields.parent)) this.objectLive(fields.parent).children.add(objRef);
+      }
+      obj.name = fields.name;
+      obj.owner = fields.owner;
+      obj.parent = fields.parent;
+      obj.anchor = anchor;
+      obj.modified = Date.now();
+    });
+    if (oldParent && this.objects.has(oldParent)) this.persistObject(oldParent);
+    if (this.objects.has(fields.parent)) this.persistObject(fields.parent);
+    this.persistObject(objRef);
+    this.persist();
+  }
+
+  /** Apply manifest-owned boolean flags through the behavior journal. */
+  setCatalogObjectFlags(objRef: ObjRef, expectedFlags: Record<string, unknown>): boolean {
+    const obj = this.objectLive(objRef);
+    let changed = false;
+    this.withBehaviorMutationPermit(() => {
+      for (const [flag, expected] of Object.entries(expectedFlags)) {
+        if (typeof expected !== "boolean") continue;
+        const flags = obj.flags as Record<string, boolean | undefined>;
+        if ((flags[flag] === true) === expected) continue;
+        flags[flag] = expected;
+        changed = true;
+      }
+      if (changed) obj.modified = Date.now();
+    });
+    if (changed) {
+      this.persistObject(objRef);
+      this.persist();
+    }
+    return changed;
+  }
+
+  /**
+   * Migration/test-fixture seam for ingress metadata stored on an own verb.
+   * Runtime authoring uses the permission-checked verb-info operations; cold
+   * bootstrap and historical fixtures sometimes need to state the already-
+   * authorized row directly, but must not retain a live alias to that row.
+   */
+  migrationSetVerbExecutionMetadata(
+    objRef: ObjRef,
+    name: string,
+    fields: { directCallable?: boolean; skipPresenceCheck?: boolean }
+  ): boolean {
+    this.assertOutsideBehaviorMutation("migrationSetVerbExecutionMetadata");
+    const obj = this.objectLive(objRef);
+    const verb = obj.verbs.find((candidate) => candidate.name === name);
+    if (!verb) return false;
+    return this.withBehaviorMutationPermit(() => {
+      let changed = false;
+      if (fields.directCallable !== undefined && fields.directCallable !== (verb.direct_callable === true)) {
+        verb.direct_callable = fields.directCallable || undefined;
+        changed = true;
+      }
+      if (fields.skipPresenceCheck !== undefined && fields.skipPresenceCheck !== (verb.skip_presence_check === true)) {
+        verb.skip_presence_check = fields.skipPresenceCheck || undefined;
+        changed = true;
+      }
+      if (!changed) return true;
+      obj.modified = Date.now();
+      this.bumpMutationVersion();
+      this.persistObject(objRef);
+      this.persist();
+      return true;
+    });
+  }
+
+  /** Remove verbs no longer present in a catalog manifest and compact slots. */
+  retainCatalogOwnVerbs(objRef: ObjRef, names: ReadonlySet<string>): boolean {
+    const obj = this.objectLive(objRef);
+    const next = obj.verbs
+      .filter((verb) => names.has(verb.name))
+      .map((verb, index) => ({ ...verb, slot: index + 1 }));
+    if (next.length === obj.verbs.length) return false;
+    this.withBehaviorMutationPermit(() => {
+      obj.verbs = next;
+      obj.modified = Date.now();
+    });
+    this.persistObject(objRef);
+    this.persist();
+    return true;
+  }
+
+  /**
+   * Catalog-repair placement seam, including the nullable `$nowhere` shape
+   * that the ordinary move primitive deliberately does not accept. It also
+   * repairs a missing inverse contents edge when the scalar location already
+   * matches, without exposing raw authoritative Set mutation to the installer.
+   */
+  setCatalogObjectLocation(objRef: ObjRef, targetRef: ObjRef | null): void {
+    const obj = this.objectLive(objRef);
+    const oldLocation = obj.location;
+    const missingInverse = targetRef !== null &&
+      this.objects.has(targetRef) &&
+      !this.objectLive(targetRef).contents.has(objRef);
+    if (oldLocation === targetRef && !missingInverse) return;
+    const locationPrior = this.structuralVersionForRecording("location", objRef);
+    this.withBehaviorMutationPermit(() => {
+      if (oldLocation && oldLocation !== targetRef && this.objects.has(oldLocation)) {
+        this.objectLive(oldLocation).contents.delete(objRef);
+      }
+      obj.location = targetRef;
+      if (targetRef && this.objects.has(targetRef)) this.objectLive(targetRef).contents.add(objRef);
+      obj.modified = Date.now();
+    });
+    this.persistObject(objRef);
+    if (oldLocation && this.objects.has(oldLocation)) this.persistObject(oldLocation);
+    if (targetRef && this.objects.has(targetRef)) this.persistObject(targetRef);
+    if (oldLocation !== targetRef) {
+      if (targetRef) {
+        this.recordTurnEvent({ kind: "object_move", object: objRef, from: oldLocation, to: targetRef });
+      }
+      this.recordTurnEvent({
+        kind: "cell_write",
+        cell: { kind: "location", object: objRef },
+        value: targetRef,
+        op: targetRef ? "move" : "delete",
+        prior: locationPrior
+      });
+    }
+    this.persist();
   }
 
   /**
@@ -2513,22 +3623,65 @@ export class WooWorld {
    * cycle checks and require both endpoints to be locally reachable.
    */
   migrationSetObjectParent(objRef: ObjRef, newParent: ObjRef): boolean {
-    const obj = this.objects.get(objRef);
-    if (!obj) return false;
-    if (obj.parent === newParent) return false;
-    if (obj.parent && this.objects.has(obj.parent)) {
-      this.object(obj.parent).children.delete(objRef);
-      this.persistObject(obj.parent);
-    }
-    obj.parent = newParent;
-    if (this.objects.has(newParent)) {
-      this.object(newParent).children.add(objRef);
-      this.persistObject(newParent);
-    }
-    obj.modified = Date.now();
-    this.persistObject(objRef);
-    this.persist();
-    return true;
+    return this.withBehaviorMutationPermit(() => {
+      const obj = this.objects.get(objRef);
+      if (!obj) return false;
+      if (obj.parent === newParent) return false;
+      if (obj.parent && this.objects.has(obj.parent)) {
+        this.objectLive(obj.parent).children.delete(objRef);
+        this.persistObject(obj.parent);
+      }
+      obj.parent = newParent;
+      if (this.objects.has(newParent)) {
+        this.objectLive(newParent).children.add(objRef);
+        this.persistObject(newParent);
+      }
+      obj.modified = Date.now();
+      this.persistObject(objRef);
+      this.persist();
+      return true;
+    });
+  }
+
+  /** Migration/install-only anchor rewrite. Runtime authority placement uses
+   * creation-time anchors; this seam exists for bounded local repair and
+   * test/installation fixtures that deliberately model an older placement. */
+  migrationSetObjectAnchor(objRef: ObjRef, anchor: ObjRef | null): boolean {
+    return this.withBehaviorMutationPermit(() => {
+      const obj = this.objects.get(objRef);
+      if (!obj || obj.anchor === anchor) return false;
+      obj.anchor = anchor;
+      obj.modified = Date.now();
+      this.persistObject(objRef);
+      this.persist();
+      return true;
+    });
+  }
+
+  /** Migration/test-fixture owner rewrite. Ordinary ownership changes must use
+   * the checked authoring path; this reconstructs an explicitly historical
+   * lineage row without handing callers the live object as a capability. */
+  migrationSetObjectOwner(objRef: ObjRef, owner: ObjRef): boolean {
+    this.assertOutsideBehaviorMutation("migrationSetObjectOwner");
+    return this.withBehaviorMutationPermit(() => {
+      const obj = this.objects.get(objRef);
+      if (!obj || obj.owner === owner) return false;
+      obj.owner = owner;
+      obj.modified = Date.now();
+      this.persistObject(objRef);
+      this.persist();
+      return true;
+    });
+  }
+
+  /** Migration/test-fixture tombstone seam. Runtime recycling must use the
+   * checked recycle path; this only reconstructs a known historical marker. */
+  migrationSetTombstone(objRef: ObjRef, present: boolean): void {
+    this.assertOutsideBehaviorMutation("migrationSetTombstone");
+    this.withBehaviorMutationPermit(() => {
+      if (present) this.tombstones.add(objRef);
+      else this.tombstones.delete(objRef);
+    });
   }
 
   /**
@@ -2563,7 +3716,7 @@ export class WooWorld {
     if (typeof name !== "string" || name.length === 0) {
       throw wooError("E_INVARG", "set_object_name requires a non-empty string", name);
     }
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     if (!this.isWizard(actor) && obj.owner !== actor) {
       throw wooError("E_PERM", `${actor} cannot rename ${objRef}`, { actor, obj: objRef });
     }
@@ -2571,11 +3724,13 @@ export class WooWorld {
   }
 
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
-    return this.ownVerbNamed(objRef, name);
+    const found = this.ownVerbNamed(objRef, name);
+    return found ? this.cloneVerbSharingBytecode(found) : null;
   }
 
   ownVerbExact(objRef: ObjRef, name: string): VerbDef | null {
-    return this.object(objRef).verbs.find((verb) => verb.name === name) ?? null;
+    const found = this.objectLive(objRef).verbs.find((verb) => verb.name === name);
+    return found ? this.cloneVerbSharingBytecode(found) : null;
   }
 
   private findOwnVerbIndex(obj: WooObject, name: string): number {
@@ -2605,7 +3760,11 @@ export class WooWorld {
   }
 
   defineEventSchema(objRef: ObjRef, type: string, shape: Record<string, WooValue>): void {
-    const obj = this.object(objRef);
+    this.withBehaviorMutationPermit(() => this.defineEventSchemaPermitted(objRef, type, shape));
+  }
+
+  private defineEventSchemaPermitted(objRef: ObjRef, type: string, shape: Record<string, WooValue>): void {
+    const obj = this.objectLive(objRef);
     obj.eventSchemas.set(type, cloneValue(shape as WooValue) as Record<string, WooValue>);
     obj.modified = Date.now();
     this.persistObject(objRef);
@@ -2641,6 +3800,11 @@ export class WooWorld {
   }
 
   resolveVerb(objRef: ObjRef, name: string): ResolvedVerb {
+    const resolved = this.resolveVerbLive(objRef, name);
+    return { definer: resolved.definer, verb: this.cloneVerbSharingBytecode(resolved.verb) };
+  }
+
+  private resolveVerbLive(objRef: ObjRef, name: string): ResolvedVerb {
     // Dispatching to a recycled/tombstoned target must raise E_OBJNF, not
     // fall through to E_VERBNF. The parent-chain walk inside
     // resolveVerbFrom tolerates missing *intermediate* ancestors (so
@@ -2649,12 +3813,12 @@ export class WooWorld {
     // "no stale-dispatch window" guarantee that tests/recycle.test.ts
     // relies on for callers that hold the target ULID after recycle.
     if (!this.objects.has(objRef)) throw wooError("E_OBJNF", `object not found: ${objRef}`, objRef);
-    const parentMatch = this.resolveVerbFrom(objRef, name, false);
+    const parentMatch = this.resolveVerbFromLive(objRef, name, false);
     if (parentMatch) return parentMatch;
     if (this.canCarryFeatures(objRef)) {
       const features = this.featureList(objRef);
       for (const feature of features) {
-        const featureMatch = this.resolveVerbFrom(feature, name, false);
+        const featureMatch = this.resolveVerbFromLive(feature, name, false);
         if (featureMatch) return featureMatch;
       }
     }
@@ -2664,6 +3828,17 @@ export class WooWorld {
   resolveVerbFrom(startRef: ObjRef | null, name: string): ResolvedVerb;
   resolveVerbFrom(startRef: ObjRef | null, name: string, required: false): ResolvedVerb | null;
   resolveVerbFrom(startRef: ObjRef | null, name: string, required = true): ResolvedVerb | null {
+    const resolved = required
+      ? this.resolveVerbFromLive(startRef, name)
+      : this.resolveVerbFromLive(startRef, name, false);
+    return resolved
+      ? { definer: resolved.definer, verb: this.cloneVerbSharingBytecode(resolved.verb) }
+      : null;
+  }
+
+  private resolveVerbFromLive(startRef: ObjRef | null, name: string): ResolvedVerb;
+  private resolveVerbFromLive(startRef: ObjRef | null, name: string, required: false): ResolvedVerb | null;
+  private resolveVerbFromLive(startRef: ObjRef | null, name: string, required = true): ResolvedVerb | null {
     let current: ObjRef | null = startRef;
     while (current) {
       const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
@@ -2678,11 +3853,11 @@ export class WooWorld {
   }
 
   describe(objRef: ObjRef): Record<string, WooValue> {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     return {
       id: obj.id,
       name: obj.name,
-      description: this.propOrNull(objRef, "description"),
+      description: this.propOrNullLive(objRef, "description"),
       parent: obj.parent,
       owner: obj.owner,
       location: obj.location,
@@ -2715,7 +3890,7 @@ export class WooWorld {
     const names = new Set<string>();
     let current: ObjRef | null = objRef;
     while (current) {
-      const obj: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      const obj: WooObject | null = current === objRef ? this.objectLive(current) : this.parentWalkLookup(objRef, current);
       if (!obj) break;
       for (const name of obj.propertyDefs.keys()) names.add(name);
       for (const name of obj.properties.keys()) names.add(name);
@@ -2726,7 +3901,7 @@ export class WooWorld {
 
   getPropForActor(actor: ObjRef, objRef: ObjRef, name: string): WooValue {
     if (!this.canReadProperty(actor, objRef, name)) throw wooError("E_PERM", `${actor} cannot read ${objRef}.${name}`, { actor, obj: objRef, property: name });
-    return this.getProp(objRef, name);
+    return cloneValue(this.getPropLive(objRef, name));
   }
 
   canReadProperty(actor: ObjRef, objRef: ObjRef, name: string): boolean {
@@ -2749,7 +3924,7 @@ export class WooWorld {
     if (!this.canReadProperty(progr, objRef, name)) {
       throw wooError("E_PERM", `${progr} cannot read ${objRef}.${name}`, { progr, obj: objRef, property: name });
     }
-    return this.getProp(objRef, name);
+    return this.getPropLive(objRef, name);
   }
 
   async collectPropChecked(progr: ObjRef, objRefs: ObjRef[], name: string, memo?: HostOperationMemo, options: { parallel?: boolean } = {}): Promise<WooValue[]> {
@@ -2775,7 +3950,7 @@ export class WooWorld {
       }
     } catch (err) {
       if (!isErrorValue(err) || err.code !== "E_PROPNF") throw err;
-      const obj = this.object(objRef);
+      const obj = this.objectLive(objRef);
       if (!this.canBypassPerms(progr) && obj.owner !== progr) {
         throw wooError("E_PERM", `${progr} cannot create ${objRef}.${name}`, { progr, obj: objRef, property: name });
       }
@@ -2788,7 +3963,7 @@ export class WooWorld {
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `cross-host property definitions are not atomic: ${objRef}.${def.name}`, { progr, obj: objRef, property: def.name });
     }
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const wizard = this.canBypassPerms(progr);
     if (!wizard && obj.owner !== progr) {
       throw wooError("E_PERM", `${progr} cannot define properties on ${objRef}`, { progr, obj: objRef, property: def.name });
@@ -2809,16 +3984,18 @@ export class WooWorld {
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `cross-host property definitions are not atomic: ${objRef}.${name}`, { progr, obj: objRef, property: name });
     }
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const def = obj.propertyDefs.get(name);
     if (!def) throw wooError("E_PROPNF", `property not defined on ${objRef}: ${name}`, { obj: objRef, property: name });
     if (!this.canBypassPerms(progr) && obj.owner !== progr && def.owner !== progr) {
       throw wooError("E_PERM", `${progr} cannot undefine ${objRef}.${name}`, { progr, obj: objRef, property: name });
     }
-    obj.propertyDefs.delete(name);
-    obj.properties.delete(name);
-    obj.propertyVersions.delete(name);
-    obj.modified = Date.now();
+    this.withBehaviorMutationPermit(() => {
+      obj.propertyDefs.delete(name);
+      obj.properties.delete(name);
+      obj.propertyVersions.delete(name);
+      obj.modified = Date.now();
+    });
     this.persistObject(objRef);
     this.persist();
   }
@@ -2830,7 +4007,7 @@ export class WooWorld {
     }
     const currentInfo = this.propertyInfo(objRef, name);
     const definedOn = assertObj(currentInfo.defined_on);
-    const obj = this.object(definedOn);
+    const obj = this.objectLive(definedOn);
     const def = obj.propertyDefs.get(name);
     if (!def) throw wooError("E_PROPNF", `property not found: ${name}`, name);
 
@@ -2845,14 +4022,16 @@ export class WooWorld {
     if (wantsOwner && !wizard && !owner && !def.perms.includes("c")) {
       throw wooError("E_PERM", `${progr} cannot change owner for ${definedOn}.${name}`, { progr, obj: definedOn, property: name });
     }
-    if (typeof info.owner === "string") {
-      this.object(info.owner);
-      def.owner = info.owner;
-    }
-    if (typeof info.perms === "string") def.perms = info.perms;
-    if (typeof info.type_hint === "string") def.typeHint = info.type_hint;
-    def.version += 1;
-    obj.modified = Date.now();
+    this.withBehaviorMutationPermit(() => {
+      if (typeof info.owner === "string") {
+        this.objectLive(info.owner);
+        def.owner = info.owner;
+      }
+      if (typeof info.perms === "string") def.perms = info.perms;
+      if (typeof info.type_hint === "string") def.typeHint = info.type_hint;
+      def.version += 1;
+      obj.modified = Date.now();
+    });
     this.persistObject(definedOn);
     this.persist();
   }
@@ -2866,8 +4045,12 @@ export class WooWorld {
   }
 
   propOrNull(objRef: ObjRef, name: string): WooValue {
+    return cloneValue(this.propOrNullLive(objRef, name));
+  }
+
+  private propOrNullLive(objRef: ObjRef, name: string): WooValue {
     try {
-      return this.getProp(objRef, name);
+      return this.getPropLive(objRef, name);
     } catch {
       return null;
     }
@@ -2886,14 +4069,14 @@ export class WooWorld {
   // Mirrors LambdaMOO's `verbs(obj)` which lists only verbs defined
   // directly on `obj`. Returns slot-order names.
   ownVerbNames(objRef: ObjRef): string[] {
-    return this.object(objRef).verbs.map((verb) => verb.name);
+    return this.objectLive(objRef).verbs.map((verb) => verb.name);
   }
 
   // Ancestor chain starting from the immediate parent up through the root.
   // Excludes `obj` itself. Empty list for objects with no parent ($system).
   parents(objRef: ObjRef): ObjRef[] {
     const out: ObjRef[] = [];
-    let current = this.object(objRef).parent;
+    let current = this.objectLive(objRef).parent;
     while (current) {
       out.push(current);
       const parent = this.objects.get(current)?.parent ?? null;
@@ -2903,7 +4086,7 @@ export class WooWorld {
   }
 
   childrenOf(objRef: ObjRef): ObjRef[] {
-    return Array.from(this.object(objRef).children);
+    return Array.from(this.objectLive(objRef).children);
   }
 
   // True iff `obj` denotes a live, non-recycled object reference.
@@ -2920,7 +4103,7 @@ export class WooWorld {
   // gaps after removeVerb, so index-addressing would silently answer with a
   // neighbour once anything had been deleted (spec/semantics/core.md §C7.4).
   ownVerbResolve(objRef: ObjRef, descriptor: WooValue): VerbDef {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     if (typeof descriptor === "number") {
       if (!Number.isInteger(descriptor) || descriptor < 1) {
         throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
@@ -3168,7 +4351,7 @@ export class WooWorld {
   // Own-only property names defined directly on `objRef` (no inheritance).
   // Mirrors LambdaMOO's `properties(obj)`. Sorted for stability.
   ownPropertyNames(objRef: ObjRef): string[] {
-    return Array.from(this.object(objRef).propertyDefs.keys()).sort();
+    return Array.from(this.objectLive(objRef).propertyDefs.keys()).sort();
   }
 
   // LambdaMOO `add_property(obj, name, value, info)`. Defines a new
@@ -3218,7 +4401,7 @@ export class WooWorld {
   // E_PROPNF if the property is not defined anywhere on the chain.
   isClearProperty(objRef: ObjRef, name: string): boolean {
     this.propertyInfo(objRef, name);
-    return !this.object(objRef).properties.has(name);
+    return !this.objectLive(objRef).properties.has(name);
   }
 
   // LambdaMOO `clear_property(obj, name)`. Removes the local value
@@ -3233,13 +4416,15 @@ export class WooWorld {
     if (!this.canWriteProperty(actor, objRef, name)) {
       throw wooError("E_PERM", `${actor} cannot clear ${objRef}.${name}`, { actor, obj: objRef, property: name });
     }
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     if (!obj.properties.has(name)) return;
     const beforeVersion = this.propertyVersionForRecording(objRef, name);
     const presenceProjection = this.presenceProjectionForProperty(objRef, name);
-    obj.properties.delete(name);
-    obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
-    obj.modified = Date.now();
+    this.withBehaviorMutationPermit(() => {
+      obj.properties.delete(name);
+      obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
+      obj.modified = Date.now();
+    });
     if (presenceProjection) {
       this.invalidatePresenceIndex();
     } else {
@@ -3324,7 +4509,7 @@ export class WooWorld {
   }
 
   verbInfo(objRef: ObjRef, name: string): Record<string, WooValue> {
-    const { definer, verb } = this.resolveVerb(objRef, name);
+    const { definer, verb } = this.resolveVerbLive(objRef, name);
     const base: Record<string, WooValue> = {
       name: verb.name,
       slot: verb.slot ?? 0,
@@ -3349,7 +4534,7 @@ export class WooWorld {
 
   propertyInfo(objRef: ObjRef, name: string): Record<string, WooValue> {
     if (name === "owner") {
-      const obj = this.object(objRef);
+      const obj = this.objectLive(objRef);
       return {
         name,
         owner: obj.owner,
@@ -3368,7 +4553,7 @@ export class WooWorld {
     // Without this, $system.name (no def in parent chain) raises E_PROPNF
     // through canReadProperty before getProp's attribute fallback runs.
     {
-      const obj = this.object(objRef);
+      const obj = this.objectLive(objRef);
       let walker: ObjRef | null = objRef;
       let hasDef = false;
       while (walker) {
@@ -3392,7 +4577,7 @@ export class WooWorld {
     }
     let current: ObjRef | null = objRef;
     while (current) {
-      const obj: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      const obj: WooObject | null = current === objRef ? this.objectLive(current) : this.parentWalkLookup(objRef, current);
       if (!obj) break;
       const def = obj.propertyDefs.get(name);
       if (def) {
@@ -3409,13 +4594,13 @@ export class WooWorld {
           // opts.expected_version): the def version doesn't change
           // when a value is updated, so it isn't the right key for
           // stale-write rejection.
-          value_version: this.object(objRef).propertyVersions.get(name) ?? 0,
-          has_value: this.object(objRef).properties.has(name)
+          value_version: this.objectLive(objRef).propertyVersions.get(name) ?? 0,
+          has_value: this.objectLive(objRef).properties.has(name)
         };
       }
       current = obj.parent;
     }
-    const target = this.object(objRef);
+    const target = this.objectLive(objRef);
     if (target.properties.has(name)) {
       const valueVersion = target.propertyVersions.get(name) ?? 1;
       return {
@@ -3442,6 +4627,10 @@ export class WooWorld {
   }
 
   auth(token: string): Session {
+    return this.cloneSessionView(this.authLive(token));
+  }
+
+  private authLive(token: string): Session {
     this.reapExpiredSessions();
     if (token.startsWith("session:")) {
       const session = this.sessions.get(token.slice("session:".length));
@@ -3462,7 +4651,7 @@ export class WooWorld {
       const tokenClass = this.tokenClassFor(token);
       const actor = this.allocateGuest();
       this.placeAllocatedGuest(actor);
-      return this.createSessionForActor(actor, tokenClass);
+      return this.createSessionForActorLive(actor, tokenClass);
     }
 
   // Move a freshly-allocated guest into the room named by `$system.guest_initial_room`,
@@ -3473,7 +4662,7 @@ export class WooWorld {
     const obj = this.objects.get(actor);
     if (!obj) return;
     if (obj.location && obj.location !== "$nowhere") return;
-    const configured = this.propOrNull("$system", "guest_initial_room");
+    const configured = this.propOrNullLive("$system", "guest_initial_room");
     if (typeof configured !== "string" || !configured) return;
     if (configured === actor) return;
     if (!this.objects.has(configured)) return;
@@ -3512,13 +4701,13 @@ export class WooWorld {
       // a key with N concurrent sessions still gets one timestamp.
       this.touchApiKeyLastSeen(id, routed?.actor ?? null);
       if (this.isAgentObject(actor)) this.setProp(actor, "last_seen_at", Date.now());
-      return this.createSessionForActor(actor, "apikey", id);
+      return this.createSessionForActorLive(actor, "apikey", id);
     }
 
     private authBearer(token: string): Session {
       if (!token) throw wooError("E_NOSESSION", "bearer token is empty");
     this.gcPendingCredentials();
-      const raw = this.propOrNull("$system", "bearer_tokens");
+      const raw = this.propOrNullLive("$system", "bearer_tokens");
       const map = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, WooValue> : {};
       const tokenHash = this.bearerTokenHash(token);
       let record = map[tokenHash];
@@ -3542,7 +4731,7 @@ export class WooWorld {
         migrated[tokenHash] = { ...r, token_hash: tokenHash } as WooValue;
         this.setProp("$system", "bearer_tokens", migrated as WooValue);
       }
-      return this.createSessionForActor(actor, "bearer");
+      return this.createSessionForActorLive(actor, "bearer");
     }
 
   /** Wizard-only: mint an apikey bound to any $actor descendant. */
@@ -3569,7 +4758,7 @@ export class WooWorld {
     if (!id || id.includes(":")) throw wooError("E_INVARG", "apikey id must be non-empty and must not contain ':'", { id });
     if (!secret) throw wooError("E_INVARG", "apikey secret must be non-empty");
 
-    const raw = this.propOrNull("$system", "api_keys");
+    const raw = this.propOrNullLive("$system", "api_keys");
     const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
     const existing = map[id];
     if (existing && typeof existing === "object" && !Array.isArray(existing)) {
@@ -3606,7 +4795,7 @@ export class WooWorld {
    * can be configured by their creator without wizard escalation. */
   createApiKeyForOwner(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     this.assertApiKeyTarget(target);
-    if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
+    if (!this.canBypassPerms(actor) && this.objectLive(target).owner !== actor) {
       throw wooError("E_PERM", "owner-mint requires the calling actor to own the target", { actor, target });
     }
     return this.createApiKeyRecord(actor, target, label, "create_api_key_for_owner");
@@ -3696,7 +4885,7 @@ export class WooWorld {
     const r = rec as Record<string, WooValue>;
     const targetActor = String(r.actor ?? "");
     const isWizard = this.canBypassPerms(actor);
-    const isOwner = targetActor && this.objects.has(targetActor) && this.object(targetActor).owner === actor;
+    const isOwner = targetActor && this.objects.has(targetActor) && this.objectLive(targetActor).owner === actor;
     if (!isWizard && !isOwner) {
       throw wooError("E_PERM", "revoke requires wizard authority or ownership of the bound actor", { actor, key_id: id });
     }
@@ -3767,7 +4956,7 @@ export class WooWorld {
     if (!this.isActorDescendant(target)) {
       throw wooError("E_TYPE", `apikey listing target must be an $actor descendant: ${target}`, target);
     }
-    if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
+    if (!this.canBypassPerms(actor) && this.objectLive(target).owner !== actor) {
       throw wooError("E_PERM", "apikey listing requires wizard authority or ownership of the bound actor", { actor, target });
     }
     return this.collectApiKeyMetadata(this.apiKeyMap(target));
@@ -3791,14 +4980,14 @@ export class WooWorld {
   }
 
   private legacyApiKeyMap(): Record<string, WooValue> {
-    const raw = this.propOrNull("$system", "api_keys");
+    const raw = this.propOrNullLive("$system", "api_keys");
     return raw && typeof raw === "object" && !Array.isArray(raw)
       ? raw as Record<string, WooValue>
       : {};
   }
 
   private apiKeyMap(actor: ObjRef): Record<string, WooValue> {
-    const raw = this.propOrNull(actor, "api_keys");
+    const raw = this.propOrNullLive(actor, "api_keys");
     return raw && typeof raw === "object" && !Array.isArray(raw)
       ? raw as Record<string, WooValue>
       : {};
@@ -3823,7 +5012,7 @@ export class WooWorld {
     while (this.objects.has(root)) {
       if (seen.has(root)) throw wooError("E_LINEAGE", "authority anchor cycles", { actor, root });
       seen.add(root);
-      const anchor = this.object(root).anchor;
+      const anchor = this.objectLive(root).anchor;
       if (!anchor) return root;
       root = anchor;
     }
@@ -3836,7 +5025,7 @@ export class WooWorld {
     if (!email) throw wooError("E_INVARG", "signup requires an email address");
     if (password.length < 8) throw wooError("E_INVARG", "password must be at least 8 characters");
     if (this.findAccountByEmail(email)) throw wooError("E_EXISTS", "account already exists for email", email);
-    if (this.propOrNull("$system", "signup_invite_required") === true) this.consumeSignupInvite(options.inviteCode ?? null);
+    if (this.propOrNullLive("$system", "signup_invite_required") === true) this.consumeSignupInvite(options.inviteCode ?? null);
 
     const account = this.createProvisionedObjectId("account");
     const now = Date.now();
@@ -3873,16 +5062,18 @@ export class WooWorld {
     const entry = pending[index];
     if (entry.expires_at < now) throw wooError("E_TOKEN_EXPIRED", "verification token has expired");
     const account = entry.account_id;
-    this.object(account);
+    this.objectLive(account);
     let actor: ObjRef | null = null;
     let promotedGuest = false;
     if (guestSessionId) {
       const session = this.sessions.get(guestSessionId);
       if (session && this.objects.has(session.actor) && this.inheritsFrom(session.actor, "$guest")) {
         actor = session.actor;
-        this.guestFreePool.delete(actor);
+        this.withBehaviorMutationPermit(() => this.guestFreePool.delete(actor!));
         this.chparentLocal(actor, "$human");
-        this.object(actor).owner = actor;
+        this.withBehaviorMutationPermit(() => {
+          this.objectLive(actor!).owner = actor!;
+        });
         this.markObjectDirty(actor);
         promotedGuest = true;
       }
@@ -3893,7 +5084,7 @@ export class WooWorld {
     this.bindHumanToAccount(actor, account, now);
     this.setProp("$system", "pending_email_verifications", pending.filter((_, i) => i !== index) as unknown as WooValue);
     const bearer = this.issueBearerToken(actor, account);
-    const session = this.createSessionForActor(actor, "bearer");
+    const session = this.createSessionForActorLive(actor, "bearer");
     this.recordWizardAction("$system", "signup_verified", { account, actor, promoted_guest: promotedGuest });
     return { account, actor, bearer, session, promoted_guest: promotedGuest };
   }
@@ -3903,15 +5094,15 @@ export class WooWorld {
     const email = normalizeEmail(emailInput);
     const account = this.findAccountByEmail(email);
     if (!account) throw wooError("E_NOSESSION", "invalid email or password");
-    if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_NOSESSION", "account is deactivated");
-    const expected = String(this.propOrNull(account, "password_hash") ?? "");
+    if (this.propOrNullLive(account, "deactivated_at") != null) throw wooError("E_NOSESSION", "account is deactivated");
+    const expected = String(this.propOrNullLive(account, "password_hash") ?? "");
     if (!await verifyPassword(password, expected)) {
       throw wooError("E_NOSESSION", "invalid email or password");
     }
-    const actor = assertObj(this.propOrNull(account, "primary_actor"));
+    const actor = assertObj(this.propOrNullLive(account, "primary_actor"));
     if (!this.actorCanAuthenticate(actor)) throw wooError("E_NOSESSION", "actor is deactivated");
     const bearer = this.issueBearerToken(actor, account);
-    const session = this.createSessionForActor(actor, "bearer");
+    const session = this.createSessionForActorLive(actor, "bearer");
     return { account, actor, bearer, session };
   }
 
@@ -3921,7 +5112,7 @@ export class WooWorld {
     if (!state) throw wooError("E_INVARG", "state nonce is required");
     if (!profileId) throw wooError("E_INVARG", "profile_id is required");
     this.consumeProvisionState(state);
-    const account = assertObj(this.propOrNull(actor, "account"));
+    const account = assertObj(this.propOrNullLive(actor, "account"));
     let agent = this.findHermesAgent(actor, profileId);
     let created = false;
     let apiKeyResult: { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number };
@@ -3938,7 +5129,7 @@ export class WooWorld {
       apiKeyResult = { id: rotated.id, secret: rotated.secret, actor: agent, label: rotated.label, created_at: rotated.created_at };
     }
     const api_key = `apikey:${apiKeyResult.id}:${apiKeyResult.secret}`;
-    const mcp_url = String(this.propOrNull("$system", "mcp_endpoint_url") ?? "/mcp");
+    const mcp_url = String(this.propOrNullLive("$system", "mcp_endpoint_url") ?? "/mcp");
     const redirect_url = appendQuery(returnUrl, { state, actor_id: agent, api_key, mcp_url });
     this.recordWizardAction(actor, created ? "hermes_agent_created" : "hermes_agent_reconnected", { account, actor: agent, profile_id: profileId });
     return { actor_id: agent, api_key, mcp_url, redirect_url, created };
@@ -3949,7 +5140,7 @@ export class WooWorld {
     const token = randomHex(32);
     const tokenHash = this.bearerTokenHash(token);
     const expiresAt = Date.now() + 60 * 60_000;
-    const raw = this.propOrNull("$system", "bearer_tokens");
+    const raw = this.propOrNullLive("$system", "bearer_tokens");
     const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
     map[tokenHash] = { token_hash: tokenHash, actor, account, expires_at: expiresAt, created_at: Date.now() } as WooValue;
     this.setProp("$system", "bearer_tokens", map as WooValue);
@@ -3962,13 +5153,13 @@ export class WooWorld {
 
   private actorCanAuthenticate(actor: ObjRef): boolean {
     if (!this.objects.has(actor)) return false;
-    if (this.propOrNull(actor, "deactivated_at") != null) return false;
+    if (this.propOrNullLive(actor, "deactivated_at") != null) return false;
     if (this.inheritsFrom(actor, "$human")) {
-      const account = this.propOrNull(actor, "account");
-      return typeof account === "string" && this.objects.has(account) && this.propOrNull(account, "deactivated_at") == null;
+      const account = this.propOrNullLive(actor, "account");
+      return typeof account === "string" && this.objects.has(account) && this.propOrNullLive(account, "deactivated_at") == null;
     }
     if (this.inheritsFrom(actor, "$agent")) {
-      const owner = this.propOrNull(actor, "owner");
+      const owner = this.propOrNullLive(actor, "owner");
       if (owner === "$wiz") return true;
       if (typeof owner !== "string" || !this.objects.has(owner)) return false;
       return this.actorCanAuthenticate(owner);
@@ -3978,7 +5169,7 @@ export class WooWorld {
 
   gcPendingCredentials(now = Date.now()): boolean {
     let changed = false;
-    const bearerRaw = this.propOrNull("$system", "bearer_tokens");
+    const bearerRaw = this.propOrNullLive("$system", "bearer_tokens");
     if (bearerRaw && typeof bearerRaw === "object" && !Array.isArray(bearerRaw)) {
       const next: Record<string, WooValue> = {};
       for (const [key, record] of Object.entries(bearerRaw as Record<string, WooValue>)) {
@@ -4002,7 +5193,7 @@ export class WooWorld {
         changed = true;
       }
     }
-    const pendingRaw = this.propOrNull("$system", "pending_email_verifications");
+    const pendingRaw = this.propOrNullLive("$system", "pending_email_verifications");
     if (Array.isArray(pendingRaw)) {
       const next = pendingRaw.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && Number((entry as Record<string, WooValue>).expires_at ?? 0) > now);
       if (next.length !== pendingRaw.length) {
@@ -4010,7 +5201,7 @@ export class WooWorld {
         changed = true;
       }
     }
-    const statesRaw = this.propOrNull("$system", "provision_state_nonces");
+    const statesRaw = this.propOrNullLive("$system", "provision_state_nonces");
     if (Array.isArray(statesRaw)) {
       const next = statesRaw.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && Number((entry as Record<string, WooValue>).issued_at ?? 0) + PROVISION_STATE_TTL_MS >= now);
       if (next.length !== statesRaw.length) {
@@ -4018,7 +5209,7 @@ export class WooWorld {
         changed = true;
       }
     }
-    const invitesRaw = this.propOrNull("$system", "signup_invites");
+    const invitesRaw = this.propOrNullLive("$system", "signup_invites");
     if (Array.isArray(invitesRaw)) {
       const next = invitesRaw.filter((entry) => {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
@@ -4035,7 +5226,7 @@ export class WooWorld {
   }
 
   private pendingEmailVerifications(): Array<{ token_hash: string; account_id: ObjRef; expires_at: number }> {
-    const raw = this.propOrNull("$system", "pending_email_verifications");
+    const raw = this.propOrNullLive("$system", "pending_email_verifications");
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((entry) => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
@@ -4048,7 +5239,7 @@ export class WooWorld {
 
   private consumeSignupInvite(code: string | null): void {
     if (!code) throw wooError("E_PERM", "invite code is required");
-    const raw = this.propOrNull("$system", "signup_invites");
+    const raw = this.propOrNullLive("$system", "signup_invites");
     const invites = Array.isArray(raw) ? raw : [];
     const now = Date.now();
     this.gcPendingCredentials(now);
@@ -4076,9 +5267,11 @@ export class WooWorld {
       // placement, not a scope migration. A multi-human account keeps its
       // original root: the anchor pins it, so later agents of a co-owning human
       // still land in the first human's cluster rather than splitting off.
-      if (this.object(account).anchor == null) {
-        this.object(account).anchor = actor;
-        this.markObjectDirty(account);
+      if (this.objectLive(account).anchor == null) {
+        this.withBehaviorMutationPermit(() => {
+          this.objectLive(account).anchor = actor;
+          this.markObjectDirty(account);
+        });
       }
       const actors = this.accountActors(account);
       if (!actors.includes(actor)) this.setProp(account, "actors", [...actors, actor]);
@@ -4092,14 +5285,14 @@ export class WooWorld {
     }
 
     private accountDisplayName(account: ObjRef): string {
-      const email = String(this.propOrNull(account, "email") ?? account);
+      const email = String(this.propOrNullLive(account, "email") ?? account);
       return email.includes("@") ? email.slice(0, email.indexOf("@")) : email;
     }
 
     private findAccountByEmail(email: string): ObjRef | null {
       for (const obj of this.objects.values()) {
         if (!this.isAccountObject(obj.id)) continue;
-        if (String(this.propOrNull(obj.id, "email") ?? "").toLowerCase() === email) return obj.id;
+        if (String(this.propOrNullLive(obj.id, "email") ?? "").toLowerCase() === email) return obj.id;
       }
       return null;
     }
@@ -4117,12 +5310,12 @@ export class WooWorld {
     }
 
     private accountActors(account: ObjRef): ObjRef[] {
-      const raw = this.propOrNull(account, "actors");
+      const raw = this.propOrNullLive(account, "actors");
       return Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
     }
 
     private systemInt(name: string, fallback: number): number {
-      const value = Number(this.propOrNull("$system", name));
+      const value = Number(this.propOrNullLive("$system", name));
       return Number.isFinite(value) ? value : fallback;
     }
 
@@ -4145,7 +5338,7 @@ export class WooWorld {
      * human in that human's authority cluster.
      */
     private authorityRootOf(human: ObjRef): ObjRef {
-      const account = this.propOrNull(human, "account");
+      const account = this.propOrNullLive(human, "account");
       if (typeof account !== "string" || !this.objects.has(account)) return human;
       const root = this.authorityAnchorRoot(account);
       // An anchorless legacy account is its own root; fall back to the human.
@@ -4170,32 +5363,36 @@ export class WooWorld {
      * of objects re-anchored.
      */
     repairAuthorityFamilyColocation(): number {
-      let repaired = 0;
-      // Pass 1: anchor each account to its primary human (the family root).
-      for (const obj of this.objects.values()) {
-        if (obj.anchor != null || !this.inheritsFrom(obj.id, "$account")) continue;
-        const primary = this.propOrNull(obj.id, "primary_actor");
-        if (typeof primary !== "string" || !this.objects.has(primary) || !this.inheritsFrom(primary, "$human")) continue;
-        obj.anchor = primary;
-        this.markObjectDirty(obj.id);
-        this.persistObject(obj.id);
-        repaired += 1;
-      }
-      // Pass 2: anchor each human-owned agent to the family root. Accounts are
-      // anchored now, so authorityRootOf resolves the shared root from them.
-      for (const obj of this.objects.values()) {
-        if (obj.anchor != null || !this.inheritsFrom(obj.id, "$agent")) continue;
-        const owner = obj.owner;
-        if (typeof owner !== "string" || !this.objects.has(owner) || !this.inheritsFrom(owner, "$human")) continue;
-        const root = this.authorityRootOf(owner);
-        if (root === obj.id) continue; // never self-anchor
-        obj.anchor = root;
-        this.markObjectDirty(obj.id);
-        this.persistObject(obj.id);
-        repaired += 1;
-      }
-      if (repaired > 0) this.persist();
-      return repaired;
+      return this.withBehaviorMutationPermit(() => {
+        let repaired = 0;
+        // Pass 1: anchor each account to its primary human (the family root).
+        for (const obj of this.objects.values()) {
+          if (obj.anchor != null || !this.inheritsFrom(obj.id, "$account")) continue;
+          const primary = this.propOrNullLive(obj.id, "primary_actor");
+          if (typeof primary !== "string" || !this.objects.has(primary) || !this.inheritsFrom(primary, "$human")) continue;
+          obj.anchor = primary;
+          obj.modified = Date.now();
+          this.markObjectDirty(obj.id);
+          this.persistObject(obj.id);
+          repaired += 1;
+        }
+        // Pass 2: anchor each human-owned agent to the family root. Accounts are
+        // anchored now, so authorityRootOf resolves the shared root from them.
+        for (const obj of this.objects.values()) {
+          if (obj.anchor != null || !this.inheritsFrom(obj.id, "$agent")) continue;
+          const owner = obj.owner;
+          if (typeof owner !== "string" || !this.objects.has(owner) || !this.inheritsFrom(owner, "$human")) continue;
+          const root = this.authorityRootOf(owner);
+          if (root === obj.id) continue; // never self-anchor
+          obj.anchor = root;
+          obj.modified = Date.now();
+          this.markObjectDirty(obj.id);
+          this.persistObject(obj.id);
+          repaired += 1;
+        }
+        if (repaired > 0) this.persist();
+        return repaired;
+      });
     }
 
     private provisionActorInternal(classRef: ObjRef, owner: ObjRef, attrs: Record<string, WooValue>, caller: ObjRef): { actor: ObjRef } {
@@ -4247,10 +5444,10 @@ export class WooWorld {
       attrs: Record<string, WooValue> = {}
     ): { actor_id: ObjRef; api_key: string; api_key_id: string; api_key_secret: string; label: string | null; created_at: number } {
       this.assertSelfHuman(human, human);
-      const account = assertObj(this.propOrNull(human, "account"));
-      if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
-      const quota = Number(this.propOrNull(account, "agent_quota") ?? 0);
-      const count = Number(this.propOrNull(account, "agent_count") ?? 0);
+      const account = assertObj(this.propOrNullLive(human, "account"));
+      if (this.propOrNullLive(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
+      const quota = Number(this.propOrNullLive(account, "agent_quota") ?? 0);
+      const count = Number(this.propOrNullLive(account, "agent_count") ?? 0);
       if (count >= quota) throw wooError("E_QUOTA_EXCEEDED", "agent quota exceeded", { account, quota, count });
       const agentClass: ObjRef = "$agent";
       if (programmer) {
@@ -4273,7 +5470,9 @@ export class WooWorld {
         // one handler, so the turn transcript commits them atomically. The agent
         // is freshly provisioned in this scope, hence co-resident by
         // construction — no cross-host guard needed on the create path.
-        this.object(actor).flags.programmer = true;
+        this.withBehaviorMutationPermit(() => {
+          this.objectLive(actor).flags.programmer = true;
+        });
         this.markObjectDirty(actor);
         this.attachProgrammerSurface(actor);
       }
@@ -4281,7 +5480,7 @@ export class WooWorld {
       this.setProp(actor, "api_key_id", key.id);
       this.setProp(account, "actors", [...this.accountActors(account), actor]);
       this.setProp(account, "agent_count", count + 1);
-      if (programmer) this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
+      if (programmer) this.setProp(account, "programmer_agent_count", Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + 1);
       // Same AU1 seam as provisionActorInternal above: the catalog `$system`
       // write is suppressed on Net and materialized everywhere else.
       this.recordProvisioningAudit(human, "actor_provisioned", { actor, owner: human, account, surface: "create_agent" });
@@ -4295,7 +5494,7 @@ export class WooWorld {
      * turn already touches, and never enumerated globally.
      */
     private operatorProvisionedAgents(account: ObjRef): Record<string, ObjRef> {
-      const raw = this.propOrNull(account, "operator_provisioned_agents");
+      const raw = this.propOrNullLive(account, "operator_provisioned_agents");
       // NULL-PROTOTYPE on purpose. A provision_id is operator-chosen text, so
       // it can be `constructor`, `toString`, or `__proto__`. On an ordinary
       // object `map[id]` would then resolve an INHERITED member — a lookup for
@@ -4341,11 +5540,11 @@ export class WooWorld {
      * leaving the slot counted, the safe direction.
      */
     private agentSlotReturnedAt(agent: ObjRef): number | null {
-      const retiredAt = this.propOrNull(agent, "retired_at");
+      const retiredAt = this.propOrNullLive(agent, "retired_at");
       if (typeof retiredAt === "number") return retiredAt;
-      const deactivatedAt = this.propOrNull(agent, "deactivated_at");
+      const deactivatedAt = this.propOrNullLive(agent, "deactivated_at");
       if (typeof deactivatedAt !== "number") return null;
-      const keyId = this.propOrNull(agent, "api_key_id");
+      const keyId = this.propOrNullLive(agent, "api_key_id");
       if (typeof keyId !== "string" || !keyId) return null;
       const keys = this.apiKeyMap(agent);
       const record = Object.hasOwn(keys, keyId) ? keys[keyId] : undefined;
@@ -4460,8 +5659,8 @@ export class WooWorld {
       // assertSelfHuman is the shared kind check (caller === human holds
       // trivially here; the operator's authority was proved above).
       this.assertSelfHuman(human, human);
-      const account = assertObj(this.propOrNull(human, "account"));
-      if (this.propOrNull(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
+      const account = assertObj(this.propOrNullLive(human, "account"));
+      if (this.propOrNullLive(account, "deactivated_at") != null) throw wooError("E_PERM", "account is deactivated", account);
       // Shape bound only. The WIRE grammar (leading alphanumeric, a fixed
       // punctuation set) is enforced by the operator route; this primitive is
       // reachable by any wizard, so it guards the durable cell's size and must
@@ -4508,22 +5707,22 @@ export class WooWorld {
         // agent that unambiguously belongs to this provision_id.
         //
         // assertOwnedAgent is the shared kind + ownership check, and it opens
-        // with `this.object(recorded)` on purpose: under a sparse guarded plan
+        // with `this.objectLive(recorded)` on purpose: under a sparse guarded plan
         // that emits a materialization probe and drives the repair loop, so an
         // unmaterialized recorded agent converges on retry instead of failing
         // as a semantic absence. The reverse provision_id pointer below is what
         // makes the match unambiguous.
         this.assertOwnedAgent(human, recorded);
-        if (this.propOrNull(recorded, "provision_id") !== input.provisionId) {
+        if (this.propOrNullLive(recorded, "provision_id") !== input.provisionId) {
           throw wooError("E_INVARG", "recorded operator-provisioned agent does not match this provision_id", { account, provision_id: input.provisionId, agent: recorded });
         }
         // Neither a retired nor a merely deactivated agent is usable, so both
         // refuse — but they are different facts and the message says which, so
         // an operator knows whether reactivation is even on the table.
-        if (this.propOrNull(recorded, "retired_at") != null) {
+        if (this.propOrNullLive(recorded, "retired_at") != null) {
           throw wooError("E_PERM", "recorded operator-provisioned agent was permanently retired; choose a new provision_id", { agent: recorded });
         }
-        if (this.propOrNull(recorded, "deactivated_at") != null) {
+        if (this.propOrNullLive(recorded, "deactivated_at") != null) {
           throw wooError("E_PERM", "recorded operator-provisioned agent is deactivated; reactivate it or choose a new provision_id", { agent: recorded });
         }
         agent = recorded;
@@ -4535,7 +5734,7 @@ export class WooWorld {
       // `$system` native whose target is catalog-scoped, so the equivalent
       // effect is applied here against the (cluster-resident) account.
       const grant = (kind: "agent_quota" | "programmer_grant_quota", need: number): void => {
-        const old = Number(this.propOrNull(account, kind) ?? 0);
+        const old = Number(this.propOrNullLive(account, kind) ?? 0);
         if (old >= need) return;
         this.setProp(account, kind, need);
         this.recordProvisioningAudit(caller, "account_quota_changed", { account, kind, old, new: need });
@@ -4543,7 +5742,7 @@ export class WooWorld {
       };
 
       if (agent === null) {
-        grant("agent_quota", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        grant("agent_quota", Number(this.propOrNullLive(account, "agent_count") ?? 0) + 1);
         // Step 2 — mint the actor. provisionActorInternal is the shared
         // primitive behind $system:provision_actor and create_agent: it picks
         // the id, anchors an agent to its owner's authority root, stamps
@@ -4557,7 +5756,7 @@ export class WooWorld {
         agent = provision.actor;
         this.setProp(agent, "provision_id", input.provisionId);
         this.setProp(account, "actors", [...this.accountActors(account), agent]);
-        this.setProp(account, "agent_count", Number(this.propOrNull(account, "agent_count") ?? 0) + 1);
+        this.setProp(account, "agent_count", Number(this.propOrNullLive(account, "agent_count") ?? 0) + 1);
         // Object-literal spread + COMPUTED key, never `obj[key] = value`: a
         // computed key defines an own property even for `__proto__`, whereas
         // plain assignment on a normal object would invoke Object.prototype's
@@ -4571,16 +5770,16 @@ export class WooWorld {
       // tuple generated on the operator machine, so no secret ever transits
       // this turn. Kept in sync so rotate/revoke find the current key — which
       // is exactly why it is validated fail-closed rather than stored as given.
-      if (input.apiKeyId && this.propOrNull(agent, "api_key_id") !== input.apiKeyId) {
+      if (input.apiKeyId && this.propOrNullLive(agent, "api_key_id") !== input.apiKeyId) {
         this.assertBindableApiKeyPointer(agent, input.apiKeyId);
         this.setProp(agent, "api_key_id", input.apiKeyId);
       }
 
       // Step 3 — programmer promotion through the shared transition.
       //
-      const alreadyProgrammer = this.object(agent).flags.programmer === true;
+      const alreadyProgrammer = this.objectLive(agent).flags.programmer === true;
       if (!alreadyProgrammer) {
-        grant("programmer_grant_quota", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
+        grant("programmer_grant_quota", Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + 1);
       }
       await this.setProgrammerAgentState(caller, agent, account, true, "agent_promoted_to_programmer");
       // Post-condition, not decoration: the surface resolved above, so if it is
@@ -4597,10 +5796,10 @@ export class WooWorld {
       // Step 4 — wizard authority. setObjectFlags is the in-world equivalent
       // but writes $system.wizard_actions unconditionally; the flag write and
       // surface reconciliation are reproduced here through the Net-safe seams.
-      const flaggedBefore = this.object(agent).flags.wizard === true;
+      const flaggedBefore = this.objectLive(agent).flags.wizard === true;
       if (!flaggedBefore) {
         const target = agent;
-        this.mutateLineage(target, () => { this.object(target).flags.wizard = true; });
+        this.mutateLineage(target, () => { this.objectLive(target).flags.wizard = true; });
         this.markObjectDirty(target);
         this.reconcileProgrammerSurface(target, true);
         this.recordProvisioningAudit(caller, "actor_wizard_flag_set", { target, account, transition: true });
@@ -4623,11 +5822,11 @@ export class WooWorld {
         created,
         promoted: !alreadyProgrammer,
         flagged: !flaggedBefore,
-        api_key_id: (this.propOrNull(agent, "api_key_id") ?? null) as WooValue,
-        agent_quota: Number(this.propOrNull(account, "agent_quota") ?? 0),
-        agent_count: Number(this.propOrNull(account, "agent_count") ?? 0),
-        programmer_grant_quota: Number(this.propOrNull(account, "programmer_grant_quota") ?? 0),
-        programmer_agent_count: Number(this.propOrNull(account, "programmer_agent_count") ?? 0),
+        api_key_id: (this.propOrNullLive(agent, "api_key_id") ?? null) as WooValue,
+        agent_quota: Number(this.propOrNullLive(account, "agent_quota") ?? 0),
+        agent_count: Number(this.propOrNullLive(account, "agent_count") ?? 0),
+        programmer_grant_quota: Number(this.propOrNullLive(account, "programmer_grant_quota") ?? 0),
+        programmer_agent_count: Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0),
         quota_grants: quotaGrants as unknown as WooValue
       };
     }
@@ -4638,15 +5837,15 @@ export class WooWorld {
     }
 
     private assertOwnedAgent(human: ObjRef, agent: ObjRef): ObjRef {
-      this.object(agent);
+      this.objectLive(agent);
       if (!this.inheritsFrom(agent, "$agent")) throw wooError("E_TYPE", "target must be a $agent", agent);
-      if (this.propOrNull(agent, "owner") !== human) throw wooError("E_PERM", "agent is not owned by this human", { human, agent });
-      return assertObj(this.propOrNull(human, "account"));
+      if (this.propOrNullLive(agent, "owner") !== human) throw wooError("E_PERM", "agent is not owned by this human", { human, agent });
+      return assertObj(this.propOrNullLive(human, "account"));
     }
 
     private assertProgrammerAgentQuota(account: ObjRef): void {
-      const count = Number(this.propOrNull(account, "programmer_agent_count") ?? 0);
-      const quota = Number(this.propOrNull(account, "programmer_grant_quota") ?? 0);
+      const count = Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0);
+      const quota = Number(this.propOrNullLive(account, "programmer_grant_quota") ?? 0);
       if (count >= quota) throw wooError("E_QUOTA_EXCEEDED", "programmer agent quota exceeded", { account, quota, count });
     }
 
@@ -4659,7 +5858,7 @@ export class WooWorld {
      * until a catalog installs one (plan §4.4).
      */
     private programmerSurface(): ObjRef | null {
-      const raw = this.propOrNull("$system", "programmer_surface");
+      const raw = this.propOrNullLive("$system", "programmer_surface");
       return typeof raw === "string" && this.objects.has(raw) ? raw : null;
     }
 
@@ -4734,9 +5933,9 @@ export class WooWorld {
       const actorNcaIndex = nca ? actorChain.indexOf(nca) : actorChain.length;
       const actorSpecific = actorChain.slice(0, actorNcaIndex);
       const surfaceNames = new Set<string>();
-      for (const cls of surfaceSpecific) for (const verb of this.object(cls).verbs) surfaceNames.add(verb.name);
+      for (const cls of surfaceSpecific) for (const verb of this.objectLive(cls).verbs) surfaceNames.add(verb.name);
       const collisions = new Set<string>();
-      for (const cls of actorSpecific) for (const verb of this.object(cls).verbs) if (surfaceNames.has(verb.name)) collisions.add(verb.name);
+      for (const cls of actorSpecific) for (const verb of this.objectLive(cls).verbs) if (surfaceNames.has(verb.name)) collisions.add(verb.name);
       if (collisions.size > 0) {
         throw wooError("E_INVARG", `cannot compose surface ${surface} onto ${actor}: kind ancestry shadows surface verb(s) ${[...collisions].sort().join(", ")}`, { actor, surface, verbs: [...collisions].sort() });
       }
@@ -4762,7 +5961,7 @@ export class WooWorld {
      * nothing mutated rather than half-applied across a host boundary.
      */
     private async setProgrammerAgentState(caller: ObjRef, actor: ObjRef, account: ObjRef, programmer: boolean, auditAction: string): Promise<void> {
-      const currently = this.object(actor).flags.programmer === true;
+      const currently = this.objectLive(actor).flags.programmer === true;
       const transition = currently !== programmer;
       const surface = this.programmerSurface();
       // Surface reconciliation reads the existing feature list in both
@@ -4778,10 +5977,10 @@ export class WooWorld {
         // boundary before mutating anything.
         await this.assertProgrammerProvisioningColocated(actor, account);
         // Flag write through the lineage seam so it commits over Net.
-        this.mutateLineage(actor, () => { this.object(actor).flags.programmer = programmer; });
+        this.mutateLineage(actor, () => { this.objectLive(actor).flags.programmer = programmer; });
         this.markObjectDirty(actor);
         const delta = programmer ? 1 : -1;
-        const next = Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + delta);
+        const next = Math.max(0, Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + delta);
         this.setProp(account, "programmer_agent_count", next);
         // The caller (the human/wizard) is the acting principal; the agent is
         // the subject (§8.10). Routed through the profile audit adapter so the
@@ -4804,9 +6003,9 @@ export class WooWorld {
       // Key construction can reject a corrupt anchor graph. Prove replacement
       // viability before revoking the currently usable credential.
       this.assertApiKeyIssuable(agent);
-      const oldKey = this.propOrNull(agent, "api_key_id");
+      const oldKey = this.propOrNullLive(agent, "api_key_id");
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(human, oldKey, force);
-      const key = this.createApiKeyForOwner(human, agent, String(this.propOrNull(agent, "name") ?? agent));
+      const key = this.createApiKeyForOwner(human, agent, String(this.propOrNullLive(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
       // The old/new actor-owned records are the cross-profile audit. Net's
       // accepted transcript adds caller attribution without a catalog write.
@@ -4840,7 +6039,7 @@ export class WooWorld {
     private findHermesAgent(human: ObjRef, profileId: string): ObjRef | null {
       for (const obj of this.objects.values()) {
         if (!this.inheritsFrom(obj.id, "$agent")) continue;
-        if (this.propOrNull(obj.id, "owner") === human && this.propOrNull(obj.id, "created_via") === "hermes_provision" && this.propOrNull(obj.id, "profile_id") === profileId) return obj.id;
+        if (this.propOrNullLive(obj.id, "owner") === human && this.propOrNullLive(obj.id, "created_via") === "hermes_provision" && this.propOrNullLive(obj.id, "profile_id") === profileId) return obj.id;
       }
       return null;
     }
@@ -4849,19 +6048,19 @@ export class WooWorld {
       const out: Array<Record<string, WooValue>> = [];
       for (const obj of this.objects.values()) {
         if (!this.inheritsFrom(obj.id, "$agent")) continue;
-        if (this.propOrNull(obj.id, "owner") !== human) continue;
+        if (this.propOrNullLive(obj.id, "owner") !== human) continue;
         out.push({
           actor_id: obj.id,
-          name: String(this.propOrNull(obj.id, "name") ?? obj.name),
-          purpose: String(this.propOrNull(obj.id, "purpose") ?? ""),
+          name: String(this.propOrNullLive(obj.id, "name") ?? obj.name),
+          purpose: String(this.propOrNullLive(obj.id, "purpose") ?? ""),
           created: obj.created,
-          last_seen: this.propOrNull(obj.id, "last_seen_at"),
-          scope: String(this.propOrNull(obj.id, "scope") ?? "write"),
+          last_seen: this.propOrNullLive(obj.id, "last_seen_at"),
+          scope: String(this.propOrNullLive(obj.id, "scope") ?? "write"),
           programmer: obj.flags.programmer === true,
-          deactivated_at: this.propOrNull(obj.id, "deactivated_at"),
+          deactivated_at: this.propOrNullLive(obj.id, "deactivated_at"),
           // Distinct from deactivated_at: reversible auth tombstone vs the
           // permanent retirement that returned the account's quota slot.
-          retired_at: this.propOrNull(obj.id, "retired_at")
+          retired_at: this.propOrNullLive(obj.id, "retired_at")
         });
       }
       out.sort((a, b) => String(a.actor_id).localeCompare(String(b.actor_id)));
@@ -4869,7 +6068,7 @@ export class WooWorld {
     }
 
     private allowedProvisionReturn(url: string): boolean {
-      const raw = this.propOrNull("$system", "allowed_provision_return_schemes");
+      const raw = this.propOrNullLive("$system", "allowed_provision_return_schemes");
       const allowed = Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : ["hermes://"];
       return allowed.some((prefix) => url.startsWith(prefix));
     }
@@ -4877,7 +6076,7 @@ export class WooWorld {
     private consumeProvisionState(state: string): void {
       const now = Date.now();
     this.gcPendingCredentials(now);
-      const raw = this.propOrNull("$system", "provision_state_nonces");
+      const raw = this.propOrNullLive("$system", "provision_state_nonces");
       const entries = Array.isArray(raw) ? raw.filter((entry) => {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
         return Number((entry as Record<string, WooValue>).issued_at ?? 0) + PROVISION_STATE_TTL_MS >= now;
@@ -4888,8 +6087,12 @@ export class WooWorld {
     }
 
   createSessionForActor(actor: ObjRef, tokenClass: Session["tokenClass"] = "bearer", apikeyId?: string): Session {
+    return this.cloneSessionView(this.createSessionForActorLive(actor, tokenClass, apikeyId));
+  }
+
+  private createSessionForActorLive(actor: ObjRef, tokenClass: Session["tokenClass"] = "bearer", apikeyId?: string): Session {
     this.reapExpiredSessions();
-    this.object(actor);
+    this.objectLive(actor);
     const id = this.generateSessionId();
     const now = Date.now();
     const session: Session = {
@@ -4904,16 +6107,18 @@ export class WooWorld {
       lastInputAt: now,
       ...(apikeyId !== undefined ? { apikeyId } : {})
     };
-    this.withPersistenceDeferred(() => {
+    const stored = this.withBehaviorMutationPermit(() => {
       this.sessions.set(id, session);
-      this.noteSessionInserted(session);
-      this.persistSession(session);
+      const inserted = this.sessions.get(id)!;
+      this.noteSessionInserted(inserted);
+      this.persistSession(inserted);
       // No reader (substrate or catalog) consults `actor.session_id` —
       // `world.sessions` is the source of truth for session lifecycle. The
       // formerly-written mirror property fired on every (actor × host)
       // first-touch and was a top-3 ambient writer.
+      return inserted;
     });
-    return session;
+    return stored;
   }
 
   private generateSessionId(): string {
@@ -4933,29 +6138,51 @@ export class WooWorld {
     apikeyId?: string,
     startedAt?: number
   ): Session {
+    return this.cloneSessionView(this.ensureSessionForActorLive(
+      id,
+      actor,
+      tokenClass,
+      expiresAt,
+      activeScope,
+      apikeyId,
+      startedAt
+    ));
+  }
+
+  private ensureSessionForActorLive(
+    id: string,
+    actor: ObjRef,
+    tokenClass: Session["tokenClass"] = "bearer",
+    expiresAt?: number,
+    activeScope?: ObjRef | null,
+    apikeyId?: string,
+    startedAt?: number
+  ): Session {
     const existing = this.sessions.get(id);
     if (existing) {
-      let changed = false;
-      if (Number.isFinite(startedAt) && startedAt !== undefined && startedAt > 0 && existing.started !== startedAt) {
-        existing.started = startedAt;
-        changed = true;
-      }
-      if (Number.isFinite(expiresAt) && expiresAt !== undefined && expiresAt > existing.expiresAt) {
-        existing.expiresAt = expiresAt;
-        changed = true;
-      }
-      if (activeScope && this.setSessionActiveScope(existing, activeScope)) changed = true;
-      // If the originating host knows the apikey id but the routed copy
-      // doesn't yet, learn it so future revokes can tear the session down
-      // here too.
-      if (apikeyId !== undefined && existing.apikeyId !== apikeyId) {
-        existing.apikeyId = apikeyId;
-        changed = true;
-      }
-      if (changed) this.persistSession(existing);
-      return existing;
+      return this.withBehaviorMutationPermit(() => {
+        let changed = false;
+        if (Number.isFinite(startedAt) && startedAt !== undefined && startedAt > 0 && existing.started !== startedAt) {
+          existing.started = startedAt;
+          changed = true;
+        }
+        if (Number.isFinite(expiresAt) && expiresAt !== undefined && expiresAt > existing.expiresAt) {
+          existing.expiresAt = expiresAt;
+          changed = true;
+        }
+        if (activeScope && this.setSessionActiveScope(existing, activeScope)) changed = true;
+        // If the originating host knows the apikey id but the routed copy
+        // doesn't yet, learn it so future revokes can tear the session down
+        // here too.
+        if (apikeyId !== undefined && existing.apikeyId !== apikeyId) {
+          existing.apikeyId = apikeyId;
+          changed = true;
+        }
+        if (changed) this.persistSession(existing);
+        return existing;
+      });
     }
-    this.object(actor);
+    this.objectLive(actor);
     const now = Date.now();
     const started = Number.isFinite(startedAt) && startedAt !== undefined && startedAt > 0 ? startedAt : now;
     const session: Session = {
@@ -4970,21 +6197,58 @@ export class WooWorld {
       lastInputAt: now,
       ...(apikeyId !== undefined ? { apikeyId } : {})
     };
-    this.withPersistenceDeferred(() => {
+    return this.withBehaviorMutationPermit(() => {
       this.sessions.set(id, session);
-      this.noteSessionInserted(session);
-      this.persistSession(session);
+      const inserted = this.sessions.get(id)!;
+      this.noteSessionInserted(inserted);
+      this.persistSession(inserted);
       // No reader (substrate or catalog) consults `actor.session_id` —
       // `world.sessions` is the source of truth for session lifecycle. The
       // formerly-written mirror property fired on every (actor × host)
       // first-touch and was a top-3 ambient writer.
+      return inserted;
     });
-    return session;
+  }
+
+  /** Migration/test-fixture seam for historical session clocks and placement.
+   * Protocol activity uses attach/touch/detach; this method deliberately does
+   * not manufacture socket liveness. */
+  migrationSetSessionState(
+    sessionId: string,
+    fields: Partial<Pick<Session, "started" | "expiresAt" | "lastDetachAt" | "lastInputAt" | "activeScope">> & {
+      rosterVisible?: boolean;
+    }
+  ): boolean {
+    this.assertOutsideBehaviorMutation("migrationSetSessionState");
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return this.withBehaviorMutationPermit(() => {
+      let changed = false;
+      if (fields.activeScope !== undefined && fields.activeScope !== session.activeScope) {
+        this.setSessionActiveScope(session, fields.activeScope);
+        changed = true;
+      }
+      for (const key of ["started", "expiresAt", "lastDetachAt", "lastInputAt"] as const) {
+        if (fields[key] === undefined || fields[key] === session[key]) continue;
+        (session as unknown as Record<string, unknown>)[key] = fields[key];
+        changed = true;
+      }
+      if (fields.rosterVisible !== undefined) {
+        const next = fields.rosterVisible === false ? false : undefined;
+        if (next !== session.rosterVisible) {
+          if (next === false) session.rosterVisible = false;
+          else delete session.rosterVisible;
+          changed = true;
+        }
+      }
+      if (changed) this.persistSession(session);
+      return changed;
+    });
   }
 
   private initialSessionLocation(actor: ObjRef): ObjRef {
-    const obj = this.object(actor);
-    const home = this.propOrNull(actor, "home");
+    const obj = this.objectLive(actor);
+    const home = this.propOrNullLive(actor, "home");
     if (obj.location && this.objects.has(obj.location)) return obj.location;
     return typeof home === "string" && this.objects.has(home) ? home : "$nowhere";
   }
@@ -4992,10 +6256,10 @@ export class WooWorld {
   claimWizardBootstrapSession(presentedToken: string, expectedToken: string | undefined): Session {
     if (!expectedToken) throw wooError("E_BOOTSTRAP_TOKEN_MISSING", "WOO_INITIAL_WIZARD_TOKEN is not set");
     const claim = () => {
-      if (this.propOrNull("$system", "bootstrap_token_used") === true) throw wooError("E_TOKEN_CONSUMED", "wizard bootstrap token has already been consumed");
+      if (this.propOrNullLive("$system", "bootstrap_token_used") === true) throw wooError("E_TOKEN_CONSUMED", "wizard bootstrap token has already been consumed");
       if (presentedToken !== expectedToken) throw wooError("E_NOSESSION", "invalid wizard bootstrap token");
       this.setProp("$system", "bootstrap_token_used", true);
-      return this.createSessionForActor("$wiz", "bearer");
+      return this.createSessionForActorLive("$wiz", "bearer");
     };
     const repo = this.activeObjectRepository();
     return repo ? repo.transaction(claim) : claim();
@@ -5004,14 +6268,16 @@ export class WooWorld {
   attachSocket(sessionId: string, socketId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    this.withPersistenceDeferred(() => {
-      session.attachedSockets.add(socketId);
-      session.lastDetachAt = null;
-      const now = Date.now();
-      session.expiresAt = Math.max(session.expiresAt, now + this.sessionTtl(session.tokenClass));
-      session.lastInputAt = now;
-      this.persistSession(session);
-      this.persist();
+    this.withBehaviorMutationPermit(() => {
+      this.withPersistenceDeferred(() => {
+        session.attachedSockets.add(socketId);
+        session.lastDetachAt = null;
+        const now = Date.now();
+        session.expiresAt = Math.max(session.expiresAt, now + this.sessionTtl(session.tokenClass));
+        session.lastInputAt = now;
+        this.persistSession(session);
+        this.persist();
+      });
     });
   }
 
@@ -5024,14 +6290,16 @@ export class WooWorld {
   touchSessionInput(sessionId: string, now: number = Date.now()): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    session.lastInputAt = now;
-    if (session.closedAt !== undefined || now >= session.expiresAt) return;
-    const ttl = this.sessionTtl(session.tokenClass);
-    if (session.expiresAt - now > ttl / 2) return;
-    // Sliding renewal keeps active stateless transports authenticated without a
-    // session-row write on every request. Persist only near the half-life.
-    session.expiresAt = now + ttl;
-    this.persistSession(session);
+    this.withBehaviorMutationPermit(() => {
+      session.lastInputAt = now;
+      if (session.closedAt !== undefined || now >= session.expiresAt) return;
+      const ttl = this.sessionTtl(session.tokenClass);
+      if (session.expiresAt - now > ttl / 2) return;
+      // Sliding renewal keeps active stateless transports authenticated without a
+      // session-row write on every request. Persist only near the half-life.
+      session.expiresAt = now + ttl;
+      this.persistSession(session);
+    });
   }
 
   /** Most recent input timestamp across any of `actor`'s sessions, regardless
@@ -5080,15 +6348,17 @@ export class WooWorld {
   detachSocket(sessionId: string, socketId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    this.withPersistenceDeferred(() => {
-      session.attachedSockets.delete(socketId);
-      if (session.attachedSockets.size === 0) {
-        const now = Date.now();
-        session.lastDetachAt = now;
-        session.expiresAt = Math.max(session.expiresAt, now + this.sessionGrace(session.tokenClass));
-      }
-      this.persistSession(session);
-      this.persist();
+    this.withBehaviorMutationPermit(() => {
+      this.withPersistenceDeferred(() => {
+        session.attachedSockets.delete(socketId);
+        if (session.attachedSockets.size === 0) {
+          const now = Date.now();
+          session.lastDetachAt = now;
+          session.expiresAt = Math.max(session.expiresAt, now + this.sessionGrace(session.tokenClass));
+        }
+        this.persistSession(session);
+        this.persist();
+      });
     });
   }
 
@@ -5167,12 +6437,12 @@ export class WooWorld {
       for (const space of Array.from(this.actorPresenceIndex.get(actor) ?? []).sort() as ObjRef[]) {
         if (this.dropAllSubscriberRowsForActor(space, actor)) changed = true;
       }
-      const guest = this.object(actor);
+      const guest = this.objectLive(actor);
       const needsReset =
         guest.location !== "$nowhere" ||
         guest.contents.size > 0 ||
-        (Array.isArray(this.propOrNull(actor, "aliases")) && (this.propOrNull(actor, "aliases") as WooValue[]).length > 0) ||
-        (Array.isArray(this.propOrNull(actor, "features")) && (this.propOrNull(actor, "features") as WooValue[]).length > 0);
+        (Array.isArray(this.propOrNullLive(actor, "aliases")) && (this.propOrNullLive(actor, "aliases") as WooValue[]).length > 0) ||
+        (Array.isArray(this.propOrNullLive(actor, "features")) && (this.propOrNullLive(actor, "features") as WooValue[]).length > 0);
       if (needsReset) {
         this.resetGuestOnDisconnect(actor);
         changed = true;
@@ -5293,20 +6563,21 @@ export class WooWorld {
     return spaces ? spaces.has(space) : false;
   }
 
-  // Read-only audience view for a $space. Returns the in-memory set the
-  // index already maintains, so callers iterating the audience get the
-  // same actor list `hasPresence` consults — without an O(N) array copy.
-  // Returns `null` when no actor is recorded as present.
+  // Detached read-only audience view for a $space. Callers cannot poison the
+  // derived presence caches by casting away ReadonlySet/ReadonlyMap and
+  // mutating the returned collection. Returns `null` when none are present.
   presenceActorsIn(space: ObjRef): ReadonlySet<ObjRef> | null {
     this.ensurePresenceIndex();
     const sessions = this.sessionSubscribersIndex.get(space);
     if (sessions) return new Set(sessions.values());
-    return this.subscribersIndex.get(space) ?? null;
+    const actors = this.subscribersIndex.get(space);
+    return actors ? new Set(actors) : null;
   }
 
   presenceSessionsIn(space: ObjRef): ReadonlyMap<string, ObjRef> | null {
     this.ensurePresenceIndex();
-    return this.sessionSubscribersIndex.get(space) ?? null;
+    const sessions = this.sessionSubscribersIndex.get(space);
+    return sessions ? new Map(sessions) : null;
   }
 
   presenceSessionIdsIn(space: ObjRef, actors?: Iterable<ObjRef>): string[] {
@@ -5336,10 +6607,19 @@ export class WooWorld {
   }
 
   async call(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.callNow(frameId, sessionId, space, message), `call:${message.target}:${message.verb}`);
+    return this.cloneFrame(await this.enqueueHostTask(
+      () => this.callNow(frameId, sessionId, space, message),
+      `call:${message.target}:${message.verb}`
+    ));
   }
 
-  private async callNow(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
+  private async callNow(
+    frameId: string | undefined,
+    sessionId: string,
+    space: ObjRef,
+    message: Message,
+    appliedOptions: AppliedCallOptions = {}
+  ): Promise<AppliedFrame | ErrorFrame> {
     const session = this.sessions.get(sessionId);
     if (!session || !this.sessionAlive(sessionId)) {
       return { op: "error", id: frameId, error: wooError("E_NOSESSION", "session token is expired or unknown") };
@@ -5350,17 +6630,21 @@ export class WooWorld {
     this.sweepIdempotency();
     if (frameId) {
       const cached = this.idempotency.get(`${sessionId}:${frameId}`);
-      if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.frame;
+      if (cached && Date.now() - cached.at < 5 * 60 * 1000) return this.cloneFrame(cached.frame);
     }
     let frame: AppliedFrame | ErrorFrame;
     try {
-        frame = await this.applyCall(frameId, space, message, sessionId);
+        frame = await this.applyCall(frameId, space, message, sessionId, appliedOptions);
     } catch (err) {
       const error = normalizeError(err);
       frame = { op: "error", id: frameId, error };
     }
-    if (frameId) this.idempotency.set(`${sessionId}:${frameId}`, { at: Date.now(), frame });
-    return frame;
+    if (frameId) {
+      const cachedFrame = deepFreezePlainValue(this.cloneFrame(frame));
+      this.idempotency.set(`${sessionId}:${frameId}`, { at: Date.now(), frame: cachedFrame });
+      return this.cloneFrame(cachedFrame);
+    }
+    return this.cloneFrame(frame);
   }
 
   private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task", chainId?: string): Promise<T> {
@@ -5451,16 +6735,25 @@ export class WooWorld {
     return await run;
   }
 
-  async directCall(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.directCallNow(frameId, actor, target, verbName, args, options), `directCall:${target}:${verbName}`);
+  async directCall(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    return this.cloneFrame(await this.enqueueHostTask(
+      () => this.directCallNow(frameId, actor, target, verbName, args, options),
+      `directCall:${target}:${verbName}`
+    ));
   }
 
   async planCommand(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.planCommandNow(frameId, sessionId, space, text), `planCommand:${space}`);
+    return this.cloneFrame(await this.enqueueHostTask(
+      () => this.planCommandNow(frameId, sessionId, space, text),
+      `planCommand:${space}`
+    ));
   }
 
   async command(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.commandNow(frameId, sessionId, space, text, options), `command:${space}`);
+    return this.cloneFrame(await this.enqueueHostTask(
+      () => this.commandNow(frameId, sessionId, space, text, options),
+      `command:${space}`
+    ));
   }
 
   private async commandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
@@ -5484,7 +6777,45 @@ export class WooWorld {
     }
     if (!ctx.session) throw wooError("E_NOSESSION", "sequenced command requires a live session");
     const commandSpace = plan.space ?? ctx.space;
-    return await this.callNow(undefined, ctx.session, commandSpace, { actor: ctx.actor, target: plan.target, verb: plan.verb, args: plan.args });
+    if (ctx.seq >= 0) {
+      if (commandSpace !== ctx.space) {
+        throw wooError("E_SCOPE_SPLIT", "nested sequenced command names an incompatible semantic space", {
+          current: ctx.space,
+          requested: commandSpace,
+          target: plan.target
+        });
+      }
+      // Already inside the compatible authoritative turn: dispatch inline.
+      // No second sequence, recorder envelope, or persistence boundary exists.
+      return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
+    }
+
+    const scope = this.behaviorUndoScopes.at(-1);
+    if (!scope) {
+      throw wooError("E_SCOPE_SPLIT", "terminal command transfer requires an active behavior journal");
+    }
+    if (
+      scope.undos.length > 0 ||
+      scope.acceptance.length > 0 ||
+      ctx.observations.length > 0 ||
+      this.turnScheduleCount > 0 ||
+      scope.terminalTransferDisallowedKinds.size > 0
+    ) {
+      throw wooError("E_SCOPE_SPLIT", "sequenced command wrapper is not proof-only", {
+        mutations: scope.undos.length,
+        acceptance: scope.acceptance.length,
+        observations: ctx.observations.length,
+        schedules: this.turnScheduleCount,
+        effects: Array.from(scope.terminalTransferDisallowedKinds)
+      });
+    }
+    const proofEvents = this.activeTurnRecorder?.currentBehaviorEvents() ?? [];
+    throw commandPlanTransfer(
+      { space: commandSpace, target: plan.target, verb: plan.verb, args: plan.args },
+      ctx.actor,
+      ctx.session,
+      [...proofEvents]
+    );
   }
 
   private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
@@ -5501,7 +6832,15 @@ export class WooWorld {
       // REST, MCP, and in-world `:command` callers so space overrides, feature
       // wrappers, skip-presence metadata, observations, and recorder reads are
       // identical on every transport.
-      return await this.directCallNow(frameId, actor, space, "command_plan", [text], { sessionId });
+      const planned = await this.directCallNow(frameId, actor, space, "command_plan", [text], { sessionId });
+      if (planned.op === "applied") {
+        throw wooError("E_INTERNAL", "command_plan transferred instead of returning a plan", {
+          space,
+          target: planned.message.target,
+          verb: planned.message.verb
+        });
+      }
+      return planned;
     } catch (err) {
       const error = normalizeError(err);
       return { op: "error", id: frameId, error };
@@ -5532,14 +6871,64 @@ export class WooWorld {
     return session.actor;
   }
 
-  private async directCallNow(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
+  private terminalTransferCacheBinding(
+    frameId: string | undefined,
+    actor: ObjRef,
+    options: DirectCallOptions
+  ): string | null {
+    if (!frameId) return null;
+    const sessionId = options.sessionId === undefined
+      ? this.primarySessionForActor(actor)?.id ?? null
+      : options.sessionId;
+    if (!sessionId) return null;
+    const session = this.sessions.get(sessionId);
+    // Match callNow's ordering: an expired/foreign session never receives a
+    // cached result, even when its frame id was valid earlier.
+    if (!session || !this.sessionAlive(sessionId) || session.actor !== actor) return null;
+    return `${sessionId}:${actor}:${frameId}`;
+  }
+
+  private directRequestFingerprint(
+    target: ObjRef,
+    verb: string,
+    args: WooValue[],
+    options: DirectCallOptions
+  ): string {
+    return hashSource(canonicalJson({
+      target,
+      verb,
+      args,
+      force_direct: options.forceDirect === true,
+      force_reason: options.forceReason ?? null
+    }));
+  }
+
+  private async directCallNow(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
     const startedAt = Date.now();
+    let transferCacheBinding: string | null = null;
     try {
       assertObj(actor);
       assertObj(target);
       assertString(verbName);
       if (!Array.isArray(args)) throw wooError("E_INVARG", "args must be a list");
-      const { verb } = this.resolveVerb(target, verbName);
+      transferCacheBinding = this.terminalTransferCacheBinding(frameId, actor, options);
+      if (transferCacheBinding) {
+        const cached = this.terminalTransferIdempotency.get(transferCacheBinding);
+        if (cached) {
+          if (Date.now() - cached.at >= 5 * 60 * 1000) {
+            this.terminalTransferIdempotency.delete(transferCacheBinding);
+          } else {
+            const requestFingerprint = this.directRequestFingerprint(target, verbName, args, options);
+            if (cached.requestFingerprint === requestFingerprint) return this.cloneFrame(cached.frame);
+            throw wooError(
+              "E_INVARG",
+              "idempotency key was already used for a different direct request",
+              { field: "id", id: frameId ?? null }
+            );
+          }
+        }
+      }
+      const { verb } = this.resolveVerbLive(target, verbName);
       const forceDirect = options.forceDirect === true && verb.direct_callable !== true;
       const wizard = this.isWizard(actor);
       // CO16.4: a scheduled turn is not client ingress, so the ingress flag
@@ -5576,10 +6965,54 @@ export class WooWorld {
         onSessionsEnded: options.onSessionsEnded
       });
     } catch (err) {
+      if (isCommandPlanTransfer(err)) {
+        const frame = await this.completeCommandPlanTransfer(frameId, actor, err);
+        if (transferCacheBinding) {
+          const cachedFrame = deepFreezePlainValue(this.cloneFrame(frame));
+          const existing = this.terminalTransferIdempotency.get(transferCacheBinding);
+          // Preserve the first request bound to this actor/session/frame, just
+          // as callNow preserves the first accepted sequenced outcome.
+          if (!existing || Date.now() - existing.at >= 5 * 60 * 1000) {
+            this.terminalTransferIdempotency.set(transferCacheBinding, {
+              at: Date.now(),
+              requestFingerprint: this.directRequestFingerprint(target, verbName, args, options),
+              frame: cachedFrame
+            });
+          }
+          this.sweepIdempotency();
+          return this.cloneFrame(cachedFrame);
+        }
+        return frame;
+      }
       const error = normalizeError(err);
       this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: null, observations: 0, ms: Date.now() - startedAt, status: "error", error: error.code });
       return { op: "error", id: frameId, error };
     }
+  }
+
+  private async completeCommandPlanTransfer(
+    frameId: string | undefined,
+    actor: ObjRef,
+    transfer: CommandPlanTransfer
+  ): Promise<AppliedFrame | ErrorFrame> {
+    if (transfer.actor !== actor) {
+      throw wooError("E_INTERNAL", "terminal command transfer actor changed during wrapper unwind", {
+        expected: actor,
+        actual: transfer.actor
+      });
+    }
+    return await this.callNow(
+      frameId,
+      transfer.session,
+      transfer.plan.space,
+      {
+        actor: transfer.actor,
+        target: transfer.plan.target,
+        verb: transfer.plan.verb,
+        args: transfer.plan.args
+      },
+      { transferredProofEvents: transfer.proofEvents }
+    );
   }
 
   private async dispatchDirectCallFrame(
@@ -5606,7 +7039,6 @@ export class WooWorld {
     const deferredHostEffects: DeferredHostEffect[] = [];
     const postAcceptEffects: PostAcceptEffect[] = [];
     let result: WooValue = null;
-    let mutated = false;
     const dispatchCtx: CallContext = {
       world: this,
       space: options.audience ?? "#-1",
@@ -5634,39 +7066,55 @@ export class WooWorld {
       },
       deferHostEffect: options.deferHostEffect ? (effect) => deferredHostEffects.push(effect) : undefined
     };
+    let liveAudiences: DirectLiveAudience = {};
     await this.withTurnRecording(
       { id: frameId, route: "direct", scope: options.audience ?? "#-1", seq: -1, session: options.sessionId, actor, target, verb: verbName, args },
       async (activeRecorder) => {
         options.hostMemo.turnRecorder = activeRecorder;
         await this.withPersistencePaused(async () => {
-          const before = this.snapshotProps();
-          const beforePlacement = this.snapshotPlacement();
-          const beforeObjectCount = this.objects.size;
-          try {
+          await this.withBehaviorSavepoint(async () => {
             result = await this.dispatch(dispatchCtx, target, verbName, args);
-            mutated =
-              beforeObjectCount !== this.objects.size ||
-              this.propsChanged(before) ||
-              this.placementChanged(beforePlacement);
-          } catch (err) {
-            this.restoreProps(before);
-            this.restorePlacement(beforePlacement);
-            throw err;
-          }
+            result = await this.enrichScopedMoveResult(dispatchCtx, result);
+            // These reads are part of constructing the success frame, so they
+            // belong before acceptance. A remote enrichment/audience failure
+            // must abort behavior, not report an error after state persisted.
+            // The cross-host bridge may already have supplied authoritative
+            // audience data; otherwise resolve it while rollback is possible.
+            const crossHostAudience = (dispatchCtx as { crossHostAudience?: DirectLiveAudience }).crossHostAudience;
+            liveAudiences = crossHostAudience ?? await this.directLiveAudiences(options.audience, observations);
+          });
         });
         return result;
       }
     );
-    if (mutated || this.persistenceDirty) this.persist(true);
+    if (this.persistenceDirty) this.persist(true);
     if (options.deferHostEffect) {
-      for (const effect of deferredHostEffects) options.deferHostEffect(effect);
+      const recordDeliveryFailure = (effect: DeferredHostEffect, err: unknown): void => {
+        this.recordMetric({
+          kind: "direct_host_effect_delivery",
+          target,
+          verb: verbName,
+          effect: effect.kind,
+          status: "error",
+          error: String(err)
+        });
+      };
+      for (const effect of deferredHostEffects) {
+        try {
+          const delivery = options.deferHostEffect(effect);
+          if (isPromiseLike(delivery)) {
+            // Post-accept transport must not hold the accepted reply open.
+            // Attach a rejection observer, but deliberately do not await it.
+            void Promise.resolve(delivery).catch((err) => recordDeliveryFailure(effect, err));
+          }
+        } catch (err) {
+          // Behavior and persistence are already accepted. A host projection
+          // sink is post-accept delivery: measure failure for repair/retry,
+          // but never rewrite the durable success into an error frame.
+          recordDeliveryFailure(effect, err);
+        }
+      }
     }
-    result = await this.enrichScopedMoveResult(dispatchCtx, result);
-    // Cross-host bridge stashes authoritative audience info on ctx; prefer it
-    // over recomputing locally where the local subscriber/presence view for
-    // self-hosted spaces is stale.
-    const crossHostAudience = (dispatchCtx as { crossHostAudience?: DirectLiveAudience }).crossHostAudience;
-    const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(options.audience, observations);
     this.runPostAcceptEffects(postAcceptEffects);
     this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: options.audience, observations: observations.length, ms: Date.now() - options.startedAt, status: "ok" });
     return {
@@ -5717,14 +7165,24 @@ export class WooWorld {
   }
 
   replay(space: ObjRef, from: number, limit: number): SpaceLogEntry[] {
-    return (this.logs.get(space) ?? []).filter((entry) => entry.seq >= from).slice(0, limit);
+    return cloneValue(
+      (this.logs.get(space) ?? [])
+        .filter((entry) => entry.seq >= from)
+        .slice(0, limit) as unknown as WooValue
+    ) as unknown as SpaceLogEntry[];
   }
 
-  async applyCall(id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
+  async applyCall(
+    id: string | undefined,
+    spaceRef: ObjRef,
+    message: Message,
+    sessionId: string | null = null,
+    options: AppliedCallOptions = {}
+  ): Promise<AppliedFrame> {
     const repo = this.activeObjectRepository();
-    if (repo) return await this.applyCallRepository(repo, id, spaceRef, message, sessionId);
+    if (repo) return await this.applyCallRepository(repo, id, spaceRef, message, sessionId, options);
     const startedAt = Date.now();
-    const frame = await this.withPersistencePaused(async () => {
+    const frame = await this.withBehaviorSavepoint(async () => await this.withPersistencePaused(async () => {
       this.validateMessage(message);
       // VTN10.1: the sequenced-call preamble (space lookup, verb
       // resolution, presence authorization, sequencer read) runs BEFORE
@@ -5734,14 +7192,14 @@ export class WooWorld {
       // guard is armed) converts a preamble `E_OBJNF` into the same repairable
       // `E_NEED_STATE` the in-run probe would emit. Off-guard this is a plain
       // passthrough, so the normal path is unchanged.
-      const space = this.guardedPreamble(() => this.object(spaceRef));
+      const space = this.guardedPreamble(() => this.objectLive(spaceRef));
       // Sequenced calls use the same catalog-level presence override as
       // direct calls. The check runs before the recorder opens, so ignoring
       // skip_presence_check here would make v2 commit-scope turns fail with no
       // transcript instead of producing an authority-verifiable result.
       let skipPresenceCheck = false;
       try {
-        skipPresenceCheck = this.resolveVerb(message.target, message.verb).verb.skip_presence_check === true;
+        skipPresenceCheck = this.resolveVerbLive(message.target, message.verb).verb.skip_presence_check === true;
       } catch {
         // Let unresolved target verbs continue into the sequenced call body,
         // where they become applied $error observations and still consume seq.
@@ -5749,11 +7207,11 @@ export class WooWorld {
       if (!skipPresenceCheck) {
         this.guardedPreamble(() => this.authorizePresence(message.actor, spaceRef, sessionId));
       }
-      const nextSeq = Number(this.guardedPreamble(() => this.getProp(spaceRef, "next_seq")));
+      const nextSeq = Number(this.guardedPreamble(() => this.getPropLive(spaceRef, "next_seq")));
       const seq = nextSeq;
       this.setProp(spaceRef, "next_seq", nextSeq + 1);
 
-      const logEntry: SpaceLogEntry = {
+      let logEntry: SpaceLogEntry = {
         space: spaceRef,
         seq,
         ts: Date.now(),
@@ -5763,8 +7221,13 @@ export class WooWorld {
         applied_ok: true
       };
       const log = this.logs.get(spaceRef) ?? [];
-      log.push(logEntry);
-      this.logs.set(spaceRef, log);
+      this.withBehaviorMutationPermit(() => {
+        log.push(logEntry);
+        this.logs.set(spaceRef, log);
+        // behavior wrappers detach caller-owned records; retain the stored
+        // authoritative row for outcome updates below.
+        logEntry = log[log.length - 1]!;
+      });
 
       const observations: Observation[] = [];
       let result: WooValue | undefined;
@@ -5799,10 +7262,11 @@ export class WooWorld {
             // The preamble's seq allocation, recorded as ordinary transcript
             // events so a net-planned turn commits the sequencer advance.
             this.recordSequencedAllocation(spaceRef, seq, message.actor);
+            for (const proof of options.transferredProofEvents ?? []) this.recordTurnEvent(proof);
             // Live-presence scrub is ordinary gateway maintenance. The helper
             // no-ops under shadow recording so user-turn transcripts do not
             // gain hidden system-authority writes.
-            await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef), ctx.hostMemo);
+            await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
             await this.withBehaviorSavepoint(async () => {
               result = await this.dispatch(ctx, message.target, message.verb, message.args);
               result = await this.enrichScopedMoveResult(ctx, result);
@@ -5810,54 +7274,65 @@ export class WooWorld {
             return result ?? null;
           }
         );
-        logEntry.applied_ok = true;
+        this.withBehaviorMutationPermit(() => {
+          logEntry.applied_ok = true;
+        });
       } catch (err) {
         const error = normalizeError(err);
-        logEntry.applied_ok = false;
-        logEntry.error = error;
+        this.withBehaviorMutationPermit(() => {
+          logEntry.applied_ok = false;
+          logEntry.error = error;
+        });
         observations.length = 0;
         observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
       }
 
-      logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
+      this.withBehaviorMutationPermit(() => {
+        logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
+      });
       const frame = { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, result };
       this.persist(true);
       return frame;
-    });
+    }));
     this.recordMetric({ kind: "applied", space: spaceRef, seq: frame.seq, verb: message.verb, ms: Date.now() - startedAt });
     return frame;
   }
 
-  private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
-    // This outer snapshot protects fatal repository failures after the
-    // in-memory turn has already advanced next_seq/log state. The inner
-    // withBehaviorSavepoint below is intentionally separate: normal verb
-    // errors must roll back only the verb body while preserving the applied
-    // error frame. Replacing both with one O(delta) undo log is the right
-    // optimization; dropping either snapshot changes rollback semantics.
-    const before = this.snapshotBehaviorState();
-    const beforeLogs = this.snapshotLogs();
+  private async applyCallRepository(
+    repo: ObjectRepository,
+    id: string | undefined,
+    spaceRef: ObjRef,
+    message: Message,
+    sessionId: string | null = null,
+    options: AppliedCallOptions = {}
+  ): Promise<AppliedFrame> {
     const startedAt = Date.now();
-    try {
-      const frame = await this.withPersistencePaused(async () => {
+    // The outer journal owns sequencer allocation, provisional log state,
+    // response assembly, and repository acceptance as one unit. The nested
+    // body journal may abort a throwing verb while the outer scope still
+    // commits its canonical applied-error envelope.
+    const frame = await this.withBehaviorSavepoint(async () =>
+      await this.withPersistencePaused(async () => {
         this.validateMessage(message);
-        const space = this.object(spaceRef);
+        const space = this.objectLive(spaceRef);
         // Match the in-memory apply path: verb metadata decides whether the
         // pre-recording presence gate applies to sequenced calls.
         let skipPresenceCheck = false;
         try {
-          skipPresenceCheck = this.resolveVerb(message.target, message.verb).verb.skip_presence_check === true;
+          skipPresenceCheck = this.resolveVerbLive(message.target, message.verb).verb.skip_presence_check === true;
         } catch {
           // Keep missing-verb calls on the applied-frame rollback path.
         }
         if (!skipPresenceCheck) {
           this.authorizePresence(message.actor, spaceRef, sessionId);
         }
-        const seq = Number(this.getProp(spaceRef, "next_seq"));
+        const seq = Number(this.getPropLive(spaceRef, "next_seq"));
         const ts = Date.now();
-        this.setPropLocal(spaceRef, "next_seq", seq + 1);
+        this.withBehaviorMutationPermit(() => {
+          this.setPropLocal(spaceRef, "next_seq", seq + 1);
+        });
 
-        const logEntry: SpaceLogEntry = {
+        let logEntry: SpaceLogEntry = {
           space: spaceRef,
           seq,
           ts,
@@ -5867,8 +7342,11 @@ export class WooWorld {
           applied_ok: true
         };
         const log = this.logs.get(spaceRef) ?? [];
-        log.push(logEntry);
-        this.logs.set(spaceRef, log);
+        this.withBehaviorMutationPermit(() => {
+          log.push(logEntry);
+          this.logs.set(spaceRef, log);
+          logEntry = log[log.length - 1]!;
+        });
         // `state(actor).spaces` exposes next_seq/log_count. In repository
         // mode, appendLog persists next_seq directly, bypassing persistProperty.
         this.bumpMutationVersion();
@@ -5905,10 +7383,11 @@ export class WooWorld {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
               // Same recorded seq allocation as the in-memory path.
               this.recordSequencedAllocation(spaceRef, seq, message.actor);
+              for (const proof of options.transferredProofEvents ?? []) this.recordTurnEvent(proof);
               // Same maintenance boundary as the in-memory path: repository
               // hosts may clean stale live rows, but recorded shadow turns
               // must not carry those cleanup writes.
-              await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef), ctx.hostMemo);
+              await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
               await this.withBehaviorSavepoint(async () => {
                 result = await this.dispatch(ctx, message.target, message.verb, message.args);
                 result = await this.enrichScopedMoveResult(ctx, result);
@@ -5916,33 +7395,64 @@ export class WooWorld {
               return result ?? null;
             }
           );
-          logEntry.applied_ok = true;
+          this.withBehaviorMutationPermit(() => {
+            logEntry.applied_ok = true;
+          });
         } catch (err) {
           const error = normalizeError(err);
-          logEntry.applied_ok = false;
-          logEntry.error = error;
+          this.withBehaviorMutationPermit(() => {
+            logEntry.applied_ok = false;
+            logEntry.error = error;
+          });
           observations.length = 0;
           observations.push({ type: "$error", code: error.code, message: error.message ?? error.code, value: error.value ?? null, trace: error.trace ?? [] });
         }
 
-        logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
-        repo.transaction(() => {
-          const appended = repo.appendLog(spaceRef, message.actor, message);
-          if (appended.seq !== seq) throw wooError("E_STORAGE", `sequenced log drift for ${spaceRef}: expected ${seq}, got ${appended.seq}`);
-          logEntry.ts = appended.ts;
-          repo.recordLogOutcome(spaceRef, seq, logEntry.applied_ok === true, observations, logEntry.error);
-          this.flushIncrementalState();
+        this.withBehaviorMutationPermit(() => {
+          logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
         });
+        // Response assembly is part of acceptance. Resolve every fallible
+        // audience read before the durable transaction; otherwise an audience
+        // fault after commit would restore only memory and report an error for
+        // a log row SQLite had already accepted.
         const audience = this.appliedFrameAudience(spaceRef, observations);
-        return { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, result, ...audience };
-      });
-      this.recordMetric({ kind: "applied", space: spaceRef, seq: frame.seq, verb: message.verb, ms: Date.now() - startedAt });
-      return frame;
-    } catch (err) {
-      this.restoreBehaviorState(before);
-      this.logs = beforeLogs;
-      throw err;
-    }
+        const frame: AppliedFrame = {
+          op: "applied",
+          id,
+          space: spaceRef,
+          seq,
+          ts: logEntry.ts,
+          message,
+          observations,
+          result,
+          ...audience
+        };
+        // The returned frame remains live until the outer direct wrapper
+        // accepts. Durable acceptance must not close over those mutable arrays
+        // or let wrapper code rewrite the log outcome after the inner turn was
+        // recorded.
+        const durableMessage = cloneValue(message) as Message;
+        const durableObservations = cloneValue(
+          observations as unknown as WooValue
+        ) as unknown as Observation[];
+        const durableAppliedOk = logEntry.applied_ok === true;
+        const durableError = logEntry.error
+          ? cloneValue(logEntry.error as unknown as WooValue) as unknown as ErrorValue
+          : undefined;
+        this.acceptNowOrWithOuterBehavior(() => {
+          const appended = repo.appendLog(spaceRef, durableMessage.actor, durableMessage);
+          if (appended.seq !== seq) throw wooError("E_STORAGE", `sequenced log drift for ${spaceRef}: expected ${seq}, got ${appended.seq}`);
+          this.withBehaviorMutationPermit(() => {
+            logEntry.ts = appended.ts;
+            frame.ts = appended.ts;
+          });
+          repo.recordLogOutcome(spaceRef, seq, durableAppliedOk, durableObservations, durableError);
+        });
+        return frame;
+      })
+    );
+    this.recordMetric({ kind: "applied", space: spaceRef, seq: frame.seq, verb: message.verb, ms: Date.now() - startedAt });
+    return frame;
   }
 
   async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string): Promise<WooValue> {
@@ -5984,7 +7494,7 @@ export class WooWorld {
         // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
         // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
         // as "no parent override" and fall back to the standard resolveVerb walk.
-        const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
+        const { definer, verb } = startAt == null ? this.resolveVerbLive(target, verbName) : this.resolveVerbFromLive(startAt, verbName);
         this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
         this.recordTurnDispatch(target, verbName, startAt, definer, verb);
         const runCtx: CallContext = {
@@ -6191,7 +7701,10 @@ export class WooWorld {
           continue;
         }
         this.mutateLineage(patch.object, () => {
-          this.object(patch.object).flags = { ...patch.after };
+          // Historical repair is an authority mutation, not a public read.
+          // Apply to the guarded live row so the journal and persistence
+          // layers both observe the lineage patch.
+          this.objectLive(patch.object).flags = { ...patch.after };
         });
         this.markObjectDirty(patch.object);
       }
@@ -6213,7 +7726,7 @@ export class WooWorld {
     const spaces: WorldSnapshot["spaces"] = {};
     for (const id of Array.from(this.objects.keys()).sort()) {
       if (!this.inheritsFrom(id, "$space")) continue;
-      const nextSeq = Number(this.propOrNull(id, "next_seq"));
+      const nextSeq = Number(this.propOrNullLive(id, "next_seq"));
       if (!Number.isFinite(nextSeq)) continue;
       spaces[id] = { next_seq: nextSeq, log_count: this.logs.get(id)?.length ?? 0 };
     }
@@ -6376,7 +7889,7 @@ export class WooWorld {
         if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
         return await this.executorContext.getPropChecked("$wiz", space, "next_seq", memo);
       }
-      return this.getProp(space, "next_seq");
+      return this.getPropLive(space, "next_seq");
     } catch (err) {
       if (!isOptionalProjectionReadError(err)) throw err;
       return null;
@@ -6410,13 +7923,13 @@ export class WooWorld {
     }
     const hostFor = (id: ObjRef): string => {
       if (selfHosted.has(id)) return id;
-      const obj = this.object(id);
+      const obj = this.objectLive(id);
       let cursor: ObjRef | null = obj.anchor;
       const seen = new Set<ObjRef>();
       while (cursor && !seen.has(cursor)) {
         if (selfHosted.has(cursor)) return cursor;
         seen.add(cursor);
-        cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+        cursor = this.objects.has(cursor) ? this.objectLive(cursor).anchor : null;
       }
       return DEFAULT_OBJECT_HOST;
     };
@@ -6426,7 +7939,7 @@ export class WooWorld {
   }
 
   private catalogState(): { installed: WooValue[] } {
-    const installed = this.objects.has("$catalog_registry") ? this.propOrNull("$catalog_registry", "installed_catalogs") : [];
+    const installed = this.objects.has("$catalog_registry") ? this.propOrNullLive("$catalog_registry", "installed_catalogs") : [];
     return { installed: Array.isArray(installed) ? installed : [] };
   }
 
@@ -6434,13 +7947,13 @@ export class WooWorld {
     const described = actor ? this.describeForActor(id, actor) : this.describe(id);
     const props: Record<string, WooValue> = {};
     for (const name of this.properties(id)) {
-      props[String(name)] = actor ? this.propOrNullForActor(actor, id, String(name)) : this.propOrNull(id, String(name));
+      props[String(name)] = actor ? this.propOrNullForActor(actor, id, String(name)) : this.propOrNullLive(id, String(name));
     }
     return { ...described, props };
   }
 
   private localScopedObjectSummary(actor: ObjRef, objRef: ObjRef): ScopedObjectSummary {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const props: Record<string, WooValue> = {};
     for (const name of this.properties(objRef)) {
       if (String(name) === "session_subscribers") continue;
@@ -6477,7 +7990,7 @@ export class WooWorld {
 
   private ancestorsOf(objRef: ObjRef): ObjRef[] {
     const ancestors: ObjRef[] = [];
-    let current = this.object(objRef).parent;
+    let current = this.objectLive(objRef).parent;
     const seen = new Set<ObjRef>();
     while (current && !seen.has(current)) {
       ancestors.push(current);
@@ -6542,7 +8055,7 @@ export class WooWorld {
     }
     this.assertCanBuildChild(actor, parentRef, actor);
     if (location) {
-      this.object(location);
+      this.objectLive(location);
       if (this.isSpaceLike(location) && !this.hasPresence(actor, location) && !this.isWizard(actor)) {
         throw wooError("E_PERM", `${actor} is not present in ${location}`, { actor, location });
       }
@@ -6579,7 +8092,7 @@ export class WooWorld {
     if (this.inheritsFrom(objRef, "$actor") && !this.inheritsFrom(parentRef, "$actor")) {
       throw wooError("E_PERM", "actors can only be reparented under actor classes", { actor, obj: objRef, parent: parentRef });
     }
-    const previousParent = this.object(objRef).parent;
+    const previousParent = this.objectLive(objRef).parent;
     const result = { ok: true, dry_run: dryRun, id: objRef, parent: parentRef, previous_parent: previousParent };
     if (dryRun) return result;
     this.chparentLocal(objRef, parentRef);
@@ -6633,7 +8146,7 @@ export class WooWorld {
       throw wooError("E_PERM", "wizard authority required for force_reserved", { progr, actor, obj: objRef });
     }
 
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     this.assertCanBuildOwnedObject(progr, objRef);
 
     const hardFloor = new Set(["$system", "$root", "$nowhere"]);
@@ -6761,7 +8274,7 @@ export class WooWorld {
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `recycle: handler moved obj across clusters: ${objRef}`, { actor, obj: objRef });
     }
-    const objAfter = this.object(objRef);
+    const objAfter = this.objectLive(objRef);
     if (objAfter.parent && objAfter.parent !== "$nowhere" && await this.remoteHostForObject(objAfter.parent)) {
       throw wooError("E_CROSS_HOST_WRITE", `recycle: handler reparented across clusters: ${objRef} -> ${objAfter.parent}`, { actor, obj: objRef, parent: objAfter.parent });
     }
@@ -6783,7 +8296,7 @@ export class WooWorld {
   private async invokeRecycleHandler(objRef: ObjRef, ctx?: CallContext): Promise<void> {
     let verbExists = false;
     try {
-      this.resolveVerb(objRef, "recycle");
+      this.resolveVerbLive(objRef, "recycle");
       verbExists = true;
     } catch (err) {
       if (isErrorValue(err) && err.code === "E_VERBNF") return;
@@ -6795,14 +8308,14 @@ export class WooWorld {
       ? { ...ctx, caller: objRef, callerPerms: ctx.progr }
       : {
           world: this,
-          space: this.object(objRef).anchor ?? "#-1",
+          space: this.objectLive(objRef).anchor ?? "#-1",
           seq: -1,
           session: null,
           actor: objRef,
           player: objRef,
           caller: objRef,
-          callerPerms: this.object(objRef).owner,
-          progr: this.object(objRef).owner,
+          callerPerms: this.objectLive(objRef).owner,
+          progr: this.objectLive(objRef).owner,
           thisObj: objRef,
           verbName: "recycle",
           definer: objRef,
@@ -6882,7 +8395,7 @@ export class WooWorld {
           break;
         }
         seen.add(cursor);
-        cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+        cursor = this.objects.has(cursor) ? this.objectLive(cursor).anchor : null;
       }
     }
     return out.sort();
@@ -7076,16 +8589,12 @@ export class WooWorld {
     // invoking programmer, not as the catalog installer that owns the surface
     // wrapper verb. callerPerms also tracks the actor.
     //
-    // Runtime errors are deliberately allowed to propagate. The outer
-    // `directCallNow` only restores property writes and placement on throw —
-    // it does NOT roll back `create()`/`recycle()` of objects or session
-    // mutations. eval can do anything the actor's progr permits, so we wrap
-    // the body in the heavier `withBehaviorSavepoint`, which snapshots and
-    // restores the full object table, tombstones, ULID counters, and parked
-    // tasks. Without this, `;create("$thing", {...}); return 1/0;` would
-    // leak the created object even though the call surface looks like a
-    // failure. Compile errors above are safe to return as data because no
-    // body ran.
+    // Runtime errors are deliberately allowed to propagate. Keep an explicit
+    // savepoint around eval because this method is also a public substrate
+    // helper and can be invoked outside the normal direct/sequenced frame.
+    // During an ordinary call it nests inside the frame savepoint; recorder
+    // behavior scopes are deliberately nestable, so an inner success remains
+    // provisional until the outer behavior commits.
     const evalCtx: CallContext = {
       ...ctx,
       thisObj: ctx.actor,
@@ -7298,14 +8807,14 @@ export class WooWorld {
     const maxChildren = optionInt(options, "max_children", 50, 0, 500);
     const maxInstances = optionInt(options, "max_instances", 50, 0, 500);
     const maxValueBytes = optionInt(options, "max_value_bytes", 512, 0, 16_384);
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const children = Array.from(obj.children).sort();
-    const fertileChildren = children.filter((child) => this.object(child).flags.fertile === true);
-    const instances = children.filter((child) => this.object(child).flags.fertile !== true);
+    const fertileChildren = children.filter((child) => this.objectLive(child).flags.fertile === true);
+    const instances = children.filter((child) => this.objectLive(child).flags.fertile !== true);
     const parentChain: Record<string, WooValue>[] = [];
     let current: ObjRef | null = objRef;
     while (current) {
-      const item: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      const item: WooObject | null = current === objRef ? this.objectLive(current) : this.parentWalkLookup(objRef, current);
       if (!item) {
         parentChain.push({ id: current, name: "<missing>", missing: true });
         break;
@@ -7322,7 +8831,7 @@ export class WooWorld {
 
     const features = this.canCarryFeatures(objRef)
       ? this.featureList(objRef).map((feature) => {
-          const featureObj = this.object(feature);
+          const featureObj = this.objectLive(feature);
           return {
             id: feature,
             name: featureObj.name,
@@ -7386,7 +8895,7 @@ export class WooWorld {
     };
 
     for (const id of this.progScopeObjectIds(actor, scope)) {
-      const obj = this.object(id);
+      const obj = this.objectLive(id);
       if (channels.has("object_name") && textMatches(normalized, obj.id, obj.name, this.propOrNullForActor(actor, id, "description"))) {
         addResult({ kind: "object", channel: "object_name", id, name: obj.name });
       }
@@ -7452,7 +8961,7 @@ export class WooWorld {
   }
 
   private assertProgrammerActor(actor: ObjRef, surfaceClass: ObjRef): void {
-    const obj = this.object(actor);
+    const obj = this.objectLive(actor);
     if (obj.flags.wizard === true) return;
     // Proxy guard (§8.5): the surface class itself is never a valid actor, even
     // though actorHasSurface would match it reflexively via ancestry.
@@ -7480,7 +8989,7 @@ export class WooWorld {
   private editorSessionPropertyInfo(editorRef: ObjRef): PropertyDef | null {
     let current: ObjRef | null = editorRef;
     while (current) {
-      const obj: WooObject | null = current === editorRef ? this.object(current) : this.parentWalkLookup(editorRef, current);
+      const obj: WooObject | null = current === editorRef ? this.objectLive(current) : this.parentWalkLookup(editorRef, current);
       if (!obj) break;
       const def = obj.propertyDefs.get("sessions");
       if (def) return def.perms === "" ? def : null;
@@ -7491,7 +9000,7 @@ export class WooWorld {
 
   private editorSessionMap(editorRef: ObjRef): Record<string, WooValue> {
     this.assertEditorObject(editorRef);
-    const raw = this.propOrNull(editorRef, "sessions");
+    const raw = this.propOrNullLive(editorRef, "sessions");
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
     return raw as Record<string, WooValue>;
   }
@@ -7555,12 +9064,12 @@ export class WooWorld {
 
   private editorReturnLocation(session: VerbEditorSession): ObjRef {
     if (session.previous_location && this.objects.has(session.previous_location)) return session.previous_location;
-    const home = this.objects.has(session.actor) ? this.propOrNull(session.actor, "home") : null;
+    const home = this.objects.has(session.actor) ? this.propOrNullLive(session.actor, "home") : null;
     return typeof home === "string" && this.objects.has(home) ? home : "$nowhere";
   }
 
   private async moveEditorActor(ctx: CallContext, destination: ObjRef, previousLocation: ObjRef | null): Promise<void> {
-    this.object(destination);
+    this.objectLive(destination);
     const actor = ctx.actor;
     // Capture the session's scope BEFORE any presence update. For a space-like
     // destination `updatePresence` sets `activeScope` as a side effect of
@@ -7655,7 +9164,7 @@ export class WooWorld {
 
   private resolveVerbSlotWithWalk(actor: ObjRef, objRef: ObjRef, slot: number, walk: Record<string, WooValue>[]): ResolvedVerb {
     if (!Number.isInteger(slot) || slot < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", slot);
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     // By slot VALUE, not array index — see ownVerbResolve.
     const verb = obj.verbs.find((entry) => entry.slot === slot);
     walk.push({ id: objRef, kind: "slot", slot, matched: verb !== undefined });
@@ -7668,7 +9177,7 @@ export class WooWorld {
     descriptor: WooValue,
     options: { mode: string; append: boolean }
   ): { current: VerbDef | null; slot: number; name: string; append: boolean } {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     if (typeof descriptor === "number") {
       if (!Number.isInteger(descriptor) || descriptor < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", descriptor);
       // By slot VALUE, not array index — see ownVerbResolve.
@@ -7698,7 +9207,7 @@ export class WooWorld {
   }
 
   private ownVerbNamed(objRef: ObjRef, name: string): VerbDef | null {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     for (const verb of obj.verbs) {
       if (verb.name === name) return verb;
     }
@@ -7733,9 +9242,9 @@ export class WooWorld {
   }
 
   private inheritedVerbSummaries(actor: ObjRef, objRef: ObjRef, includeSource: boolean): Record<string, WooValue>[] {
-    const shadowed = new Set<string>(this.object(objRef).verbs.map((verb) => verb.name));
+    const shadowed = new Set<string>(this.objectLive(objRef).verbs.map((verb) => verb.name));
     const summaries: Record<string, WooValue>[] = [];
-    let current = this.object(objRef).parent;
+    let current = this.objectLive(objRef).parent;
     while (current) {
       const obj = this.parentWalkLookup(objRef, current);
       if (!obj) break;
@@ -7765,15 +9274,15 @@ export class WooWorld {
   }
 
   private ownPropertySummaries(actor: ObjRef, objRef: ObjRef, maxValueBytes: number): Record<string, WooValue>[] {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const names = new Set<string>([...obj.propertyDefs.keys(), ...obj.properties.keys()]);
     return Array.from(names).sort().map((name) => this.propertySummaryForActor(actor, objRef, name, maxValueBytes, objRef));
   }
 
   private inheritedPropertySummaries(actor: ObjRef, objRef: ObjRef, maxValueBytes: number): Record<string, WooValue>[] {
-    const seen = new Set<string>(this.object(objRef).propertyDefs.keys());
+    const seen = new Set<string>(this.objectLive(objRef).propertyDefs.keys());
     const summaries: Record<string, WooValue>[] = [];
-    let current = this.object(objRef).parent;
+    let current = this.objectLive(objRef).parent;
     while (current) {
       const obj = this.parentWalkLookup(objRef, current);
       if (!obj) break;
@@ -7818,7 +9327,7 @@ export class WooWorld {
     const add = (id: ObjRef | null | undefined): void => {
       if (id && this.objects.has(id)) ids.add(id);
     };
-    const actorObj = this.object(actor);
+    const actorObj = this.objectLive(actor);
     // No "all" scope: a global object enumeration is forbidden on Net
     // (spec/semantics/distribution.md) and on any host it would return only the
     // misleading local closure. "owned" is bounded to the actor's own objects
@@ -7830,7 +9339,7 @@ export class WooWorld {
       add(actorObj.location);
       for (const item of actorObj.contents) add(item);
       if (actorObj.location && this.objects.has(actorObj.location)) {
-        for (const item of this.object(actorObj.location).contents) add(item);
+        for (const item of this.objectLive(actorObj.location).contents) add(item);
       }
       if (this.canCarryFeatures(actor)) {
         for (const feature of this.featureList(actor)) add(feature);
@@ -7849,9 +9358,9 @@ export class WooWorld {
     fertile?: boolean;
   } = {}): ObjRef {
     return this.withPersistenceDeferred(() => {
-      this.object(parent);
-      this.object(owner);
-      if (anchor) this.object(anchor);
+      this.objectLive(parent);
+      this.objectLive(owner);
+      if (anchor) this.objectLive(anchor);
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
       // Generic creation follows the executing-host contract (objects.md §4.1):
@@ -7865,11 +9374,11 @@ export class WooWorld {
       // while declaring it a member of another cluster, breaking
       // co-residency. The recycle anchored-descendants check (recycle.md
       // §RC3 pre-flight A3) relies on this.
-      if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+      if (anchor !== null && this.propOrNullLive(parent, "instances_self_host") === true) {
         throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
       }
       const location = options.location ?? null;
-      if (location) this.object(location);
+      if (location) this.objectLive(location);
       const scope = runtimeObjectScope(anchor ?? parent);
       let id: ObjRef;
       do {
@@ -7900,7 +9409,7 @@ export class WooWorld {
       // class itself as self-hosted (which it isn't; classes live on
       // WORLD). Setting host_placement on the instance is the spec's
       // per-instance representation (§4.2 routing precedence: rule 1).
-      if (this.propOrNull(parent, "instances_self_host") === true) {
+      if (this.propOrNullLive(parent, "instances_self_host") === true) {
         this.setProp(id, "host_placement", "self");
       }
       this.persistCounters();
@@ -7912,7 +9421,7 @@ export class WooWorld {
     const parent = assertObj(input.parent);
     const location = input.location ?? null;
     if (location) {
-      this.object(location);
+      this.objectLive(location);
       if (this.isSpaceLike(location) && !this.hasPresence(actor, location) && !this.isWizard(actor)) {
         throw wooError("E_PERM", `${actor} is not present in ${location}`);
       }
@@ -7928,7 +9437,7 @@ export class WooWorld {
 
   moveAuthoredObject(actor: ObjRef, objRef: ObjRef, targetRef: ObjRef): void {
     this.assertCanAuthorObject(actor, objRef);
-    this.object(targetRef);
+    this.objectLive(targetRef);
     this.moveObject(objRef, targetRef);
   }
 
@@ -7956,8 +9465,8 @@ export class WooWorld {
       }
       const objRemote = await this.remoteHostForObject(objRef, ctx.hostMemo);
     const targetRemote = await this.remoteHostForObject(targetRef, ctx.hostMemo);
-    if (!objRemote) this.object(objRef);
-    if (!targetRemote) this.object(targetRef);
+    if (!objRemote) this.objectLive(objRef);
+    if (!targetRemote) this.objectLive(targetRef);
 
     if (objRemote && ctx.deferHostEffect) {
       await this.invokeAcceptableHook(ctx, targetRef, objRef);
@@ -8014,7 +9523,7 @@ export class WooWorld {
       }
       const session = this.sessions.get(ctx.session);
       if (!session || session.actor !== actor) throw wooError("E_NOSESSION", "actor moveto requires the calling actor's live session", { actor, session: ctx.session });
-      if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
+      if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.objectLive(targetRef);
       // CA11.2 occupancy transition. The destination of a move is resolved at the
       // VM (from an exit's `dest`), so it is not in the authority payload's
       // served-scope set — the gateway may have served its lineage as a
@@ -8176,12 +9685,12 @@ export class WooWorld {
     this.assertCanAuthorObject(actor, objRef);
     const objRemote = await this.remoteHostForObject(objRef, ctx?.hostMemo);
     if (ctx?.deferHostEffect && objRemote) {
-      if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
+      if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.objectLive(targetRef);
       this.mirrorRemoteMoveLocally(objRef, targetRef);
       ctx.deferHostEffect({ kind: "move_object", obj: objRef, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
       return;
     }
-    if (!await this.remoteHostForObject(targetRef, ctx?.hostMemo)) this.object(targetRef);
+    if (!await this.remoteHostForObject(targetRef, ctx?.hostMemo)) this.objectLive(targetRef);
     await this.moveObjectChecked(objRef, targetRef);
   }
 
@@ -8196,7 +9705,7 @@ export class WooWorld {
   }
 
   contentsOf(objRef: ObjRef): ObjRef[] {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const value = Array.from(obj.contents);
     this.recordTurnEvent({
       kind: "cell_read",
@@ -8208,6 +9717,11 @@ export class WooWorld {
   }
 
   repairDerivedContentsIndex(options: { persist?: boolean } = {}): DerivedContentsRepairResult {
+    this.assertOutsideBehaviorMutation("repairDerivedContentsIndex");
+    return this.withBehaviorMutationPermit(() => this.repairDerivedContentsIndexPermitted(options));
+  }
+
+  private repairDerivedContentsIndexPermitted(options: { persist?: boolean }): DerivedContentsRepairResult {
     // `location` is the authoritative movement cell. `contents` is a derived
     // compatibility index used by catalogs and cached gateway views, so a full
     // host-local world may safely rebuild it from local object rows. This is
@@ -8289,7 +9803,11 @@ export class WooWorld {
    * the owner-location write has already happened elsewhere.
    */
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): void {
-    const container = this.object(containerRef);
+    this.withBehaviorMutationPermit(() => this.mirrorContentsPermitted(containerRef, objRef, present));
+  }
+
+  private mirrorContentsPermitted(containerRef: ObjRef, objRef: ObjRef, present: boolean): void {
+    const container = this.objectLive(containerRef);
     if (present) container.contents.add(objRef);
     else container.contents.delete(objRef);
     container.modified = Date.now();
@@ -8298,26 +9816,28 @@ export class WooWorld {
   }
 
   private mirrorRemoteMoveLocally(objRef: ObjRef, targetRef: ObjRef): void {
-    let changed = false;
-    // Deliberate O(object count) cache cleanup. This only runs on the deferred
-    // cross-host move path while object counts are small; if movement becomes
-    // hot, maintain a local contents reverse index instead.
-    for (const obj of this.objects.values()) {
-      if (!obj.contents.delete(objRef)) continue;
-      obj.modified = Date.now();
-      this.persistObject(obj.id);
-      changed = true;
-    }
-    if (this.objects.has(targetRef)) {
-      const target = this.object(targetRef);
-      if (!target.contents.has(objRef)) {
-        target.contents.add(objRef);
-        target.modified = Date.now();
-        this.persistObject(targetRef);
+    this.withBehaviorMutationPermit(() => {
+      let changed = false;
+      // Deliberate O(object count) cache cleanup. This only runs on the deferred
+      // cross-host move path while object counts are small; if movement becomes
+      // hot, maintain a local contents reverse index instead.
+      for (const obj of this.objects.values()) {
+        if (!obj.contents.delete(objRef)) continue;
+        obj.modified = Date.now();
+        this.persistObject(obj.id);
         changed = true;
       }
-    }
-    if (changed) this.persist();
+      if (this.objects.has(targetRef)) {
+        const target = this.objectLive(targetRef);
+        if (!target.contents.has(objRef)) {
+          target.contents.add(objRef);
+          target.modified = Date.now();
+          this.persistObject(targetRef);
+          changed = true;
+        }
+      }
+      if (changed) this.persist();
+    });
   }
 
     setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
@@ -8340,6 +9860,7 @@ export class WooWorld {
   }
 
   async applyDeferredHostEffects(effects: DeferredHostEffect[]): Promise<void> {
+    this.assertOutsideBehaviorMutation("applyDeferredHostEffects");
     for (const effect of effects) {
         if (effect.kind === "actor_presence") {
           await this.setActorPresenceChecked(effect.actor, effect.space, effect.present, effect.session);
@@ -8354,7 +9875,7 @@ export class WooWorld {
   async objectLocationChecked(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null> {
     const remote = await this.remoteHostForObject(objRef, memo);
     if (!remote) {
-      const obj = this.object(objRef);
+      const obj = this.objectLive(objRef);
       this.recordTurnEvent({
         kind: "cell_read",
         cell: { kind: "location", object: objRef },
@@ -8419,7 +9940,7 @@ export class WooWorld {
     let current: ObjRef | null = objRef;
     while (current && this.objects.has(current)) {
       ids.push(current);
-      current = this.object(current).parent;
+      current = this.objectLive(current).parent;
     }
     return ids;
   }
@@ -8527,7 +10048,7 @@ export class WooWorld {
       if (directive === "*verbdoc*") {
         const obj = assertObj(raw[1]);
         const name = assertString(raw[2] ?? "");
-        const { definer, verb } = this.resolveVerb(obj, name);
+        const { definer, verb } = this.resolveVerbLive(obj, name);
         const readable = this.canReadVerb(ctx.actor, verb);
         const source = readable ? verb.source || "No source available." : "Verb source is not readable.";
         const lines = [`${obj}:${verb.name} (${verb.perms})`, source];
@@ -8558,23 +10079,25 @@ export class WooWorld {
   }
 
   private chparentLocal(objRef: ObjRef, parentRef: ObjRef): void {
-    const obj = this.object(objRef);
-    if (obj.parent && this.objects.has(obj.parent)) this.object(obj.parent).children.delete(objRef);
-    // `parent` lives in the object_lineage cell. Route it through the seam so a
-    // runtime @chparent records the lineage write over Net. Off-turn callers
-    // (bootstrap, host-scoped migrations) no-op the recorder — see mutateLineage.
-    this.mutateLineage(objRef, () => { obj.parent = parentRef; });
-    this.object(parentRef).children.add(objRef);
-    obj.modified = Date.now();
+    const obj = this.objectLive(objRef);
+    this.withBehaviorMutationPermit(() => {
+      if (obj.parent && this.objects.has(obj.parent)) this.objectLive(obj.parent).children.delete(objRef);
+      // `parent` lives in the object_lineage cell. Route it through the seam so a
+      // runtime @chparent records the lineage write over Net. Off-turn callers
+      // (bootstrap, host-scoped migrations) no-op the recorder — see mutateLineage.
+      this.mutateLineage(objRef, () => { obj.parent = parentRef; });
+      this.objectLive(parentRef).children.add(objRef);
+      obj.modified = Date.now();
+    });
     this.persistObject(objRef);
     this.persistObject(parentRef);
     this.persist();
   }
 
   private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean }): ObjRef {
-    this.object(parent);
-    this.object(owner);
-    const selfHosted = this.propOrNull(parent, "instances_self_host") === true;
+    this.objectLive(parent);
+    this.objectLive(owner);
+    const selfHosted = this.propOrNullLive(parent, "instances_self_host") === true;
     // A builder object with no explicit space anchor co-locates in its AUTHOR's
     // authority cluster (§7 authoring workspace), not the catalog scope — so a
     // later source install on it is a local cluster write, not E_CATALOG_MUTATION
@@ -8584,7 +10107,7 @@ export class WooWorld {
       anchor === null && !selfHosted && this.isActorDescendant(owner)
         ? this.authorityAnchorRoot(owner)
         : anchor;
-    if (effectiveAnchor) this.object(effectiveAnchor);
+    if (effectiveAnchor) this.objectLive(effectiveAnchor);
     // Mirror the createRuntimeObject self-host/anchor rejection. See
     // spec/semantics/objects.md §4.1.
     if (effectiveAnchor !== null && selfHosted) {
@@ -8613,13 +10136,13 @@ export class WooWorld {
   }
 
   private assertCanBuildOwnedObject(actor: ObjRef, objRef: ObjRef): void {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     if (this.isWizard(actor) || obj.owner === actor) return;
     throw wooError("E_PERM", `${actor} cannot build on ${objRef}`, { actor, obj: objRef });
   }
 
   private assertCanBuildChild(actor: ObjRef, parent: ObjRef, owner: ObjRef): void {
-    const parentObj = this.object(parent);
+    const parentObj = this.objectLive(parent);
     if (this.isWizard(actor)) return;
     if (owner !== actor) throw wooError("E_PERM", `${actor} cannot create objects owned by ${owner}`, { actor, owner });
     if (parentObj.owner !== actor && parentObj.flags.fertile !== true) {
@@ -8628,7 +10151,11 @@ export class WooWorld {
   }
 
   private recycleObjectLocal(objRef: ObjRef): void {
-    const obj = this.object(objRef);
+    this.withBehaviorMutationPermit(() => this.recycleObjectLocalPermitted(objRef));
+  }
+
+  private recycleObjectLocalPermitted(objRef: ObjRef): void {
+    const obj = this.objectLive(objRef);
     // Editor sessions referencing this ULID are cleaned lazily on next
     // access via editorSessionOrNull — the eager scrub that lived here
     // moved to a §RC5-style lazy check.
@@ -8660,7 +10187,7 @@ export class WooWorld {
     const contentsSnapshot = Array.from(obj.contents);
     for (const content of contentsSnapshot) {
       if (!this.objects.has(content)) continue;
-      const contentObj = this.object(content);
+      const contentObj = this.objectLive(content);
       if (contentObj.location !== objRef) {
         // Stale cache entry — drop it from obj.contents but leave the
         // referenced object's location alone.
@@ -8674,11 +10201,11 @@ export class WooWorld {
 
     // Step 5/6: parent-side and container-side bookkeeping.
     if (parent && this.objects.has(parent)) {
-      this.object(parent).children.delete(objRef);
+      this.objectLive(parent).children.delete(objRef);
       this.persistObject(parent);
     }
     if (location && this.objects.has(location)) {
-      this.object(location).contents.delete(objRef);
+      this.objectLive(location).contents.delete(objRef);
       this.persistObject(location);
     }
     // R1: a recycled object must vanish from same-run ordering answers even
@@ -8686,7 +10213,7 @@ export class WooWorld {
     // recycling, but the substrate must not depend on that).
     if (this.requireOrderedChildrenProjection && !this.orderedEdgeWritesThisRun.has(objRef)) {
       const obj2 = this.objects.get(objRef);
-      this.orderedEdgeWritesThisRun.set(
+      this.noteOrderedEdgeWriteThisRun(
         objRef,
         this.priorOrderingMembership(objRef, obj2?.properties.has(ORDERED_EDGE_PROP) === true, obj2?.properties.get(ORDERED_EDGE_PROP))
       );
@@ -8702,8 +10229,8 @@ export class WooWorld {
   }
 
   private assertCanCreateObject(progr: ObjRef, parent: ObjRef, owner: ObjRef): void {
-    const progrObj = this.object(progr);
-    const parentObj = this.object(parent);
+    const progrObj = this.objectLive(progr);
+    const parentObj = this.objectLive(parent);
     if (progrObj.flags.wizard === true) return;
     if (owner !== progr) throw wooError("E_PERM", `${progr} cannot create objects owned by ${owner}`, { progr, owner });
     if (progrObj.flags.programmer !== true) throw wooError("E_PERM", `${progr} does not have programmer authority`, progr);
@@ -8720,7 +10247,9 @@ export class WooWorld {
       objects: Array.from(this.objects.values())
         .sort((a, b) => a.id.localeCompare(b.id))
         .map((obj) => this.serializeObject(obj)),
-      sessions: Array.from(this.sessions.values()).map((session) => this.serializeSession(session)),
+      sessions: Array.from(this.sessions.values())
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((session) => this.serializeSession(session)),
       logs: Array.from(this.logs.entries())
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
@@ -8733,7 +10262,9 @@ export class WooWorld {
     // Transport relays need fresh session claims for auth/revocation checks, but
     // not a full world snapshot. Keep this narrow so hot-path gateways do not
     // serialize object/log state just to refresh bearer-token authority.
-    return Array.from(this.sessions.values()).map((session) => this.serializeSession(session));
+    return Array.from(this.sessions.values())
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((session) => this.serializeSession(session));
   }
 
   exportObjects(ids: Iterable<ObjRef>): SerializedObject[] {
@@ -8938,7 +10469,7 @@ export class WooWorld {
       sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
-        .map((id) => this.serializeScopedObject(this.object(id), scope.objects, scope.hostedObjects)),
+        .map((id) => this.serializeScopedObject(this.objectLive(id), scope.objects, scope.hostedObjects)),
       sessions: [],
       logs: Array.from(this.logs.entries())
         .filter(([space]) => scope.hostedSpaces.has(space))
@@ -9035,6 +10566,10 @@ export class WooWorld {
     // transfer. The canonical form is gateway-internal, never
     // transmitted, so it doesn't perturb merge semantics.
     const digest = hashSource(canonicalJsonStringify(canonicalSeedForDigest(seed)));
+    // A cache hit returns the same object for performance. Make that shared
+    // identity immutable before publication so a caller cannot poison later
+    // satellite cold-loads by retaining and editing the first result.
+    deepFreezePlainValue(seed);
     // version is no longer consulted by the cache lookup (kept on the
     // entry shape for backward compatibility — invalidation is purely
     // by explicit delete). Capture the current mutationCounter as a
@@ -9045,17 +10580,22 @@ export class WooWorld {
   }
 
   importWorld(serialized: SerializedWorld): void {
+    this.assertOutsideBehaviorMutation("importWorld");
     // importWorld replaces every cell of the world. Any caller-visible
     // cache derived from prior state must be invalidated, including
     // the host-seed memoization keyed on mutationCounter.
     this.bumpMutationVersion();
     this.hostSeedCache.clear();
-    this.withPersistencePaused(() => {
+    this.withBehaviorMutationPermit(() => this.withPersistencePaused(() => {
       this.objects.clear();
       this.sessions.clear();
       this.logs.clear();
       this.snapshots = [];
-      this.tombstones = new Set(serialized.tombstones ?? []);
+      this.tombstones = new BehaviorMutationSet(
+        (undo, id) => this.recordBehaviorUndo(undo, "tombstones", id),
+        serialized.tombstones ?? [],
+        (id) => this.assertBehaviorMutationPermitted("tombstones", id)
+      );
       this.presenceIndexBuilt = false;
       this.subscribersIndex.clear();
       this.actorPresenceIndex.clear();
@@ -9068,7 +10608,7 @@ export class WooWorld {
           owner: item.owner,
           location: item.location,
           anchor: item.anchor,
-          flags: { ...(item.flags ?? {}) },
+          flags: cloneImportedPlainData(item.flags ?? {}),
           created: item.created,
           modified: item.modified,
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
@@ -9090,8 +10630,8 @@ export class WooWorld {
       this.snapshots = cloneImportedPlainData(serialized.snapshots ?? []);
       this.objectCounter = serialized.objectCounter ?? serialized.taskCounter ?? 1;
       this.sessionCounter = serialized.sessionCounter;
-      this.rebuildGuestPool();
-    });
+      this.rebuildGuestPoolPermitted();
+    }));
   }
 
   /**
@@ -9110,6 +10650,11 @@ export class WooWorld {
    * not durable, and these rows must never be written back as authority.
    */
   mergeTopologySeedObjects(objects: readonly SerializedObject[]): Set<ObjRef> {
+    this.assertOutsideBehaviorMutation("mergeTopologySeedObjects");
+    return this.withBehaviorMutationPermit(() => this.mergeTopologySeedObjectsPermitted(objects));
+  }
+
+  private mergeTopologySeedObjectsPermitted(objects: readonly SerializedObject[]): Set<ObjRef> {
     const added = new Set<ObjRef>();
     if (objects.length === 0) return added;
     this.withPersistencePaused(() => {
@@ -9122,7 +10667,7 @@ export class WooWorld {
           owner: item.owner,
           location: item.location,
           anchor: item.anchor,
-          flags: { ...(item.flags ?? {}) },
+          flags: cloneImportedPlainData(item.flags ?? {}),
           created: item.created,
           modified: item.modified,
           propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
@@ -9141,6 +10686,11 @@ export class WooWorld {
   }
 
   applyProjectionWrites(writes: readonly ProjectionWrite[], options: ProjectionApplyOptions = {}): ShadowHostApplyResult {
+    this.assertOutsideBehaviorMutation("applyProjectionWrites");
+    return this.withBehaviorMutationPermit(() => this.applyProjectionWritesPermitted(writes, options));
+  }
+
+  private applyProjectionWritesPermitted(writes: readonly ProjectionWrite[], options: ProjectionApplyOptions): ShadowHostApplyResult {
     const persist = options.persist !== false;
     const result: ShadowHostApplyResult = {
       ok: true,
@@ -9347,6 +10897,7 @@ export class WooWorld {
   }
 
   applyCommittedShadowTranscript(transcript: EffectTranscript, options: ShadowGatewayApplyOptions = {}): void {
+    this.assertOutsideBehaviorMutation("applyCommittedShadowTranscript");
     // CommitScopeDO is the authority for v2 shadow commits. The gateway keeps
     // this WooWorld as a routing/tool-list cache. Apply the same transcript
     // materialization semantics in-place so hot v2/MCP commits scale with the
@@ -9366,11 +10917,24 @@ export class WooWorld {
         writes: transcript.writes.length
       });
     };
-    this.applyCommittedShadowTranscriptInPlace(transcript, Date.now(), profile, options);
+    this.withBehaviorMutationPermit(() => {
+      this.applyCommittedShadowTranscriptInPlace(transcript, Date.now(), profile, options);
+    });
     profile("total", totalStartedAt);
   }
 
   applyCommittedShadowTranscriptToHost(hostKey: string, transcript: EffectTranscript, options: { gatewayHost?: boolean } = {}): ShadowHostApplyResult {
+    this.assertOutsideBehaviorMutation("applyCommittedShadowTranscriptToHost");
+    return this.withBehaviorMutationPermit(() =>
+      this.applyCommittedShadowTranscriptToHostPermitted(hostKey, transcript, options)
+    );
+  }
+
+  private applyCommittedShadowTranscriptToHostPermitted(
+    hostKey: string,
+    transcript: EffectTranscript,
+    options: { gatewayHost?: boolean }
+  ): ShadowHostApplyResult {
     // CommitScopeDO accepts against its own authority snapshot; object-host DOs
     // are the durable read authority for public object routes. This materializes
     // only the slice owned by `hostKey`, preserving the accepted transcript
@@ -9495,7 +11059,7 @@ export class WooWorld {
     for (const delta of presenceDeltas) {
       if (!belongsHere(delta.room)) continue;
       if (!this.objects.has(delta.room)) continue;
-      const before = this.propOrNull(delta.room, delta.property);
+      const before = this.propOrNullLive(delta.room, delta.property);
       const after = this.effects.applyPresenceProjectionRowDelta(before, delta);
       if (this.setPropLocal(delta.room, delta.property, after)) markObject(delta.room);
     }
@@ -9665,7 +11229,7 @@ export class WooWorld {
     for (const delta of presenceDeltas) {
       if (skippedHostPredicates?.belongsHere(delta.room)) continue;
       if (!this.objects.has(delta.room)) continue;
-      const before = this.propOrNull(delta.room, delta.property);
+      const before = this.propOrNullLive(delta.room, delta.property);
       const after = this.effects.applyPresenceProjectionRowDelta(before, delta);
       if (this.setPropLocal(delta.room, delta.property, after)) touchedObjects.add(delta.room);
     }
@@ -9721,7 +11285,7 @@ export class WooWorld {
       owner: item.owner,
       location: item.location,
       anchor: item.anchor,
-      flags: item.flags ?? {},
+      flags: cloneImportedPlainData(item.flags ?? {}),
       created: item.created,
       modified: item.modified,
       propertyDefs: new Map(),
@@ -9742,7 +11306,7 @@ export class WooWorld {
       owner: item.owner,
       location: item.location,
       anchor: item.anchor,
-      flags: { ...(item.flags ?? {}) },
+      flags: cloneImportedPlainData(item.flags ?? {}),
       created: item.created,
       modified: item.modified,
       propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
@@ -9843,6 +11407,47 @@ export class WooWorld {
     } as unknown as VerbDef;
   }
 
+  private cloneObjectView(obj: WooObject): WooObject {
+    return {
+      id: obj.id,
+      name: obj.name,
+      parent: obj.parent,
+      owner: obj.owner,
+      location: obj.location,
+      anchor: obj.anchor,
+      flags: { ...obj.flags },
+      created: obj.created,
+      modified: obj.modified,
+      propertyDefs: new Map(Array.from(obj.propertyDefs, ([name, def]) => [
+        name,
+        cloneValue(def as unknown as WooValue) as unknown as PropertyDef
+      ])),
+      properties: new Map(Array.from(obj.properties, ([name, value]) => [name, cloneValue(value)])),
+      propertyVersions: new Map(obj.propertyVersions),
+      verbs: obj.verbs.map((verb) => this.cloneVerbSharingBytecode(verb)),
+      children: new Set(obj.children),
+      contents: new Set(obj.contents),
+      eventSchemas: new Map(Array.from(obj.eventSchemas, ([type, shape]) => [
+        type,
+        cloneValue(shape as WooValue) as Record<string, WooValue>
+      ]))
+    };
+  }
+
+  private cloneSessionView(session: Session): Session {
+    return {
+      ...session,
+      attachedSockets: new Set(session.attachedSockets)
+    };
+  }
+
+  /** Frames cross a public boundary and may be retained or replayed. Never
+   * expose the cache's immutable value or a behavior-owned result graph:
+   * callers receive a fresh plain-data copy on every delivery. */
+  private cloneFrame<T extends AppliedFrame | DirectResultFrame | ErrorFrame>(frame: T): T {
+    return cloneValue(frame as unknown as WooValue) as unknown as T;
+  }
+
   private serializeObject(obj: WooObject): SerializedObject {
     return {
       id: obj.id,
@@ -9851,10 +11456,12 @@ export class WooWorld {
       owner: obj.owner,
       location: obj.location,
       anchor: obj.anchor,
-      flags: obj.flags,
+      flags: { ...obj.flags },
       created: obj.created,
       modified: obj.modified,
-      propertyDefs: Array.from(obj.propertyDefs.values()).map((def) => ({ ...def, defaultValue: cloneValue(def.defaultValue) })),
+      propertyDefs: Array.from(obj.propertyDefs.values()).map(
+        (def) => cloneValue(def as unknown as WooValue) as unknown as PropertyDef
+      ),
       properties: Array.from(obj.properties.entries()).map(([name, value]) => [name, cloneValue(value)]),
       propertyVersions: Array.from(obj.propertyVersions.entries()),
       verbs: obj.verbs.map((verb) => this.cloneVerbSharingBytecode(verb)),
@@ -9906,7 +11513,7 @@ export class WooWorld {
 
     for (let i = 0; i < queue.length; i++) {
       const { id, scanRefs, includeLineage } = queue[i];
-      const obj = this.object(id);
+      const obj = this.objectLive(id);
       if (includeLineage) {
         add(obj.parent, scanRefs);
         add(obj.owner, false);
@@ -9978,7 +11585,7 @@ export class WooWorld {
 
   private installedCatalogRecords(): Array<Record<string, WooValue>> {
     if (!this.objects.has("$catalog_registry")) return [];
-    const raw = this.propOrNull("$catalog_registry", "installed_catalogs");
+    const raw = this.propOrNullLive("$catalog_registry", "installed_catalogs");
     if (!Array.isArray(raw)) return [];
     return raw.filter(isPlainValueMap);
   }
@@ -9998,7 +11605,11 @@ export class WooWorld {
     }
 
   saveSnapshot(space: ObjRef): SpaceSnapshotRecord {
-    const seq = Number(this.getProp(space, "next_seq")) - 1;
+    return this.withBehaviorMutationPermit(() => this.saveSnapshotPermitted(space));
+  }
+
+  private saveSnapshotPermitted(space: ObjRef): SpaceSnapshotRecord {
+    const seq = Number(this.getPropLive(space, "next_seq")) - 1;
     const state = this.materializedSpaceState(space);
     const snapshot: SpaceSnapshotRecord = {
       space_id: space,
@@ -10007,17 +11618,33 @@ export class WooWorld {
       state,
       hash: hashCanonical(state)
     };
-    this.snapshots = this.snapshots.filter((item) => !(item.space_id === space && item.seq === seq));
+    const existingIndex = this.snapshots.findIndex((item) => item.space_id === space && item.seq === seq);
+    if (existingIndex >= 0) this.snapshots.splice(existingIndex, 1);
     this.snapshots.push(snapshot);
-    this.recordSnapshotProjectionUpsert(snapshot);
+    const stored = this.snapshots[this.snapshots.length - 1]!;
+    this.recordSnapshotProjectionUpsert(stored);
     this.setProp(space, "last_snapshot_seq", seq);
-    this.repository?.saveSpaceSnapshot?.(snapshot);
+    const repo = this.activeObjectRepository();
+    if (repo) {
+      const durableSnapshot = cloneValue(stored as unknown as WooValue) as unknown as SpaceSnapshotRecord;
+      if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
+        this.dirtySnapshots.set(`${stored.space_id}:${stored.seq}`, durableSnapshot);
+        this.persistenceDirty = true;
+      } else {
+        repo.saveSpaceSnapshot(durableSnapshot);
+      }
+    }
     this.persist();
-    return snapshot;
+    return cloneValue(stored as unknown as WooValue) as unknown as SpaceSnapshotRecord;
   }
 
   latestSnapshot(space: ObjRef): SpaceSnapshotRecord | null {
-    return this.repository?.latestSpaceSnapshot?.(space) ?? this.snapshots.filter((snapshot) => snapshot.space_id === space).sort((a, b) => b.seq - a.seq)[0] ?? null;
+    const found = this.repository?.latestSpaceSnapshot?.(space) ??
+      this.snapshots.filter((snapshot) => snapshot.space_id === space).sort((a, b) => b.seq - a.seq)[0] ??
+      null;
+    return found
+      ? cloneValue(found as unknown as WooValue) as unknown as SpaceSnapshotRecord
+      : null;
   }
 
   withPersistencePaused<T>(fn: () => Promise<T>): Promise<T>;
@@ -10059,6 +11686,14 @@ export class WooWorld {
 
   persist(force = false): void {
     if (!this.repository) return;
+    // Public persistence is never an escape hatch from a live behavior
+    // transaction, even with force=true. The outermost behavior acceptance
+    // path performs the one transactional flush while rollback is still
+    // available.
+    if (this.behaviorSavepointDepth > 0 || this.persistencePaused > 0) {
+      this.persistenceDirty = true;
+      return;
+    }
     if (this.activeObjectRepository()) {
       if (!force && (this.persistencePaused > 0 || this.persistenceDeferred > 0)) {
         this.persistenceDirty = true;
@@ -10077,6 +11712,7 @@ export class WooWorld {
   }
 
   persistFullSnapshot(trigger: "persist_full_snapshot" | "host_seed_apply" = "persist_full_snapshot"): void {
+    this.assertOutsideBehaviorMutation("persistFullSnapshot");
     if (!this.repository) return;
     // Use sparingly for whole-world replacement paths such as importing a
     // repaired host seed; incremental persistence has no dirty-row record for
@@ -10174,6 +11810,10 @@ export class WooWorld {
       dirtySessions: new Set(this.dirtySessions),
       deletedSessions: new Set(this.deletedSessions),
       dirtyTombstones: new Set(this.dirtyTombstones),
+      dirtySnapshots: new Map(Array.from(this.dirtySnapshots.entries()).map(([key, snapshot]) => [
+        key,
+        cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord
+      ])),
       dirtyCounters: this.dirtyCounters,
       dirty: this.persistenceDirty
     };
@@ -10186,6 +11826,10 @@ export class WooWorld {
     this.dirtySessions = new Set(state.dirtySessions);
     this.deletedSessions = new Set(state.deletedSessions);
     this.dirtyTombstones = new Set(state.dirtyTombstones);
+    this.dirtySnapshots = new Map(Array.from(state.dirtySnapshots.entries()).map(([key, snapshot]) => [
+      key,
+      cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord
+    ]));
     this.dirtyCounters = state.dirtyCounters;
     this.persistenceDirty = state.dirty;
   }
@@ -10198,6 +11842,7 @@ export class WooWorld {
       this.dirtySessions.size > 0 ||
       this.deletedSessions.size > 0 ||
       this.dirtyTombstones.size > 0 ||
+      this.dirtySnapshots.size > 0 ||
       this.dirtyCounters
     );
   }
@@ -10294,7 +11939,7 @@ export class WooWorld {
   }
 
   private serializeProperty(objRef: ObjRef, name: string): SerializedProperty {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const def = obj.propertyDefs.get(name);
     const hasValue = obj.properties.has(name);
     const hasVersion = obj.propertyVersions.has(name);
@@ -10370,6 +12015,7 @@ export class WooWorld {
     const dirtySessions = Array.from(this.dirtySessions);
     const deletedSessions = Array.from(this.deletedSessions);
     const dirtyTombstones = Array.from(this.dirtyTombstones);
+    const dirtySnapshots = Array.from(this.dirtySnapshots.entries());
     const dirtyCounters = this.dirtyCounters;
     const startedAt = Date.now();
     let rows = 0;
@@ -10415,6 +12061,10 @@ export class WooWorld {
         repo.saveTombstone(id, now, null);
         rows += 1;
       }
+      for (const [, snapshot] of dirtySnapshots) {
+        repo.saveSpaceSnapshot(snapshot);
+        rows += 1;
+      }
     });
     for (const objRef of dirtyObjects) this.dirtyObjects.delete(objRef);
     for (const objRef of deletedObjects) this.deletedObjects.delete(objRef);
@@ -10426,6 +12076,7 @@ export class WooWorld {
     for (const sessionId of dirtySessions) this.dirtySessions.delete(sessionId);
     for (const sessionId of deletedSessions) this.deletedSessions.delete(sessionId);
     for (const id of dirtyTombstones) this.dirtyTombstones.delete(id);
+    for (const [key] of dirtySnapshots) this.dirtySnapshots.delete(key);
     if (dirtyCounters) this.dirtyCounters = false;
     this.persistenceDirty = this.hasDirtyPersistence();
     const persistedProps = dirtyProperties.filter(({ objRef }) => !deletedObjectSet.has(objRef) && !dirtyObjectSet.has(objRef));
@@ -10450,13 +12101,18 @@ export class WooWorld {
   }
 
   rebuildGuestPool(): void {
+    this.assertOutsideBehaviorMutation("rebuildGuestPool");
+    this.withBehaviorMutationPermit(() => this.rebuildGuestPoolPermitted());
+  }
+
+  private rebuildGuestPoolPermitted(): void {
     this.guestFreePool.clear();
     const sessions = Array.from(this.sessions.values());
     for (const obj of this.objects.values()) {
       if (obj.id.startsWith("guest_") && obj.parent === "$player" && this.objects.has("$guest")) {
-        this.object("$player").children.delete(obj.id);
+        this.objectLive("$player").children.delete(obj.id);
         obj.parent = "$guest";
-        this.object("$guest").children.add(obj.id);
+        this.objectLive("$guest").children.add(obj.id);
         if (!obj.properties.has("home") && this.objects.has("$nowhere")) {
           obj.properties.set("home", "$nowhere");
           obj.propertyVersions.set("home", (obj.propertyVersions.get("home") ?? 0) + 1);
@@ -10579,6 +12235,10 @@ export class WooWorld {
   }
 
   private reapSession(sessionId: string): void {
+    this.withBehaviorMutationPermit(() => this.reapSessionPermitted(sessionId));
+  }
+
+  private reapSessionPermitted(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     const isGuest = this.inheritsFrom(session.actor, "$guest");
@@ -10603,13 +12263,15 @@ export class WooWorld {
    * replacement for `endSession`; it makes local liveness and presence queries
    * stop seeing the session immediately. */
   markSessionClosed(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    this.removeSessionPresence(sessionId, session.actor);
-    session.closedAt = Date.now();
-    session.attachedSockets.clear();
-    this.noteSessionDeleted(session);
-    this.sessions.delete(sessionId);
+    this.withBehaviorMutationPermit(() => {
+      const session = this.sessions.get(sessionId);
+      if (!session) return;
+      this.removeSessionPresence(sessionId, session.actor);
+      session.closedAt = Date.now();
+      session.attachedSockets.clear();
+      this.noteSessionDeleted(session);
+      this.sessions.delete(sessionId);
+    });
   }
 
   private promoteActorPrimaryLocation(actor: ObjRef): void {
@@ -10621,10 +12283,10 @@ export class WooWorld {
   }
 
   private resetGuestOnDisconnect(actor: ObjRef): void {
-    const homeValue = this.propOrNull(actor, "home");
+    const homeValue = this.propOrNullLive(actor, "home");
     const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
     const fallback = this.guestInventoryFallback(actor, home);
-    const contents = this.object(actor).contents;
+    const contents = this.objectLive(actor).contents;
     for (const item of Array.from(contents)) {
       if (!this.objects.has(item)) {
         contents.delete(item);
@@ -10636,7 +12298,7 @@ export class WooWorld {
     this.setProp(actor, "description", "");
     this.setProp(actor, "aliases", []);
     this.setProp(actor, "features", []);
-    this.setProp(actor, "features_version", Number(this.propOrNull(actor, "features_version") ?? 0) + 1);
+    this.setProp(actor, "features_version", Number(this.propOrNullLive(actor, "features_version") ?? 0) + 1);
     this.returnGuest(actor);
   }
 
@@ -10647,12 +12309,12 @@ export class WooWorld {
 
   private focusListOf(actor: ObjRef): ObjRef[] {
     if (!this.objects.has(actor)) return [];
-    const raw = this.propOrNull(actor, "focus_list");
+    const raw = this.propOrNullLive(actor, "focus_list");
     return Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
   }
 
   private inventoryEjectTarget(item: ObjRef, fallback: ObjRef): ObjRef {
-    const homeValue = this.propOrNull(item, "home");
+    const homeValue = this.propOrNullLive(item, "home");
     return typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : fallback;
   }
 
@@ -10692,7 +12354,7 @@ export class WooWorld {
   private removeActorActiveLists(actor: ObjRef): void {
     if (!this.objects.has(actor)) return;
     if (!this.sessionCleanupOwned(actor)) return;
-    const focusList = this.propOrNull(actor, "focus_list");
+    const focusList = this.propOrNullLive(actor, "focus_list");
     if (Array.isArray(focusList) && focusList.length > 0) this.setProp(actor, "focus_list", []);
   }
 
@@ -10703,17 +12365,21 @@ export class WooWorld {
    * where the catalog hook chain has nothing to veto. In-world movement
    * must keep going through the checked verbs. */
   moveObject(objRef: ObjRef, targetRef: ObjRef): void {
-    const obj = this.object(objRef);
-    this.object(targetRef);
+    this.withBehaviorMutationPermit(() => this.moveObjectPermitted(objRef, targetRef));
+  }
+
+  private moveObjectPermitted(objRef: ObjRef, targetRef: ObjRef): void {
+    const obj = this.objectLive(objRef);
+    this.objectLive(targetRef);
     const oldLocation = obj.location;
     const locationPrior = this.structuralVersionForRecording("location", objRef);
     if (oldLocation && this.objects.has(oldLocation)) {
-      const oldContainer = this.object(oldLocation);
+      const oldContainer = this.objectLive(oldLocation);
       oldContainer.contents.delete(objRef);
       oldContainer.modified = Date.now();
     }
     obj.location = targetRef;
-    const target = this.object(targetRef);
+    const target = this.objectLive(targetRef);
     target.contents.add(objRef);
     target.modified = Date.now();
     obj.modified = Date.now();
@@ -10731,13 +12397,15 @@ export class WooWorld {
   }
 
   private async moveObjectOwned(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
-    const obj = this.object(objRef);
+    const obj = this.objectLive(objRef);
     const targetRemote = await this.remoteHostForObject(targetRef);
-    if (!targetRemote) this.object(targetRef);
+    if (!targetRemote) this.objectLive(targetRef);
     const oldLocation = obj.location;
     const locationPrior = this.structuralVersionForRecording("location", objRef);
-    obj.location = targetRef;
-    obj.modified = Date.now();
+    this.withBehaviorMutationPermit(() => {
+      obj.location = targetRef;
+      obj.modified = Date.now();
+    });
     this.persistObject(objRef);
     if (oldLocation && oldLocation !== targetRef) await this.mirrorContainerContents(oldLocation, objRef, false, options);
     await this.mirrorContainerContents(targetRef, objRef, true, options);
@@ -10773,7 +12441,7 @@ export class WooWorld {
   private returnGuest(actor: ObjRef): void {
     if (!this.inheritsFrom(actor, "$guest")) return;
     if (Array.from(this.sessions.values()).some((session) => session.actor === actor)) return;
-    this.guestFreePool.add(actor);
+    this.withBehaviorMutationPermit(() => this.guestFreePool.add(actor));
   }
 
   private collectVerbNames(startRef: ObjRef | null, names: Set<string>): void {
@@ -10803,7 +12471,7 @@ export class WooWorld {
   }
 
   private featureList(objRef: ObjRef): ObjRef[] {
-    const value = this.getProp(objRef, "features");
+    const value = this.getPropLive(objRef, "features");
     if (!Array.isArray(value)) throw wooError("E_TYPE", "features must be a list", value);
     return value.map((item) => assertObj(item));
   }
@@ -10825,7 +12493,7 @@ export class WooWorld {
   }
 
   recordWizardAction(principal: ObjRef, action: string, details: Record<string, WooValue>): void {
-    const raw = this.propOrNull("$system", "wizard_actions");
+    const raw = this.propOrNullLive("$system", "wizard_actions");
     const actions = Array.isArray(raw) ? raw : [];
     // `actor` is the acting principal and `action`/`ts` are structural — a
     // details key must never clobber them. A details.actor (the subject some
@@ -10851,6 +12519,7 @@ export class WooWorld {
    * is the seam that keeps provisioning logic free of `if (net)` branches.
    */
   setProvisioningAuditSink(sink: ((principal: ObjRef, action: string, details: Record<string, WooValue>) => void) | null): void {
+    this.assertOutsideBehaviorMutation("setProvisioningAuditSink");
     this.provisioningAuditSink = sink;
   }
 
@@ -10890,7 +12559,7 @@ export class WooWorld {
   private prepareObjectFlagPlan(target: ObjRef, flags: Record<string, unknown>): ObjectFlagPlan {
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
     const allowed = new Set(["wizard", "programmer", "fertile"]);
-    const obj = this.object(target);
+    const obj = this.objectLive(target);
     const before: Record<string, boolean> = { ...obj.flags };
     // Pass 1 — validate every flag and compute the intended changes WITHOUT
     // mutating, so a later failure (a non-composable surface) cannot leave a
@@ -10922,7 +12591,10 @@ export class WooWorld {
   }
 
   private applyObjectFlagPlan(actor: ObjRef, plan: ObjectFlagPlan): WooObject["flags"] {
-    const obj = this.object(plan.target);
+    // This is the apply half of a validated authority mutation. `object()` is
+    // deliberately detached at the public boundary; mutate the guarded live
+    // row so the journal records and can reverse the lineage change.
+    const obj = this.objectLive(plan.target);
     const { target, changes } = plan;
     if (Object.keys(changes).length === 0) return { ...obj.flags };
     // The authoring surface must resolve on any actor that can author — a
@@ -10966,7 +12638,7 @@ export class WooWorld {
   }
 
   private bumpFeaturesVersion(objRef: ObjRef): void {
-    const current = Number(this.getProp(objRef, "features_version") ?? 0);
+    const current = Number(this.getPropLive(objRef, "features_version") ?? 0);
     this.setProp(objRef, "features_version", Number.isFinite(current) ? current + 1 : 1);
   }
 
@@ -10997,7 +12669,7 @@ export class WooWorld {
       return Boolean(await this.dispatch(ctx, feature, "can_be_attached_by", [actor]));
     } catch (err) {
       const error = normalizeError(err);
-      if (error.code === "E_VERBNF") return actor === this.object(feature).owner;
+      if (error.code === "E_VERBNF") return actor === this.objectLive(feature).owner;
       throw err;
     }
   }
@@ -11005,9 +12677,9 @@ export class WooWorld {
   private async addFeature(consumer: ObjRef, feature: ObjRef, actor: ObjRef, observations?: Observation[]): Promise<boolean> {
     this.assertFeatureConsumer(consumer);
     if (feature.startsWith("~")) throw wooError("E_INVARG", "transient objects cannot be features", feature);
-    this.object(feature);
+    this.objectLive(feature);
     if (consumer === feature) throw wooError("E_RECMOVE", "object cannot add itself as a feature", feature);
-    const consumerOwner = this.object(consumer).owner;
+    const consumerOwner = this.objectLive(consumer).owner;
     const wizard = this.isWizard(actor);
     if (!wizard && consumerOwner !== actor) throw wooError("E_PERM", `${actor} cannot add features to ${consumer}`);
     if (!wizard && !(await this.canFeatureBeAttachedBy(feature, actor))) throw wooError("E_PERM", `${feature} cannot be attached by ${actor}`);
@@ -11032,8 +12704,8 @@ export class WooWorld {
 
   private removeFeature(consumer: ObjRef, feature: ObjRef, actor: ObjRef, observations?: Observation[]): boolean {
     this.assertFeatureConsumer(consumer);
-    this.object(feature);
-    const consumerOwner = this.object(consumer).owner;
+    this.objectLive(feature);
+    const consumerOwner = this.objectLive(consumer).owner;
     if (!this.isWizard(actor) && consumerOwner !== actor) throw wooError("E_PERM", `${actor} cannot remove features from ${consumer}`);
     const features = this.featureList(consumer);
     if (!features.includes(feature)) return false;
@@ -11051,7 +12723,7 @@ export class WooWorld {
       const destination = args[0] as ObjRef;
       if (await this.isDescendantOfCheckedOrFalse(destination, "$space", memo)) return destination;
     }
-    const obj = this.object(target);
+    const obj = this.objectLive(target);
     if (await this.isDescendantOfCheckedOrFalse(target, "$space", memo)) return target;
     if (obj.anchor && await this.isDescendantOfCheckedOrFalse(obj.anchor, "$space", memo)) return obj.anchor;
     if (obj.location && await this.isDescendantOfCheckedOrFalse(obj.location, "$space", memo)) return obj.location;
@@ -11130,11 +12802,11 @@ export class WooWorld {
     // rows must not route destination-room observations to actors who have
     // already moved back out.
     const tableActors = this.sessionTableAudienceIn(space).actors;
-    const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+    const rawSessionSubscribers = this.propOrNullLive(space, "session_subscribers");
     if (Array.isArray(rawSessionSubscribers)) {
       return Array.from(new Set([...tableActors, ...this.projectedDeliveryAudienceIn(space).actors]));
     }
-    const rawLegacySubscribers = this.propOrNull(space, "subscribers");
+    const rawLegacySubscribers = this.propOrNullLive(space, "subscribers");
     if (!Array.isArray(rawLegacySubscribers)) return tableActors.length > 0 ? tableActors : undefined;
     this.ensurePresenceIndex();
     const subs = this.subscribersIndex.get(space);
@@ -11316,7 +12988,7 @@ export class WooWorld {
     private isSpaceLike(objRef: ObjRef): boolean {
       try {
         if (this.inheritsFrom(objRef, "$space")) return true;
-        this.getProp(objRef, "next_seq");
+        this.getPropLive(objRef, "next_seq");
         return true;
       } catch {
         return false;
@@ -11354,7 +13026,7 @@ export class WooWorld {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       return await this.executorContext.isDescendantOf(objRef, ancestorRef, memo);
     }
-    this.object(objRef);
+    this.objectLive(objRef);
     return false;
   }
 
@@ -11430,15 +13102,15 @@ export class WooWorld {
     void space;
     void present;
     void sessionId;
-    this.object(actor);
+    this.objectLive(actor);
     return false;
   }
 
   private updateSpaceSubscriberLocal(space: ObjRef, actor: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
-    this.object(space);
-    const rawSubscribers = this.getProp(space, "subscribers");
+    this.objectLive(space);
+    const rawSubscribers = this.getPropLive(space, "subscribers");
     if (!Array.isArray(rawSubscribers)) throw wooError("E_TYPE", `${space}.subscribers must be a list`, rawSubscribers);
-    const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+    const rawSessionSubscribers = this.propOrNullLive(space, "session_subscribers");
     const parsedSessionSubscribers = Array.isArray(rawSessionSubscribers)
       ? rawSessionSubscribers
         .filter((item): item is Record<string, WooValue> => !!item && typeof item === "object" && !Array.isArray(item))
@@ -11479,10 +13151,10 @@ export class WooWorld {
   // `subscribers` from the survivors so the two views stay coherent.
   private dropAllSubscriberRowsForActor(space: ObjRef, actor: ObjRef): boolean {
     if (!this.objects.has(space)) return false;
-    const rawSubscribers = this.getProp(space, "subscribers");
+    const rawSubscribers = this.getPropLive(space, "subscribers");
     if (!Array.isArray(rawSubscribers)) throw wooError("E_TYPE", `${space}.subscribers must be a list`, rawSubscribers);
     const subscribers = rawSubscribers.filter((item): item is ObjRef => typeof item === "string");
-    const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+    const rawSessionSubscribers = this.propOrNullLive(space, "session_subscribers");
     const parsedRows = Array.isArray(rawSessionSubscribers)
       ? rawSessionSubscribers
         .filter((item): item is Record<string, WooValue> => !!item && typeof item === "object" && !Array.isArray(item))
@@ -11509,7 +13181,7 @@ export class WooWorld {
     if (this.guestFreePool.size === 0) this.rebuildGuestPool();
     const pooled = Array.from(this.guestFreePool).sort()[0];
     if (pooled) {
-      this.guestFreePool.delete(pooled);
+      this.withBehaviorMutationPermit(() => this.guestFreePool.delete(pooled));
       return pooled;
     }
     const counter = this.objects.size;
@@ -11530,128 +13202,302 @@ export class WooWorld {
       .sort();
     return {
       space,
-      seq: Number(this.getProp(space, "next_seq")) - 1,
-      objects: Object.fromEntries(ids.map((id) => [id, Object.fromEntries(this.object(id).properties)]))
+      seq: Number(this.getPropLive(space, "next_seq")) - 1,
+      objects: Object.fromEntries(ids.map((id) => [id, Object.fromEntries(this.objectLive(id).properties)]))
     };
-  }
-
-  private snapshotProps(): Map<ObjRef, Map<string, WooValue>> {
-    return new Map(Array.from(this.objects.entries()).map(([id, obj]) => [id, new Map(Array.from(obj.properties.entries()).map(([k, v]) => [k, cloneValue(v)]))]));
-  }
-
-  private restoreProps(snapshot: Map<ObjRef, Map<string, WooValue>>): void {
-    for (const [id, props] of snapshot) {
-      const obj = this.objects.get(id);
-      if (obj) obj.properties = new Map(Array.from(props.entries()).map(([k, v]) => [k, cloneValue(v)]));
-    }
-  }
-
-  private propsChanged(snapshot: Map<ObjRef, Map<string, WooValue>>): boolean {
-    for (const [id, props] of snapshot) {
-      const obj = this.objects.get(id);
-      if (!obj || obj.properties.size !== props.size) return true;
-      for (const [name, value] of props) {
-        if (!obj.properties.has(name) || !valuesEqual(obj.properties.get(name)!, value)) return true;
-      }
-    }
-    return false;
-  }
-
-  private snapshotPlacement(): Map<ObjRef, { location: ObjRef | null; contents: ObjRef[] }> {
-    return new Map(Array.from(this.objects.entries()).map(([id, obj]) => [id, { location: obj.location, contents: Array.from(obj.contents).sort() }]));
-  }
-
-  private restorePlacement(snapshot: Map<ObjRef, { location: ObjRef | null; contents: ObjRef[] }>): void {
-    for (const [id, placement] of snapshot) {
-      const obj = this.objects.get(id);
-      if (!obj) continue;
-      obj.location = placement.location;
-      obj.contents = new Set(placement.contents);
-    }
-  }
-
-  private placementChanged(snapshot: Map<ObjRef, { location: ObjRef | null; contents: ObjRef[] }>): boolean {
-    for (const [id, placement] of snapshot) {
-      const obj = this.objects.get(id);
-      if (!obj || obj.location !== placement.location) return true;
-      const contents = Array.from(obj.contents).sort();
-      if (contents.length !== placement.contents.length) return true;
-      for (let i = 0; i < contents.length; i++) if (contents[i] !== placement.contents[i]) return true;
-    }
-    return false;
   }
 
   private withBehaviorSavepoint<T>(fn: () => Promise<T>): Promise<T>;
   private withBehaviorSavepoint<T>(fn: () => T): T;
   private withBehaviorSavepoint<T>(fn: () => T | Promise<T>): T | Promise<T> {
-    const savepoint = this.snapshotBehaviorState();
-    try {
-      const result = fn();
-      if (isPromiseLike(result)) {
-        return result.catch((err) => {
-          this.restoreBehaviorState(savepoint);
-          throw err;
-        });
+    const recorder = this.activeTurnRecorder;
+    recorder?.beginBehaviorScope();
+    this.behaviorUndoScopes.push({
+      undos: [],
+      terminalTransferDisallowedKinds: new Set(),
+      acceptance: [],
+      objects: new Set(),
+      sessions: new Set(),
+      logs: new Set(),
+      tombstones: new Set(),
+      guestFreePool: new Set(),
+      snapshots: false,
+      createdThisRun: new Set(),
+      orderedEdgeWritesThisRun: new Set(),
+      roomRosterProjections: new Map(),
+      subscriberScrubAt: new Map(),
+      objectCounter: this.objectCounter,
+      sessionCounter: this.sessionCounter,
+      persistence: this.snapshotPersistenceDirtyState()
+    });
+    this.behaviorSavepointDepth += 1;
+    this.persistencePaused += 1;
+    const commit = (value: T): T => {
+      try {
+        if (this.behaviorSavepointDepth === 1 && this.persistenceDeferred === 0) {
+          // Nested sequenced calls can stage durable log acceptance beneath a
+          // direct command-plan turn. Execute those commits only while the
+          // outer rollback journal is still live; any repository refusal then
+          // aborts both the nested turn and its outer behavior atomically.
+          this.runBehaviorAcceptance(this.behaviorUndoScopes.at(-1)?.acceptance ?? []);
+        }
+        this.commitBehaviorUndoScope();
+        recorder?.commitBehaviorScope();
+        return value;
+      } catch (err) {
+        this.abortBehaviorUndoScope();
+        recorder?.abortBehaviorScope();
+        throw err;
+      } finally {
+        this.behaviorSavepointDepth -= 1;
+        this.persistencePaused -= 1;
       }
-      return result;
-    } catch (err) {
-      this.restoreBehaviorState(savepoint);
+    };
+    const abort = (err: unknown): never => {
+      try {
+        this.abortBehaviorUndoScope();
+        recorder?.abortBehaviorScope();
+      } finally {
+        this.behaviorSavepointDepth -= 1;
+        this.persistencePaused -= 1;
+      }
       throw err;
+    };
+    let result: T | Promise<T>;
+    try {
+      result = fn();
+    } catch (err) {
+      return abort(err);
+    }
+    // Keep commit outside the fn() catch. A synchronous repository refusal
+    // during commit is already rolled back by commit(); catching it here as
+    // though fn() had failed would abort the same journal a second time and
+    // mask the acceptance error with "undo-scope abort without begin".
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).then(commit, abort);
+    }
+    return commit(result);
+  }
+
+  private prepareBehaviorObject(object: WooObject): WooObject {
+    const existing = this.behaviorObjectProxies.get(object);
+    if (existing) return existing;
+    // Capture only the primitive owner id. Capturing `object` retains the
+    // detached caller graph for as long as the authoritative proxy lives.
+    const objectId = object.id;
+    const record = (undo: () => void): void => this.recordBehaviorUndo(undo, "objects", objectId);
+    const cache = new WeakMap<object, unknown>();
+    const proxy = behaviorMutationValue(
+      object,
+      record,
+      cache,
+      () => this.assertBehaviorMutationPermitted("objects", objectId),
+      "woo_object"
+    );
+    this.behaviorObjectProxies.set(object, proxy);
+    this.behaviorObjectProxies.set(proxy, proxy);
+    return proxy;
+  }
+
+  private prepareBehaviorSession(session: Session): Session {
+    const existing = this.behaviorSessionProxies.get(session);
+    if (existing) return existing;
+    const sessionId = session.id;
+    const record = (undo: () => void): void => this.recordBehaviorUndo(undo, "sessions", sessionId);
+    const cache = new WeakMap<object, unknown>();
+    const proxy = behaviorMutationValue(
+      session,
+      record,
+      cache,
+      () => this.assertBehaviorMutationPermitted("sessions", sessionId)
+    );
+    this.behaviorSessionProxies.set(session, proxy);
+    this.behaviorSessionProxies.set(proxy, proxy);
+    return proxy;
+  }
+
+  private prepareBehaviorLog(entries: SpaceLogEntry[]): SpaceLogEntry[] {
+    const existing = this.behaviorLogProxies.get(entries);
+    if (existing) return existing;
+    const cache = new WeakMap<object, unknown>();
+    const proxy = behaviorMutationValue(
+      entries,
+      (undo) => this.recordBehaviorUndo(undo, "logs"),
+      cache,
+      () => this.assertBehaviorMutationPermitted("logs")
+    );
+    this.behaviorLogProxies.set(entries, proxy);
+    this.behaviorLogProxies.set(proxy, proxy);
+    return proxy;
+  }
+
+  private prepareBehaviorSnapshot(snapshot: SpaceSnapshotRecord): SpaceSnapshotRecord {
+    const existing = this.behaviorSnapshotProxies.get(snapshot);
+    if (existing) return existing;
+    // Snapshot rows are independently owned durable records. Each root keeps
+    // its own graph cache, but repeated reads of that root resolve to the same
+    // proxy and therefore preserve identity.
+    const cache = new WeakMap<object, unknown>();
+    const proxy = behaviorMutationValue(
+      snapshot,
+      (undo) => this.recordBehaviorUndo(undo, "snapshots"),
+      cache,
+      () => this.assertBehaviorMutationPermitted("snapshots")
+    );
+    this.behaviorSnapshotProxies.set(snapshot, proxy);
+    this.behaviorSnapshotProxies.set(proxy, proxy);
+    return proxy;
+  }
+
+  private recordBehaviorUndo(
+    undo: () => void,
+    kind: "objects" | "sessions" | "logs" | "tombstones" | "guestFreePool" | "snapshots",
+    id?: string
+  ): void {
+    if (this.behaviorJournalRestoring > 0) return;
+    const scope = this.behaviorUndoScopes.at(-1);
+    if (!scope) return;
+    if (this.behaviorMutationPermit === 0) {
+      throw wooError("E_INTERNAL", "authoritative mutation attempted without a mutation permit", { kind, id: id ?? null });
+    }
+    scope.undos.push(undo);
+    if (kind === "snapshots") scope.snapshots = true;
+    else if (id !== undefined) scope[kind].add(id);
+  }
+
+  private assertBehaviorMutationPermitted(
+    kind: "objects" | "sessions" | "logs" | "tombstones" | "guestFreePool" | "snapshots",
+    id?: string
+  ): void {
+    if (this.behaviorJournalRestoring > 0) return;
+    if (this.behaviorMutationPermit === 0) {
+      throw wooError("E_INTERNAL", "authoritative mutation attempted without a mutation permit", { kind, id: id ?? null });
     }
   }
 
-  private snapshotBehaviorState(): BehaviorSavepoint {
-    return {
-      objects: new Map(Array.from(this.objects.entries()).map(([id, obj]) => [id, this.cloneObject(obj)])),
-      sessions: new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)])),
-      snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
-      tombstones: new Set(this.tombstones),
-      objectCounter: this.objectCounter,
-      sessionCounter: this.sessionCounter,
-      guestFreePool: new Set(this.guestFreePool),
-      persistence: this.snapshotPersistenceDirtyState()
-    };
+  private assertOutsideBehaviorMutation(what: string): void {
+    if (this.behaviorSavepointDepth === 0) return;
+    throw wooError("E_INTERNAL", `${what} cannot mutate during behavior execution`, { operation: what });
   }
 
-  private restoreBehaviorState(savepoint: BehaviorSavepoint): void {
-    this.objects = new Map(Array.from(savepoint.objects.entries()).map(([id, obj]) => [id, this.cloneObject(obj)]));
-    this.sessions = new Map(Array.from(savepoint.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)]));
-    this.snapshots = cloneValue(savepoint.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[];
-    this.tombstones = new Set(savepoint.tombstones);
-    this.objectCounter = savepoint.objectCounter;
-    this.sessionCounter = savepoint.sessionCounter;
-    this.guestFreePool = new Set(savepoint.guestFreePool);
-    this.restorePersistenceDirtyState(savepoint.persistence);
-    // The index mirrors session_subscribers plus compatibility presence
-    // properties on objects we just rolled back. Drop it so the next read
-    // rebuilds from the restored property values.
+  private withBehaviorMutationPermit<T>(fn: () => T): T {
+    this.behaviorMutationPermit += 1;
+    try {
+      return fn();
+    } finally {
+      this.behaviorMutationPermit -= 1;
+    }
+  }
+
+  private commitBehaviorUndoScope(): void {
+    const committed = this.behaviorUndoScopes.pop();
+    if (!committed) throw new Error("behavior undo-scope commit without begin");
+    const parent = this.behaviorUndoScopes.at(-1);
+    if (!parent) {
+      this.lastBehaviorUndoStats = this.behaviorUndoStats(committed);
+      return;
+    }
+    parent.undos.push(...committed.undos);
+    for (const kind of committed.terminalTransferDisallowedKinds) {
+      parent.terminalTransferDisallowedKinds.add(kind);
+    }
+    parent.acceptance.push(...committed.acceptance);
+    for (const id of committed.objects) parent.objects.add(id);
+    for (const id of committed.sessions) parent.sessions.add(id);
+    for (const id of committed.logs) parent.logs.add(id);
+    for (const id of committed.tombstones) parent.tombstones.add(id);
+    for (const id of committed.guestFreePool) parent.guestFreePool.add(id);
+    for (const id of committed.createdThisRun) parent.createdThisRun.add(id);
+    for (const id of committed.orderedEdgeWritesThisRun) parent.orderedEdgeWritesThisRun.add(id);
+    for (const [room, before] of committed.roomRosterProjections) {
+      if (!parent.roomRosterProjections.has(room)) parent.roomRosterProjections.set(room, before);
+    }
+    for (const [space, before] of committed.subscriberScrubAt) {
+      if (!parent.subscriberScrubAt.has(space)) parent.subscriberScrubAt.set(space, before);
+    }
+    parent.snapshots ||= committed.snapshots;
+  }
+
+  private acceptNowOrWithOuterBehavior(accept: () => void): void {
+    const scope = this.behaviorUndoScopes.at(-1);
+    if (scope) scope.acceptance.push(accept);
+    else this.runBehaviorAcceptance([accept]);
+  }
+
+  private runBehaviorAcceptance(acceptance: Array<() => void>): void {
+    const repo = this.activeObjectRepository();
+    if (
+      acceptance.length === 0 &&
+      !this.persistenceDirty &&
+      !this.hasDirtyPersistence()
+    ) return;
+    const acceptAll = (): void => {
+      this.behaviorJournalAccepting += 1;
+      try {
+        for (const accept of acceptance) accept();
+        // Log allocation and every dirty object/property/session row produced
+        // by the nested turns share one repository transaction. If the final
+        // callback or flush fails, no earlier nested turn survives the outer
+        // in-memory rollback.
+        if (repo) {
+          this.flushIncrementalState();
+          this.persistenceDirty = this.hasDirtyPersistence();
+        } else if (this.repository && this.persistenceDirty) {
+          this.runFullSave("world_persist");
+          this.persistenceDirty = false;
+        }
+      } finally {
+        this.behaviorJournalAccepting -= 1;
+      }
+    };
+    if (repo) repo.transaction(acceptAll);
+    else acceptAll();
+  }
+
+  private abortBehaviorUndoScope(): void {
+    const aborted = this.behaviorUndoScopes.pop();
+    if (!aborted) throw new Error("behavior undo-scope abort without begin");
+    this.behaviorJournalRestoring += 1;
+    try {
+      for (let index = aborted.undos.length - 1; index >= 0; index -= 1) aborted.undos[index]();
+    } finally {
+      this.behaviorJournalRestoring -= 1;
+    }
+    this.objectCounter = aborted.objectCounter;
+    this.sessionCounter = aborted.sessionCounter;
+    for (const id of aborted.createdThisRun) this.createdThisRun.delete(id);
+    for (const id of aborted.orderedEdgeWritesThisRun) this.orderedEdgeWritesThisRun.delete(id);
+    for (const [room, before] of aborted.roomRosterProjections) {
+      if (before === undefined) this.roomRosterProjections.delete(room);
+      else this.roomRosterProjections.set(room, before);
+    }
+    for (const [space, before] of aborted.subscriberScrubAt) {
+      if (before === undefined) this.lastSubscriberScrubAt.delete(space);
+      else this.lastSubscriberScrubAt.set(space, before);
+    }
+    this.restorePersistenceDirtyState(aborted.persistence);
     this.invalidatePresenceIndex();
     this.invalidateSessionActiveScopeIndex();
+    if (this.behaviorUndoScopes.length === 0) this.lastBehaviorUndoStats = this.behaviorUndoStats(aborted);
   }
 
-  private cloneObject(obj: WooObject): WooObject {
+  private behaviorUndoStats(scope: BehaviorUndoScope): NonNullable<WooWorld["lastBehaviorUndoStats"]> {
     return {
-      ...obj,
-      flags: { ...obj.flags },
-      propertyDefs: new Map(Array.from(obj.propertyDefs.entries()).map(([name, def]) => [name, { ...def, defaultValue: cloneValue(def.defaultValue) }])),
-      properties: new Map(Array.from(obj.properties.entries()).map(([name, value]) => [name, cloneValue(value)])),
-      propertyVersions: new Map(obj.propertyVersions),
-      verbs: obj.verbs.map((verb) => this.cloneVerbSharingBytecode(verb)),
-      children: new Set(obj.children),
-      contents: new Set(obj.contents),
-      eventSchemas: new Map(Array.from(obj.eventSchemas.entries()).map(([type, schema]) => [type, cloneValue(schema as unknown as WooValue) as Record<string, WooValue>]))
+      objects: scope.objects.size,
+      sessions: scope.sessions.size,
+      tombstones: scope.tombstones.size,
+      guestPool: scope.guestFreePool.size,
+      snapshots: scope.snapshots ? 1 : 0
     };
   }
 
-  private snapshotLogs(): Map<ObjRef, SpaceLogEntry[]> {
-    return new Map(Array.from(this.logs.entries()).map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]));
-  }
-
-  private cloneSession(session: Session): Session {
-    return {
-      ...session,
-      attachedSockets: new Set(session.attachedSockets)
-    };
+  /**
+   * Test/benchmark diagnostic for the most recently completed outer behavior
+   * scope. Counts distinct mutated categories/rows; inverse-operation count is
+   * intentionally not exposed as a semantic contract.
+   */
+  behaviorUndoStatsForTesting(): Readonly<NonNullable<WooWorld["lastBehaviorUndoStats"]>> | null {
+    return this.lastBehaviorUndoStats ? { ...this.lastBehaviorUndoStats } : null;
   }
 
   private async publicCommandActor(ctx: CallContext, value: WooValue | undefined): Promise<ObjRef> {
@@ -11660,7 +13506,7 @@ export class WooWorld {
       throw wooError("E_PERM", `${ctx.actor} cannot parse commands as ${actor}`, { actor: ctx.actor, requested_actor: actor });
     }
     if (this.objects.has(actor) || await this.remoteHostForObject(actor, ctx.hostMemo)) return actor;
-    this.object(actor);
+    this.objectLive(actor);
     return actor;
   }
 
@@ -11713,7 +13559,7 @@ export class WooWorld {
       // Fall through to the original message verb below.
     }
     try {
-      return this.resolveVerb(ctx.message.target, ctx.message.verb).verb.skip_presence_check === true;
+      return this.resolveVerbLive(ctx.message.target, ctx.message.verb).verb.skip_presence_check === true;
     } catch {
       return false;
     }
@@ -11768,7 +13614,7 @@ export class WooWorld {
     });
     this.nativeHandlers.set("player_join", (ctx, args) => this.playerJoin(ctx, args));
     this.nativeHandlers.set("guest_on_disfunc", async (ctx, args) => {
-      const homeValue = this.propOrNull(ctx.thisObj, "home");
+      const homeValue = this.propOrNullLive(ctx.thisObj, "home");
       // The optional destination is for trusted session cleanup (the net guest
       // door restores a claimed seat to its catalog-declared initial room).
       // Ordinary disfunc keeps the historical home/$nowhere behavior.
@@ -11782,7 +13628,9 @@ export class WooWorld {
       const carried = await this.objectContents(ctx.thisObj, ctx.hostMemo);
       for (const item of carried) {
         if (!this.objects.has(item) && !await this.remoteHostForObject(item, ctx.hostMemo)) {
-          this.object(ctx.thisObj).contents.delete(item);
+          this.withBehaviorMutationPermit(() => {
+            this.objectLive(ctx.thisObj).contents.delete(item);
+          });
           continue;
         }
         await this.moveObjectChecked(item, this.inventoryEjectTarget(item, fallback));
@@ -11791,7 +13639,7 @@ export class WooWorld {
       this.setProp(ctx.thisObj, "description", "");
       this.setProp(ctx.thisObj, "aliases", []);
       this.setProp(ctx.thisObj, "features", []);
-      this.setProp(ctx.thisObj, "features_version", Number(this.propOrNull(ctx.thisObj, "features_version") ?? 0) + 1);
+      this.setProp(ctx.thisObj, "features_version", Number(this.propOrNullLive(ctx.thisObj, "features_version") ?? 0) + 1);
       this.returnGuest(ctx.thisObj);
       return true;
     });
@@ -11809,9 +13657,9 @@ export class WooWorld {
     this.nativeHandlers.set("mint_session_for", (ctx, args) => {
       if (!this.isWizard(ctx.actor)) throw wooError("E_PERM", "wizard authority required to mint sessions", ctx.actor);
       const target = assertObj(args[0]);
-      this.object(target);
+      this.objectLive(target);
       if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
-      const session = this.createSessionForActor(target, "bearer");
+      const session = this.createSessionForActorLive(target, "bearer");
       this.recordWizardAction(ctx.actor, "mint_session_for", { actor: target, session: session.id });
       return { id: session.id, actor: session.actor, expires_at: session.expiresAt, token_class: session.tokenClass } as unknown as WooValue;
     });
@@ -11859,9 +13707,9 @@ export class WooWorld {
       // createApiKey performs the same check, but it must happen before the old
       // credential is revoked on this prepare-then-apply path.
       this.assertApiKeyIssuable(agent);
-      const oldKey = this.propOrNull(agent, "api_key_id");
+      const oldKey = this.propOrNullLive(agent, "api_key_id");
       if (typeof oldKey === "string" && oldKey) this.revokeApiKeyRecordById(ctx.actor, oldKey, args[1] === true);
-      const key = this.createApiKey(ctx.actor, agent, String(this.propOrNull(agent, "name") ?? agent));
+      const key = this.createApiKey(ctx.actor, agent, String(this.propOrNullLive(agent, "name") ?? agent));
       this.setProp(agent, "api_key_id", key.id);
       return { api_key: `apikey:${key.id}:${key.secret}`, id: key.id, actor: agent, created_at: key.created_at } as unknown as WooValue;
     });
@@ -11894,7 +13742,7 @@ export class WooWorld {
       // is permanent by contract; a replacement is a fresh provisioning.
       // Plain deactivation stays fully reversible: it never returned a slot,
       // so there is nothing to restore.
-      if (this.propOrNull(target, "retired_at") != null) {
+      if (this.propOrNullLive(target, "retired_at") != null) {
         throw wooError("E_PERM", "actor was permanently retired; provision a replacement instead of reactivating", { actor: target });
       }
       this.setProp(target, "deactivated_at", null);
@@ -11913,7 +13761,7 @@ export class WooWorld {
       this.gcPendingCredentials();
       const quantity = Math.max(1, Math.min(100, Math.floor(Number(args[0] ?? 1))));
       const expiresAt = Number(args[1] ?? Date.now() + 7 * 24 * 60 * 60_000);
-      const raw = this.propOrNull("$system", "signup_invites");
+      const raw = this.propOrNullLive("$system", "signup_invites");
       const invites = Array.isArray(raw) ? raw : [];
       const created = Array.from({ length: quantity }, () => ({ code: randomHex(16), expires_at: expiresAt, used_by: null }));
       this.setProp("$system", "signup_invites", [...invites, ...created] as unknown as WooValue);
@@ -11937,20 +13785,20 @@ export class WooWorld {
       // here rather than after set_actor_flag has consumed or returned quota.
       const flagPlan = this.prepareObjectFlagPlan(target, { [flag]: value });
       if (flag === "programmer" && value === true && this.inheritsFrom(target, "$agent")) {
-        const owner = this.propOrNull(target, "owner");
+        const owner = this.propOrNullLive(target, "owner");
         if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
-          const account = assertObj(this.propOrNull(owner, "account"));
-          if (!this.object(target).flags.programmer) {
+          const account = assertObj(this.propOrNullLive(owner, "account"));
+          if (!this.objectLive(target).flags.programmer) {
             this.assertProgrammerAgentQuota(account);
-            this.setProp(account, "programmer_agent_count", Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + 1);
+            this.setProp(account, "programmer_agent_count", Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) + 1);
           }
         }
       }
-      if (flag === "programmer" && value === false && this.inheritsFrom(target, "$agent") && this.object(target).flags.programmer) {
-        const owner = this.propOrNull(target, "owner");
+      if (flag === "programmer" && value === false && this.inheritsFrom(target, "$agent") && this.objectLive(target).flags.programmer) {
+        const owner = this.propOrNullLive(target, "owner");
         if (typeof owner === "string" && this.objects.has(owner) && this.inheritsFrom(owner, "$human")) {
-          const account = assertObj(this.propOrNull(owner, "account"));
-          this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) - 1));
+          const account = assertObj(this.propOrNullLive(owner, "account"));
+          this.setProp(account, "programmer_agent_count", Math.max(0, Number(this.propOrNullLive(account, "programmer_agent_count") ?? 0) - 1));
         }
       }
       return this.applyObjectFlagPlan(ctx.actor, flagPlan) as unknown as WooValue;
@@ -11961,7 +13809,7 @@ export class WooWorld {
       const kind = String(args[1] ?? "");
       const value = Math.max(0, Math.floor(Number(args[2] ?? 0)));
       if (kind !== "agent_quota" && kind !== "programmer_grant_quota") throw wooError("E_INVARG", "unknown quota kind", kind);
-      const old = Number(this.propOrNull(account, kind) ?? 0);
+      const old = Number(this.propOrNullLive(account, kind) ?? 0);
       this.setProp(account, kind, value);
       // AU1 seam, not recordWizardAction: the quota cell is cluster-resident but
       // `$system` is catalog-scoped on Net, so appending wizard_actions here made
@@ -11977,7 +13825,7 @@ export class WooWorld {
         const purpose = typeof args[1] === "string" ? args[1] : "";
         const result = this.createAgentForHuman(ctx.thisObj, name, purpose, args[2] === true);
         ctx.observe({ type: "agent_created", source: ctx.thisObj, actor: result.actor_id, name, _audience_override: [ctx.thisObj] });
-        return { actor_id: result.actor_id, api_key: result.api_key, mcp_url: this.propOrNull("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
+        return { actor_id: result.actor_id, api_key: result.api_key, mcp_url: this.propOrNullLive("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
       });
       this.nativeHandlers.set("human_list_agents", (ctx) => {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
@@ -11996,7 +13844,7 @@ export class WooWorld {
         // other path left half-retired: $system:deactivate_actor tombstones
         // without stripping programmer state or revoking keys.
         await this.setProgrammerAgentState(ctx.actor, agent, account, false, "agent_demoted_from_programmer");
-        const key = this.propOrNull(agent, "api_key_id");
+        const key = this.propOrNullLive(agent, "api_key_id");
         const keyNewlyRevoked = typeof key === "string" && key
           ? this.revokeApiKeyRecordById(ctx.actor, key, true)
           : false;
@@ -12004,7 +13852,7 @@ export class WooWorld {
         if (slotReturnedAt !== null) {
           // Backfill the explicit marker when it was inferred, so the next call
           // needs no inference at all.
-          if (this.propOrNull(agent, "retired_at") == null) this.setProp(agent, "retired_at", slotReturnedAt);
+          if (this.propOrNullLive(agent, "retired_at") == null) this.setProp(agent, "retired_at", slotReturnedAt);
           // No counter change and no duplicate "this agent retired" record —
           // but a repeat that actually repaired something is still auditable,
           // marked as the repair it is.
@@ -12016,9 +13864,9 @@ export class WooWorld {
         // Preserve an earlier deactivation time: when deactivate_actor ran
         // first, THAT is when the identity stopped authenticating. `retired_at`
         // separately records when the slot came back.
-        if (this.propOrNull(agent, "deactivated_at") == null) this.setProp(agent, "deactivated_at", now);
+        if (this.propOrNullLive(agent, "deactivated_at") == null) this.setProp(agent, "deactivated_at", now);
         this.setProp(agent, "retired_at", now);
-        this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNull(account, "agent_count") ?? 0) - 1));
+        this.setProp(account, "agent_count", Math.max(0, Number(this.propOrNullLive(account, "agent_count") ?? 0) - 1));
         // AU1 seam, not recordWizardAction: every durable effect above is
         // cluster-resident (agent lineage, agent props, account counter, the
         // actor-owned api-key record), but `$system` is catalog-scoped on Net,
@@ -12062,11 +13910,11 @@ export class WooWorld {
         this.assertSelfHuman(ctx.actor, ctx.thisObj);
         const agent = assertObj(args[0]);
         const key = this.rotateAgentKey(ctx.thisObj, agent, args[1] === true);
-        return { actor_id: agent, api_key: `apikey:${key.id}:${key.secret}`, mcp_url: this.propOrNull("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
+        return { actor_id: agent, api_key: `apikey:${key.id}:${key.secret}`, mcp_url: this.propOrNullLive("$system", "mcp_endpoint_url") ?? "/mcp" } as unknown as WooValue;
       });
       this.nativeHandlers.set("feature_can_be_attached_by", (ctx, args) => {
       const actor = assertObj(args[0] ?? ctx.actor);
-      return actor === this.object(ctx.thisObj).owner;
+      return actor === this.objectLive(ctx.thisObj).owner;
     });
     this.nativeHandlers.set("thing_moveto", async (ctx, args) => {
       const target = assertObj(args[0] ?? "$nowhere");
@@ -12142,7 +13990,7 @@ export class WooWorld {
       queue_depth: 0
     } as unknown as WooValue));
     this.nativeHandlers.set("catalog_registry_install", (ctx, args) => {
-      if (!this.object(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may install catalogs", ctx.actor);
+      if (!this.objectLive(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may install catalogs", ctx.actor);
       const manifest = assertMap(args[0]) as unknown as CatalogManifest;
       const alias = typeof args[2] === "string" ? args[2] : manifest.name;
       const provenance = args[3] && typeof args[3] === "object" && !Array.isArray(args[3]) ? (args[3] as Record<string, WooValue>) : {};
@@ -12154,7 +14002,7 @@ export class WooWorld {
       }) as unknown as WooValue;
     });
     this.nativeHandlers.set("catalog_registry_update", (ctx, args) => {
-      if (!this.object(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may update catalogs", ctx.actor);
+      if (!this.objectLive(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may update catalogs", ctx.actor);
       const manifest = assertMap(args[0]) as unknown as CatalogManifest;
       const alias = typeof args[2] === "string" ? args[2] : manifest.name;
       const provenance = args[3] && typeof args[3] === "object" && !Array.isArray(args[3]) ? (args[3] as Record<string, WooValue>) : {};
@@ -12174,7 +14022,7 @@ export class WooWorld {
     // verb_bytecode and rides the net path; no native handler is needed.
     this.nativeHandlers.set("catalog_registry_migration_state", (_ctx, args) => {
       const alias = assertString(args[0] ?? "");
-      const records = this.propOrNull("$catalog_registry", "installed_catalogs");
+      const records = this.propOrNullLive("$catalog_registry", "installed_catalogs");
       if (!Array.isArray(records)) return null;
       const record = records.find((item) => item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, WooValue>).alias === alias);
       return record && typeof record === "object" && !Array.isArray(record) ? ((record as Record<string, WooValue>).migration_state ?? null) : null;
@@ -12200,7 +14048,7 @@ export class WooWorld {
             arg_spec: resolved.arg_spec ?? {}
           } : this.matchSentinelRef("failed");
         }
-        const { definer, verb } = this.resolveVerb(target, name);
+        const { definer, verb } = this.resolveVerbLive(target, name);
         return {
           name: verb.name,
           definer,
@@ -12260,9 +14108,17 @@ export class WooWorld {
     return actors;
   }
 
-  private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
-    void progr;
-    if (!this.objects.has(space)) return subscribers;
+  private async scrubStaleSubscribersForSpace(space: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
+    if (!this.objects.has(space)) return [];
+    // Scrub the authoritative live-presence projection, not physical room
+    // contents. A disconnected actor can remain in `subscribers` while its
+    // reusable player object sits at $nowhere; using chatPresent(space) as the
+    // input skipped exactly those stale rows and made the throttle rollback
+    // fix appear ineffective on immediate retry.
+    const rawSubscribers = this.propOrNullLive(space, "subscribers");
+    const subscribers = Array.isArray(rawSubscribers)
+      ? rawSubscribers.filter((value): value is ObjRef => typeof value === "string")
+      : [];
     // Subscriber rows are live-presence maintenance, not user-turn semantics.
     // Shadow/local execution records only VM-authorized effects; letting a
     // browser-planned turn carry gateway cleanup writes would require granting
@@ -12271,10 +14127,14 @@ export class WooWorld {
     const now = Date.now();
     const last = this.lastSubscriberScrubAt.get(space) ?? 0;
     if (now - last < SUBSCRIBER_SCRUB_FLOOR_MS) return subscribers;
+    const behavior = this.behaviorUndoScopes.at(-1);
+    if (behavior && !behavior.subscriberScrubAt.has(space)) {
+      behavior.subscriberScrubAt.set(space, this.lastSubscriberScrubAt.get(space));
+    }
     this.lastSubscriberScrubAt.set(space, now);
     let survivingActors = subscribers;
     if (subscribers.length > 0) {
-      const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+      const rawSessionSubscribers = this.propOrNullLive(space, "session_subscribers");
       const rowsByActor = new Map<ObjRef, Array<{ session: string; actor: ObjRef }>>();
       if (Array.isArray(rawSessionSubscribers)) {
         for (const entry of rawSessionSubscribers) {
@@ -12430,7 +14290,7 @@ export class WooWorld {
    */
   private scrubExpiredSessionSubscribersForSpace(space: ObjRef): void {
     if (!this.objects.has(space)) return;
-    const raw = this.propOrNull(space, "session_subscribers");
+    const raw = this.propOrNullLive(space, "session_subscribers");
     if (!Array.isArray(raw) || raw.length === 0) return;
     const now = Date.now();
     let changed = false;
@@ -12619,7 +14479,7 @@ export class WooWorld {
    */
   private dullCommandDefiners(): Set<ObjRef> {
     const dull = new Set<ObjRef>(["$root", "$player"]);
-    const raw = this.propOrNull("$system", "dull_command_definers");
+    const raw = this.propOrNullLive("$system", "dull_command_definers");
     if (Array.isArray(raw)) for (const item of raw) if (typeof item === "string") dull.add(item);
     return dull;
   }
@@ -12630,7 +14490,7 @@ export class WooWorld {
     const dull = this.dullCommandDefiners();
     for (const definer of this.localAncestry(target)) {
       if (dull.has(definer)) continue;
-      for (const verb of this.object(definer).verbs) {
+      for (const verb of this.objectLive(definer).verbs) {
         if (!this.canReadVerb(actor, verb)) continue;
         const command = verb.arg_spec && typeof verb.arg_spec === "object" && !Array.isArray(verb.arg_spec)
           ? (verb.arg_spec.command as WooValue | undefined)
@@ -12729,9 +14589,9 @@ export class WooWorld {
     }
     const now = this.logicalNow("player_join.now");
     if (old && old !== dest && old !== "$nowhere") {
-      ctx.observe({ type: "left", source: old, actor: ctx.actor, room: old, destination: dest, text: `${this.object(ctx.actor).name} leaves.`, ts: now });
+      ctx.observe({ type: "left", source: old, actor: ctx.actor, room: old, destination: dest, text: `${this.objectLive(ctx.actor).name} leaves.`, ts: now });
     }
-    ctx.observe({ type: "entered", source: dest, actor: ctx.actor, room: dest, origin: old, text: `${this.object(ctx.actor).name} arrives.`, ts: now });
+    ctx.observe({ type: "entered", source: dest, actor: ctx.actor, room: dest, origin: old, text: `${this.objectLive(ctx.actor).name} arrives.`, ts: now });
     return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
   }
 
@@ -12790,7 +14650,7 @@ export class WooWorld {
     const seen = new Set<string>();
     for (const definer of this.localAncestry(target)) {
       if (dullClasses.has(definer)) continue;
-      for (const verb of this.object(definer).verbs) {
+      for (const verb of this.objectLive(definer).verbs) {
         if (!verb.perms.includes("r")) continue;
         if (options.executableOnly && options.actor && !this.canExecuteVerb(options.actor, verb)) continue;
         const syntax = this.formatCommandSyntax(verb, target);
@@ -12875,7 +14735,7 @@ export class WooWorld {
     } catch (err) {
       const error = normalizeError(err);
       if (error.code !== "E_VERBNF" && error.code !== "E_TOOBIG") throw err;
-      return this.objects.has(item) ? this.object(item).name : item;
+      return this.objects.has(item) ? this.objectLive(item).name : item;
     }
   }
 
@@ -12895,13 +14755,13 @@ export class WooWorld {
       }
       return objRef;
     }
-    if (this.objects.has(objRef)) return this.object(objRef).name || objRef;
+    if (this.objects.has(objRef)) return this.objectLive(objRef).name || objRef;
     return objRef;
   }
 
   private tryResolveVerb(target: ObjRef, verb: string): ResolvedVerb | null {
     try {
-      return this.resolveVerb(target, verb);
+      return this.resolveVerbLive(target, verb);
     } catch {
       return null;
     }
@@ -13111,7 +14971,7 @@ export class WooWorld {
       if (!start) return;
       let current: ObjRef | null = start;
       while (current) {
-        const obj: WooObject | null = current === start ? this.object(current) : this.parentWalkLookup(start, current);
+        const obj: WooObject | null = current === start ? this.objectLive(current) : this.parentWalkLookup(start, current);
         if (!obj) break;
         for (const verb of obj.verbs) {
           if (!verbNameMatches(verb, name)) continue;
@@ -13476,7 +15336,7 @@ export class WooWorld {
       return { id, names, aliases };
     }
     if (!this.objects.has(id)) return { id, names, aliases };
-    const name = this.getProp(id, "name");
+    const name = this.getPropLive(id, "name");
     if (typeof name === "string") names.push(name);
     // Command planning has a bounded syntax surface: ids, names, aliases, and
     // catalog-declared :match_names(). Generic $match:match_object retains the
@@ -13491,7 +15351,7 @@ export class WooWorld {
       ]);
       if (typeof title === "string") names.push(title);
     }
-    const localAliases = this.propOrNull(id, "aliases");
+    const localAliases = this.propOrNullLive(id, "aliases");
     if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
     return { id, names, aliases };
   }
@@ -13501,7 +15361,7 @@ export class WooWorld {
     // can't blow up the matcher. Skip the dispatch entirely when the verb
     // isn't defined; matching runs on every unhandled chat utterance, so
     // avoiding a throw-on-miss for the common no-:match_names case matters.
-    if (!this.resolveVerbFrom(id, "match_names", false)) return;
+    if (!this.resolveVerbFromLive(id, "match_names", false)) return;
     const result = await this.dispatch(
       { ...ctx, caller: ctx.thisObj, progr: ctx.actor },
       id,
@@ -13534,7 +15394,7 @@ export class WooWorld {
   // config was seeded. See spec/semantics/match.md §MA7.
   private matchSentinelRef(kind: "failed" | "ambiguous"): ObjRef | null {
     const prop = kind === "failed" ? "failed_match_ref" : "ambiguous_match_ref";
-    const configured = this.propOrNull("$system", prop);
+    const configured = this.propOrNullLive("$system", prop);
     if (typeof configured === "string" && this.objects.has(configured)) return configured;
     const legacy = kind === "failed" ? "$failed_match" : "$ambiguous_match";
     return this.objects.has(legacy) ? legacy : null;
@@ -13549,9 +15409,19 @@ export class WooWorld {
     for (const [key, entry] of this.idempotency) {
       if (now - entry.at >= 5 * 60 * 1000) this.idempotency.delete(key);
     }
-    if (this.idempotency.size <= 1000) return;
-    const oldest = Array.from(this.idempotency.entries()).sort((a, b) => a[1].at - b[1].at);
-    for (const [key] of oldest.slice(0, this.idempotency.size - 1000)) this.idempotency.delete(key);
+    for (const [key, entry] of this.terminalTransferIdempotency) {
+      if (now - entry.at >= 5 * 60 * 1000) this.terminalTransferIdempotency.delete(key);
+    }
+    if (this.idempotency.size > 1000) {
+      const oldest = Array.from(this.idempotency.entries()).sort((a, b) => a[1].at - b[1].at);
+      for (const [key] of oldest.slice(0, this.idempotency.size - 1000)) this.idempotency.delete(key);
+    }
+    if (this.terminalTransferIdempotency.size > 1000) {
+      const oldest = Array.from(this.terminalTransferIdempotency.entries()).sort((a, b) => a[1].at - b[1].at);
+      for (const [key] of oldest.slice(0, this.terminalTransferIdempotency.size - 1000)) {
+        this.terminalTransferIdempotency.delete(key);
+      }
+    }
   }
 }
 
@@ -13709,10 +15579,20 @@ function splitEditorLines(buffer: string): string[] {
 }
 
 export function normalizeError(err: unknown): ErrorValue {
-  if (isErrorValue(err)) return err;
-  if (err instanceof SyntaxError) return wooError("E_INVARG", err.message);
-  if (err instanceof Error) return wooError("E_INTERNAL", err.message);
-  return wooError("E_INTERNAL", "unknown error", String(err));
+  // Error values often originate in caller-owned Woo data. Frames and log
+  // rows must not retain that alias: a caller mutating `value` after throw
+  // would otherwise rewrite both the returned error observation and replay.
+  // A native may throw any JavaScript value, including a hostile Proxy. Error
+  // normalization is the containment boundary, so inspection/stringification
+  // traps must become an ordinary E_INTERNAL frame rather than escaping it.
+  try {
+    if (isErrorValue(err)) return cloneValue(err as unknown as WooValue) as unknown as ErrorValue;
+    if (err instanceof SyntaxError) return wooError("E_INVARG", err.message);
+    if (err instanceof Error) return wooError("E_INTERNAL", err.message);
+    return wooError("E_INTERNAL", "unknown error", String(err));
+  } catch {
+    return wooError("E_INTERNAL", "unknown error", "<uninspectable thrown value>");
+  }
 }
 
 function isReadAvailabilityError(err: unknown): boolean {
@@ -14209,12 +16089,57 @@ function cloneImportedPlainData<T>(value: T): T {
   // than structuredClone here and still gives importWorld the by-value
   // isolation contract it needs for cached snapshots.
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => cloneImportedPlainData(item)) as T;
+  if (Array.isArray(value)) {
+    const out: unknown[] = new Array(value.length);
+    for (const key of Reflect.ownKeys(value)) {
+      if (key === "length") continue;
+      if (typeof key === "symbol" || !/^(0|[1-9]\d*)$/.test(key)) {
+        throw new TypeError("imported Woo lists cannot contain named or symbol fields");
+      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) {
+        // Caller-owned getters are code, not serialized data. Never execute
+        // one while crossing an authority ingress boundary.
+        throw new TypeError("imported Woo lists cannot contain accessors");
+      }
+      if (!descriptor.enumerable) {
+        throw new TypeError("imported Woo lists cannot contain non-enumerable entries");
+      }
+      Reflect.defineProperty(out, key, {
+        value: cloneImportedPlainData(descriptor.value),
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+    }
+    return out as T;
+  }
+  const prototype = Reflect.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("imported Woo maps must have a plain or null prototype");
+  }
   // Keys here are object ids, property names, and arbitrary Woo map keys —
   // all data. Copying into a plain `{}` loses a `__proto__` entry (the setter
   // swallows it), so a world could lose data simply by being imported.
   const out: Record<string, unknown> = dataKeyedMap<unknown>();
-  for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === "symbol") {
+      throw new TypeError("imported Woo maps cannot contain symbol keys");
+    }
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) {
+      throw new TypeError("imported Woo maps cannot contain accessors");
+    }
+    if (!descriptor.enumerable) {
+      throw new TypeError("imported Woo maps cannot contain non-enumerable fields");
+    }
+    Reflect.defineProperty(out, key, {
+      value: cloneImportedPlainData(descriptor.value),
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  }
   return out as T;
 }
 

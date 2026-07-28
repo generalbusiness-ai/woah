@@ -27,12 +27,8 @@ function createMovementRoom(world: ReturnType<typeof createWorld>, id: string): 
 }
 
 function placeSessionActor(world: ReturnType<typeof createWorld>, session: Session, room: string): void {
-  const actor = world.object(session.actor);
-  if (actor.location) world.object(actor.location).contents.delete(session.actor);
-  actor.location = room;
-  world.object(room).contents.add(session.actor);
-  const row = world.sessions.get(session.id);
-  if (row) row.activeScope = room;
+  world.setCatalogObjectLocation(session.actor, room);
+  world.migrationSetSessionState(session.id, { activeScope: room });
 }
 
 function movementCall(session: Session, scope: string, id: string): ShadowTurnCall {

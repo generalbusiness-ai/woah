@@ -8,9 +8,8 @@ describe("moveto", () => {
   async function setupMovetoWorld(label: string) {
     const world = createWorld();
     const auth = world.auth(`guest:${label}`);
-    const aobj = world.object(auth.actor);
-    aobj.owner = auth.actor;
-    aobj.flags.programmer = true;
+    world.migrationSetObjectOwner(auth.actor, auth.actor);
+    world.setCatalogObjectFlags(auth.actor, { programmer: true });
     installVerbAs(world, auth.actor, auth.actor, "do_move", `verb :do_move(obj, target) rxd {
   return moveto(obj, target);
 }`, null);
@@ -140,10 +139,10 @@ describe("moveto", () => {
     const world = createWorld();
     const owner = world.auth("guest:moveto-owner");
     const stranger = world.auth("guest:moveto-stranger");
-    world.object(owner.actor).owner = owner.actor;
-    world.object(owner.actor).flags.programmer = true;
-    world.object(stranger.actor).owner = stranger.actor;
-    world.object(stranger.actor).flags.programmer = true;
+    world.migrationSetObjectOwner(owner.actor, owner.actor);
+    world.setCatalogObjectFlags(owner.actor, { programmer: true });
+    world.migrationSetObjectOwner(stranger.actor, stranger.actor);
+    world.setCatalogObjectFlags(stranger.actor, { programmer: true });
     installVerbAs(world, stranger.actor, stranger.actor, "do_move", `verb :do_move(obj, target) rxd { return moveto(obj, target); }`, null);
     const item = world.createAuthoredObject(owner.actor, { parent: "$thing", name: "Owned" });
     const target = world.createAuthoredObject(stranger.actor, { parent: "$thing", name: "Snatch" });

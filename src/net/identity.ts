@@ -399,7 +399,7 @@ export async function importIdentity(
       // Adopt: identity flags overwrite; the §8 rehome applies when the
       // stock object sits nowhere (never displaces a placed object —
       // that placement is fresh-world state, not carried state).
-      Object.assign(world.object(actor.id).flags, actor.flags);
+      world.setCatalogObjectFlags(actor.id, actor.flags);
       if (embodied && start !== null && (existing.location === null || existing.location === "$nowhere")) {
         world.moveObject(actor.id, start);
       }

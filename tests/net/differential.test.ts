@@ -48,7 +48,7 @@ function genesis() {
   const world = createWorld();
   const session = world.auth("guest:differential");
   const actor = session.actor;
-  world.object(actor).flags.programmer = true;
+  world.setCatalogObjectFlags(actor, { programmer: true });
   // MOO-faithful property shape for the removal leg: the def lives on the
   // CLASS, the instance carries only a local value override. clear_property
   // then reverts the instance to the class default — exactly the
@@ -253,7 +253,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     const world = createWorld();
     const session = world.auth("guest:differential-2");
     const actor = session.actor;
-    world.object(actor).flags.programmer = true;
+    world.setCatalogObjectFlags(actor, { programmer: true });
     world.createObject({ id: "diff2_room", name: "North Room", parent: "$space", owner: actor });
     world.createObject({ id: "diff2_annex", name: "South Annex", parent: "$space", owner: actor });
     // The carried item: anchored to the actor, so its authority cells

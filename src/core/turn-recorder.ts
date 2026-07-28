@@ -84,6 +84,23 @@ export type RecordedTurn = {
 
 export interface ActiveTurnRecorder {
   event(event: TurnRecorderEvent): void;
+  /**
+   * Open a nestable behavior transaction. Events remain private to the
+   * innermost scope until it commits. Abort discards rolled-back domain
+   * effects, but retains reads/proofs/logical inputs and untracked-effect
+   * evidence needed for validation and deterministic replay.
+   * Envelope events recorded outside a scope (sequence allocation and the
+   * terminal outcome) therefore cannot be confused with behavior effects.
+   */
+  beginBehaviorScope(): void;
+  commitBehaviorScope(): void;
+  abortBehaviorScope(): void;
+  /** Events staged in the innermost behavior scope, used to prove that a
+   * terminal command wrapper has performed reads/dispatch only. */
+  currentBehaviorEvents(): readonly TurnRecorderEvent[];
+  /** Remove a provisional wrapper turn which has transferred ownership to
+   * the target's one authoritative turn. */
+  discardTurn(): void;
 }
 
 export interface TurnRecorder {
@@ -92,6 +109,26 @@ export interface TurnRecorder {
 
 class NoopActiveTurnRecorder implements ActiveTurnRecorder {
   event(): void {
+    // Intentionally empty.
+  }
+
+  beginBehaviorScope(): void {
+    // Intentionally empty.
+  }
+
+  commitBehaviorScope(): void {
+    // Intentionally empty.
+  }
+
+  abortBehaviorScope(): void {
+    // Intentionally empty.
+  }
+
+  currentBehaviorEvents(): readonly TurnRecorderEvent[] {
+    return [];
+  }
+
+  discardTurn(): void {
     // Intentionally empty.
   }
 }
@@ -120,9 +157,29 @@ export class InMemoryTurnRecorder implements TurnRecorder {
       events: [{ kind: "turn_start", turn: start }]
     };
     this.turns.push(recorded);
+    const behaviorScopes: TurnRecorderEvent[][] = [];
+    const destination = (): TurnRecorderEvent[] => behaviorScopes.at(-1) ?? recorded.events;
     return {
       event: (event) => {
-        recorded.events.push(cloneRecorderEvent(event));
+        destination().push(cloneRecorderEvent(event));
+      },
+      beginBehaviorScope: () => {
+        behaviorScopes.push([]);
+      },
+      commitBehaviorScope: () => {
+        const committed = behaviorScopes.pop();
+        if (!committed) throw new Error("turn recorder behavior-scope commit without begin");
+        destination().push(...committed);
+      },
+      abortBehaviorScope: () => {
+        const aborted = behaviorScopes.pop();
+        if (!aborted) throw new Error("turn recorder behavior-scope abort without begin");
+        destination().push(...aborted.filter(recorderEventSurvivesBehaviorAbort));
+      },
+      currentBehaviorEvents: () => behaviorScopes.at(-1) ?? [],
+      discardTurn: () => {
+        const index = this.turns.indexOf(recorded);
+        if (index >= 0) this.turns.splice(index, 1);
       }
     };
   }
@@ -137,10 +194,21 @@ export function objectCreateEvent(object: WooObject): TurnRecorderEvent {
     owner: object.owner,
     anchor: object.anchor,
     location: object.location,
-    flags: object.flags
+    flags: { ...object.flags }
   };
 }
 
 function cloneRecorderEvent(event: TurnRecorderEvent): TurnRecorderEvent {
   return structuredClone(event) as TurnRecorderEvent;
+}
+
+function recorderEventSurvivesBehaviorAbort(event: TurnRecorderEvent): boolean {
+  return (
+    event.kind === "cell_read" ||
+    event.kind === "prop_read" ||
+    event.kind === "dispatch" ||
+    event.kind === "state_probe" ||
+    event.kind === "logical_input" ||
+    event.kind === "untracked_effect"
+  );
 }
