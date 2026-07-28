@@ -83,9 +83,9 @@ export async function buildLaneFixture() {
     null
   );
   if (!welcomeInstalled.ok) throw new Error(`fixture welcome install failed: ${JSON.stringify(welcomeInstalled)}`);
-  const welcomeVerb = world.object("net_lane_annex").verbs.find((verb) => verb.name === "welcome");
-  if (!welcomeVerb) throw new Error("fixture welcome verb missing after install");
-  welcomeVerb.skip_presence_check = true;
+  if (!world.migrationSetVerbExecutionMetadata("net_lane_annex", "welcome", { skipPresenceCheck: true })) {
+    throw new Error("fixture welcome verb missing after install");
+  }
   // Phase-4 item 3 (WS observation push): an observing verb ON the annex
   // for sessions that have transitioned in — the wave's fanout carries
   // the observation the peer socket must receive. No presence skip: by
@@ -167,7 +167,16 @@ export async function buildLaneFixture() {
   const progAccount = world.propOrNull(progHuman, "account") as string;
   world.setProp(progAccount, "programmer_grant_quota", 10);
   world.ensureApiKey("$wiz", progHuman, "prog-human-key", "prog-human-secret", "prog-human");
-  const progProv = (await world.directCall("prog-provision", progHuman, progHuman, "create_agent", ["LaneProgBot", "", false])) as { result: { actor_id: string } };
+  const progProv = await world.directCall("prog-provision", progHuman, progHuman, "create_agent", ["LaneProgBot", "", false]);
+  if (
+    progProv.op !== "result"
+    || typeof progProv.result !== "object"
+    || progProv.result === null
+    || Array.isArray(progProv.result)
+    || typeof progProv.result.actor_id !== "string"
+  ) {
+    throw new Error(`fixture programmer agent provisioning failed: ${JSON.stringify(progProv)}`);
+  }
   const progAgent = progProv.result.actor_id;
   const progAgentKey = world.createApiKeyForOwner(progHuman, progAgent, "lane-prog-bot");
   const progAgentToken = `apikey:${progAgentKey.id}:${progAgentKey.secret}`;
