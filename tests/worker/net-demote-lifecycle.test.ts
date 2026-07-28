@@ -142,9 +142,12 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
       };
       const call = async (name: string, args: unknown) =>
         rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }, { "mcp-session-id": sid });
+      // Headless SSE open: no Origin, which mcp.md §M7.1 admits. Origin
+      // admission is exercised through the real Worker entry in
+      // tests/worker/net-mcp-origin.test.ts — a direct DO fetch cannot see it.
       const listen = async () => gateway.fetch(new Request("https://do/net-api/mcp", {
         method: "GET",
-        headers: { accept: "text/event-stream", "mcp-session-id": sid, origin: "https://do" }
+        headers: { accept: "text/event-stream", "mcp-session-id": sid }
       }));
       return { sid, list, call, listen };
     };

@@ -13,6 +13,7 @@ import { handleAdmin, type AdminEnv } from "./admin";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { netGatewayShardForKey, parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
+import { withPublicOrigin } from "./public-origin";
 
 export { NetGatewayDO } from "./net/gateway-do";
 export { NetScopeDO } from "./net/scope-do";
@@ -173,8 +174,15 @@ async function netHealth(env: NetOnlyEnv): Promise<Response> {
 }
 
 async function handleNetApi(request: Request, env: NetOnlyEnv, url: URL): Promise<Response> {
+  // The DO is addressed by its own opaque name, so the public origin does NOT
+  // survive this hop in the URL — it is asserted in a header instead. Without
+  // it a DO-side `Origin` check would compare a browser origin against
+  // `https://do` and refuse every browser while admitting every headless
+  // client. See src/worker/public-origin.ts for the trust model; the header is
+  // stripped from inbound requests twice before the edge sets it.
   const target = new URL(`https://do${url.pathname}`);
   target.search = url.search;
+  const forwardHeaders = withPublicOrigin(request.headers, url);
   try {
     const body = request.method === "GET" ? undefined : await readLimitedBody(request, MAX_JSON_BODY_BYTES);
     const bodyText = body === undefined ? undefined : new TextDecoder().decode(body);
@@ -187,8 +195,14 @@ async function handleNetApi(request: Request, env: NetOnlyEnv, url: URL): Promis
       anonymousKey: crypto.randomUUID()
     });
     const stub = resolveNetDestination(env, `gateway:${shard}`);
-    if (request.method === "GET") return await stub.fetch(new Request(target, request));
-    return await stub.fetch(new Request(target, { method: request.method, headers: request.headers, body }));
+    if (request.method === "GET") {
+      // Two-step so the WebSocket upgrade survives: `new Request(target,
+      // request)` carries the upgrade semantics that an init-only Request
+      // cannot, and the header swap then rides the same copy-constructor
+      // sanitizePublicHeaders already uses on upgrade requests.
+      return await stub.fetch(new Request(new Request(target, request), { headers: forwardHeaders }));
+    }
+    return await stub.fetch(new Request(target, { method: request.method, headers: forwardHeaders, body }));
   } catch (error) {
     return publicError(error);
   }

@@ -119,6 +119,7 @@ import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { identityAnchorIds, provisionAnchorSubmit } from "../../net/identity-anchor";
 import { verifyInternalRequest } from "../internal-auth";
+import { mcpOriginDecision, PUBLIC_ORIGIN_HEADER } from "../public-origin";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import {
   ClientAuthError,
@@ -193,6 +194,11 @@ export type NetGatewayEnv = NetBindingsEnv & {
   /** Maximum staleness of one authority-verified API-key record. Zero forces
    * an exact RPC per request. Default: 1000ms; hard-capped at 30s. */
   NET_CREDENTIAL_TTL_MS?: string;
+  /** Extra browser origins admitted by the MCP `Origin` check, comma or
+   * whitespace separated (e.g. a second public hostname serving the client).
+   * Unset by default — the endpoint's own public origin always passes, so no
+   * hostname is compiled in. See src/worker/public-origin.ts. */
+  WOO_MCP_ALLOWED_ORIGINS?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -3271,7 +3277,7 @@ export class NetGatewayDO {
       // branches before the header-credential path below.
       if (url.pathname === "/net-api/mcp"
         && (request.method === "POST" || request.method === "GET" || request.method === "DELETE")) {
-        const rejectedOrigin = rejectForeignMcpOrigin(request, url);
+        const rejectedOrigin = rejectForeignMcpOrigin(request, this.env);
         if (rejectedOrigin) return rejectedOrigin;
       }
       if (request.method === "POST" && url.pathname === "/net-api/mcp") {
@@ -9877,15 +9883,20 @@ function mcpSseMessage(message: unknown): Uint8Array {
 
 /** Streamable HTTP accepts headless clients without an Origin header. Browser
  * requests do carry one, and must be same-origin to prevent a hostile page
- * from using a locally reachable MCP server as a DNS-rebinding target. */
-function rejectForeignMcpOrigin(request: Request, target: URL): Response | null {
-  const raw = request.headers.get("origin");
-  if (raw === null) return null;
-  try {
-    if (new URL(raw).origin === target.origin) return null;
-  } catch {
-    // Malformed and opaque origins are not a trustworthy same-origin claim.
-  }
+ * from using a reachable MCP endpoint as a DNS-rebinding / cross-site target.
+ *
+ * The comparison is against the EDGE-ASSERTED public origin, never this DO's
+ * own request URL: the edge rewrites the URL to `https://do/...`, so comparing
+ * against it refused every browser and admitted every headless client — the
+ * exact inversion of the intended property. See src/worker/public-origin.ts
+ * for the header's trust model and the admission rule. */
+function rejectForeignMcpOrigin(request: Request, env: NetGatewayEnv): Response | null {
+  const decision = mcpOriginDecision({
+    origin: request.headers.get("origin"),
+    publicOrigin: request.headers.get(PUBLIC_ORIGIN_HEADER),
+    configured: env.WOO_MCP_ALLOWED_ORIGINS
+  });
+  if (decision === "allow") return null;
   return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
 }
 

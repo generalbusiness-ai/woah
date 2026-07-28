@@ -1,6 +1,6 @@
 ---
 date: 2026-05-02
-updated: 2026-07-27
+updated: 2026-07-28
 status: implemented
 ---
 
@@ -709,8 +709,8 @@ re-list at any time even if it missed a live hint.
 ## M7. Security and scaling invariants
 
 - API-key authentication happens before session creation.
-- A present Streamable HTTP `Origin` must exactly match the MCP endpoint's
-  request origin; headless clients may omit the header.
+- A present Streamable HTTP `Origin` must be admitted by §M7.1; headless
+  clients may omit the header.
 - Every non-initialize method validates `Mcp-Session-Id` and its expiry.
 - Other actors' session bearers never appear in tools, relation results, or
   observations.
@@ -719,6 +719,55 @@ re-list at any time even if it missed a live hint.
 - Context work is proportional to the bounded actor/space context, never the
   installed world or all sessions.
 - Catalog identities, command words, and UI shapes do not enter the gateway.
+
+### M7.1 The `Origin` contract
+
+`POST`, `GET` and `DELETE` on `/net-api/mcp` are all gated by the same rule.
+The rule constrains browsers and only browsers: a browser writes `Origin`
+itself and a page cannot override it, so the check prevents a hostile page
+from driving a victim's browser — and any ambient credentials it holds — into
+this endpoint. It constrains no non-browser caller, which may send any header
+it likes; credentials, not `Origin`, authorize a call.
+
+**What the edge asserts.** The endpoint's public origin does not survive the
+edge → gateway hop: the edge addresses the Durable Object by its own opaque
+name, so the forwarded URL carries no public hostname. The edge therefore
+states the public origin in a dedicated internal request header. That header is
+an edge assertion, never client input: the edge strips every inbound header on
+the internal-header prefix before routing, and overwrites the value when
+forwarding. A gateway MUST use only that asserted value as its same-origin
+reference, and MUST NOT compare `Origin` against its own request URL — that
+comparison refuses every browser and admits every headless client, inverting
+the property.
+
+**What is trusted.** The asserted origin is a valid same-origin reference only
+when its own hostname is authenticated: `https:` (the hostname is proven by
+TLS), or a loopback literal host (`localhost`, `*.localhost`, `127.0.0.1`,
+`[::1]`) over either scheme. Plain `http:` on a routable name is NOT trusted,
+because under DNS rebinding a hostile page's `Host` and `Origin` agree on the
+attacker's own name and would satisfy a naive same-origin test. When no
+trustworthy reference is available, a present `Origin` is refused — the rule
+fails closed.
+
+**Admission.** A present `Origin` is admitted when, after serializing to
+scheme/host/port, it equals the trusted asserted origin; or it appears in an
+operator-configured extra-origin list, which is empty by default so no hostname
+is compiled into the runtime; or the endpoint is loopback and the origin is
+loopback, which covers a development proxy serving the page and the endpoint on
+different loopback ports. Anything else — including an unparseable value and
+the opaque `null` origin — is refused with `E_PERM` and HTTP 403. A refusal
+carries no CORS headers; this endpoint is not a cross-origin API.
+
+**Absent `Origin`.** An absent `Origin` is admitted. Streamable HTTP's normal
+clients — stdio bridges, CLI agents, server runtimes — send none, and refusing
+them would break every legitimate headless client while stopping no attacker,
+since anyone able to omit a header is equally able to send an arbitrary one.
+The asymmetry is deliberate and is the whole reason the check is worth having:
+it binds exactly the class of caller that cannot lie.
+
+Conformance for this section is exercised through the public Worker entry, so
+the URL rewrite is inside the tested path; a test that fetches the gateway
+directly cannot observe the contract.
 
 ## M8. Deferred extensions
 
