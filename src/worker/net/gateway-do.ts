@@ -5514,19 +5514,12 @@ export class NetGatewayDO {
         replay_omitted?: unknown;
         [key: string]: unknown;
       };
-      const shape = (failure: unknown): Response =>
-        this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object));
-      if (!turnResponse.ok) return shape(turn.error ?? turn);
-      if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
-      // A replayed turn whose RECORDED outcome was an error replays that
-      // error: the verb threw, its (effect-less or partial) transcript still
-      // committed, and reporting it as success would be worse than the
-      // double-execution this whole path exists to prevent.
-      if (turn.error !== undefined) return shape(turn.error);
       // CO2.5: a replay carries the committed execution's outcome plus the
       // markers that say how much of it survived retention. `result` is
       // omitted (not `null`) when the outcome exists but was not retained,
       // so a client can tell "returned nothing" from "cannot show you".
+      // Computed BEFORE the failure branches: a replayed FAILURE is still a
+      // replay, and the client needs to know it did not just re-run.
       const replay = turn.replayed === true
         ? {
             replayed: true as const,
@@ -5534,6 +5527,22 @@ export class NetGatewayDO {
             ...(Array.isArray(turn.replay_omitted) ? { omitted: turn.replay_omitted } : {})
           }
         : undefined;
+      const shape = (failure: unknown, observations?: unknown[]): Response =>
+        this.mcpToolError(id, this.mcpShapeTurnError(failure, actor, session, object), observations, replay);
+      // A transport failure and a rejected commit never executed a verb, so
+      // there are no own-turn observations to carry.
+      if (!turnResponse.ok) return shape(turn.error ?? turn);
+      if (turn.reply?.status !== "accepted") return shape(turn.reply ?? turn);
+      // An ACCEPTED commit whose verb THREW is a failure that still ran: its
+      // transcript committed, and it may have emitted lines before throwing.
+      // Those lines are the submitter's ONLY copy — the gateway suppresses
+      // its own committed echo from woo_wait precisely because the reply is
+      // supposed to carry them (§M4.1) — so returning early here dropped
+      // them on the floor and left an MCP actor unable to see what its own
+      // failed action did. A replayed failure replays the RECORDED lines.
+      if (turn.error !== undefined) {
+        return shape(turn.error, this.mcpOwnTurnObservations(turn.observations, actor));
+      }
       const resultKnown = !(replay !== undefined && turn.result === undefined && replay.outcome !== "full");
       return this.mcpResult(
         id,
@@ -5709,13 +5718,48 @@ export class NetGatewayDO {
     });
   }
 
-  private mcpToolError(id: number | string, detail: unknown): Response {
+  /**
+   * A failed tool call.
+   *
+   * `observations` is the same seat as on a successful reply (§M4.1), and it
+   * matters MORE here: a verb that threw after emitting lines still commits
+   * its transcript, the gateway suppresses the submitter's own committed
+   * echo from `woo_wait` because the reply is supposed to carry them, and so
+   * an error envelope without them loses those lines entirely — the actor
+   * can never learn what its own failed action did. Absent for transport
+   * failures and rejected commits, which ran no verb.
+   *
+   * `replay` marks a failure that is the RECORDED outcome of an earlier
+   * committed turn rather than a fresh one. Without it a client sees an
+   * error and cannot tell whether its retry ran again or replayed.
+   */
+  private mcpToolError(
+    id: number | string,
+    detail: unknown,
+    observations?: unknown[],
+    replay?: { replayed: true; outcome: string; omitted?: unknown[] }
+  ): Response {
     return json({
       jsonrpc: "2.0",
       id,
       result: {
-        content: [{ type: "text", text: JSON.stringify(detail) }],
-        structuredContent: { error: detail },
+        content: [
+          { type: "text", text: JSON.stringify(detail) },
+          ...(observations && observations.length > 0
+            ? [{ type: "text", text: JSON.stringify({ observations }) }]
+            : [])
+        ],
+        structuredContent: {
+          error: detail,
+          ...(observations ? { observations } : {}),
+          ...(replay
+            ? {
+                replayed: true,
+                replay_outcome: replay.outcome,
+                ...(Array.isArray(replay.omitted) && replay.omitted.length > 0 ? { replay_omitted: replay.omitted } : {})
+              }
+            : {})
+        },
         isError: true
       }
     });

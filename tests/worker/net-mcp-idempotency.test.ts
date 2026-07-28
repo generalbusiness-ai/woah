@@ -69,6 +69,18 @@ async function fixture() {
         "verb :bump() rxd { this.hits = this.hits + 1; return this.hits; }",
         null
       ).ok).toBe(true);
+      // Emits, then throws. The transcript still COMMITS (a refused verb
+      // consumed its seq), so the emitted line is real and the submitter's
+      // only copy of it is the turn reply — woo_wait suppresses its own echo.
+      expect(installVerb(
+        fresh,
+        "the_mug",
+        "complain",
+        "verb :complain() rxd { this.hits = this.hits + 1;"
+        + " observe({ type: \"complained\", text: \"before the fall\", source: this });"
+        + " raise({ code: \"E_PERM\", message: \"refused on purpose\" }); }",
+        null
+      ).ok).toBe(true);
       expect(installVerb(
         fresh,
         "the_mug",
@@ -175,6 +187,14 @@ async function fixture() {
       ...(operationId ? { operation_id: operationId } : {})
     });
 
+  const complain = async (session: string, operationId?: string) =>
+    await call(session, "woo_call", {
+      object: "the_mug",
+      verb: "complain",
+      args: [],
+      ...(operationId ? { operation_id: operationId } : {})
+    });
+
   const bump = async (session: string, operationId?: string, viaMeta = false) =>
     viaMeta
       ? await call(session, "woo_call", { object: "the_mug", verb: "bump", args: [] }, { "woo.net/operation_id": operationId })
@@ -187,7 +207,7 @@ async function fixture() {
 
   return {
     alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv,
-    mcp, call, hits, bump, say, drain, settleAll,
+    mcp, call, hits, bump, say, complain, drain, settleAll,
     close: () => { for (const st of states) st.close(); }
   };
 }
@@ -504,6 +524,46 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
         isError: true,
         structuredContent: { error: { code: "E_IDEMPOTENCY_CONFLICT" } }
       });
+      expect(await f.hits()).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  // FINDING 3. A verb that emits and then throws still COMMITS its
+  // transcript, so those lines happened. The gateway suppresses the
+  // submitter's own committed echo from woo_wait precisely because the reply
+  // is supposed to carry them (M4.1) — so returning the error without them
+  // lost them entirely, and the actor could never see what its own failed
+  // action did. That is the exact hole the own-observations seat was built
+  // to close, still open on the failure path.
+  it("a FAILED turn still carries the submitter's own observations", async () => {
+    const f = await fixture();
+    try {
+      const failed = await f.complain(f.aliceSession, "fail-1");
+      await f.settleAll();
+      expect(failed.result?.isError).toBe(true);
+      expect(failed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
+      const lines = (failed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
+      expect(
+        lines.some((obs) => obs?.type === "complained"),
+        `failed turn dropped its own observations: ${JSON.stringify(failed.result).slice(0, 500)}`
+      ).toBe(true);
+      // And they are not ALSO waiting in the queue — one seat, not two.
+      const queued = await f.drain(f.aliceSession);
+      expect(queued.some((obs) => obs?.type === "complained")).toBe(false);
+
+      // A REPLAYED failure replays the recorded error AND the recorded
+      // lines, and says it is a replay — otherwise a client seeing an error
+      // cannot tell whether its retry ran again.
+      const replayed = await f.complain(f.aliceSession, "fail-1");
+      await f.settleAll();
+      expect(replayed.result?.isError).toBe(true);
+      expect(replayed.result?.structuredContent?.replayed).toBe(true);
+      expect(replayed.result?.structuredContent?.error).toMatchObject({ code: "E_PERM" });
+      const replayedLines = (replayed.result?.structuredContent?.observations ?? []) as Record<string, any>[];
+      expect(replayedLines.some((obs) => obs?.type === "complained")).toBe(true);
+      // The partial write committed once, and the replay did not repeat it.
       expect(await f.hits()).toBe(1);
     } finally {
       f.close();

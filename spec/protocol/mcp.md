@@ -353,9 +353,13 @@ Successful `tools/call` results use:
 ```
 
 World or Net failures use the same MCP tool-result envelope with
-`isError:true` and `structuredContent.error`. JSON-RPC protocol errors such as
-an unknown tool name use a JSON-RPC error object. A missing, expired, or
-malformed MCP session is rejected before discovery or invocation.
+`isError:true` and `structuredContent.error`. When the failure is a verb that
+THREW on an accepted commit, the envelope also carries that turn's
+`observations` (§M4.1) and, on a replay, `replayed`/`replay_outcome` (§M4.2) —
+an error the client cannot distinguish from a fresh one is a retry hazard.
+JSON-RPC protocol errors such as an unknown tool name use a JSON-RPC error
+object. A missing, expired, or malformed MCP session is rejected before
+discovery or invocation.
 
 ### M4.1 The submitter's own observations
 
@@ -382,6 +386,13 @@ payload shape it has always had.
 Exactly one seat. `observations` on the reply and the queue's echo dedupe are
 two halves of one rule, so a client that reads both never receives an event
 twice, and delivery to every other session is unaffected.
+
+**The seat survives failure.** A verb that emits and then throws still commits
+its transcript, so those lines happened — and because the echo dedupe has
+already suppressed them from `woo_wait`, the error envelope is their only
+carrier. An `isError:true` result for an accepted commit therefore carries
+`structuredContent.observations` under the same filtering rule as a successful
+one. Transport failures and rejected commits ran no verb and carry none.
 
 A detected idempotent replay (§M4.2) commits nothing this round. It carries
 the observations RECORDED with the committed execution, never the retry's own
