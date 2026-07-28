@@ -286,6 +286,17 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     return row ? verbFromRow(row) : null;
   }
 
+  /** Upsert one verb page, keyed on its SLOT — the durable per-object ordinal
+   * (spec/semantics/objects.md §9.1), enforced here by `PRIMARY KEY
+   * (object_id, slot)`. Replace-at-slot is what a rename needs: the new name is
+   * written at the same ordinal and the old name is then deleted. It relies on
+   * the in-memory invariant that no two of an object's verbs share a slot, which
+   * `WooWorld.addVerb` maintains for everything it writes. A world hydrated from
+   * a corrupt image (an aged Net world's duplicate-slot pages — see
+   * spec/protocol/coherence.md §CO4.7) would violate that; `saveWorld`'s plain
+   * INSERT fails loudly on the constraint rather than persisting the shape, and
+   * such an image must be walked forward with `repair:net-verb-slots` before it
+   * is loaded into a SQLite host. */
   saveVerb(id: ObjRef, verb: SerializedVerb): void {
     this.ensureHostedObject(id);
     const slot =

@@ -30,6 +30,17 @@
  * carries (absent/invalid → null, an even older page than the duplicates). */
 export type VerbSlotPage = { name: string; slot: number | null };
 
+/** The `slot` a verb CELL VALUE carries, or null when it carries none — a page
+ * written before slots were persisted, or a value that is not a page at all.
+ * Verb cells are the serialized VerbDef minus line_map, so the ordinal rides
+ * along on both the read and the write side. Shared by the commit-time
+ * allocation check and the operator repair so they cannot read it differently. */
+export function verbCellSlot(value: unknown): number | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const slot = (value as { slot?: unknown }).slot;
+  return typeof slot === "number" && Number.isSafeInteger(slot) && slot > 0 ? slot : null;
+}
+
 /** The repaired ordinal for each page, or null when the object needs no work.
  *
  * A no-op is defined as "already a strictly ascending, distinct, slot-carrying

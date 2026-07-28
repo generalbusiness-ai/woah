@@ -696,12 +696,16 @@ function buildSeedSlice(view: CellStore, call: ShadowTurnCall): Set<string> {
   // is what makes the common case converge in ONE round instead of a repair
   // cycle per verb.
   //
-  // Bounded by (arguments × that object's own cells), which is the turn's own
-  // read-set shape — never a scan of the view.
-  for (const arg of call.args ?? []) {
-    if (typeof arg !== "string" || !arg) continue;
-    if (!view.has(cellKey("object_lineage", arg))) continue; // not a resident object
-    for (const cell of view.cellsForObject(arg)) seed.add(cell.key);
+  // Every string ANYWHERE in the argument payload is a candidate ref (an id
+  // nested in an options map is as much a subject as a positional one), and
+  // only view-resident objects are seeded, so the cost is bounded by
+  // (argument payload × that object's own cells) — the turn's own read-set
+  // shape, never a scan of the view.
+  const argRefs = new Set<string>();
+  collectStrings(call.args ?? [], argRefs);
+  for (const ref of argRefs) {
+    if (!view.has(cellKey("object_lineage", ref))) continue; // not a resident object
+    for (const cell of view.cellsForObject(ref)) seed.add(cell.key);
   }
   // Resolve object-valued properties so obj-ref reads land on materialized
   // objects: an unmaterialized ref target makes the engine attribute the

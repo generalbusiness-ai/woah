@@ -69,6 +69,7 @@ import {
 import type { TraceContext } from "./trace";
 import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
+import { verbCellSlot } from "./verb-slots";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
@@ -191,16 +192,6 @@ export function scheduledTurnBytes(turn: ScheduledTurn): number {
   // UTF-8 bytes. `.length` counts UTF-16 code units and undercounts non-ASCII
   // payloads by up to ~4x against a byte cap the spec states in bytes.
   return SCHEDULE_BYTE_ENCODER.encode(JSON.stringify(turn)).length;
-}
-
-/** The `slot` a verb-page cell value carries, or null when it carries none
- * (a legacy page written before slots were persisted, or a non-page value).
- * Verb cells are the serialized VerbDef minus line_map, so the ordinal rides
- * along on both the read and the write side. */
-function verbSlotOf(value: unknown): number | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const slot = (value as { slot?: unknown }).slot;
-  return typeof slot === "number" && Number.isSafeInteger(slot) && slot > 0 ? slot : null;
 }
 
 const RETRYABLE_VERDICTS: ReadonlySet<RejectReason> = new Set([
@@ -1177,7 +1168,7 @@ export class ScopeSequencer {
     const vacatedVerbSlots = new Map<string, Set<number>>();
     for (const write of submit.transcript.writes) {
       if (write.cell.kind !== "verb" || write.op !== "remove") continue;
-      const held = verbSlotOf(this.store.get(cellKey("verb_bytecode", write.cell.object, write.cell.name))?.value);
+      const held = verbCellSlot(this.store.get(cellKey("verb_bytecode", write.cell.object, write.cell.name))?.value);
       if (held === null) continue;
       const slots = vacatedVerbSlots.get(write.cell.object) ?? new Set<number>();
       slots.add(held);
@@ -1187,11 +1178,11 @@ export class ScopeSequencer {
       if (write.cell.kind !== "verb" || write.op === "remove") continue;
       const object = write.cell.object;
       if (this.options.owns && !this.options.owns(object)) continue; // the owner enforces its own
-      const proposed = verbSlotOf(write.value);
+      const proposed = verbCellSlot(write.value);
       if (proposed === null) continue; // slotless write: nothing to check
       const existing = this.store.get(cellKey("verb_bytecode", object, write.cell.name));
       if (existing !== undefined) {
-        const held = verbSlotOf(existing.value);
+        const held = verbCellSlot(existing.value);
         if (held === null || held === proposed) continue;
         return this.reject(submit, "read_version_mismatch", {
           verb_slot_moved: { object, verb: write.cell.name, held, proposed }
@@ -1202,7 +1193,7 @@ export class ScopeSequencer {
       const pages: TranscriptCell[] = [];
       for (const cell of this.store.cellsForObject(object)) {
         if (cell.kind !== "verb_bytecode" || typeof cell.name !== "string") continue;
-        floor = Math.max(floor, (verbSlotOf(cell.value) ?? 0) + 1);
+        floor = Math.max(floor, (verbCellSlot(cell.value) ?? 0) + 1);
         pages.push({ kind: "verb", object, name: cell.name } as TranscriptCell);
       }
       if (proposed === floor) continue;

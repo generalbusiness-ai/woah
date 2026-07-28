@@ -136,6 +136,19 @@ An already-healthy object is declined, GAPS INCLUDED — distinct ascending
 ordinals are correct even when not dense — which is also what makes replays
 no-ops.
 
+### A second invariant this makes load-bearing
+
+`PRIMARY KEY (object_id, slot)` in the SQLite verb table has always declared
+slot uniqueness; nothing enforced it above the storage layer, because
+`cloneImportedVerb`'s renumbering guaranteed it by accident. It is now an
+explicit invariant that `addVerb` maintains. Hydration deliberately does NOT
+enforce it — the planning world hydrates a SLICE through the same
+`importWorld` path, so renumbering there would rewrite ordinals the authority
+then refuses (`verb_slot_moved`), and the turn would oscillate to
+E_NONCONVERGENT_READ. An aged duplicate-slot image is therefore repaired by the
+operator op, not silently by a loader, and `saveWorld`'s plain INSERT fails
+loudly on the constraint if one is ever pointed at a SQLite host.
+
 ## Deploy-day checklist addition
 
 After deploying this runtime, and before treating verb authoring on the deployed

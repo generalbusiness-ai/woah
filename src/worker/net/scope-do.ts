@@ -119,7 +119,7 @@ import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import { mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
-import { repairedVerbSlots } from "../../net/verb-slots";
+import { repairedVerbSlots, verbCellSlot } from "../../net/verb-slots";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
@@ -523,13 +523,6 @@ export class SqliteScopeStore implements ScopeStore {
  * `remaining` — the operator re-runs until it reaches zero. Keeps one signed
  * request a bounded transaction rather than a scope-sized rewrite. */
 const VERB_SLOT_REPAIR_OBJECT_LIMIT = 32;
-
-/** The `slot` a stored verb page carries, or null for a slotless legacy page. */
-function verbPageSlot(value: unknown): number | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const slot = (value as { slot?: unknown }).slot;
-  return typeof slot === "number" && Number.isSafeInteger(slot) && slot > 0 ? slot : null;
-}
 
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
@@ -1935,7 +1928,7 @@ export class NetScopeDO {
             .map((cell) => ({
               name: cell.name as string,
               cell,
-              slot: verbPageSlot(cell.value)
+              slot: verbCellSlot(cell.value)
             }));
           const assignment = repairedVerbSlots(pages.map(({ name, slot }) => ({ name, slot })));
           if (assignment === null) continue; // already a distinct ascending set
