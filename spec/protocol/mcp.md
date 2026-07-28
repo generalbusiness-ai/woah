@@ -554,6 +554,22 @@ It is intentionally live and at-most-once: Durable Object eviction or session
 close drops undelivered observations. Durable observation recovery is a
 separate protocol feature and must not be implied by this queue.
 
+**Parking is bounded and cancellable.** Each parked `woo_wait` holds a
+continuation and a live timer for up to 25 seconds, so the set of outstanding
+waits per session is capped (currently 4 — one in flight is the well-behaved
+shape, with slack for a retry). A call beyond the cap is refused as a tool
+result with `E_WAIT_LIMIT` and `detail.reason:"wait_concurrency"`; it is never
+a transport error, because a client must be able to read it.
+
+`notifications/cancelled` naming a parked request releases that request
+promptly. A cancelled wait **drains nothing**: it returns no observations and
+does not advance the continuity watermark, because the client is no longer
+reading that response and consuming rows into it would turn at-most-once
+delivery into none. Cancellation is advisory — an unknown or already-completed
+request id is not an error — and can only ever release a wait parked under the
+same session. Without honouring it, a bounded waiter set would let a client's
+own abandoned polls refuse its next legitimate one until they timed out.
+
 **Eviction is not rare, and a silent client goes deaf.** The queue lives in
 the gateway shard's memory, and on Cloudflare an idle shard is evicted within
 roughly ten seconds. A session that stops asking therefore stops hearing:

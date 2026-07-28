@@ -5115,8 +5115,20 @@ export class NetGatewayDO {
       return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
     }
     // Notifications (no id) acknowledge with 202 and no body — the MCP
-    // handshake's notifications/initialized.
+    // handshake's notifications/initialized. `notifications/cancelled` is
+    // ACTED ON first: with a bounded waiter set, dropping it would leave a
+    // client unable to reclaim its own parked slots before their timeouts.
     if (rpc.id === undefined || rpc.id === null) {
+      if (rpc.method === "notifications/cancelled") {
+        const params = mcpRecord(rpc.params);
+        const requestId = params.requestId;
+        // Cancellation is advisory and unauthenticated beyond the session
+        // header: it can only ever release a waiter parked under THIS
+        // session id, and releasing one drains nothing.
+        if (typeof requestId === "string" || typeof requestId === "number") {
+          this.mcpCancelWait(request.headers.get("mcp-session-id") ?? "", String(requestId));
+        }
+      }
       return new Response(null, { status: 202 });
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
@@ -5323,7 +5335,8 @@ export class NetGatewayDO {
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
         : 64;
-      const drained = await this.mcpWait(session, actor, timeout, limit);
+      const drained = await this.mcpWait(session, actor, timeout, limit, String(id));
+      if ("refused" in drained) return this.mcpToolError(id, drained.refused);
       return this.mcpResult(id, { observations: drained.observations, gap: drained.gap });
     }
     // The relation mirror can be newer than this gateway's object-cell view.
@@ -5776,7 +5789,13 @@ export class NetGatewayDO {
    * gateway can still PROVE continuity since its last drain. A pending gap
    * short-circuits the park so the agent learns to re-orient immediately
    * instead of after a full long-poll. */
-  private async mcpWait(session: string, actor: string, timeoutMs: number, limit: number): Promise<{ observations: unknown[]; gap: boolean }> {
+  private async mcpWait(
+    session: string,
+    actor: string,
+    timeoutMs: number,
+    limit: number,
+    requestId: string
+  ): Promise<{ observations: unknown[]; gap: boolean } | { refused: Record<string, unknown> }> {
     const queue = this.mcpQueues.get(session);
     // No live state at all: nothing to drain and nothing to vouch for.
     if (!queue) return { observations: [], gap: true };
@@ -5793,18 +5812,66 @@ export class NetGatewayDO {
     };
     if (queue.gapPending || queue.buffer.length > 0) return take();
     if (timeoutMs === 0) return take();
+    // Bounded parking. Each parked call holds a closure and a live timer for
+    // up to 25s, so an unbounded set is a resource-exhaustion vector on an
+    // authenticated-but-public surface. One outstanding long-poll is the
+    // well-behaved shape; the cap leaves room for a retry or two in flight
+    // and refuses beyond that with a code that names the condition.
+    if (queue.waiters.length >= MCP_MAX_SESSION_WAITS) {
+      // Refused as a TOOL result, not a thrown taxonomy error: a throw here
+      // would escape the woo_wait branch as an HTTP failure instead of the
+      // MCP envelope a client can read.
+      return {
+        refused: {
+          code: "E_WAIT_LIMIT",
+          message: "too many concurrent woo_wait calls for this session",
+          detail: {
+            reason: "wait_concurrency",
+            outstanding: queue.waiters.length,
+            limit: MCP_MAX_SESSION_WAITS,
+            remediation:
+              "keep at most one woo_wait in flight per session; await it, or cancel it with "
+              + "notifications/cancelled naming its request id"
+          }
+        }
+      };
+    }
     return await new Promise<{ observations: unknown[]; gap: boolean }>((resolve) => {
-      const timer = setTimeout(() => {
-        const index = queue.waiters.indexOf(wake);
+      const release = (): void => {
+        clearTimeout(timer);
+        const index = queue.waiters.findIndex((entry) => entry.wake === wake);
         if (index >= 0) queue.waiters.splice(index, 1);
+      };
+      const timer = setTimeout(() => {
+        release();
         resolve(take());
       }, timeoutMs);
-      const wake = (): void => {
-        clearTimeout(timer);
-        resolve(take());
+      const wake = (cancelled: boolean): void => {
+        release();
+        // A CANCELLED wait must not drain: the client is no longer reading
+        // this response, and `take()` would consume buffered rows into a
+        // reply nobody sees — at-most-once delivery turning into none.
+        resolve(cancelled ? { observations: [], gap: false } : take());
       };
-      queue.waiters.push(wake);
+      queue.waiters.push({ requestId, wake });
     });
+  }
+
+  /**
+   * MCP `notifications/cancelled`: release the parked request it names.
+   *
+   * Ignoring cancellation left a client with no way to reclaim a parked slot
+   * short of waiting out its timeout, which — with a bounded waiter set —
+   * would turn a client's own abandoned polls into a self-inflicted refusal.
+   * Unknown ids are silently fine: the request may have completed already,
+   * and a cancellation is advisory by construction.
+   */
+  private mcpCancelWait(session: string, requestId: string): void {
+    const queue = this.mcpQueues.get(session);
+    if (!queue) return;
+    const index = queue.waiters.findIndex((entry) => entry.requestId === requestId);
+    if (index < 0) return;
+    queue.waiters[index].wake(true);
   }
 
   /** Fanout-side feed (called after the same server-side submitter echo
@@ -5823,7 +5890,7 @@ export class NetGatewayDO {
       queue.gapPending = true;
     }
     const waiters = queue.waiters.splice(0, queue.waiters.length);
-    for (const wake of waiters) wake();
+    for (const waiter of waiters) waiter.wake(false);
     return true;
   }
 
@@ -5895,8 +5962,10 @@ export class NetGatewayDO {
     state.toolListDigest = null;
     state.listChangedDirty = false;
     state.listChangedPending = false;
+    // Cancelled, not drained: the buffer above is already cleared, and a
+    // disposed session must not record a drain watermark it will never use.
     const waiters = state.waiters.splice(0, state.waiters.length);
-    for (const wake of waiters) wake();
+    for (const waiter of waiters) waiter.wake(true);
     const streams = state.sseWaiters.splice(0, state.sseWaiters.length);
     for (const stream of streams) stream.close();
   }
@@ -9737,6 +9806,10 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 /** MCP adapter bounds (client-shell phase i). */
+/** Bounded per-session `woo_wait` parking (M5). One outstanding long-poll is
+ * the well-behaved shape; the slack covers a retry in flight. */
+const MCP_MAX_SESSION_WAITS = 4;
+
 const MCP_QUEUE_CAP = 256;
 const MCP_SESSION_STATE_CAP = 512;
 /** Conservative SQLite bind chunk for scope ∩ local-carrier queries. */
@@ -9763,7 +9836,11 @@ type NetMcpSseWaiter = {
 type NetMcpSessionState = {
   actor: string;
   buffer: unknown[];
-  waiters: Array<() => void>;
+  /** Parked `woo_wait` calls. Keyed by JSON-RPC request id so an explicit
+   * `notifications/cancelled` can release exactly one, and BOUNDED
+   * (MCP_MAX_SESSION_WAITS) because this is a public surface: without a cap
+   * a client could park closures and timers without limit. */
+  waiters: NetMcpWaiter[];
   ownEchoIds: Set<string>;
   /** M5.1 continuity marker. True when this gateway cannot prove that the
    * session's queue has been continuous since the client's last drain —
@@ -9775,6 +9852,10 @@ type NetMcpSessionState = {
   listChangedPending: boolean;
   sseWaiters: NetMcpSseWaiter[];
 };
+
+/** One parked woo_wait. `wake(cancelled)` resolves it; a cancelled wake must
+ * NOT drain, or a client that walked away would consume rows it never read. */
+type NetMcpWaiter = { requestId: string; wake: (cancelled: boolean) => void };
 
 function mcpSessionState(actor: string): NetMcpSessionState {
   return {

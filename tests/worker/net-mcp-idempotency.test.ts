@@ -591,6 +591,81 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
     }
   });
 
+  // FINDING 5. Every woo_wait parked a closure and a live timer in an
+  // unbounded per-session set, and notifications/cancelled was swallowed by
+  // the blanket 202 — a resource-exhaustion vector on a public surface with
+  // no way for a client to reclaim its own slots.
+  it("bounds parked woo_wait calls per session and names the refusal", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.aliceSession);
+      // Park the cap. Each stays parked because the queue is empty.
+      const parked = [1, 2, 3, 4].map((n) =>
+        f.mcp(
+          { jsonrpc: "2.0", id: 700 + n, method: "tools/call", params: { name: "woo_wait", arguments: { timeout_ms: 20_000 } } },
+          { "mcp-session-id": f.aliceSession }
+        )
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const over = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 20_000 });
+      expect(over.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "E_WAIT_LIMIT", detail: { reason: "wait_concurrency", limit: 4 } } }
+      });
+
+      // Cancellation releases exactly the request it names, and resolves it
+      // WITHOUT draining — a client that walked away must not consume rows
+      // into a reply nobody reads, nor advance the M5.1 drain watermark.
+      //
+      // The assertion is on ELAPSED TIME, deliberately. An ignored
+      // cancellation also resolves with no observations — by timing out 20s
+      // later — so a shape-only assertion would pass against a server that
+      // dropped the notification entirely. Prompt resolution is the only
+      // thing that distinguishes the two.
+      const startedAt = Date.now();
+      await f.mcp(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 701 } },
+        { "mcp-session-id": f.aliceSession }
+      );
+      const cancelled = await parked[0];
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed, `cancellation took ${elapsed}ms — the park was not released`).toBeLessThan(5_000);
+      expect(cancelled.body?.result?.structuredContent?.result?.observations).toEqual([]);
+
+      // The slot is free again: a call that was refused a moment ago is
+      // accepted now. (timeout_ms 0 returns immediately, so it parks nothing.)
+      const reclaimed = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 0 });
+      expect(reclaimed.result?.isError).not.toBe(true);
+
+      // The other three are still parked and still functional: a delivery
+      // wakes them and exactly one carries the row, with nothing lost to the
+      // cancellation.
+      (f.gateway() as any).mcpEnqueue(f.aliceSession, [{ type: "kept" }]);
+      const settled = await Promise.all(parked.slice(1));
+      const delivered = settled.flatMap(
+        (response) => response.body?.result?.structuredContent?.result?.observations ?? []
+      );
+      expect(delivered).toEqual([{ type: "kept" }]);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("a timed-out woo_wait releases its slot", async () => {
+    const f = await fixture();
+    try {
+      await f.drain(f.aliceSession);
+      // Four short parks that all expire; if the timeout path leaked its
+      // waiter, the fifth call would be refused.
+      await Promise.all([1, 2, 3, 4].map(() => f.call(f.aliceSession, "woo_wait", { timeout_ms: 5 })));
+      const after = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 5 });
+      expect(after.result?.isError).not.toBe(true);
+      expect(after.result?.structuredContent?.result?.observations).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
   it("advertises operation_id on woo_call and on dynamic tools", async () => {
     const f = await fixture();
     try {
