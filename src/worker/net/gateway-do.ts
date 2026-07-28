@@ -5171,11 +5171,30 @@ export class NetGatewayDO {
     return new Response(null, { status: 202 });
   }
 
-  /** Streamable HTTP's optional standalone GET/SSE carrier. The listen is
+  /**
+   * Streamable HTTP's optional standalone GET/SSE carrier. The listen is
    * deliberately bounded: an idle Durable Object request must not become a
    * permanent synchronous dependency. Standard clients reconnect after the
    * stream closes, while a not-yet-delivered hint remains pending in the
-   * session state and is handed to exactly one later stream. */
+   * session state and is handed to exactly one later stream.
+   *
+   * BOUNDED PER SESSION (MCP_MAX_SESSION_SSE, mcp.md M6), and bounded by
+   * REPLACEMENT rather than refusal. Admitting a listen over the cap closes
+   * the oldest one instead of rejecting the new one, because the excess this
+   * has to survive is not usually abuse: an ungracefully dropped connection
+   * leaves a phantom waiter behind — `cancel()` is not guaranteed to fire
+   * promptly — and refusing would then lock a legitimately reconnecting
+   * client out for up to a full 25-second listen window. An evicted stream
+   * ends normally (the `retry:` field already told the client to reconnect),
+   * so replacement costs a reconnect while refusal costs availability. There
+   * is consequently NO new refusal status on this path; a client cannot
+   * provoke more than MCP_MAX_SESSION_SSE live listens no matter how many
+   * GETs it sends, and their arrival RATE is what `enforceClientRate` bounds.
+   *
+   * Nothing is lost by an eviction: `listChangedPending` is only cleared by a
+   * delivery that a stream actually accepted, so a pending hint survives to
+   * the next stream.
+   */
   private async clientMcpEvents(request: Request): Promise<Response> {
     const accept = request.headers.get("accept") ?? "";
     if (!accept.toLowerCase().includes("text/event-stream")) {
@@ -5236,6 +5255,15 @@ export class NetGatewayDO {
             }
           }
         };
+        // Make room before admitting. `close()` splices the evicted waiter out
+        // of `sseWaiters` itself, so the loop always makes progress; the guard
+        // on `length` (rather than a fixed count) tolerates a waiter that
+        // closed concurrently.
+        while (state.sseWaiters.length >= MCP_MAX_SESSION_SSE) {
+          const evicted = state.sseWaiters[0];
+          evicted.close();
+          if (state.sseWaiters[0] === evicted) state.sseWaiters.shift();
+        }
         state.sseWaiters.push(waiter);
         timer = setTimeout(close, MCP_SSE_LISTEN_MS);
         gateway.mcpFlushListChanged(state);
@@ -9919,6 +9947,20 @@ const MCP_DISCOVERY_MAX_PAGE = 256;
 const MCP_CONTEXT_WARM_FAILURE_CAP = 512;
 const MCP_CONTEXT_WARM_SUCCESS_CAP = 512;
 const MCP_SSE_LISTEN_MS = 25_000;
+/**
+ * Live standalone GET/SSE listens per session (mcp.md M6).
+ *
+ * `woo_wait` is capped per session, but each authenticated GET used to append
+ * another ~25-second waiter with no limit at all: the per-actor rate bucket
+ * alone permits on the order of 1,250 concurrent listens inside one listen
+ * window, every one of them holding a stream controller and a timer.
+ *
+ * Streamable HTTP gives a client exactly one standalone stream, so the cap is
+ * small; the slack covers a reconnect that overlaps the stream it replaces.
+ * Over the cap the OLDEST listen is CLOSED to admit the new one — see
+ * clientMcpEvents for why replacement rather than refusal.
+ */
+const MCP_MAX_SESSION_SSE = 2;
 const MCP_SSE_CONNECTED = new TextEncoder().encode("retry: 1000\n\n");
 const MCP_LIST_CHANGED_NOTIFICATION = {
   jsonrpc: "2.0",
@@ -9948,6 +9990,9 @@ type NetMcpSessionState = {
   toolListDigest: string | null;
   listChangedDirty: boolean;
   listChangedPending: boolean;
+  /** Live standalone GET/SSE listens. Bounded by MCP_MAX_SESSION_SSE for the
+   * same reason `waiters` is: each holds a stream controller and a 25s timer.
+   * Oldest-first, so admitting one over the cap evicts from the front. */
   sseWaiters: NetMcpSseWaiter[];
 };
 

@@ -771,6 +771,32 @@ At most one open stream receives a given hint. A disconnect before delivery
 leaves the hint pending, while delivery is live and not resumable. Missing,
 expired, or malformed sessions are rejected before a stream is opened.
 
+**Listens are bounded per session, by eviction rather than refusal.** Each
+open listen holds a stream controller and a live 25-second timer, so the count
+per session is capped (currently 2 — Streamable HTTP gives a client one
+standalone stream, with slack for a reconnect that overlaps the stream it
+replaces). Opening a listen beyond the cap **closes the oldest one** and
+admits the new one; a GET is never refused for this reason, and there is no
+status code for it. Refusal was the wrong choice here because the excess this
+must survive is usually not abuse: an ungracefully dropped connection leaves a
+phantom listen behind — cancellation is not guaranteed to be observed
+promptly — and refusing would lock a legitimately reconnecting client out for
+up to a full listen window. A client cannot provoke more than the cap in live
+listens however many GETs it sends, and their arrival *rate* is bounded by the
+ordinary per-actor limit.
+
+What an evicted client observes is a **normal end of stream**: the response
+ends cleanly, exactly as it would at the 25-second bound, with no error event
+and no trailing data. That is deliberately indistinguishable from the bounded
+close a conforming client already handles, and the correct response to both is
+the same — reconnect after the advertised `retry` interval. It *is*
+distinguishable from a network drop, which surfaces as a transport error
+rather than an orderly EOF. A client that never opens a second listen never
+sees an eviction at all.
+
+Eviction loses nothing: a pending hint is cleared only by a delivery a stream
+actually accepted, so it survives to the next listen.
+
 The notification is a freshness hint only. Clients re-run `tools/list`; the
 current structural resolver remains the authorization boundary. No temporary
 tool-result field substitutes for the standard notification, and a client may
