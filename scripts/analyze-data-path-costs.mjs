@@ -103,6 +103,16 @@ const CLASSIFICATION = {
     signal: "target, verb, observations, status, projection_bytes",
     endState: "Execution emits EffectTranscript; authority appends accepted frame and updates touched projection rows."
   },
+  direct_host_effect_delivery: {
+    bucket: "post_accept_delivery",
+    signal: "target, verb, effect, status, error",
+    endState: "A failed host projection delivery is observable repair work; it never rewrites the already accepted domain result."
+  },
+  post_accept_effect: {
+    bucket: "post_accept_delivery",
+    signal: "effect, ms, status, error",
+    endState: "Host-only callbacks run after durable acceptance; latency and failure remain outside the behavior transaction and response wall time."
+  },
   dispatch_resolved: {
     bucket: "routing",
     signal: "target, verb, host, path",
@@ -337,6 +347,11 @@ const CLASSIFICATION = {
     bucket: "data_integrity",
     signal: "scope, route, reason, object",
     endState: "Transcript vocabulary should cover durable side effects without anomalies."
+  },
+  failed_transcript_effects: {
+    bucket: "data_integrity",
+    signal: "scope, route, policy, generation, valid, reason, reasons, counts",
+    endState: "Observe mode establishes the failed-turn corpus; enforced clean generations should remain valid with zero rolled-back domain effects."
   },
   state_projection: {
     bucket: "projection_read",

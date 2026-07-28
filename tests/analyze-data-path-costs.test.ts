@@ -16,7 +16,7 @@ describe("analyze-data-path-costs", () => {
       status: "ok"
     });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("Observed metric-kind coverage");
     expect(result.stdout).toContain("| direct_call | 1 | vm_execution |");
   });
@@ -250,7 +250,7 @@ describe("analyze-data-path-costs", () => {
     const kinds = metricKindsFromTypes();
     const result = runAnalyzer(...kinds.map((kind) => ({ kind })));
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     for (const kind of kinds) {
       expect(result.stdout).toContain(`| ${kind} | 1 |`);
     }
