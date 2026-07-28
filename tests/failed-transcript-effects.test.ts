@@ -8,9 +8,11 @@ import {
 } from "../src/core/effect-transcript";
 import {
   FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION,
+  FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
   classifyFailedTranscriptEffects,
   type FailedTranscriptEffectsReport
 } from "../src/core/failed-transcript-effects";
+import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import { runShadowTurnCallOnWorldTranscript } from "../src/core/shadow-turn-call";
@@ -24,7 +26,10 @@ import {
 } from "../src/core/shadow-turn-exec";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { MetricEvent } from "../src/core/types";
-import { CellStore, cellVersion } from "../src/net/cells";
+import { cellsFromSerialized, storeCells } from "../src/net/bridge";
+import { CellStore } from "../src/net/cells";
+import { planTurn } from "../src/net/plan";
+import type { ScopeClassifier } from "../src/net/route";
 import { ScopeSequencer, type CommitSubmit } from "../src/net/scope";
 import { applyTranscript, type EffectTranscript as NetEffectTranscript } from "../src/net/transcript";
 
@@ -38,6 +43,38 @@ const ERROR_OBSERVATION = {
 };
 
 describe("failed transcript effect classifier", () => {
+  it("classifies every EffectTranscript field into a closed semantic class", () => {
+    expect(FAILED_TRANSCRIPT_FIELD_CLASSIFICATION).toEqual({
+      kind: "envelope",
+      failureEffectsGeneration: "integrity",
+      id: "envelope",
+      route: "envelope",
+      scope: "envelope",
+      space: "envelope",
+      seq: "envelope",
+      session: "envelope",
+      call: "envelope",
+      reads: "proof",
+      stateProbes: "proof",
+      writes: "effect",
+      creates: "effect",
+      moves: "effect",
+      recycles: "effect",
+      schedules: "effect",
+      cancellations: "effect",
+      sessionScopeTransition: "effect",
+      projectionWrites: "effect",
+      observations: "outcome",
+      logicalInputs: "proof",
+      untrackedEffects: "effect",
+      result: "outcome",
+      error: "outcome",
+      complete: "integrity",
+      incompleteReasons: "integrity",
+      hash: "integrity"
+    });
+  });
+
   it("allows proof material plus exactly one owner allocation and canonical error outcome", () => {
     const transcript = failedTranscript({
       route: "sequenced",
@@ -251,9 +288,217 @@ describe("clean failed-transcript producers", () => {
       FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
     );
   });
+
+  it("replays a failed generation-1 turn with only durable proofs and its canonical failure", async () => {
+    const world = createWorld();
+    world.createObject({ id: "failed_replay_probe", parent: "$thing", owner: "$wiz" });
+    world.defineProperty("failed_replay_probe", {
+      name: "counter",
+      defaultValue: 1,
+      owner: "$wiz",
+      perms: "rw",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "failed_replay_probe",
+      "write_read_raise",
+      `verb :write_read_raise() rxd {
+        this.counter = this.counter + 1;
+        let transient = this.counter;
+        raise({ code: "E_PROOF_REPLAY", message: "expected failed replay" });
+      }`,
+      null
+    ).ok).toBe(true);
+    const serializedBefore = world.exportWorld();
+    const fresh = await runShadowTurnCallOnWorldTranscript(world, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "failed-clean-producer",
+      route: "direct",
+      scope: "failed_replay_probe",
+      actor: "$wiz",
+      target: "failed_replay_probe",
+      verb: "write_read_raise",
+      args: []
+    });
+
+    expect(fresh.transcript).toMatchObject({
+      failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION,
+      error: { code: "E_PROOF_REPLAY", message: "expected failed replay" },
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: []
+    });
+    expect(fresh.transcript.result).toBeUndefined();
+    expect(fresh.transcript.reads.filter((read) =>
+      read.cell.kind === "prop" &&
+      read.cell.object === "failed_replay_probe" &&
+      read.cell.name === "counter"
+    )).toEqual([
+      expect.objectContaining({ value: 1 })
+    ]);
+    expect(classifyFailedTranscriptEffects(fresh.transcript, {
+      ownsSequencingSpace: false
+    })).toMatchObject({ policy: "enforce", valid: true, reasons: [] });
+
+    const key = shadowTurnKeyFromTranscript(fresh.transcript);
+    const replay = await executeShadowRecordedTurnOrNeedState(
+      createShadowExecutionNode({
+        node: "failed-clean-replay",
+        scope: key.scope,
+        atom_hashes: key.atom_hashes,
+        serialized: serializedBefore
+      }),
+      fresh.recorded,
+      key
+    );
+    if (!replay.ok) {
+      throw new Error(`unexpected failed-turn replay refusal: ${JSON.stringify(replay)}`);
+    }
+    expect(replay.transcript).toEqual(fresh.transcript);
+    expect(world.getProp("failed_replay_probe", "counter")).toBe(1);
+  });
 });
 
 describe("failed transcript authority rollout", () => {
+  it("shadow and Net accept the exact planned write-read-raise transcript", async () => {
+    const world = createWorld();
+    world.createObject({ id: "authority_parity_probe", parent: "$thing", owner: "$wiz" });
+    world.defineProperty("authority_parity_probe", {
+      name: "counter",
+      defaultValue: 1,
+      owner: "$wiz",
+      perms: "rw",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "authority_parity_probe",
+      "write_read_raise",
+      `verb :write_read_raise() rxd {
+        this.counter = this.counter + 1;
+        let transient = this.counter;
+        raise({ code: "E_AUTHORITY_PARITY", message: "expected authority parity" });
+      }`,
+      null
+    ).ok).toBe(true);
+    const serialized = world.exportWorld();
+    const net = new ScopeSequencer("hall", "epoch-1");
+    net.seed(cellsFromSerialized(serialized));
+    const view = new CellStore("derived");
+    for (const cell of storeCells(net.store)) view.install(cell);
+    const classifier: ScopeClassifier = {
+      scopeOf: () => "hall",
+      isShared: (scope) => scope === "hall"
+    };
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "authority-parity",
+        route: "direct",
+        scope: "hall",
+        actor: "$wiz",
+        target: "authority_parity_probe",
+        verb: "write_read_raise",
+        args: []
+      },
+      view,
+      planningScope: "hall",
+      classifier,
+      base: net.head(),
+      idempotencyKey: "authority-parity",
+      stamp: net.stamp(),
+      // Same-scope reads are already covered by the base-head CAS. Compacting
+      // them is the real gateway submission shape and also removes the two
+      // authorities' intentionally different local version vocabularies.
+      compactOwnedReads: { scope: "hall" }
+    });
+    expect(plan.transcript.reads.filter((read) =>
+      read.cell.kind === "prop" &&
+      read.cell.object === "authority_parity_probe" &&
+      read.cell.name === "counter"
+    )).toEqual([
+      expect.objectContaining({ value: 1 })
+    ]);
+    // This turn has no Net-only session cells after same-scope compaction, so
+    // the widened Net transcript is also a core shadow transcript without
+    // cloning or reshaping it.
+    const sharedTranscript = plan.submit.transcript as unknown as EffectTranscript;
+
+    const shadow = createShadowCommitScope({
+      node: "scope:authority-parity",
+      scope: "hall",
+      serialized
+    });
+    const shadowReply = submitShadowCommit(shadow, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "authority-parity",
+      scope: "hall",
+      expected: shadow.head,
+      transcript: sharedTranscript
+    });
+    const netReply = net.submit(plan.submit);
+
+    expect(plan.submit.transcript).toBe(sharedTranscript);
+    expect(sharedTranscript).toMatchObject({
+      failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION,
+      error: { code: "E_AUTHORITY_PARITY" },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: []
+    });
+    expect(shadowReply, JSON.stringify(shadowReply)).toMatchObject({
+      kind: "woo.commit.accepted.shadow.v1"
+    });
+    expect(netReply, JSON.stringify(netReply)).toMatchObject({ status: "accepted" });
+  });
+
+  it("shadow and Net prioritize incompleteness over failed-effect admission", () => {
+    const transcript = failedTranscript({
+      id: "authority-reason-parity",
+      scope: "hall",
+      failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION,
+      complete: false,
+      incompleteReasons: ["native:escaped_effect"],
+      untrackedEffects: [{ name: "escaped_effect", detail: null }],
+      hash: "authority-reason-parity-hash"
+    });
+    const shadow = createShadowCommitScope({
+      node: "scope:authority-reason-parity",
+      scope: "hall",
+      serialized: serializedWorld()
+    });
+    const shadowReply = submitShadowCommit(shadow, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "authority-reason-parity",
+      scope: "hall",
+      expected: shadow.head,
+      transcript
+    });
+
+    const net = new ScopeSequencer("hall", "epoch-1");
+    const netReply = net.submit(netSubmit(
+      net,
+      transcript as NetEffectTranscript,
+      "authority-reason-parity"
+    ));
+
+    expect(shadowReply).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "incomplete_transcript"
+    });
+    expect(netReply).toMatchObject({
+      status: "rejected",
+      reason: "incomplete_transcript"
+    });
+  });
+
   it("Net scope observes legacy violations and enforces the marked clean generation", () => {
     const reports: FailedTranscriptEffectsReport[] = [];
     const sequencer = new ScopeSequencer("hall", "epoch-1", {

@@ -984,6 +984,154 @@ describe("native exception rollback", () => {
     ]);
   });
 
+  it("keeps the durable property proof but drops read-back of a rolled-back property write", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "direct",
+      scope: "room",
+      seq: 0,
+      actor: "$wiz",
+      target: "controller",
+      verb: "write_then_fail",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({ kind: "prop_read", object: "subject", name: "counter", value: 1, version: 4 });
+    active.event({
+      kind: "prop_write",
+      object: "subject",
+      name: "counter",
+      hadValue: true,
+      before: 1,
+      after: 2,
+      changed: true,
+      beforeVersion: 4,
+      afterVersion: 5
+    });
+    active.event({ kind: "prop_read", object: "subject", name: "counter", value: 2, version: 5 });
+    active.event({ kind: "state_probe", cell: { kind: "prop", object: "subject", name: "counter" } });
+    active.abortBehaviorScope();
+
+    expect(recorder.turns[0].events).toEqual([
+      expect.objectContaining({ kind: "turn_start" }),
+      { kind: "prop_read", object: "subject", name: "counter", value: 1, version: 4 }
+    ]);
+  });
+
+  it("drops location and contents proofs observed after a rolled-back move", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "direct",
+      scope: "room",
+      seq: 0,
+      actor: "$wiz",
+      target: "controller",
+      verb: "move_then_fail",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({ kind: "cell_read", cell: { kind: "location", object: "subject" }, value: "old_room", version: "v1" });
+    active.event({ kind: "object_move", object: "subject", from: "old_room", to: "new_room" });
+    active.event({ kind: "cell_read", cell: { kind: "location", object: "subject" }, value: "new_room", version: "v2" });
+    active.event({ kind: "state_probe", cell: { kind: "contents", object: "old_room" } });
+    active.event({ kind: "state_probe", cell: { kind: "contents", object: "new_room" } });
+    active.abortBehaviorScope();
+
+    expect(recorder.turns[0].events).toEqual([
+      expect.objectContaining({ kind: "turn_start" }),
+      { kind: "cell_read", cell: { kind: "location", object: "subject" }, value: "old_room", version: "v1" }
+    ]);
+  });
+
+  it("drops lifecycle and dispatch proofs observed after a rolled-back recycle", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "direct",
+      scope: "room",
+      seq: 0,
+      actor: "$wiz",
+      target: "controller",
+      verb: "recycle_then_fail",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({ kind: "cell_read", cell: { kind: "lifecycle", object: "subject" }, value: "live", version: "v1" });
+    active.event({
+      kind: "projection_write",
+      write: { table: "tombstones", key: "subject", op: "upsert", row: { id: "subject" }, bytes: 16 }
+    });
+    active.event({ kind: "state_probe", cell: { kind: "lifecycle", object: "subject" } });
+    active.event({
+      kind: "dispatch",
+      target: "subject",
+      verb: "inherited",
+      definer: "$thing",
+      implementation: "bytecode",
+      owner: "$wiz"
+    });
+    active.abortBehaviorScope();
+
+    expect(recorder.turns[0].events).toEqual([
+      expect.objectContaining({ kind: "turn_start" }),
+      { kind: "cell_read", cell: { kind: "lifecycle", object: "subject" }, value: "live", version: "v1" }
+    ]);
+  });
+
+  it("applies proof invalidation across committed nested scopes but not an aborted inner mutation", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "direct",
+      scope: "room",
+      seq: 0,
+      actor: "$wiz",
+      target: "controller",
+      verb: "nested_failure",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({
+      kind: "cell_write",
+      cell: { kind: "verb", object: "controller", name: "changed" },
+      value: { implementation: "bytecode" },
+      op: "replace"
+    });
+    active.beginBehaviorScope();
+    active.event({
+      kind: "dispatch",
+      target: "controller",
+      verb: "changed",
+      definer: "controller",
+      implementation: "bytecode",
+      owner: "$wiz"
+    });
+    active.commitBehaviorScope();
+
+    active.beginBehaviorScope();
+    active.event({
+      kind: "prop_write",
+      object: "subject",
+      name: "inner_only",
+      hadValue: false,
+      after: true,
+      changed: true
+    });
+    active.event({ kind: "prop_read", object: "subject", name: "inner_only", value: true, version: 1 });
+    active.abortBehaviorScope();
+    // The inner mutation was already restored. This proof therefore describes
+    // the durable state seen by the outer scope and may survive its abort.
+    active.event({ kind: "state_probe", cell: { kind: "prop", object: "subject", name: "inner_only" } });
+    active.abortBehaviorScope();
+
+    expect(recorder.turns[0].events).toEqual([
+      expect.objectContaining({ kind: "turn_start" }),
+      { kind: "state_probe", cell: { kind: "prop", object: "subject", name: "inner_only" } }
+    ]);
+  });
+
   it("does not retain a failed create as a same-run ordered parent", async () => {
     const world = createWorld();
     world.setRequireOrderedChildrenProjection(true);

@@ -69,6 +69,50 @@ export type FailedTranscriptEffectsOptions = {
 };
 
 /**
+ * Exhaustive semantic ownership for every core transcript field. Adding a
+ * field to EffectTranscript is therefore a compile error here until its
+ * failed-turn semantics are chosen explicitly. This closes the otherwise easy
+ * gap where a new effect array could silently bypass admission because the
+ * classifier never mentioned it.
+ */
+export type FailedTranscriptFieldClass =
+  | "envelope"
+  | "proof"
+  | "effect"
+  | "outcome"
+  | "integrity";
+
+export const FAILED_TRANSCRIPT_FIELD_CLASSIFICATION = {
+  kind: "envelope",
+  failureEffectsGeneration: "integrity",
+  id: "envelope",
+  route: "envelope",
+  scope: "envelope",
+  space: "envelope",
+  seq: "envelope",
+  session: "envelope",
+  call: "envelope",
+  reads: "proof",
+  stateProbes: "proof",
+  writes: "effect",
+  creates: "effect",
+  moves: "effect",
+  recycles: "effect",
+  schedules: "effect",
+  cancellations: "effect",
+  sessionScopeTransition: "effect",
+  projectionWrites: "effect",
+  observations: "outcome",
+  logicalInputs: "proof",
+  untrackedEffects: "effect",
+  result: "outcome",
+  error: "outcome",
+  complete: "integrity",
+  incompleteReasons: "integrity",
+  hash: "integrity"
+} as const satisfies Record<keyof EffectTranscript, FailedTranscriptFieldClass>;
+
+/**
  * Structural input shared by the core transcript and the net bridge's widened
  * session-cell vocabulary. Core must not import net merely to classify a
  * session write as a forbidden behavior effect.

@@ -87,8 +87,10 @@ export interface ActiveTurnRecorder {
   /**
    * Open a nestable behavior transaction. Events remain private to the
    * innermost scope until it commits. Abort discards rolled-back domain
-   * effects, but retains reads/proofs/logical inputs and untracked-effect
-   * evidence needed for validation and deterministic replay.
+   * effects, but retains durable pre-mutation reads/proofs, logical inputs,
+   * and untracked-effect evidence needed for validation and deterministic
+   * replay. Proofs of state seen only after a rolled-back mutation are
+   * discarded because no authority can validate that transient state.
    * Envelope events recorded outside a scope (sequence allocation and the
    * terminal outcome) therefore cannot be confused with behavior effects.
    */
@@ -174,23 +176,14 @@ export class InMemoryTurnRecorder implements TurnRecorder {
       abortBehaviorScope: () => {
         const aborted = behaviorScopes.pop();
         if (!aborted) throw new Error("turn recorder behavior-scope abort without begin");
-        // Reads normally survive a failed behavior because they are the
-        // optimistic proof for the canonical error outcome. A read whose
-        // SUBJECT was created inside this same aborted scope is different:
-        // rollback erased that subject, so no authority can attest it and it
-        // cannot conflict with durable state. Drop those orphan proofs along
-        // with the create. This is computed over the complete aborted scope,
-        // including committed nested scopes, so an outer abort also cleans up
-        // reads of objects created before a nested call.
-        const rolledBackCreates = new Set(
-          aborted
-            .filter((event): event is Extract<TurnRecorderEvent, { kind: "object_create" }> => event.kind === "object_create")
-            .map((event) => event.object)
-        );
-        destination().push(...aborted.filter((event) =>
-          recorderEventSurvivesBehaviorAbort(event) &&
-          !recorderEventReadsRolledBackObject(event, rolledBackCreates)
-        ));
+        // A proof remains authority-valid only when it describes durable
+        // pre-scope state. Walk in execution order: once a rolled-back
+        // mutation touches a cell, later reads of that cell describe the
+        // transient state which rollback just erased and must not escape into
+        // the failed transcript. Earlier reads still prove the path into the
+        // failure. Committed nested scopes have already merged here, so an
+        // outer abort applies the same rule across the complete nested trace.
+        destination().push(...recorderEventsSurvivingBehaviorAbort(aborted));
       },
       currentBehaviorEvents: () => behaviorScopes.at(-1) ?? [],
       discardTurn: () => {
@@ -229,21 +222,120 @@ function recorderEventSurvivesBehaviorAbort(event: TurnRecorderEvent): boolean {
   );
 }
 
-function recorderEventReadsRolledBackObject(event: TurnRecorderEvent, rolledBackCreates: ReadonlySet<ObjRef>): boolean {
-  if (rolledBackCreates.size === 0) return false;
+/**
+ * Retain only proof material that an authority can validate against the
+ * restored pre-scope state. This is deliberately a cell/dependency rule, not
+ * an effect-kind allow-list for the transcript: logical inputs and untracked
+ * effect evidence survive independently, while each proof is checked against
+ * the precise rolled-back mutations that preceded it.
+ */
+function recorderEventsSurvivingBehaviorAbort(events: readonly TurnRecorderEvent[]): TurnRecorderEvent[] {
+  const invalidatedCells = new Set<string>();
+  const invalidatedObjects = new Set<ObjRef>();
+  const invalidatedDispatchTargets = new Set<ObjRef>();
+  const surviving: TurnRecorderEvent[] = [];
+
+  for (const event of events) {
+    if (
+      recorderEventSurvivesBehaviorAbort(event) &&
+      !recorderProofWasInvalidated(event, invalidatedCells, invalidatedObjects, invalidatedDispatchTargets)
+    ) {
+      surviving.push(event);
+    }
+    recordRolledBackProofInvalidations(event, invalidatedCells, invalidatedObjects, invalidatedDispatchTargets);
+  }
+  return surviving;
+}
+
+function recordedCellKey(cell: RecordedCell): string {
+  switch (cell.kind) {
+    case "prop":
+    case "verb":
+      return `${cell.kind}\u0000${cell.object}\u0000${cell.name}`;
+    case "location":
+    case "contents":
+    case "lifecycle":
+      return `${cell.kind}\u0000${cell.object}`;
+  }
+}
+
+function recorderProofCell(event: TurnRecorderEvent): RecordedCell | null {
   switch (event.kind) {
     case "cell_read":
     case "state_probe":
-      return rolledBackCreates.has(event.cell.object);
+      return event.cell;
     case "prop_read":
-      return rolledBackCreates.has(event.object);
+      return { kind: "prop", object: event.object, name: event.name };
     case "dispatch":
       // The transcript turns a dispatch into a verb-page read on its definer.
       // An inherited dispatch on a transient target still proves a durable
       // class page, while a verb defined on the transient object has no
       // surviving authority row.
-      return rolledBackCreates.has(event.definer);
+      return { kind: "verb", object: event.definer, name: event.verb };
     default:
-      return false;
+      return null;
+  }
+}
+
+function recorderProofWasInvalidated(
+  event: TurnRecorderEvent,
+  invalidatedCells: ReadonlySet<string>,
+  invalidatedObjects: ReadonlySet<ObjRef>,
+  invalidatedDispatchTargets: ReadonlySet<ObjRef>
+): boolean {
+  if (event.kind === "dispatch" && invalidatedDispatchTargets.has(event.target)) return true;
+  const cell = recorderProofCell(event);
+  return cell !== null && (
+    invalidatedObjects.has(cell.object) ||
+    invalidatedCells.has(recordedCellKey(cell))
+  );
+}
+
+function recordRolledBackProofInvalidations(
+  event: TurnRecorderEvent,
+  invalidatedCells: Set<string>,
+  invalidatedObjects: Set<ObjRef>,
+  invalidatedDispatchTargets: Set<ObjRef>
+): void {
+  const invalidate = (cell: RecordedCell): void => {
+    invalidatedCells.add(recordedCellKey(cell));
+  };
+  const invalidateContents = (object: ObjRef | null): void => {
+    if (object !== null) invalidate({ kind: "contents", object });
+  };
+
+  switch (event.kind) {
+    case "prop_write":
+      invalidate({ kind: "prop", object: event.object, name: event.name });
+      return;
+    case "cell_write":
+      invalidate(event.cell);
+      if (event.cell.kind === "lifecycle") {
+        // Lineage/lifecycle state participates in method resolution even when
+        // the resolved verb page itself belongs to a durable ancestor.
+        invalidatedDispatchTargets.add(event.cell.object);
+        if (event.op === "create" || event.op === "delete") invalidatedObjects.add(event.cell.object);
+      }
+      return;
+    case "object_create":
+      invalidatedObjects.add(event.object);
+      invalidateContents(event.location);
+      return;
+    case "object_move":
+      invalidate({ kind: "location", object: event.object });
+      invalidateContents(event.from);
+      invalidateContents(event.to);
+      return;
+    case "projection_write":
+      if (event.write.table === "tombstones") {
+        // Tombstone changes are the durable lifecycle effect of recycle (and
+        // repair-time resurrection). Either direction changes whether every
+        // cell and dispatch edge for the object can be attested.
+        invalidatedObjects.add(event.write.key);
+        invalidatedDispatchTargets.add(event.write.key);
+      }
+      return;
+    default:
+      return;
   }
 }
