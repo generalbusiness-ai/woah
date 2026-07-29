@@ -541,6 +541,17 @@ that rollback and stamp generation 1. The generic `RecordedTurn` converter does
 not stamp: imported and legacy recordings remain observe-only unless their
 actual producer establishes the capability.
 
+The field grammar is mechanically exhaustive at every authority boundary.
+Core assigns every core transcript field a semantic class, and the Net bridge
+does the same for every field it intersects onto that transcript. Executable
+effect and outcome inspectors are derived from the core classification, so
+classifying a new core effect without implementing its admission rule is a
+compile error. At runtime, a failed transcript field absent from the
+authority's classification, or an effect/outcome field with no executable
+inspector, contributes the bounded, payload-free `unclassified_fields` reason.
+A complete generation-1 transcript with that reason is terminally invalid.
+Field names and values MUST NOT enter the diagnostic report.
+
 ## CO4. Commit validation
 
 A scope validates a submitted transcript in the VTN8 order, carried

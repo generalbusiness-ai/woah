@@ -70,7 +70,14 @@ import type { TraceContext } from "./trace";
 import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
 import { verbCellSlot } from "./verb-slots";
-import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
+import {
+  NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+  applyTranscript,
+  isSequencedAllocationCell,
+  netCellKeyFor,
+  type EffectTranscript,
+  type TranscriptCell
+} from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
 import {
@@ -1188,7 +1195,8 @@ export class ScopeSequencer {
       ownsSequencingSpace:
         submit.transcript.route === "sequenced"
           ? (this.options.owns ? this.options.owns(submit.transcript.space ?? submit.transcript.scope) : true)
-          : false
+          : false,
+      fieldClassification: NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION
     });
     if (failureEffects.policy !== "not_failed") {
       // Observability is not authority. A broken metrics sink must never turn

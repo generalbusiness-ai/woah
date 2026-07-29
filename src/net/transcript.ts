@@ -37,6 +37,10 @@ import type {
   TranscriptWrite as EngineTranscriptWrite
 } from "../core/effect-transcript";
 import { isSequencedAllocationCell } from "../core/effect-transcript";
+import {
+  FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+  type FailedTranscriptFieldClassification
+} from "../core/failed-transcript-effects";
 
 // The sequenced seq-allocation classifier (SL1's reserved `next_seq`
 // bookkeeping), re-exported at the bridge so route selection and the
@@ -117,6 +121,22 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * the customer's own systems. Present-only-when-set. */
   trace?: TraceContext;
 };
+
+/**
+ * The authority-visible Net transcript vocabulary, including every field
+ * intersected onto the core transcript at this bridge. Scope admission passes
+ * this map to the failed-turn classifier, so neither a future Net effect nor
+ * an unrecognized wire field can hide outside the core `keyof` guard.
+ */
+export const NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION = {
+  ...FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+  exclusiveMint: "envelope",
+  sessionClose: "envelope",
+  orderingReads: "proof",
+  replayReads: "proof",
+  principal: "envelope",
+  trace: "envelope"
+} as const satisfies FailedTranscriptFieldClassification<EffectTranscript>;
 
 /**
  * The canonical `property_cell` payload: `{value?, def?}`.
