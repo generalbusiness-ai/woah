@@ -1409,13 +1409,12 @@ export class ScopeSequencer {
       for (const cell of entry.cells) attested.set(cell.key, cell.version);
     }
     const mismatched = new Map<string, TranscriptCell>();
-    // Reads of objects THIS transcript creates validate within the transcript:
-    // the owner has no pre-state cell to compare or attest. The core grammar
-    // proves those reads against the create and same-turn writes, while the
-    // create-collision guard below proves the authority object was absent.
-    // Re-running the ordinary version comparison here would compare a valid
-    // post-create lifecycle version with "absent" and deterministically replan
-    // forever after create(...); chparent(...).
+    // Reads of objects THIS transcript creates are same-turn derived
+    // observations, not proofs about authority pre-state. Lifecycle mutation
+    // producers omit that redundant read entirely; other derived reads may
+    // remain for deterministic execution but do not participate in CAS. The
+    // create/write stream is validated below, and the create-collision guard
+    // proves the authority object was absent before apply.
     const createdHere = new Set((submit.transcript.creates ?? []).map((create) => create.object));
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read

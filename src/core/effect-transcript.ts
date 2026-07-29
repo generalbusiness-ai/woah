@@ -205,6 +205,11 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const writes: TranscriptWrite[] = [];
   const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
+  // Creation is already an ordered authority fact in this transcript. A
+  // later lineage mutation of that fresh object reads only state produced by
+  // the same turn, so it is not a pre-state proof. Authorities reconstruct
+  // the intermediate lineage from the create plus ordered lifecycle writes.
+  const createdObjects = new Set<ObjRef>();
   const moves: TranscriptMove[] = [];
   const recycles: TranscriptRecycle[] = [];
   // Last-write-wins per id within a turn: arming the same stable key twice in
@@ -223,6 +228,9 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   for (const event of turn.events) {
     switch (event.kind) {
       case "cell_read":
+        if (event.cell.kind === "lifecycle" && createdObjects.has(event.cell.object)) {
+          break;
+        }
         reads.push({
           cell: event.cell,
           version: event.version,
@@ -258,6 +266,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         });
         break;
       case "object_create":
+        createdObjects.add(event.object);
         creates.push({
           object: event.object,
           name: event.name,
@@ -746,8 +755,14 @@ function readMatchesSequencedAllocation(transcript: EffectTranscript, read: Tran
 }
 
 function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok: true } | { ok: false; reason?: "own_write_mismatch" } {
-  if (sameTurnReadMatchesOwnWrite(transcript, read)) return { ok: true };
   const create = transcript.creates.find((item) => item.object === read.cell.object);
+  // A lifecycle read of a same-turn create is never a producer proof. Check
+  // this before the generic own-write rule so the synthetic
+  // lifecycle:"created" write cannot validate a forged sentinel read.
+  if (create && read.cell.kind === "lifecycle") {
+    return { ok: false, reason: "own_write_mismatch" };
+  }
+  if (sameTurnReadMatchesOwnWrite(transcript, read)) return { ok: true };
   if (!create) return { ok: false };
   switch (read.cell.kind) {
     case "prop":
@@ -769,24 +784,8 @@ function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok:
       return { ok: false, reason: "own_write_mismatch" };
     }
     case "lifecycle":
-      // `mutateLineage` may read a freshly-created object's exact lifecycle
-      // value before replacing it later in the same turn. There is no
-      // authority pre-state to compare with, so validate the read against the
-      // create record itself. The old string sentinels were not values the
-      // recorder emits and let malformed lifecycle proofs bypass this check.
-      return transcriptReadValuesMatch(
-        read.cell,
-        {
-          parent: create.parent,
-          owner: create.owner,
-          name: create.name,
-          anchor: create.anchor,
-          flags: create.flags
-        },
-        read.value
-      )
-        ? { ok: true }
-        : { ok: false, reason: "own_write_mismatch" };
+      // Handled before generic own-write matching above.
+      return { ok: false, reason: "own_write_mismatch" };
     case "contents":
       return { ok: false, reason: "own_write_mismatch" };
     case "verb":
