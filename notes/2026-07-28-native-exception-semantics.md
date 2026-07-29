@@ -2,8 +2,8 @@
 
 Date: 2026-07-28
 
-Status: implemented and locally validated on isolated branch
-`worktree-native-exception-integration`; not merged to main and not deployed
+Status: implemented and locally validated; integration head `a9334621` was
+fast-forwarded to local main on 2026-07-29; not pushed and not deployed
 
 Audited base: main `fb8bfe85`
 
