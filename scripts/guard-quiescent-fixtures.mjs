@@ -65,15 +65,12 @@ const UNCONVERTED = new Set([
   "net-audit.test.ts",
   "net-demote-lifecycle.test.ts",
   "net-gateway-repair.test.ts",
-  "net-identity-door.test.ts",
-  "net-load-asymptote.test.ts",
-  "net-outliner-converge.test.ts",
-  "net-turn-structure.test.ts",
-  "net-wire-contract.test.ts",
   "net-help-migration-aged.test.ts",
   "net-help-topics-aged.test.ts",
+  "net-identity-door.test.ts",
   "net-kv-seed.test.ts",
   "net-legacy-split-refusal.test.ts",
+  "net-load-asymptote.test.ts",
   "net-load-skew.test.ts",
   "net-mcp-agent-surface.test.ts",
   "net-mcp-hardening.test.ts",
@@ -81,6 +78,7 @@ const UNCONVERTED = new Set([
   "net-mcp-programmer.test.ts",
   "net-mcp.test.ts",
   "net-outbox-bounded.test.ts",
+  "net-outliner-converge.test.ts",
   "net-programmer-lifecycle.test.ts",
   "net-provision-wizard.test.ts",
   "net-relations.test.ts",
@@ -89,9 +87,11 @@ const UNCONVERTED = new Set([
   "net-session-leak.test.ts",
   "net-session-reap.test.ts",
   "net-topology-turn.test.ts",
+  "net-turn-structure.test.ts",
   "net-verb-editor-aged.test.ts",
   "net-verb-editor.test.ts",
-  "net-verb-slots.test.ts"
+  "net-verb-slots.test.ts",
+  "net-wire-contract.test.ts"
 ]);
 
 function testFiles(dir) {
