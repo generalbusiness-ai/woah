@@ -7,6 +7,11 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- @dig-equivalent.
+
+- tool-granularity redesign from the original walkthrough (collapsing per-room
+  compass/speech duplicates, decoupling presence from working set)  
+
 - MCP v2
 
 - DSL syntax: json-wrapped is terrible for editors

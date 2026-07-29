@@ -683,6 +683,27 @@ cell, and consumes no sequence number. This is a correctness rule, not a
 conformance one — an unvalidated argument otherwise reaches the VM, which
 makes the schema published to a model decorative.
 
+**The advertised set and the accepted set are the same set.** That is the
+governing rule, and it binds in both directions: the gateway never accepts
+what the published schema forbids, and never refuses what the published
+schema permits. A constraint that is enforced but unpublished is as much a
+defect as one that is published but unenforced — an agent that satisfies the
+printed schema and is refused anyway has no way to comply. Where the two have
+disagreed, the resolution has been to publish the real rule rather than to
+weaken it, except where the leniency itself was the correct behaviour (see
+optional parameters below), in which case the leniency is published.
+
+**The `arguments` envelope is validated before its properties are.** MCP
+declares `arguments` an optional object, so omitting it is legal and means
+"this call has no arguments". Supplying it as anything other than a JSON
+object — a string, a number, a boolean, an array, or an explicit `null` — is
+refused with `invalid_arguments_object`. It is not silently read as an empty
+object: for a tool with no required properties there is nothing further to
+object, so the call would otherwise run on its defaults and report success to
+a client whose payload was malformed. `null` is refused here even though our
+own optional *parameters* accept `null`, because this envelope's schema is
+MCP's to define and it is declared optional, not nullable.
+
 The validator reads the **same object that was advertised**, never a second
 derivation of it. A dynamic tool is checked against the protocol schema
 `tools/list` published for it (the derived `arg_spec` schema plus the reserved
@@ -699,14 +720,24 @@ closes.
 | `type` | `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`. `integer` is the narrower assertion over JSON's single number type. |
 | `enum` | The value must be one of the listed values. |
 | `anyOf` | At least one branch must accept (the form a `a\|b` type hint derives). |
+| `type` as a union | An array of type names, any of which may match. This is how a nullable optional parameter is published. |
+| `minLength` | Minimum string length. Published on `woo_call`'s `object` and `verb`, which must be non-empty. Applies only to strings. |
+| `pattern` | The value must match. Published on `operation_id`. Applies only to strings. |
 
 **What is deliberately NOT checked**, because no advertisement can express
 it: nested object properties, array element schemas (`items` is always `{}`),
-`additionalProperties`, `format`, numeric or length bounds, `pattern`,
-`oneOf`/`allOf`/`not`, and `$ref`. A schema fragment the validator does not
-recognize **constrains nothing** rather than refusing, so a future
+`additionalProperties`, `format`, numeric bounds, `maxLength`,
+`oneOf`/`allOf`/`not`, and schema references. A schema fragment the validator
+does not recognize **constrains nothing** rather than refusing, so a future
 advertisement can never begin rejecting calls that were valid before the
 validator learned about it.
+
+A published `pattern` must be the regex that is actually enforced, not a
+restatement of it. `operation_id`'s is emitted from the enforcing expression
+itself. The rule is load-bearing rather than cosmetic — it is what keeps the
+turn key `mcp:<actor>:<operation id>` injective in (actor, operation id) — so
+a published approximation admitting one character the enforced rule rejects
+would advertise a key shape the turn layer cannot honour.
 
 **Unknown properties are ignored, not rejected.** Advertised schemas do not
 set `additionalProperties:false`, so JSON Schema's own reading of them permits
@@ -717,11 +748,15 @@ caught, because the correctly spelled parameter is then *missing*: that
 refusal lists the unrecognized properties under `detail.unknown_properties` so
 the typo is diagnosable.
 
-**`null` in an optional slot means "not supplied."** It is precisely what the
+**Every optional parameter is advertised nullable, and accepts `null`.**
+`null` in an optional slot means "not supplied": it is precisely what the
 transport substitutes for an absent property when mapping named arguments onto
-positional ones (§M2.2), so refusing it would refuse the protocol's own
-encoding of absence. A `null` supplied for a *required*, type-declared
-parameter is a type mismatch.
+positional ones (§M2.2), and clients routinely spell an unset optional that
+way. That acceptance is therefore stated in the schema — an optional
+parameter's published `type` is a union including `"null"`, and an optional
+`enum` includes `null` among its values — rather than living as an undeclared
+leniency inside the validator. A `null` supplied for a *required* parameter is
+a type mismatch, because a required parameter is not widened.
 
 **Refusal shape.** `E_INVARG` with a `detail.reason`, the offending parameter,
 what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
@@ -731,10 +766,21 @@ what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
 | A required parameter is absent | `missing_required_argument` | `field`, `expected`, `missing`, `required`, `unknown_properties?` |
 | A supplied value has the wrong type | `argument_type_mismatch` | `field`, `expected`, `received` |
 | More positional args than the verb declares | `too_many_arguments` | `declared`, `maximum_arity`, `received_arity` |
-| `woo_call` `object`/`verb` supplied but empty | `empty_required_argument` | `field` |
+| A string is shorter than the published `minLength` | `argument_too_short` | `field`, `expected`, `min_length`, `received_length` |
+| A string fails the published `pattern` | `argument_pattern_mismatch` | `field`, `expected`, `pattern` |
+| `arguments` was supplied but is not a JSON object | `invalid_arguments_object` | `field`, `expected`, `received` |
+
+`operation_id` is adjudicated before the generic schema check and keeps its
+own `invalid_operation_id` reason (§M4.2). It rides two carriers — `_meta` and
+`arguments` — and only one of them has a published schema, so letting the
+generic validator reach it first would report the same malformed value under
+two different reasons depending on which carrier a client used. Both paths
+enforce the identical expression, so this fixes only which refusal is
+reported, never which values are accepted.
 
 **`woo_call` is validated in two stages, and carries a residual.** Its own
-schema (`object` and `verb` required strings, `args` an array) is checked
+schema (`object` and `verb` required non-empty strings, `args` an array) is
+checked
 first. Its `args` list is free-form by construction — the tool cannot
 advertise the parameters of a verb chosen at call time — so the second stage
 runs *after* verb resolution, against the resolved page's own `arg_spec`,

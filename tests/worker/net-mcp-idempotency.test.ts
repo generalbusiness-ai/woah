@@ -6,7 +6,7 @@
 // the verb increments), not on reply shape alone — a fix that deduplicates
 // the reply while letting the effect happen twice must fail here.
 import { describe, expect, it } from "vitest";
-import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -80,11 +80,11 @@ async function fixture() {
     }
   });
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   /** Per-scope DO state, so a test can reach the authority's own SQL (the
    * recorded-reply table) instead of only its wire surface. */
-  const scopeStates = new Map<string, ReturnType<typeof netState>>();
+  const scopeStates = new Map<string, QuiescentHost>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
     if (destination === "gateway:net-api") return gateway;
@@ -727,11 +727,15 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       );
       const tools = listed.body?.result?.tools ?? [];
       const wooCall = tools.find((tool: any) => tool.name === "woo_call");
-      expect(wooCall?.inputSchema?.properties?.operation_id?.type).toBe("string");
+      // Optional, therefore advertised nullable (mcp.md §M4.3): the accepted
+      // set includes `null`, so the published type has to say so.
+      expect(wooCall?.inputSchema?.properties?.operation_id?.type).toEqual(["string", "null"]);
+      // The published pattern is the ENFORCED regex, not a paraphrase of it.
+      expect(wooCall?.inputSchema?.properties?.operation_id?.pattern).toBe("^[A-Za-z0-9._:-]{1,128}$");
       // Dynamic tools carry it too — an agent that only ever sees dynamic
       // names must still be able to retry safely.
       const dynamic = tools.find((tool: any) => tool.name?.includes("__") && tool.inputSchema?.properties);
-      expect(dynamic?.inputSchema?.properties?.operation_id?.type).toBe("string");
+      expect(dynamic?.inputSchema?.properties?.operation_id?.type).toEqual(["string", "null"]);
       // It is never `required`: an existing client that has never heard of
       // it keeps working exactly as before.
       expect(wooCall?.inputSchema?.required ?? []).not.toContain("operation_id");
@@ -742,7 +746,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       const page = await f.call(f.aliceSession, "woo_list_reachable_tools", { limit: 5, include_schema: true });
       const listed2 = page.result?.structuredContent?.result?.tools ?? [];
       expect(listed2.length).toBeGreaterThan(0);
-      expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toBe("string");
+      expect(listed2[0]?.input_schema?.properties?.operation_id?.type).toEqual(["string", "null"]);
     } finally {
       await f.close();
     }

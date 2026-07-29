@@ -11,7 +11,7 @@
 // stay empty. A "fix" that lets the turn run and then reports an error must
 // fail here.
 import { describe, expect, it } from "vitest";
-import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -104,9 +104,9 @@ async function fixture() {
     }
   });
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
-  const scopeStates = new Map<string, ReturnType<typeof netState>>();
+  const scopeStates = new Map<string, QuiescentHost>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
     if (destination === "gateway:net-api") return gateway;
@@ -270,8 +270,12 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       } while (cursor && !schema);
       expect(schema, `${BUMP_TOOL} was not advertised`).toBeTruthy();
       expect(schema!.required).toEqual(["text"]);
+      // Required parameter: the plain declared type.
       expect(schema!.properties.text).toMatchObject({ type: "string" });
-      expect(schema!.properties.amount).toMatchObject({ type: "integer" });
+      // OPTIONAL parameter: advertised NULLABLE, because it really does
+      // accept null (mcp.md §M4.3). Before this the accepted set was wider
+      // than the advertised one — drift with the sign flipped.
+      expect(schema!.properties.amount.type).toEqual(["integer", "null"]);
       // The reserved retry-safety property rides the protocol view, and the
       // validator sees the same object — so sending it is never "unknown".
       expect(schema!.properties.operation_id).toBeTruthy();
@@ -324,7 +328,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.code).toBe("E_INVARG");
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("amount");
-      expect(refusal.detail.expected).toBe("integer");
+      expect(refusal.detail.expected).toBe("integer or null");
       expect(refusal.detail.received).toBe("number");
       expect(refusal.message).toContain("amount");
       expect(await f.hits()).toBe(0);
@@ -410,7 +414,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("amount");
       expect(refusal.detail.position).toBe(1);
-      expect(refusal.detail.expected).toBe("integer");
+      expect(refusal.detail.expected).toBe("integer or null");
       expect(refusal.detail.received).toBe("string");
       expect(String(refusal.detail.remediation)).toContain("args[1]");
       expect(await f.hits()).toBe(0);
@@ -448,7 +452,8 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       });
       expect(wrongArgs.detail.reason).toBe("argument_type_mismatch");
       expect(wrongArgs.detail.field).toBe("args");
-      expect(wrongArgs.detail.expected).toBe("array");
+      // `args` is optional, so its advertised type is the nullable union.
+      expect(wrongArgs.detail.expected).toBe("array or null");
 
       // `object` declared `string`. Pre-fix a non-string was coerced to ""
       // and reported as though it had been omitted.
@@ -522,7 +527,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.code).toBe("E_INVARG");
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("timeout_ms");
-      expect(refusal.detail.expected).toBe("number");
+      expect(refusal.detail.expected).toBe("number or null");
       expect(refusal.detail.received).toBe("string");
       // Pre-fix this parked for the 1000ms default and told the client
       // nothing — a client that asked for five seconds got one.
@@ -548,6 +553,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(ok.result?.isError, JSON.stringify(ok).slice(0, 400)).not.toBe(true);
     } finally {
       await f.close();
+
     }
   });
 });
