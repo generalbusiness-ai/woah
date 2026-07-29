@@ -791,29 +791,98 @@ describe("reply-cache boundedness (H2a)", () => {
   // current head, so the seq-ordered "never prune inside the recovery tail"
   // rule can never reach it, and any actor could mint storage forever out of
   // cheap repeated speech.
-  it("bounds same-head RECEIPTS: repeated keyed observation-only acts cannot grow the cache", () => {
+  // Contract A. This test used to assert the OPPOSITE — that quota pressure
+  // evicts old receipts — and that behaviour is exactly what a reviewer's
+  // probe turned into a double execution inside the advertised window. A
+  // guarantee that quota pressure can evict is not a guarantee, so storage is
+  // now bounded by the LEASE and by REFUSAL, never by discarding a live one.
+  it("keyed receipts are NOT evicted by quota inside the lease, however tight the quota", () => {
     const store = new InMemoryScopeStore();
-    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLimit: 3, // the probe's setting: far below the ten outcomes recorded
+      replyLeaseMs: 600_000,
+      now: () => clock
+    });
     for (let i = 0; i < 10; i += 1) {
-      const reply = seq.submit(receiptSubmit(seq, `receipt-key-${i}`, `receipt-${i}`));
-      expect(reply.status, `receipt ${i}`).toBe("accepted");
+      expect(seq.submit(receiptSubmit(seq, `receipt-key-${i}`, `receipt-${i}`)).status, `receipt ${i}`).toBe("accepted");
     }
     // No head movement at all: receipts consume no seq (CO2.5).
     expect(seq.head().seq).toBe(0);
-    // Bounded in BOTH copies. Memory is proved through the public surface:
-    // the oldest keys no longer replay, the newest still do.
-    const durableKeys = store.readReplies().map((row) => row.key);
-    expect(durableKeys.length).toBeLessThanOrEqual(3);
-    expect(durableKeys).toContain("receipt-key-9");
-    expect(durableKeys).not.toContain("receipt-key-0");
+    // Every one of them still replays — including the oldest, which the quota
+    // rule would have discarded.
+    expect(store.readReplies().length).toBe(10);
+    for (let i = 0; i < 10; i += 1) {
+      const replay = seq.submit(receiptSubmit(seq, `receipt-key-${i}`, `receipt-${i}`));
+      expect(replay.status === "accepted" && replay.replayed, `replay ${i}`).toBe(true);
+    }
+  });
 
-    const newest = seq.submit(receiptSubmit(seq, "receipt-key-9", "receipt-9"));
-    expect(newest.status === "accepted" && newest.replayed).toBe(true);
-    const evicted = seq.submit(receiptSubmit(seq, "receipt-key-0", "receipt-0"));
-    expect(evicted.status === "accepted" && evicted.replayed).not.toBe(true);
-    // Still bounded after that fresh record — the prune runs on EVERY
-    // insertion, so there is no window in which the cache is over quota.
-    expect(store.readReplies().length).toBeLessThanOrEqual(3);
+  it("storage stays bounded by REFUSAL, not by discarding a live guarantee", () => {
+    const store = new InMemoryScopeStore();
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLeaseMs: 600_000,
+      guaranteedOutcomeCapacity: 4,
+      now: () => clock
+    });
+    for (let i = 0; i < 4; i += 1) {
+      expect(seq.submit(receiptSubmit(seq, `cap-${i}`, `cap-${i}`)).status).toBe("accepted");
+    }
+    // At capacity the FIFTH new key is refused rather than admitted by
+    // evicting one of the four already promised.
+    const refused = seq.submit(receiptSubmit(seq, "cap-overflow", "cap-overflow"));
+    expect(refused.status).toBe("rejected");
+    expect(refused.status === "rejected" && refused.reason).toBe("retry_capacity");
+    expect(store.readReplies().length).toBe(4);
+    // The refusal is NOT recorded: recording it would consume the very room it
+    // is refusing for, and would answer the client's later legitimate retry
+    // with a stale refusal.
+    expect(store.readReplies().map((row) => row.key)).not.toContain("cap-overflow");
+    // Every promise already made is still kept.
+    for (let i = 0; i < 4; i += 1) {
+      const replay = seq.submit(receiptSubmit(seq, `cap-${i}`, `cap-${i}`));
+      expect(replay.status === "accepted" && replay.replayed, `replay ${i}`).toBe(true);
+    }
+    // Past the lease the room is released and the refused key is admitted.
+    clock += 600_001;
+    const admitted = seq.submit(receiptSubmit(seq, "cap-overflow", "cap-overflow"));
+    expect(admitted.status).toBe("accepted");
+  });
+
+  it("sheds the outcome PAYLOAD under pressure, never the verdict", () => {
+    // The two halves of a recorded reply have very different costs. The
+    // verdict makes a retry SAFE and is small; the payload makes it
+    // INFORMATIVE and is 25x larger. Protecting every payload for a full lease
+    // is unaffordable, so payloads shed oldest-first and degrade to the
+    // `replay_outcome:"none"` state the client contract already defines.
+    const store = new InMemoryScopeStore();
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLeaseMs: 600_000,
+      retainedPayloadCap: 2,
+      now: () => clock
+    });
+    for (let i = 0; i < 6; i += 1) {
+      expect(seq.submit(receiptSubmit(seq, `shed-${i}`, `shed-${i}`)).status).toBe("accepted");
+    }
+    // Every verdict survives: the safety property is untouched.
+    expect(store.readReplies().length).toBe(6);
+    const oldest = seq.submit(receiptSubmit(seq, "shed-0", "shed-0"));
+    expect(oldest.status === "accepted" && oldest.replayed, "the oldest still dedupes").toBe(true);
+    expect(oldest.status === "accepted" && oldest.replay_output, "but its payload is gone").toBeUndefined();
+    // The newest keep theirs.
+    const newest = seq.submit(receiptSubmit(seq, "shed-5", "shed-5"));
+    expect(newest.status === "accepted" && newest.replay_output?.observations).toBeDefined();
+    // Memory and storage agree about what was shed.
+    const storedOldest = store.readReplies().find((row) => row.key === "shed-0");
+    expect(storedOldest?.reply.status === "accepted" && storedOldest.reply.replay_output).toBeUndefined();
   });
 
   it("bounds recorded REJECTIONS under the same quota, memory and durable in lockstep", () => {
@@ -830,22 +899,30 @@ describe("reply-cache boundedness (H2a)", () => {
   });
 
   it("receipt pressure never evicts an accepted commit's reply", () => {
-    // The two quotas are separate on purpose: cheap non-advancing rows are
-    // the ones an actor controls, and letting them push out advancing
-    // replies would turn a storage bound into an idempotency bypass.
+    // Under contract A both are guaranteed, so neither yields to the other and
+    // the count quotas never come into it. Kept because the ORIGINAL failure —
+    // cheap non-advancing rows pushing out a committed turn's reply — must
+    // stay closed however the retention rules are rewritten.
     const store = new InMemoryScopeStore();
-    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 4, receiptLimit: 2 });
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLimit: 4,
+      receiptLimit: 2,
+      replyLeaseMs: 600_000,
+      now: () => clock
+    });
     const commit = submitFor(seq, transcript({ writes: [propWrite("kept")], hash: "kept" }), "kept-key");
-    expect(seq.submit(commit).status).toBe("accepted");
+    const first = { ...commit, retry_receipt: true as const };
+    expect(seq.submit(first).status).toBe("accepted");
     for (let i = 0; i < 20; i += 1) {
       expect(seq.submit(receiptSubmit(seq, `noise-${i}`, `noise-${i}`)).status).toBe("accepted");
     }
-    const replay = seq.submit(commit);
+    const replay = seq.submit(first);
     expect(replay.status === "accepted" && replay.replayed).toBe(true);
     expect(seq.head().seq).toBe(1); // never a second commit
     expect(store.readReplies().map((row) => row.key)).toContain("kept-key");
-    // 1 advancing + at most 2 receipts.
-    expect(store.readReplies().length).toBeLessThanOrEqual(3);
   });
 
   it("heals an AGED cache: unmarked receipts sharing one head are reclassified and pruned", () => {
@@ -867,13 +944,15 @@ describe("reply-cache boundedness (H2a)", () => {
       } as never);
     }
     const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
-    expect(store.readReplies().length, "rehydration alone rewrites nothing").toBe(12);
+    // Hydration stamps the undated rows and writes the stamp back DURABLY, so
+    // a cold start cannot renew their apparent age. It changes nothing else.
+    expect(store.readReplies().length).toBe(12);
+    expect(store.readReplies().every((row) => row.reply.recorded_at !== undefined)).toBe(true);
 
-    // One insertion, one pass: the quota is restored immediately, not over
-    // the next twelve turns.
+    // Legacy rows carry no guarantee flag — no client ever named them under
+    // contract A — so they remain evictable, and one pass restores the quota.
     expect(seq.submit(receiptSubmit(seq, "fresh", "fresh")).status).toBe("accepted");
     const keys = store.readReplies().map((row) => row.key);
-    expect(keys.length).toBe(4); // 1 advancing (aged-0) + receiptLimit 3
     expect(keys).toContain("aged-0"); // the genuine accept at seq 0 is kept
     expect(keys).toContain("fresh");
     expect(keys).not.toContain("aged-1");
@@ -936,15 +1015,123 @@ describe("reply-cache boundedness (H2a)", () => {
     expect(store.readReplies().map((row) => row.key)).not.toContain("legacy");
   });
 
-  it("rehydration rebuilds the bounded set, not a resurrected unbounded one", () => {
+  it("rehydration preserves the guarantees, and the lease still retires them", () => {
     const store = new InMemoryScopeStore();
-    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
+    let clock = 1_000_000;
+    const opts = { durable: store, tailLimit: 64, replyLimit: 3, replyLeaseMs: 600_000, now: () => clock };
+    const seq = new ScopeSequencer(SCOPE, EPOCH, opts);
     for (let i = 0; i < 10; i += 1) seq.submit(receiptSubmit(seq, `rehydrate-${i}`, `rehydrate-${i}`));
-    const rehydrated = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 3 });
-    const replay = rehydrated.submit(receiptSubmit(rehydrated, "rehydrate-9", "rehydrate-9"));
-    expect(replay.status === "accepted" && replay.replayed).toBe(true);
-    for (let i = 0; i < 10; i += 1) rehydrated.submit(receiptSubmit(rehydrated, `after-${i}`, `after-${i}`));
-    expect(store.readReplies().length).toBeLessThanOrEqual(3);
+
+    const rehydrated = new ScopeSequencer(SCOPE, EPOCH, opts);
+    for (let i = 0; i < 10; i += 1) {
+      const replay = rehydrated.submit(receiptSubmit(rehydrated, `rehydrate-${i}`, `rehydrate-${i}`));
+      expect(replay.status === "accepted" && replay.replayed, `replay ${i}`).toBe(true);
+    }
+    // The bound is the lease, not the quota: past it the whole set retires.
+    clock += 600_001;
+    expect(rehydrated.submit(receiptSubmit(rehydrated, "after", "after")).status).toBe("accepted");
+    expect(store.readReplies().map((row) => row.key)).toEqual(["after"]);
+  });
+
+});
+
+// The three probes that falsified the previous lease claim, verbatim in shape.
+// Each one produced a real double execution or a stale replay against the code
+// as shipped; each is now the thing that fails first if the contract regresses.
+describe("contract A: the lease is a guarantee, not a hope", () => {
+  it("probe: a QUIET scope does not replay an outcome older than its lease", () => {
+    // Expiry used to be enforced only by the retention sweep, which runs when
+    // ANOTHER outcome is recorded. A quiet scope records nothing, so a
+    // 120-second-old outcome under a 60-second lease still replayed — living
+    // on past every gateway pin routing to it, which is the cross-scope double
+    // execution reached through the lease instead of around it.
+    const store = new InMemoryScopeStore();
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      tailLimit: 64,
+      replyLeaseMs: 60_000,
+      now: () => clock
+    });
+    expect(seq.submit(receiptSubmit(seq, "quiet", "quiet")).status).toBe("accepted");
+
+    clock += 120_000; // twice the lease, and NOTHING else has happened
+    const late = seq.submit(receiptSubmit(seq, "quiet", "quiet"));
+    expect(late.status === "accepted" && late.replayed, "an expired outcome must not replay").not.toBe(true);
+    // Enforced at the LOOKUP, not by a sweep that nothing here would trigger:
+    // the stale row was dropped as it was read, and what sits under the key
+    // now is the fresh outcome this submit recorded, dated now.
+    expect(store.readReplies().find((row) => row.key === "quiet")?.reply.recorded_at).toBe(clock);
+  });
+
+  it("probe: quota pressure cannot execute the same operation twice inside the lease", () => {
+    // `replyLimit:1` with a ten-minute lease: the reviewer's fresh-plan probe
+    // reported {"retry_status":"accepted","retry_replayed":false,"head_after":3}
+    // — the same operation committed twice, well inside the advertised window,
+    // because the quota evicted the record that would have deduplicated it.
+    const store = new InMemoryScopeStore();
+    let clock = 1_000_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, {
+      durable: store,
+      // A tail window small enough that the recovery-tail carve-out stops
+      // shielding old commits — which is the ordinary state of a busy scope,
+      // and the condition under which the quota actually reaches them.
+      tailLimit: 1,
+      replyLimit: 1,
+      replyLeaseMs: 600_000,
+      now: () => clock
+    });
+    const keyed = (key: string, value: string) => ({
+      ...submitFor(seq, transcript({ writes: [propWrite(value)], hash: `probe-${value}` }), key),
+      retry_receipt: true as const
+    });
+    const first = keyed("probe-op", "v1");
+    expect(seq.submit(first).status).toBe("accepted");
+    const headAfterFirst = seq.head().seq;
+
+    // Traffic under a quota of one — every one of these would have evicted the
+    // record above under the old rule.
+    for (let i = 0; i < 3; i += 1) {
+      expect(seq.submit(keyed(`probe-other-${i}`, `w${i}`)).status).toBe("accepted");
+    }
+
+    const retry = seq.submit(first);
+    expect(retry.status, "retry_status").toBe("accepted");
+    expect(retry.status === "accepted" && retry.replayed, "retry_replayed").toBe(true);
+    expect(seq.head().seq, "head must not have advanced for the retry").toBe(headAfterFirst + 3);
+  });
+
+  it("probe: a LEGACY row's age is fixed once, not renewed by every cold start", () => {
+    // The stamp used to be in-memory only, so each cold start reset the row's
+    // apparent age while its gateway pin — which got a single durable expiry —
+    // aged out normally. The two stores drifted in opposite directions.
+    const store = new InMemoryScopeStore();
+    store.writeReply("legacy", {
+      kind: "woo.net.commit_reply.v1",
+      status: "accepted",
+      scope: SCOPE,
+      head: { seq: 0, hash: "genesis" },
+      touched: [],
+      post_state_version: "v0",
+      replay_output: { actor: "#actor" }
+    } as never);
+    let clock = 5_000_000;
+    const opts = { durable: store, tailLimit: 64, replyLeaseMs: 60_000, now: () => clock };
+
+    new ScopeSequencer(SCOPE, EPOCH, opts); // first hydration stamps it, durably
+    const stampedAt = store.readReplies().find((row) => row.key === "legacy")?.reply.recorded_at;
+    expect(stampedAt, "hydration must write the stamp back").toBe(5_000_000);
+
+    // Cold start after cold start, well inside the lease: the stamp must not move.
+    clock += 30_000;
+    new ScopeSequencer(SCOPE, EPOCH, opts);
+    expect(store.readReplies().find((row) => row.key === "legacy")?.reply.recorded_at).toBe(5_000_000);
+
+    // And past the lease it is gone, however many times it was rehydrated.
+    clock += 40_000;
+    const seq = new ScopeSequencer(SCOPE, EPOCH, opts);
+    const late = seq.submit(receiptSubmit(seq, "legacy", "legacy"));
+    expect(late.status === "accepted" && late.replayed).not.toBe(true);
   });
 });
 
