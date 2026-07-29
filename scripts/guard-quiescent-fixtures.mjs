@@ -21,6 +21,17 @@
 // nowhere), one leak (net-scheduled never closed thirteen of its hosts), and
 // one product defect in `NetAuditDO`'s AE index. So they are done deliberately
 // and not in one sweep.
+//
+// But do NOT judge a conversion by whether the noise counter moves. The five
+// MCP suites moved it by zero, and were still worth converting: probing their
+// teardown showed three tests reaching `close()` with live deferred work, and
+// simulating the old close-without-draining teardown on those same five
+// produced zero events when they run ALONE. That is the whole shape of this
+// bug. The full lane runs `isolate: false`, so undrained work outlives the
+// suite that queued it and lands on whichever suite's storage is closed next —
+// the damage is cross-suite and timing-dependent, so a quiet counter on one
+// sample means "did not fire this run", not "was never a hazard". The register
+// shrinking is the guarantee; the counter is only ever a lower bound.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
