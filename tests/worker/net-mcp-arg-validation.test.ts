@@ -162,15 +162,30 @@ async function fixture() {
     await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": session });
     return session;
   };
+  /**
+   * `tools/call` with the params object supplied VERBATIM.
+   *
+   * `call` below cannot express the envelope this suite most needs to test:
+   * its `args` is typed `Record<string, unknown>` and is always spread under
+   * an `arguments` key, so a scalar, an array, an explicit `null`, and an
+   * OMITTED `arguments` were all unreachable through it. The root-envelope
+   * validation therefore had no coverage at all — correct in code, untested,
+   * and a regression would have shipped silently. Tests that need a
+   * non-object (or absent) `arguments` build the params here instead.
+   */
+  const callRaw = async (
+    session: string,
+    params: Record<string, unknown>
+  ) => (await mcp(
+    { jsonrpc: "2.0", id: nextId++, method: "tools/call", params },
+    { "mcp-session-id": session }
+  )).body as Record<string, any>;
   const call = async (
     session: string,
     name: string,
     args: Record<string, unknown>,
     meta?: Record<string, unknown>
-  ) => (await mcp(
-    { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name, arguments: args, ...(meta ? { _meta: meta } : {}) } },
-    { "mcp-session-id": session }
-  )).body as Record<string, any>;
+  ) => callRaw(session, { name, arguments: args, ...(meta ? { _meta: meta } : {}) });
 
   const aliceSession = await open("apikey:argval-key-a:argval-secret-a");
   await settleAll();
@@ -216,7 +231,7 @@ async function fixture() {
   };
 
   return {
-    alice, aliceSession, mcp, call, drain, hits, settleAll, worldSnapshot,
+    alice, aliceSession, mcp, call, callRaw, drain, hits, settleAll, worldSnapshot,
     close: async () => closeQuiescent(states)
   };
 }
@@ -237,16 +252,28 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
     name: string,
     args: Record<string, unknown>
   ): Promise<Record<string, any>> {
+    return refusedEnvelopeWithoutEffect(f, name, { name, arguments: args });
+  }
+
+  /**
+   * The same instrument, but driving the params object verbatim, so an
+   * envelope that is not `{name, arguments: {...}}` can be tested at all.
+   */
+  async function refusedEnvelopeWithoutEffect(
+    f: Awaited<ReturnType<typeof fixture>>,
+    label: string,
+    params: Record<string, unknown>
+  ): Promise<Record<string, any>> {
     // A clean queue first, so "no observation" cannot be satisfied by an
     // earlier drain having already emptied a queue that then refilled.
     await f.settleAll();
     await f.drain();
     const before = f.worldSnapshot();
-    const reply = await f.call(f.aliceSession, name, args);
+    const reply = await f.callRaw(f.aliceSession, params);
     const refusal = refusalOf(reply);
     await f.settleAll();
-    expect(f.worldSnapshot(), `${name} changed authoritative state before refusing`).toBe(before);
-    expect(await f.drain(), `${name} emitted an observation before refusing`).toEqual([]);
+    expect(f.worldSnapshot(), `${label} changed authoritative state before refusing`).toBe(before);
+    expect(await f.drain(), `${label} emitted an observation before refusing`).toEqual([]);
     return refusal;
   }
 
@@ -554,6 +581,103 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
     } finally {
       await f.close();
 
+    }
+  });
+
+  /**
+   * The ROOT of the envelope, not its contents.
+   *
+   * `(params.arguments ?? {})` cast anything non-object straight through as an
+   * empty property bag. On a control with NO required properties that is
+   * silent: `arguments: null` on `woo_list_reachable_tools` ran on defaults
+   * and returned a full tool listing with `isError: false` — a caller sending
+   * a malformed envelope got a successful-looking answer to a question it had
+   * not asked. The fix landed; the coverage did not, because the fixture's
+   * `call` helper typed `args` as `Record<string, unknown>` and always spread
+   * it under an `arguments` key, so no test in the suite could send a scalar,
+   * an array, an explicit null, or omit the field. `callRaw` exists for this.
+   *
+   * Both targets are exercised deliberately: the no-required-properties
+   * control is where it slipped through, and the dynamic `<object>__<verb>`
+   * tool is the path a model actually drives.
+   */
+  const NON_OBJECT_ENVELOPES: Array<{ label: string; value: unknown; received: string }> = [
+    { label: "explicit null", value: null, received: "null" },
+    { label: "array", value: [], received: "array" },
+    { label: "string", value: "text", received: "string" },
+    { label: "integer", value: 7, received: "integer" },
+    { label: "fractional number", value: 1.5, received: "number" },
+    { label: "boolean", value: true, received: "boolean" }
+  ];
+
+  for (const target of [
+    { tool: "woo_list_reachable_tools", why: "control with NO required properties" },
+    { tool: BUMP_TOOL, why: "dynamic <object>__<verb> tool" }
+  ]) {
+    for (const envelope of NON_OBJECT_ENVELOPES) {
+      it(`refuses a ${envelope.label} "arguments" on the ${target.why}, before dispatch`, async () => {
+        const f = await fixture();
+        try {
+          const before = await f.hits();
+          const refusal = await refusedEnvelopeWithoutEffect(
+            f,
+            `${target.tool} arguments=${envelope.label}`,
+            { name: target.tool, arguments: envelope.value }
+          );
+          expect(refusal.code).toBe("E_INVARG");
+          expect(refusal.detail.reason).toBe("invalid_arguments_object");
+          expect(refusal.detail.tool).toBe(target.tool);
+          expect(refusal.detail.field).toBe("arguments");
+          expect(refusal.detail.expected).toBe("object");
+          expect(refusal.detail.received).toBe(envelope.received);
+          // The refusal must NAME the type it got, not just say "invalid" —
+          // that is what tells a client which of its call sites is wrong.
+          expect(String(refusal.message)).toContain(envelope.received);
+          // The dynamic tool's counter is the second, independent witness that
+          // nothing dispatched (worldSnapshot is the first).
+          expect(await f.hits()).toBe(before);
+        } finally {
+          await f.close();
+        }
+      });
+    }
+  }
+
+  it("keeps an ABSENT arguments legal: MCP declares the field optional, not required", async () => {
+    const f = await fixture();
+    try {
+      // The control takes no required properties, so omitting the field
+      // entirely must SUCCEED. A validator that refused absence would break
+      // every conforming client that spells "no arguments" by omission.
+      const served = await f.callRaw(f.aliceSession, { name: "woo_list_reachable_tools" });
+      expect(served.result?.isError, JSON.stringify(served).slice(0, 400)).not.toBe(true);
+      expect(Array.isArray(served.result?.structuredContent?.result?.tools)).toBe(true);
+
+      // And absence must fall through to the ORDINARY named-argument
+      // validator rather than being special-cased: the dynamic tool declares
+      // a required property, so omitting `arguments` is refused for the
+      // missing property, NOT as an invalid envelope. That distinction is
+      // what proves absent and non-object take different paths.
+      const refusal = await refusedEnvelopeWithoutEffect(
+        f,
+        `${BUMP_TOOL} arguments=absent`,
+        { name: BUMP_TOOL }
+      );
+      expect(refusal.code).toBe("E_INVARG");
+      expect(refusal.detail.reason).not.toBe("invalid_arguments_object");
+      expect(refusal.detail.field).toBe("text");
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("still accepts an EMPTY object arguments — the legal way to say 'no arguments'", async () => {
+    const f = await fixture();
+    try {
+      const served = await f.callRaw(f.aliceSession, { name: "woo_list_reachable_tools", arguments: {} });
+      expect(served.result?.isError, JSON.stringify(served).slice(0, 400)).not.toBe(true);
+    } finally {
+      await f.close();
     }
   });
 });
