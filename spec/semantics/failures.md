@@ -81,7 +81,10 @@ turn. A restore failure means the in-memory authority can no longer prove that
 it matches its durable state, so the world instance becomes poisoned: all
 subsequent behavior and mutation MUST refuse with `E_WORLD_POISONED` until the
 host discards the instance and reloads it from persistence. A poisoned instance
-MUST NOT continue serving writes from partially restored state.
+MUST NOT continue serving writes from partially restored state. This includes
+explicit `persist()` and full/incremental acceptance-time flush entry points:
+persistence is not a recovery mechanism and MUST refuse before consulting or
+writing a repository.
 The shadow execution host checks the world's reload signal after every normal
 behavior frame and immediately drops a poisoned cached execution world; the
 next request rebuilds from the committed authority snapshot. An in-memory

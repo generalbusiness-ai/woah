@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
@@ -20,6 +20,120 @@ import type { ExecutorContext } from "../src/core/world";
 import { message, nativeVerb } from "./core-support";
 
 describe("turn recorder", () => {
+  it("does no semantic-dependency work when no recorder can consume it", () => {
+    const world = createWorld();
+    world.createObject({ id: "dependency_parent", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "dependency_child", parent: "dependency_parent", owner: "$wiz" });
+    world.defineProperty("dependency_parent", {
+      name: "inherited",
+      defaultValue: 7,
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "dependency_parent",
+      "answer",
+      `verb :answer() rxd { return 42; }`,
+      null
+    ).ok).toBe(true);
+    world.createObject({ id: "dependency_feature", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(
+      world,
+      "dependency_feature",
+      "feature_answer",
+      `verb :feature_answer() rxd { return 99; }`,
+      null
+    ).ok).toBe(true);
+    world.setProp("the_dubspace", "features", ["dependency_feature"]);
+    const internals = world as unknown as {
+      propertyResolutionDependenciesForRecording(object: string, name: string): unknown[];
+    };
+    const dependencyWalk = vi.spyOn(internals, "propertyResolutionDependenciesForRecording");
+    const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone");
+    try {
+      expect(world.getProp("dependency_child", "inherited")).toBe(7);
+      const resolved = world.resolveVerb("dependency_child", "answer");
+      expect(resolved.definer).toBe("dependency_parent");
+      expect(resolved.dependencies).toEqual([]);
+      const featureResolved = world.resolveVerb("the_dubspace", "feature_answer");
+      expect(featureResolved.definer).toBe("dependency_feature");
+      expect(featureResolved.dependencies).toEqual([]);
+      expect(dependencyWalk).not.toHaveBeenCalled();
+      expect(structuredCloneSpy).not.toHaveBeenCalled();
+    } finally {
+      dependencyWalk.mockRestore();
+      structuredCloneSpy.mockRestore();
+    }
+  });
+
+  it("retains exact property and dispatch dependency paths with an active recorder", async () => {
+    const world = createWorld();
+    world.createObject({ id: "recorded_dependency_parent", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "recorded_dependency_child", parent: "recorded_dependency_parent", owner: "$wiz" });
+    world.defineProperty("recorded_dependency_parent", {
+      name: "inherited",
+      defaultValue: 7,
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "recorded_dependency_parent",
+      "answer",
+      `verb :answer() rxd { return 42; }`,
+      null
+    ).ok).toBe(true);
+    expect(installVerb(
+      world,
+      "recorded_dependency_child",
+      "probe",
+      `verb :probe() rxd {
+        let inherited = this.inherited;
+        return dispatch(this, "answer", []);
+      }`,
+      null
+    ).ok).toBe(true);
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall(
+      "recorded-dependency-path",
+      "$wiz",
+      "recorded_dependency_child",
+      "probe",
+      []
+    );
+
+    expect(result).toMatchObject({ op: "result", result: 42 });
+    expect(recorder.turns[0].events).toContainEqual(expect.objectContaining({
+      kind: "prop_read",
+      object: "recorded_dependency_child",
+      name: "inherited",
+      dependencies: [
+        { kind: "lineage", object: "recorded_dependency_child" },
+        {
+          kind: "property_resolution",
+          object: "recorded_dependency_parent",
+          name: "inherited"
+        }
+      ]
+    }));
+    expect(recorder.turns[0].events).toContainEqual(expect.objectContaining({
+      kind: "dispatch",
+      target: "recorded_dependency_child",
+      verb: "answer",
+      definer: "recorded_dependency_parent",
+      dependencies: [
+        { kind: "verb_resolution", object: "recorded_dependency_child" },
+        { kind: "lineage", object: "recorded_dependency_child" },
+        { kind: "verb_resolution", object: "recorded_dependency_parent" }
+      ]
+    }));
+  });
+
   it("records a direct VM turn's central reads, writes, observations, and logical inputs", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder");
