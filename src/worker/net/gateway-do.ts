@@ -133,6 +133,7 @@ import {
   verifyPasswordCredential
 } from "./client-auth";
 import {
+  MCP_JSONRPC_METHOD_NOT_FOUND,
   MCP_JSONRPC_PARSE_ERROR,
   mcpJsonRpcError,
   mcpWooErrorBody,
@@ -5283,7 +5284,7 @@ export class NetGatewayDO {
         );
       }
       if (typeof rpc.id === "number" || typeof rpc.id === "string") id = rpc.id;
-      return await this.clientMcp(request, rpc, id);
+      return await this.clientMcp(request, rpc.method, rpc.params ?? {}, id);
     } catch (err) {
       return this.mcpRefusal(err, id, url.pathname);
     }
@@ -5326,21 +5327,19 @@ export class NetGatewayDO {
     return mcpWooRefusal(id, { code: "E_INTERNAL", message: String(err) }, 500);
   }
 
+  /** Dispatch one validated JSON-RPC message. `id === null` means the message
+   * carried no id and is therefore a notification (§M1.1). */
   private async clientMcp(
     request: Request,
-    rpc: { method?: string; params?: Record<string, unknown> },
+    method: string,
+    params: Record<string, unknown>,
     id: McpRequestId
   ): Promise<Response> {
-    const method = rpc.method as string;
-    if (id === null) {
-      return await this.mcpNotification(request, method, mcpRecord(rpc.params));
-    }
-    if (method === "initialize") return await this.mcpInitialize(request, id, rpc.params ?? {});
-    if (method === "tools/list") return await this.mcpToolsList(request, id, rpc.params ?? {});
-    if (method === "tools/call") {
-      return await this.mcpToolsCall(request, id, rpc.params ?? {});
-    }
-    return json(mcpJsonRpcError(id, -32601, `method not found: ${method}`), 200);
+    if (id === null) return await this.mcpNotification(request, method, mcpRecord(params));
+    if (method === "initialize") return await this.mcpInitialize(request, id, params);
+    if (method === "tools/list") return await this.mcpToolsList(request, id, params);
+    if (method === "tools/call") return await this.mcpToolsCall(request, id, params);
+    return json(mcpJsonRpcError(id, MCP_JSONRPC_METHOD_NOT_FOUND, `method not found: ${method}`), 200);
   }
 
   /**

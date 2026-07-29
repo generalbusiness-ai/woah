@@ -35,6 +35,11 @@ export const MCP_JSONRPC_SERVER_ERROR = -32000;
 /** JSON-RPC's own parse-error code, for a body that is not a request at all. */
 export const MCP_JSONRPC_PARSE_ERROR = -32700;
 
+/** JSON-RPC's own code for a method this server does not implement. Genuine
+ * protocol errors keep their standard codes; only woo refusals map to
+ * {@link MCP_JSONRPC_SERVER_ERROR}. */
+export const MCP_JSONRPC_METHOD_NOT_FOUND = -32601;
+
 /**
  * The id to echo on a reply.
  *
