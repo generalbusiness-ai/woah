@@ -78,7 +78,6 @@ const UNCONVERTED = new Set([
   "net-mcp-programmer.test.ts",
   "net-mcp.test.ts",
   "net-outbox-bounded.test.ts",
-  "net-outliner-converge.test.ts",
   "net-programmer-lifecycle.test.ts",
   "net-provision-wizard.test.ts",
   "net-relations.test.ts",

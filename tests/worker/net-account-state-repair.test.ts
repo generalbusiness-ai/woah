@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
-import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { NetScopeDO, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { routedApiKeyId } from "../../src/core/api-key-id";
+import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
 
 const SECRET = "net-account-state-repair-secret";
 const HUMAN = "human_repair";
@@ -10,22 +10,6 @@ const ACCOUNT = "account_repair";
 const AGENT = "agent_repair";
 const CLUSTER = `cluster:${HUMAN}`;
 const KEY = routedApiKeyId(HUMAN, AGENT, "44444444444444444444444444444444");
-
-function netState(name: string): { state: NetScopeDurableState; close: () => void } {
-  const fake = new FakeDurableObjectState(name);
-  return {
-    state: {
-      id: fake.id,
-      storage: {
-        sql: fake.storage.sql,
-        transactionSync: fake.storage.transactionSync,
-        setAlarm: () => {},
-        deleteAlarm: () => {}
-      }
-    },
-    close: () => fake.close()
-  };
-}
 
 function prop(object: string, name: string, value: unknown) {
   return { kind: "property_cell" as const, object, name, value: { value } };
@@ -180,7 +164,7 @@ describe("Net account-state historical repair", () => {
       ))).json() as { head: unknown };
       expect(after.head).toEqual(before.head);
       expect(catalogReads).toBe(0);
-      clusterState.close();
+      await closeQuiescent([clusterState]);
     }
   });
 
@@ -191,6 +175,7 @@ describe("Net account-state historical repair", () => {
     let cluster: NetScopeDO;
     let catalogPause: Promise<void> | null = null;
     let catalogPauseEntered: (() => void) | null = null;
+    let repairFanoutDeliveries = 0;
     const env: NetScopeEnv = {
       WOO_INTERNAL_SECRET: SECRET,
       NET_RESOLVE: (destination) => {
@@ -206,6 +191,18 @@ describe("Net account-state historical repair", () => {
           } as unknown as NetScopeDO;
         }
         if (destination === `scope:${CLUSTER}`) return cluster;
+        if (destination === "gateway:repair-rollback") {
+          // The synthetic subscriber exists to force the outbox leg into the
+          // faulted transaction. Once the trigger is removed, a later
+          // successful repair must be able to drain that subscriber rather
+          // than leaving a retrying fixture-only transport error behind.
+          return {
+            fetch: async () => {
+              repairFanoutDeliveries += 1;
+              return Response.json({ applied: true });
+            }
+          } as unknown as NetScopeDO;
+        }
         throw new Error(`unexpected destination ${destination}`);
       }
     };
@@ -559,8 +556,8 @@ describe("Net account-state historical repair", () => {
     expect(detached.status).toBe(400);
     expect(await detached.text()).toContain("E_STALE_HEAD");
 
-    catalogState.close();
-    clusterState.close();
+    await closeQuiescent([catalogState, clusterState]);
+    expect(repairFanoutDeliveries).toBeGreaterThan(0);
   });
 
   it("reports an evidence-free failed-create orphan without advancing the owner head", async () => {
@@ -719,8 +716,7 @@ describe("Net account-state historical repair", () => {
     expect(cells.find((cell) => cell.key === `property_cell:${ACCOUNT}:actors`)?.value.value).toEqual([HUMAN]);
     expect(cells.find((cell) => cell.key === `property_cell:${ACCOUNT}:agent_count`)?.value.value).toBe(0);
 
-    catalogState.close();
-    clusterState.close();
+    await closeQuiescent([catalogState, clusterState]);
   });
 
   it("refuses to re-promote an explicitly demoted AP11 ledger agent", async () => {
@@ -840,7 +836,6 @@ describe("Net account-state historical repair", () => {
     expect(cells.find((cell) => cell.key === `property_cell:${AGENT}:features`)?.value.value).toEqual([]);
     expect(cells.find((cell) => cell.key === `property_cell:${ACCOUNT}:programmer_agent_count`)?.value.value).toBe(0);
 
-    catalogState.close();
-    clusterState.close();
+    await closeQuiescent([catalogState, clusterState]);
   });
 });
