@@ -25,7 +25,6 @@
 //   controls; woo_list_reachable_tools `total` counts dynamic descriptors with
 //   no cap. The two numbers are not comparable, and the pager now says so.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { netActivationCell, partitionInstallRelations, planNetInstall } from "../../src/net/install";
@@ -39,32 +38,10 @@ import {
 } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-mcp-legibility-secret";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -192,7 +169,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const identity = exportIdentity(old.exportWorld());
     const plan = await planNetInstall({ graft: async (fresh) => { importIdentity(fresh, identity); } });
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -226,9 +203,9 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
 
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const scope of scopeDOs.values()) await scope.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     let nextId = 10;
@@ -609,7 +586,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     expect(settledWait.result?.structuredContent?.result?.gap).toBe(false);
 
     await settleAll();
-    for (const st of states) st.close();
+    await closeQuiescent(states);
   });
 
   // Same-definer alias collisions resolve in SLOT order over MCP, exactly as
@@ -656,7 +633,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const epoch = "cat-net-mcp-legibility-slots";
     partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -688,9 +665,9 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
       NET_GATEWAY_SELF: "gateway:net-api"
     } as NetGatewayEnv);
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const scope of scopeDOs.values()) await scope.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     let nextId = 200;
@@ -732,8 +709,8 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     // Exact names still reach exactly their own verb.
     expect((await call("slot_probe_za", "a_second")).result?.structuredContent?.result).toBe("a_second");
 
-    for (const st of states) await st.settle();
-    for (const st of states) st.close();
+    await settleHosts(states);
+    await closeQuiescent(states);
   });
 
   // The fail-closed branch (M2.1 `verb_order_unavailable`), against the world
@@ -777,7 +754,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const epoch = "cat-net-mcp-legibility-aged-slots";
     partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -831,7 +808,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
 
     const errorOf = (envelope: Record<string, any>) => envelope.result?.structuredContent?.error ?? {};
     const ambiguous = await call("aged_probe", "x");
-    for (const st of states) await st.settle();
+    await settleHosts(states);
     expect(ambiguous.result?.isError, JSON.stringify(ambiguous).slice(0, 400)).toBe(true);
     expect(errorOf(ambiguous).detail?.reason).toBe("verb_order_unavailable");
     expect(errorOf(ambiguous).detail?.candidates).toEqual(["a_second", "z_first"]);
@@ -856,17 +833,17 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     })));
     expect(repaired.ok, await repaired.clone().text()).toBe(true);
     expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", objects: ["aged_probe"] });
-    for (const st of states) await st.settle();
+    await settleHosts(states);
     for (const scope of scopeDOs.values()) await scope.alarm();
-    for (const st of states) await st.settle();
+    await settleHosts(states);
 
     const resolved = await call("aged_probe", "x");
-    for (const st of states) await st.settle();
+    await settleHosts(states);
     expect(resolved.result?.isError, JSON.stringify(resolved).slice(0, 400)).not.toBe(true);
     expect(resolved.result?.structuredContent?.result, "the repair did not lift the refusal").toBe("a_second");
 
-    for (const st of states) await st.settle();
-    for (const st of states) st.close();
+    await settleHosts(states);
+    await closeQuiescent(states);
   });
 
   // A freshly provisioned agent (AP11) is PLACELESS: create_agent mints it at
@@ -901,7 +878,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const epoch = "cat-net-mcp-legibility-placeless";
     partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(epoch)]);
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -980,7 +957,7 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     const page = await call("woo_list_reachable_tools", { scope: "active" });
     expect(page.result?.structuredContent?.result?.active_scope).toBeNull();
 
-    for (const st of states) await st.settle();
-    for (const st of states) st.close();
+    await settleHosts(states);
+    await closeQuiescent(states);
   });
 });
