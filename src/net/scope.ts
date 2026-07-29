@@ -1409,15 +1409,17 @@ export class ScopeSequencer {
       for (const cell of entry.cells) attested.set(cell.key, cell.version);
     }
     const mismatched = new Map<string, TranscriptCell>();
-    // Reads of objects THIS transcript creates validate locally: the
-    // owner cannot attest a cell that does not exist there yet, and the
-    // planner honestly recorded such reads against pre-create absence —
-    // absent == absent below. (The v2 twin of this rule was the
-    // sameTurnRead fix; without it every create-then-read turn rejects
-    // terminal rider_unattested at a cross-scope commit.)
+    // Reads of objects THIS transcript creates validate within the transcript:
+    // the owner has no pre-state cell to compare or attest. The core grammar
+    // proves those reads against the create and same-turn writes, while the
+    // create-collision guard below proves the authority object was absent.
+    // Re-running the ordinary version comparison here would compare a valid
+    // post-create lifecycle version with "absent" and deterministically replan
+    // forever after create(...); chparent(...).
     const createdHere = new Set((submit.transcript.creates ?? []).map((create) => create.object));
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read
+      if (createdHere.has(read.cell.object)) continue;
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
       if (this.options.owns && !this.options.owns(read.cell.object) && !createdHere.has(read.cell.object)) {

@@ -570,10 +570,16 @@ actor (a wizard-owned wrapper must be lowered exactly to that actor), and
 proves from authority state that the actor carries that frame's definer through
 ancestry or an attached feature. Generic creates without that combined proof
 retain the programmer requirement. Recursive parentage is rejected.
-These checks are in addition to the exact pre-state lifecycle read and
-deterministic post-state re-derivation; the transcript is not a capability to
-synthesize a lineage state that the executed primitive could not have
-produced.
+These checks are in addition to lifecycle CAS and deterministic post-state
+re-derivation; the transcript is not a capability to synthesize a lineage state
+that the executed primitive could not have produced. An existing-object
+replacement carries the exact authority pre-state lifecycle read. An object
+created by the same turn has no authority pre-state: any post-create lifecycle
+read is validated against the create record and earlier same-turn writes, and
+the authority's create-collision check proves the object was absent before
+apply. A later same-turn replacement, such as `create(...); chparent(...)`, is
+therefore validated and materialized as the final lifecycle value rather than
+compared with absence or forced back to the create's initial parent.
 
 `ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
 validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,

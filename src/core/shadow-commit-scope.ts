@@ -752,10 +752,25 @@ function validateShadowPostState(reader: TranscriptCellReader, transcript: Effec
       errors.push(`post_state_mismatch create ${create.object}: object missing`);
       continue;
     }
+    // Creation records the initial lineage, but the same turn may legitimately
+    // replace that lifecycle cell (for example create(...); chparent(...)).
+    // Post-state validation must compare with the final replacement, not
+    // re-impose the create preimage after finalWritesByCell already proved the
+    // replacement itself.
+    const finalLifecycleWrite = finalWrites.find((write) =>
+      write.cell.kind === "lifecycle" && write.cell.object === create.object
+    );
+    const expectedLifecycle = finalLifecycleWrite?.op === "set"
+      ? parseShadowLifecycleCellValue(finalLifecycleWrite.value)
+      : lifecycleValueFromCreate(create);
+    if (!expectedLifecycle) {
+      errors.push(`post_state_mismatch create ${create.object}: invalid lifecycle`);
+      continue;
+    }
     const expectedLocation = lastMoveForObject(transcript, create.object)?.to ?? create.location;
-    if (obj.parent !== create.parent) errors.push(`post_state_mismatch create ${create.object}: parent`);
-    if (obj.owner !== create.owner) errors.push(`post_state_mismatch create ${create.object}: owner`);
-    if (obj.anchor !== create.anchor) errors.push(`post_state_mismatch create ${create.object}: anchor`);
+    if (obj.parent !== expectedLifecycle.parent) errors.push(`post_state_mismatch create ${create.object}: parent`);
+    if (obj.owner !== expectedLifecycle.owner) errors.push(`post_state_mismatch create ${create.object}: owner`);
+    if (obj.anchor !== expectedLifecycle.anchor) errors.push(`post_state_mismatch create ${create.object}: anchor`);
     if (obj.location !== expectedLocation) errors.push(`post_state_mismatch create ${create.object}: location`);
   }
 

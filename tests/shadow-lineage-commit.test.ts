@@ -22,6 +22,11 @@ import {
 import { runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { hashSource } from "../src/core/source-hash";
 import type { WooValue } from "../src/core/types";
+import { cellsFromSerialized, storeCells } from "../src/net/bridge";
+import { CellStore, cellKey } from "../src/net/cells";
+import { planTurn } from "../src/net/plan";
+import type { ScopeClassifier } from "../src/net/route";
+import { ScopeSequencer } from "../src/net/scope";
 
 const PROGRAMMER = "lineage_programmer";
 
@@ -111,6 +116,109 @@ async function lineageTurn(
 }
 
 describe("shadow lineage commit authority", () => {
+  it("accepts create followed by a lifecycle replacement in both authorities", async () => {
+    const world = lineageWorld();
+    const installed = installVerb(
+      world,
+      PROGRAMMER,
+      "spawn_rekind",
+      'verb :spawn_rekind(parent) rxd { let child = create($thing, { owner: actor, name: "Fresh lineage child", location: null }); chparent(child, parent); return child; }',
+      null
+    );
+    if (!installed.ok) throw new Error(JSON.stringify(installed));
+    const before = world.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "lineage-create-then-chparent",
+      route: "direct",
+      scope: "#-1",
+      session: null,
+      actor: PROGRAMMER,
+      target: PROGRAMMER,
+      verb: "spawn_rekind",
+      args: ["lineage_kind_b"]
+    };
+    const shadowRun = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), call);
+    expect(shadowRun.frame).toMatchObject({ op: "result" });
+    const shadowTranscript = shadowRun.transcript;
+    const created = shadowTranscript.creates[0];
+    expect(created).toBeDefined();
+    if (!created) return;
+    expect(shadowTranscript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: created.object },
+      value: {
+        parent: "$thing",
+        owner: PROGRAMMER,
+        name: "Fresh lineage child",
+        anchor: null,
+        flags: {}
+      }
+    }));
+    expect(shadowTranscript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: created.object },
+      op: "set",
+      value: expect.objectContaining({ parent: "lineage_kind_b" })
+    }));
+
+    const shadow = createShadowCommitScope({
+      node: "lineage-create-shadow-authority",
+      scope: call.scope,
+      serialized: before
+    });
+    const shadowResult = submitShadowCommit(shadow, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: call.id,
+      scope: call.scope,
+      expected: shadow.head,
+      transcript: shadowTranscript
+    });
+    expect(shadowResult.kind, JSON.stringify(shadowResult)).toBe("woo.commit.accepted.shadow.v1");
+    expect(serializedFor(shadow).objects.find((row) => row.id === created.object)?.parent).toBe("lineage_kind_b");
+
+    const net = new ScopeSequencer(call.scope, "lineage-create-epoch");
+    net.seed(cellsFromSerialized(before));
+    const view = new CellStore("derived");
+    for (const cell of storeCells(net.store)) view.install(cell);
+    const classifier: ScopeClassifier = {
+      scopeOf: () => call.scope,
+      isShared: (scope) => scope === call.scope
+    };
+    const plan = await planTurn({
+      call,
+      view,
+      planningScope: call.scope,
+      classifier,
+      base: net.head(),
+      idempotencyKey: call.id,
+      stamp: net.stamp()
+    });
+    const transcript = plan.submit.transcript;
+    const netCreated = transcript.creates[0];
+    expect(netCreated).toBeDefined();
+    if (!netCreated) return;
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: netCreated.object },
+      value: {
+        parent: "$thing",
+        owner: PROGRAMMER,
+        name: "Fresh lineage child",
+        anchor: null,
+        flags: {}
+      }
+    }));
+    expect(transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: netCreated.object },
+      op: "set",
+      value: expect.objectContaining({ parent: "lineage_kind_b" })
+    }));
+
+    const netResult = net.submit(plan.submit);
+    expect(netResult.status, JSON.stringify(netResult)).toBe("accepted");
+    expect(
+      (net.store.get(cellKey("object_lineage", netCreated.object))?.value as { parent?: string } | undefined)?.parent
+    ).toBe("lineage_kind_b");
+  });
+
   it("accepts non-programmer builder-surface create and chparent turns", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "prog"]);

@@ -733,7 +733,24 @@ function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok:
       return { ok: false, reason: "own_write_mismatch" };
     }
     case "lifecycle":
-      return read.value === "created" || read.value === "present" ? { ok: true } : { ok: false, reason: "own_write_mismatch" };
+      // `mutateLineage` may read a freshly-created object's exact lifecycle
+      // value before replacing it later in the same turn. There is no
+      // authority pre-state to compare with, so validate the read against the
+      // create record itself. The old string sentinels were not values the
+      // recorder emits and let malformed lifecycle proofs bypass this check.
+      return transcriptReadValuesMatch(
+        read.cell,
+        {
+          parent: create.parent,
+          owner: create.owner,
+          name: create.name,
+          anchor: create.anchor,
+          flags: create.flags
+        },
+        read.value
+      )
+        ? { ok: true }
+        : { ok: false, reason: "own_write_mismatch" };
     case "contents":
       return { ok: false, reason: "own_write_mismatch" };
     case "verb":
