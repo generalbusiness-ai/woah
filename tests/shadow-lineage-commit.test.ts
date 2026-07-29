@@ -4,6 +4,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import {
   readTranscriptCellFromSerializedWorld,
+  validateTranscriptAgainstSerializedWorld,
   type EffectTranscript
 } from "../src/core/effect-transcript";
 import { installLocalCatalogs } from "../src/core/local-catalogs";
@@ -116,13 +117,13 @@ async function lineageTurn(
 }
 
 describe("shadow lineage commit authority", () => {
-  it("accepts create followed by a lifecycle replacement in both authorities", async () => {
+  it("accepts multiple lifecycle replacements after create in both authorities", async () => {
     const world = lineageWorld();
     const installed = installVerb(
       world,
       PROGRAMMER,
       "spawn_rekind",
-      'verb :spawn_rekind(parent) rxd { let child = create($thing, { owner: actor, name: "Fresh lineage child", location: null }); chparent(child, parent); return child; }',
+      'verb :spawn_rekind(first_parent, final_parent) rxd { let child = create($thing, { owner: actor, name: "Fresh lineage child", location: null }); chparent(child, first_parent); chparent(child, final_parent); return child; }',
       null
     );
     if (!installed.ok) throw new Error(JSON.stringify(installed));
@@ -136,7 +137,7 @@ describe("shadow lineage commit authority", () => {
       actor: PROGRAMMER,
       target: PROGRAMMER,
       verb: "spawn_rekind",
-      args: ["lineage_kind_b"]
+      args: ["lineage_kind_a", "lineage_kind_b"]
     };
     const shadowRun = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), call);
     expect(shadowRun.frame).toMatchObject({ op: "result" });
@@ -144,21 +145,17 @@ describe("shadow lineage commit authority", () => {
     const created = shadowTranscript.creates[0];
     expect(created).toBeDefined();
     if (!created) return;
-    expect(shadowTranscript.reads).toContainEqual(expect.objectContaining({
-      cell: { kind: "lifecycle", object: created.object },
-      value: {
-        parent: "$thing",
-        owner: PROGRAMMER,
-        name: "Fresh lineage child",
-        anchor: null,
-        flags: {}
-      }
-    }));
-    expect(shadowTranscript.writes).toContainEqual(expect.objectContaining({
-      cell: { kind: "lifecycle", object: created.object },
-      op: "set",
-      value: expect.objectContaining({ parent: "lineage_kind_b" })
-    }));
+    expect(shadowTranscript.reads.filter((read) =>
+      read.cell.kind === "lifecycle" && read.cell.object === created.object
+    )).toEqual([]);
+    expect(shadowTranscript.writes.filter((write) =>
+      write.cell.kind === "lifecycle" &&
+      write.cell.object === created.object &&
+      write.op === "set"
+    )).toEqual([
+      expect.objectContaining({ value: expect.objectContaining({ parent: "lineage_kind_a" }) }),
+      expect.objectContaining({ value: expect.objectContaining({ parent: "lineage_kind_b" }) })
+    ]);
 
     const shadow = createShadowCommitScope({
       node: "lineage-create-shadow-authority",
@@ -189,34 +186,47 @@ describe("shadow lineage commit authority", () => {
       planningScope: call.scope,
       classifier,
       base: net.head(),
-      idempotencyKey: call.id,
+      idempotencyKey: call.id ?? "lineage-create-then-chparent",
       stamp: net.stamp()
     });
     const transcript = plan.submit.transcript;
     const netCreated = transcript.creates[0];
     expect(netCreated).toBeDefined();
     if (!netCreated) return;
-    expect(transcript.reads).toContainEqual(expect.objectContaining({
-      cell: { kind: "lifecycle", object: netCreated.object },
-      value: {
-        parent: "$thing",
-        owner: PROGRAMMER,
-        name: "Fresh lineage child",
-        anchor: null,
-        flags: {}
-      }
-    }));
-    expect(transcript.writes).toContainEqual(expect.objectContaining({
-      cell: { kind: "lifecycle", object: netCreated.object },
-      op: "set",
-      value: expect.objectContaining({ parent: "lineage_kind_b" })
-    }));
+    expect(transcript.reads.filter((read) =>
+      read.cell.kind === "lifecycle" && read.cell.object === netCreated.object
+    )).toEqual([]);
+    expect(transcript.writes.filter((write) =>
+      write.cell.kind === "lifecycle" &&
+      write.cell.object === netCreated.object &&
+      write.op === "set"
+    )).toHaveLength(2);
 
     const netResult = net.submit(plan.submit);
     expect(netResult.status, JSON.stringify(netResult)).toBe("accepted");
     expect(
       (net.store.get(cellKey("object_lineage", netCreated.object))?.value as { parent?: string } | undefined)?.parent
     ).toBe("lineage_kind_b");
+
+    // No host-language sentinel may stand in for a lifecycle proof. In
+    // particular, the dead `present` spelling must not regain a blanket
+    // exemption merely because this transcript also creates the object.
+    for (const sentinel of ["present", "created"]) {
+      const forged = structuredClone(shadowTranscript);
+      forged.reads.push({
+        cell: { kind: "lifecycle", object: created.object },
+        version: sentinel,
+        value: sentinel
+      });
+      const validation = validateTranscriptAgainstSerializedWorld(
+        before,
+        rehashTranscript(forged)
+      );
+      expect(validation.ok, sentinel).toBe(false);
+      expect(validation.errors, sentinel).toContain(
+        `read unavailable ${created.object}.lifecycle: object not found`
+      );
+    }
   });
 
   it("accepts non-programmer builder-surface create and chparent turns", async () => {

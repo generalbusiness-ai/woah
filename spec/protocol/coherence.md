@@ -563,6 +563,13 @@ echo; recycle remains a typed `TranscriptRecycle`. An authority MUST NOT
 interpret an existing-object `op:"set"` as permission to create the object, nor
 accept another lifecycle op as an implicit lineage mutation.
 
+A lifecycle mutation of an object created earlier in the same turn does not
+emit a lifecycle read: that intermediate value is derived from the turn's own
+create, not a proof about durable pre-state. The ordered create and lifecycle
+writes are sufficient for sequential authority and cycle validation, including
+multiple replacements of the fresh object. `created` and `present` are never
+lifecycle read values or validation sentinels.
+
 Lifecycle replacement authority is checked against the recorded VM frame.
 Wizard-owned frames may replace any semantic lineage field. A non-wizard frame
 may rename only an object it owns; it may also change that object's parent only
@@ -576,16 +583,12 @@ actor (a wizard-owned wrapper must be lowered exactly to that actor), and
 proves from authority state that the actor carries that frame's definer through
 ancestry or an attached feature. Generic creates without that combined proof
 retain the programmer requirement. Recursive parentage is rejected.
-These checks are in addition to lifecycle CAS and deterministic post-state
-re-derivation; the transcript is not a capability to synthesize a lineage state
-that the executed primitive could not have produced. An existing-object
-replacement carries the exact authority pre-state lifecycle read. An object
-created by the same turn has no authority pre-state: any post-create lifecycle
-read is validated against the create record and earlier same-turn writes, and
-the authority's create-collision check proves the object was absent before
-apply. A later same-turn replacement, such as `create(...); chparent(...)`, is
-therefore validated and materialized as the final lifecycle value rather than
-compared with absence or forced back to the create's initial parent.
+For an existing object, these checks are in addition to the exact pre-state
+lifecycle read and deterministic post-state re-derivation; the transcript is
+not a capability to synthesize a lineage state that the executed primitive
+could not have produced. A created object's final lifecycle is the last
+same-turn replacement, while the authority's create-collision check proves the
+object was absent before apply.
 
 `ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
 validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,
