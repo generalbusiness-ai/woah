@@ -2028,7 +2028,10 @@ export class NetScopeDO {
               object: account,
               field: "review_token"
             }],
-            review_token: expectedReviewToken,
+            // A mismatch is not a substitute dry-run. Never hand the caller a
+            // fresh capability for an unreviewed plan; they must rerun the
+            // diagnostic to receive both the redacted plan and its token.
+            review_token: null,
             head: seq.head()
           }, 409);
         }

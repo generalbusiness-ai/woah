@@ -178,6 +178,21 @@ describe("net-only Worker entry", () => {
       url: "https://do/net/repair-account-state",
       body
     }]);
+    const applyBody = {
+      ...body,
+      dry_run: false,
+      review_token: `sha256:${"a".repeat(64)}`
+    };
+    const applied = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(applyBody)
+    })), env);
+    expect(applied.status, await applied.clone().text()).toBe(200);
+    expect(forwarded.at(-1)).toEqual({
+      url: "https://do/net/repair-account-state",
+      body: applyBody
+    });
 
     // The edge never accepts a catalog/global target or a body without the
     // concrete account family; malformed addressing reaches no authority.
@@ -187,7 +202,7 @@ describe("net-only Worker entry", () => {
       body: JSON.stringify({ authority_scope: "catalog", account: "account_repair" })
     })), env);
     expect(malformed.status).toBe(400);
-    expect(forwarded).toHaveLength(1);
+    expect(forwarded).toHaveLength(2);
     for (const invalidBody of [null, 7, [], "account_repair"]) {
       const invalid = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
         method: "POST",
@@ -199,7 +214,7 @@ describe("net-only Worker entry", () => {
         error: { code: "E_INVARG" }
       });
     }
-    expect(forwarded).toHaveLength(1);
+    expect(forwarded).toHaveLength(2);
 
     // A missing/malformed dry_run must never be interpreted as apply, and
     // the value-free contract rejects fields that could look like operator
@@ -221,7 +236,13 @@ describe("net-only Worker entry", () => {
       body: JSON.stringify({ ...body, agent_count: 4 })
     })), env);
     expect(inventedValue.status).toBe(400);
-    expect(forwarded).toHaveLength(1);
+    const malformedToken = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/account/repair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, dry_run: false, review_token: 7 })
+    })), env);
+    expect(malformedToken.status).toBe(400);
+    expect(forwarded).toHaveLength(2);
   });
 
   it("forwards the AP11 wizard provisioning op to a gateway shard, freshly signed", async () => {

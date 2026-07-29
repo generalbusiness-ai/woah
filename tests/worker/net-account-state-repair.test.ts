@@ -371,7 +371,8 @@ describe("Net account-state historical repair", () => {
     expect(await unpinned.json()).toMatchObject({
       ok: false,
       status: "stale_review",
-      conflicts: [{ code: "review_token_mismatch" }]
+      conflicts: [{ code: "review_token_mismatch" }],
+      review_token: null
     });
     expect(await authorityHead()).toEqual(beforeUnpinnedHead);
 
