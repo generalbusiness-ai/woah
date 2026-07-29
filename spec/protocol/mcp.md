@@ -634,10 +634,34 @@ clock both sides share:
 - an unexpired guarantee is **never** evicted — not by a row quota, not to make
   room. At capacity each side REFUSES a new retry-safe admission instead: the
   gateway with `E_RETRY_CAPACITY`, the authority with a terminal
-  `retry_capacity` rejection. Nothing is planned or submitted, and the client is
-  told that the retry *guarantee* was refused, not the operation. It MAY retry
-  shortly, or re-issue without an operation id and accept at-least-once
-  semantics knowingly.
+  `retry_capacity` rejection. The client is told that the retry *guarantee* was
+  refused, not the operation. It MAY retry shortly, or re-issue without an
+  operation id and accept at-least-once semantics knowingly.
+
+  The gateway's capacity refusal MUST be decided **before the turn is planned**.
+  A saturated shard that plans first can be driven through the whole planning
+  and authority-read path on every attempt, which is the load the refusal exists
+  to shed. The pre-planning check races another request for the last slot, so
+  the insert re-checks atomically; both refusals precede the submit, so nothing
+  executes either way.
+
+**The retry class of an operation id is immutable.** An id first used WITHOUT
+retry safety is bound to a transient route: sooner-expiring and freely
+evictable, because no client can present a gateway-minted key again. Reusing
+that same id WITH retry safety is refused with `E_RETRY_CLASS` before the turn
+is planned, and the client is told to use a fresh id.
+
+The alternative — upgrading the route in place — has to rewrite the gateway's
+pin AND the authority's classification of an outcome that may already exist,
+in two stores with no atomic boundary spanning them; a half-applied upgrade
+lands silently in exactly the state this refuses. Accepting the reuse without
+upgrading is worse still: it mints a guaranteed outcome behind an evictable
+route, so once that route is dropped a retry re-plans and may commit at a
+second scope, inside the window advertised as guaranteed.
+
+The reverse reuse — an id first used WITH retry safety, later without — is
+permitted. The route is more durable than the second caller asked for, which
+costs nothing.
 
 **What is guaranteed, and what degrades.** A recorded outcome has two parts, and
 only one of them is protected. The VERDICT — that this key already committed —

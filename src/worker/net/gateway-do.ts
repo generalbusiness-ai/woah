@@ -905,6 +905,21 @@ const PLANNING_HEAD_CACHE_CAP = 256;
 
 type PlanningHead = { head: ScopeHead; catalog_epoch?: string; object_counter?: number };
 
+/** The capacity refusal, shared by the pre-planning admission check and the
+ * atomic re-check at pin insert so the two answers cannot drift apart. */
+function retryCapacityError(trace: AttemptTraceEntry[]): NetError {
+  return new NetError(
+    "E_RETRY_CAPACITY",
+    "this gateway shard cannot currently guarantee retry safety for a new operation id",
+    {
+      reason: "pin_capacity",
+      retry_after_ms: 60_000,
+      remediation: "retry this call unchanged in a moment; the guarantee is refused, not the operation"
+    },
+    trace
+  );
+}
+
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
@@ -1755,6 +1770,13 @@ export class NetGatewayDO {
   }
 
   private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[], structure: TurnStructure): Promise<TurnResult> {
+    // Retry ADMISSION runs before anything is planned. Both halves of it —
+    // the class check and the capacity check — need only the key and the
+    // client's own `retry_safe` flag, so neither has any reason to wait for a
+    // plan, and both are refusals: a saturated shard that plans first can be
+    // driven through the full planning and authority-read path on every
+    // attempt, which is the load the refusal exists to shed.
+    this.admitRetryClass(request, trace);
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
     // stale_head resubmit carry-over: when only the base was stale the
@@ -2065,22 +2087,12 @@ export class NetGatewayDO {
         // pins carry the retention guarantee; a gateway-minted key only has to
         // survive this request's own repair loop.
         const guaranteed = request.retry_receipt === true;
+        // Capacity was already checked before planning (admitRetryClass); this
+        // is the ATOMIC re-check, because that one races — another request can
+        // take the last slot in between. Refusing here still precedes the
+        // submit, so nothing executes either way.
         if (this.pinScope(request.idempotency_key, planned.selection.scope, guaranteed) === "capacity") {
-          // Refuse BEFORE the submit leaves. Issuing a retry guarantee this
-          // shard cannot keep would mean a lost response re-executes silently;
-          // a named refusal lets the client wait, or drop the operation id and
-          // accept ordinary at-least-once semantics knowingly.
-          throw new NetError(
-            "E_RETRY_CAPACITY",
-            "this gateway shard cannot currently guarantee retry safety for a new operation id",
-            {
-              reason: "pin_capacity",
-              retry_after_ms: 60_000,
-              remediation:
-                "retry this call unchanged in a moment; the guarantee is refused, not the operation"
-            },
-            trace
-          );
+          throw retryCapacityError(trace);
         }
       } else if (pinned !== planned.selection.scope) {
         this.metric({
@@ -8517,23 +8529,100 @@ export class NetGatewayDO {
     return this.callReadsVerbFlag(view, call, "reads_ordered_children");
   }
 
-  /** The scope pinned to an idempotency key, or null (fix 5c). An EXPIRED pin
+  /** The live pin row for an idempotency key, or null (fix 5c). An EXPIRED pin
    * is not a pin: its lease is the same boundary the authority prunes its
    * recorded reply on, so past it there is nothing left to route back to. */
-  private pinnedScope(idempotencyKey: string): string | null {
-    const rows = sqlRows<{ scope: string }>(
+  private pinRecord(idempotencyKey: string): { scope: string; guaranteed: boolean } | null {
+    const rows = sqlRows<{ scope: string; guaranteed: number | null }>(
       this.state.storage.sql.exec(
         // A NULL lease is a legacy row, and legacy reads as LIVE: honouring a
         // route we can no longer date is the harmless direction (a pin
         // outliving its reply costs nothing), while treating it as expired
         // would silently drop exactly the routes this change exists to keep.
         // The constructor backfill retires them on the next boot.
-        "SELECT scope FROM net_gateway_pin WHERE idempotency_key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        "SELECT scope, guaranteed FROM net_gateway_pin " +
+          "WHERE idempotency_key = ? AND (expires_at IS NULL OR expires_at > ?)",
         idempotencyKey,
         Date.now()
       )
     );
-    return rows.length > 0 ? rows[0].scope : null;
+    if (rows.length === 0) return null;
+    // A legacy row (NULL class) is read as guaranteed, matching the
+    // constructor backfill: over-protecting a route costs nothing.
+    return { scope: rows[0].scope, guaranteed: rows[0].guaranteed !== 0 };
+  }
+
+  private pinnedScope(idempotencyKey: string): string | null {
+    return this.pinRecord(idempotencyKey)?.scope ?? null;
+  }
+
+  /** Unexpired guaranteed pins held by this shard. */
+  private guaranteedPinCount(now: number): number {
+    const held = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 1 AND (expires_at IS NULL OR expires_at > ?)",
+        now
+      )
+    )[0];
+    return held ? Number(held.n) : 0;
+  }
+
+  /**
+   * Retry admission, decided BEFORE planning. Two refusals, neither of which
+   * needs a plan to reach.
+   *
+   * **The retry class of a key is immutable.** `pinScope` inserts with
+   * `ON CONFLICT DO NOTHING`, so a pin that already exists is never rewritten:
+   * a key first used WITHOUT `retry_safe` keeps its transient, sooner-expiring,
+   * freely-evictable route forever. The authority, meanwhile, checks recorded
+   * outcomes before it classifies, so reusing that key WITH `retry_safe` mints
+   * a guaranteed outcome sitting behind an evictable route. When the route is
+   * dropped a retry re-plans and can commit at a second scope — inside the
+   * window advertised as guaranteed. The class system reaching the same
+   * cross-scope double execution the class system was meant to prevent.
+   *
+   * Refusing the upgrade is chosen over performing it. A coordinated upgrade
+   * has to rewrite the pin AND the authority's classification of an outcome
+   * that already exists, in two stores, without an atomic boundary spanning
+   * them — and a half-applied upgrade lands in exactly the state this refusal
+   * exists to prevent, silently. A fresh key costs the client one string.
+   *
+   * The reverse — a key first used WITH `retry_safe`, reused without — is
+   * allowed: the route is more durable than the second caller asked for, which
+   * is harmless.
+   *
+   * **Capacity** is checked here too, so a saturated shard refuses before
+   * paying for a plan. The check races (another request may take the last slot
+   * between here and the insert), so `pinScope` re-checks atomically at the
+   * insert; this one exists to shed load, not to be the authority on capacity.
+   */
+  private admitRetryClass(request: TurnRequest, trace: AttemptTraceEntry[]): void {
+    if (request.retry_receipt !== true) return; // asks for no guarantee
+    const existing = this.pinRecord(request.idempotency_key);
+    if (existing !== null) {
+      if (existing.guaranteed) return; // already the class it is asking for
+      this.metric({
+        kind: "net_turn_pin_class_refusal",
+        scope: existing.scope,
+        idempotency_key: request.idempotency_key
+      });
+      throw new NetError(
+        "E_RETRY_CLASS",
+        "this operation id was already used without retry safety and cannot be upgraded",
+        {
+          reason: "retry_class_immutable",
+          remediation:
+            "use a NEW operation id for this call; the id you sent is already bound to a " +
+            "route that carries no retry guarantee, and upgrading it in place cannot be " +
+            "done safely across the gateway and the authority"
+        },
+        trace
+      );
+    }
+    if (this.guaranteedPinCount(Date.now()) >= GATEWAY_GUARANTEED_PIN_CAPACITY) {
+      this.metric({ kind: "net_turn_pin_capacity_refusal", scope: request.planningScope, held: -1 });
+      throw retryCapacityError(trace);
+    }
   }
 
   /**
@@ -8568,11 +8657,9 @@ export class NetGatewayDO {
       );
     }
     if (guaranteed) {
-      const held = sqlRows<{ n: number }>(
-        this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 1")
-      )[0];
-      if (held && Number(held.n) >= GATEWAY_GUARANTEED_PIN_CAPACITY) {
-        this.metric({ kind: "net_turn_pin_capacity_refusal", scope, held: Number(held.n) });
+      const held = this.guaranteedPinCount(now);
+      if (held >= GATEWAY_GUARANTEED_PIN_CAPACITY) {
+        this.metric({ kind: "net_turn_pin_capacity_refusal", scope, held });
         return "capacity";
       }
     }
@@ -10709,15 +10796,21 @@ function mcpSchemaForHint(raw: string): Record<string, unknown> {
  *
  * This is deliberately NOT a JSON Schema engine. It implements exactly the
  * vocabulary our own advertisements can contain — `type`, `enum`, `anyOf`,
- * and `required` — which covers everything `mcpInputSchema` derives from an
- * `arg_spec` (type hints, `command.args_from` shapes) plus the hand-written
- * stable-control schemas. Deliberately NOT supported, because no
- * advertisement can express them: nested object/array element schemas
- * (`items` is always `{}`), `additionalProperties`, `format`, numeric or
- * length bounds, `pattern`, `oneOf`/`allOf`/`not`, and schema references. A
- * schema fragment this validator does not understand constrains NOTHING rather than
- * refusing, so a richer future advertisement can never start rejecting calls
- * that were valid before the validator learned about it.
+ * `required`, `minLength` and `pattern` — which covers everything
+ * `mcpInputSchema` derives from an `arg_spec` (type hints, `command.args_from`
+ * shapes) plus the hand-written stable-control schemas. `minLength` and
+ * `pattern` are supported because we DO advertise them: the operation-id
+ * control publishes `MCP_OPERATION_ID_PATTERN`, and the non-empty rule is an
+ * advertised `minLength: 1`. Advertising a constraint the validator ignored
+ * would make the published schema decorative.
+ *
+ * Still NOT supported, because no advertisement can express them: nested
+ * object/array element schemas (`items` is always `{}`),
+ * `additionalProperties`, `format`, numeric bounds, `maxLength`,
+ * `oneOf`/`allOf`/`not`, and schema references. A schema fragment this
+ * validator does not understand constrains NOTHING rather than refusing, so a
+ * richer future advertisement can never start rejecting calls that were valid
+ * before the validator learned about it.
  */
 type McpArgRefusal = { code: string; message: string; detail: Record<string, unknown> };
 

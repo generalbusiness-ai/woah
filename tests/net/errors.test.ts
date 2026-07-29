@@ -29,7 +29,10 @@ const ALL_CODES: NetErrorCode[] = [
   // H2c: the shard holds its full complement of UNEXPIRED retry guarantees.
   // Terminal for this request and nothing was submitted — the guarantee was
   // refused, not the operation.
-  "E_RETRY_CAPACITY"
+  "E_RETRY_CAPACITY",
+  // The retry class of an operation id is immutable — a transient key cannot
+  // be upgraded to a guaranteed one. Terminal; nothing was planned.
+  "E_RETRY_CLASS"
 ];
 
 describe("net divergence taxonomy (CO6)", () => {
