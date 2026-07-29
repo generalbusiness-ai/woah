@@ -80,15 +80,13 @@ const UNCONVERTED = new Set([
   "net-provision-wizard.test.ts",
   "net-relations.test.ts",
   "net-repair-contents.test.ts",
-  "net-scheduled.test.ts",
   "net-scope-fanout.test.ts",
   "net-session-leak.test.ts",
   "net-session-reap.test.ts",
   "net-topology-turn.test.ts",
   "net-verb-editor-aged.test.ts",
   "net-verb-editor.test.ts",
-  "net-verb-slots.test.ts",
-  "net-ws.test.ts"
+  "net-verb-slots.test.ts"
 ]);
 
 function testFiles(dir) {

@@ -15,7 +15,6 @@
 // REDELIVERED dispatch cannot double-commit (the scope's reply cache),
 // and a cold planner view converges via pull-on-miss.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
@@ -27,41 +26,26 @@ import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from ".
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import type { NetStub } from "../../src/worker/net/workerd-host";
+import { closeQuiescent, quiescentNetState, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-scheduled-test-secret";
 const EPOCH = "cat-net-sched-1";
 const SCOPE = "room-sched";
 
-/** Fake DO state + alarm recording + waitUntil capture (the same shape
- * as net-do/net-scope-fanout tests). */
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
+/** The shared quiescent host plus the alarm recording this suite asserts on.
+ * Hand-rolling the fixture here used to mean deferred work ran on against
+ * closed storage; `close()` now drains to quiescence first. */
+function netState(name: string): QuiescentHost & { alarms: Array<number | null> } {
   const alarms: Array<number | null> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
+  const host = quiescentNetState(name, {
+    setAlarm: (at: number) => {
+      alarms.push(at);
     },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (at: number) => {
-        alarms.push(at);
-      },
-      deleteAlarm: () => {
-        alarms.push(null);
-      }
+    deleteAlarm: () => {
+      alarms.push(null);
     }
-  };
-  return {
-    state,
-    alarms,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
+  });
+  return { ...host, alarms };
 }
 
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };
@@ -272,6 +256,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(body.scheduled_turn.id).toBe("sched-1");
     expect(body.scheduled_turn.call.verb).toBe("tick");
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_dispatched"))).toBe(true);
+    await closeQuiescent([scope]);
   });
 
   it("answers the live introspection read with pending entries and recent failures (CO16.9)", async () => {
@@ -308,6 +293,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(after.pending.map((row) => row.id)).toEqual(["sched-later"]);
     expect(after.failures.map((row) => row.id)).toEqual(["sched-doomed"]);
     expect(after.failures[0]).toMatchObject({ outcome: "rejected" });
+    await closeQuiescent([scope]);
   });
 
   it("records a terminal failure durably instead of discarding it (CO16.8)", async () => {
@@ -344,6 +330,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(failures[0]).toMatchObject({ id: "sched-fail", outcome: "rejected", verb: "tick" });
     expect(failures[0].detail).toMatch(/write_unauthorized/);
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
+    await closeQuiescent([scope]);
   });
 
   it("records an ACCEPTED turn whose verb threw", async () => {
@@ -370,6 +357,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(failures[0]).toMatchObject({ id: "sched-threw", outcome: "errored" });
     expect(failures[0].detail).toMatch(/E_PROPNF/);
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
+    await closeQuiescent([scope]);
   });
 
   it("delivers the failure observation to a fanout subscriber", async () => {
@@ -406,6 +394,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     const bodies = fanout.received.filter((entry) => entry.path.endsWith("/live") || entry.path.endsWith("/fanout"));
     expect(JSON.stringify(bodies)).toContain("scheduled_turn_failed");
     expect(JSON.stringify(bodies)).toContain("sched-seen");
+    await closeQuiescent([scope]);
   });
 
   it("rolls the outbox delete back when the failure row cannot be written", async () => {
@@ -421,6 +410,8 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     await sleep(60);
 
     // Break the failure table so the insert throws inside the transaction.
+    // This deliberately emits one `net_deferred_task_error` ("no such table:
+    // net_scope_sched_failure") -- the injected fault, not teardown noise.
     scope.state.storage.sql.exec("DROP TABLE net_scope_sched_failure");
 
     await scopeDO.alarm().catch(() => undefined);
@@ -429,6 +420,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     // The dispatch row is still there: no record, no deletion.
     const rows = outboxRows(scope.state).filter((row) => row.route === "/plan-scheduled");
     expect(rows.length).toBeGreaterThan(0);
+    await closeQuiescent([scope]);
   });
 
 
@@ -477,6 +469,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ id: "sched-gone", outcome: "abandoned" });
     expect(metricLines.some((line) => line.includes("net_scope_scheduled_turn_failed"))).toBe(true);
+    await closeQuiescent([scope]);
   });
 
   it("no planner registered → the due turn stays parked with the named metric (fanout role does not qualify)", async () => {
@@ -506,6 +499,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     const fired = metricLines.filter((line) => line.includes("net_scope_scheduled_turn_fired"));
     expect(fired).toHaveLength(1);
     expect(fired[0]).toContain("no planner-role subscriber registered");
+    await closeQuiescent([scope]);
   });
 
   it("an accepted turn wakes work parked by the idle policy (CO16.6)", async () => {
@@ -536,6 +530,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     // from the dueNow branch. A ±ms tolerance would be flaky; this is exact.
     const armed = scope.alarms.filter((at): at is number => typeof at === "number");
     expect(armed.some((at) => at <= Date.now())).toBe(true);
+    await closeQuiescent([scope]);
   });
 
   it("a later planner subscription arms an immediate wake for parked overdue turns", async () => {
@@ -569,6 +564,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     await scope.settle();
     expect(scheduledRows(scope.state)).toEqual([]);
     expect(planner.received.filter((entry) => entry.path === "/net/plan-scheduled")).toHaveLength(1);
+    await closeQuiescent([scope]);
   });
 
   it("a faulted planner delivery leaves a durable pending row (crash window) that drain-on-reactivation delivers", async () => {
@@ -580,6 +576,8 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     const scope = netState(`scope-${SCOPE}-crash`);
     const faultedEnv: NetScopeEnv = {
       WOO_INTERNAL_SECRET: SECRET,
+      // Injected: emits one expected `net_scope_outbox_delivery_failed`
+      // ("injected fault: planner lane down") inside the test body.
       WOO_NET_FAULTS: JSON.stringify({ "/plan-scheduled": { error: "planner lane down" } }),
       NET_RESOLVE: resolve
     };
@@ -609,6 +607,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     await scope.settle();
     expect(outboxRows(scope.state)).toEqual([]);
     expect(planner.received.filter((entry) => entry.path === "/net/plan-scheduled")).toHaveLength(1);
+    await closeQuiescent([scope]);
   });
 
   it("migrates a legacy destination-only subscribers table: existing rows keep working as fanout", async () => {
@@ -631,6 +630,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     ]);
     // An unknown role refuses loudly.
     await expect(call(scopeDO, env, "/subscribe", { destination: "gateway:x", role: "observer" })).rejects.toThrow(/role/);
+    await closeQuiescent([scope]);
   });
 
   it("picks the lexicographically first planner deterministically", async () => {
@@ -655,6 +655,7 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     await scope.settle();
     expect(plannerA.received.filter((entry) => entry.path === "/net/plan-scheduled")).toHaveLength(1);
     expect(plannerB.received).toEqual([]);
+    await closeQuiescent([scope]);
   });
 });
 
@@ -713,7 +714,7 @@ describe("CO16 planner gateway execution (chunk 2, end-to-end over fake-DO)", ()
     };
     const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
     const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
-    const doStates = new Map<string, ReturnType<typeof netState>>();
+    const doStates = new Map<string, QuiescentHost>();
     for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
       const st = netState(`scope-${scope}`);
       const instance = new NetScopeDO(st.state, scopeEnv);
@@ -728,7 +729,7 @@ describe("CO16 planner gateway execution (chunk 2, end-to-end over fake-DO)", ()
       await call(gateway, gatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
     }
     const roomDO = scopeDOs.get(roomScope) as NetScopeDO;
-    const roomState = doStates.get(roomScope) as ReturnType<typeof netState>;
+    const roomState = doStates.get(roomScope) as QuiescentHost;
     await call(roomDO, scopeEnv, "/subscribe", { destination: "gateway:sched-gw", role: "planner" });
 
     const counterAt = async (): Promise<unknown> => {
@@ -793,8 +794,6 @@ describe("CO16 planner gateway execution (chunk 2, end-to-end over fake-DO)", ()
       expect(rpcLog).toContain(`scope:${scope}/net/closure`);
     }
 
-    for (const st of doStates.values()) st.close();
-    gatewayState.close();
-    coldState.close();
+    await closeQuiescent([...doStates.values(), gatewayState, coldState]);
   });
 });
