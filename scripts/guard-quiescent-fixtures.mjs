@@ -13,9 +13,14 @@
 // quiescence before closing and fails the owning test on a deferred rejection.
 // This guard stops a NEW hand-rolled copy from appearing. Files still carrying
 // their own copy are listed below as an explicit, shrinking debt register
-// rather than silently tolerated — converting them is mechanical, but each one
-// can surface real hidden failures, so they are done deliberately and not in
-// one sweep.
+// rather than silently tolerated. Converting one is NOT mechanical: draining
+// makes previously invisible work visible, and the first eleven conversions
+// turned up three genuinely undelivered legs (net-install's gateways were
+// unresolvable, net-client-api's gateway was registered under the wrong
+// destination so no fanout ever reached it, net-do's rider `/adopt` went
+// nowhere), one leak (net-scheduled never closed thirteen of its hosts), and
+// one product defect in `NetAuditDO`'s AE index. So they are done deliberately
+// and not in one sweep.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
@@ -23,47 +28,70 @@ const root = process.cwd();
 const workerTests = join(root, "tests", "worker");
 const SHARED = "quiescent-do";
 
-/** Deferring `waitUntil` hand-off: the promise is STORED rather than awaited or
- * discarded. `[^}]*` keeps the match inside the arrow body, so the common safe
- * form `waitUntil: () => {}` — which drops deferred work entirely and has
- * nothing to drain — does not trip on an unrelated `.push(` further down. */
-const DEFERS_WORK = /waitUntil\s*:\s*\([^)]*\)\s*=>\s*\{[^}]*\.push\(/;
+/** A hand-rolled DO state that supplies its own `waitUntil` at all.
+ *
+ * The earlier detector looked for the promise being STORED (`.push(` inside
+ * the arrow body) on the theory that `waitUntil: () => {}` "drops deferred
+ * work entirely and has nothing to drain". That theory is wrong, and it let
+ * two real offenders (net-install, net-install-doorway) off the register while
+ * they emitted eight `net_scope_outbox_delivery_failed` between them.
+ *
+ * `WorkerdHost.defer` calls `task()` FIRST and only then hands the resulting
+ * promise to `waitUntil`. The work is already running by the time the fixture
+ * sees it. An empty `waitUntil` therefore does not cancel anything — it throws
+ * away the only handle anyone had on live work, which is strictly worse than
+ * storing it: the suite cannot drain what it cannot reference, so the work
+ * lands on storage the suite has since closed.
+ *
+ * So the rule is simply: if a worker test defines `waitUntil`, it owns
+ * deferred DO work and must use the shared quiescent fixture. There is no
+ * safe hand-rolled form, which is the point.
+ *
+ * OMITTING `waitUntil` is not an escape either, and that hole was real too:
+ * net-do.test.ts built its DO state without one, so `state.waitUntil?.(p)` was
+ * a no-op that discarded the handle just as thoroughly — and the file matched
+ * no `waitUntil` token, so no register entry could even have been written for
+ * it. The trigger is therefore CONSTRUCTING the fake DO state at all. Anything
+ * that owns a `FakeDurableObjectState` and drives a net DO owns its deferred
+ * work; the shared fixture re-exports the raw fake as `host.fake` for the
+ * handful of suites that need DO-state surface it does not model. */
+const DEFERS_WORK = /waitUntil\s*:|new\s+FakeDurableObjectState\s*\(/;
 /** Uses the shared fixture (under any local alias). */
 const USES_SHARED = new RegExp(`from\\s+["'][./]*${SHARED}["']`);
 
 // Not yet converted. Each still hand-rolls the fixture and may be hiding
 // deferred failures. Remove entries as they are converted; do not add any.
 const UNCONVERTED = new Set([
-  "net-client-api.test.ts",
+  "net-audit.test.ts",
   "net-demote-lifecycle.test.ts",
   "net-gateway-repair.test.ts",
   "net-help-migration-aged.test.ts",
   "net-help-topics-aged.test.ts",
+  "net-identity-door.test.ts",
   "net-kv-seed.test.ts",
   "net-legacy-split-refusal.test.ts",
+  "net-load-asymptote.test.ts",
   "net-load-skew.test.ts",
   "net-mcp-agent-surface.test.ts",
   "net-mcp-hardening.test.ts",
   "net-mcp-legibility.test.ts",
-  "net-mcp-origin.test.ts",
   "net-mcp-programmer.test.ts",
   "net-mcp.test.ts",
-  "net-operator-anchor.test.ts",
   "net-outbox-bounded.test.ts",
+  "net-outliner-converge.test.ts",
   "net-programmer-lifecycle.test.ts",
-  "net-promote.test.ts",
   "net-provision-wizard.test.ts",
   "net-relations.test.ts",
   "net-repair-contents.test.ts",
-  "net-scheduled.test.ts",
   "net-scope-fanout.test.ts",
   "net-session-leak.test.ts",
   "net-session-reap.test.ts",
   "net-topology-turn.test.ts",
+  "net-turn-structure.test.ts",
   "net-verb-editor-aged.test.ts",
   "net-verb-editor.test.ts",
   "net-verb-slots.test.ts",
-  "net-ws.test.ts"
+  "net-wire-contract.test.ts"
 ]);
 
 function testFiles(dir) {

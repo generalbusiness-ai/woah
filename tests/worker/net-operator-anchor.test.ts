@@ -14,7 +14,6 @@
 // page removed, no human anywhere — and drives the whole operator runbook
 // through the real signed routes.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -23,6 +22,7 @@ import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 import { verbCellSlot } from "../../src/net/verb-slots";
 import { identityAnchorIds } from "../../src/net/identity-anchor";
 import { provisionNetWizard } from "../../scripts/net-provision-wizard";
@@ -31,16 +31,6 @@ const SECRET = "net-anchor-test-secret";
 const EPOCH = "cat-anchor-1";
 const AP11_VERB = "provision_wizard_agent";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
-    storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
-  };
-  return { state, settle: async () => { while (deferred.length > 0) await deferred.shift(); }, close: () => fake.close() };
-}
 
 /** A world shaped like the deployed one: no human, and (optionally) without the
  * AP11 verb page or the published authoring-surface reference, so each aged-world
@@ -59,7 +49,7 @@ async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef
   const relations = partitionInstallRelations(cells);
   partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   let gateway!: NetGatewayDO;
   let auditDO!: NetAuditDO;
@@ -105,11 +95,11 @@ async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef
   return {
     old, gateway, scopeDOs, scopeEnv, states, cells,
     settleAll: async () => {
-      for (const st of [...states]) await st.settle();
+      await settleHosts(states);
       for (const s of [...scopeDOs.values()]) await s.alarm();
-      for (const st of [...states]) await st.settle();
+      await settleHosts(states);
     },
-    close: () => { for (const st of states) st.close(); }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -223,7 +213,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(out).toMatch(/"authoring_surface": "\$programmer"/);
       expect(out).toMatch(/ready/);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -261,7 +251,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(again.body?.status).toBe("empty");
       expect(verbCellSlot((await catalogCell(h, key))?.value)).toBe(slot);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -286,7 +276,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // The stored ordinal is unchanged: the authority owns it.
       expect(verbCellSlot((await catalogCell(h, key))?.value)).toBe(heldSlot);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -307,7 +297,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       }])).status).toBe(400);
       expect(await catalogCell(h, "verb_bytecode:$human:x")).toBeUndefined();
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -366,7 +356,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       // No probe mutated anything: nothing was provisioned.
       expect(ready.body?.recorded_agent ?? null).toBe(null);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -457,7 +447,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect((await signedPost(h, "/net/provision-anchor", { anchor_id: "bad token" })).status).toBe(400);
       expect((await signedPost(h, "/net/provision-anchor", {})).status).toBe(400);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -493,7 +483,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(closure.cells?.find((c) => c.key === `property_cell:${account}:agent_count`)?.value?.value).toBe(0);
       expect(closure.cells?.find((c) => c.key === `property_cell:${account}:operator_provisioned_agents`)).toBeUndefined();
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -554,7 +544,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(superseded.body?.status).toBe("applied");
       expect((await catalogCell(h, key))?.value).toMatchObject({ value: "$newer_surface" });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -623,7 +613,7 @@ describe("AP11.9 operator anchor + aged-world primitive install (fake-DO lane)",
       expect(rerun.body?.result?.actor_id).toBe(result.actor_id);
       expect(rerun.body?.result?.created).toBe(false);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 });

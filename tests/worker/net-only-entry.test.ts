@@ -1,25 +1,10 @@
 import { describe, expect, it } from "vitest";
 import worker, { type NetOnlyEnv } from "../../src/worker/net-only-index";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetScopeDO, type NetScopeDurableState } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { routedApiKeyId } from "../../src/core/api-key-id";
+import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
 
-function netState(name: string): { state: NetScopeDurableState; close: () => void } {
-  const fake = new FakeDurableObjectState(name);
-  return {
-    state: {
-      id: fake.id,
-      storage: {
-        sql: fake.storage.sql,
-        transactionSync: fake.storage.transactionSync,
-        setAlarm: () => {},
-        deleteAlarm: () => {}
-      }
-    },
-    close: () => fake.close()
-  };
-}
 
 function harness() {
   const scopeState = netState("scope-catalog");
@@ -32,7 +17,7 @@ function harness() {
       throw new Error(`unexpected destination ${destination}`);
     }
   };
-  return { env, close: scopeState.close };
+  return { env, close: async () => closeQuiescent([scopeState]) };
 }
 
 describe("net-only Worker entry", () => {
@@ -59,7 +44,7 @@ describe("net-only Worker entry", () => {
     const redirected = await worker.fetch(new Request("https://woah.generalbusiness.ai/docs/getting-started?q=1"), env);
     expect(redirected.status).toBe(308);
     expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/docs/getting-started?q=1");
-    close();
+    await close();
   });
 
   it("keeps credential ensure internal-signed and routes only the verifier to its authority", async () => {
@@ -126,7 +111,7 @@ describe("net-only Worker entry", () => {
       body: JSON.stringify(reorderedBody)
     })), env);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", actor: "$wiz", id });
-    close();
+    await close();
   });
 
   it("forwards the AP11 wizard provisioning op to a gateway shard, freshly signed", async () => {
@@ -227,7 +212,7 @@ describe("net-only Worker entry", () => {
     })), env);
     expect(anchorMalformed.status).toBe(400);
     expect(forwarded).toHaveLength(2);
-    scopeState.close();
+    await closeQuiescent([scopeState]);
   });
 
   it("retains the signed, world-state-free install readiness probe", async () => {
@@ -236,7 +221,7 @@ describe("net-only Worker entry", () => {
     const response = await worker.fetch(request, env);
     expect(response.status, await response.clone().text()).toBe(200);
     expect(await response.json()).toEqual({ ok: true, service: "net-scope" });
-    close();
+    await close();
   });
 
   it("serves an authoritative net default and probes the catalog scope", async () => {
@@ -272,7 +257,7 @@ describe("net-only Worker entry", () => {
     const health = await worker.fetch(new Request("https://woo.test/healthz"), env);
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({ ok: true, net: true });
-    close();
+    await close();
   });
 
   it("retires legacy routes before the asset fallback", async () => {
@@ -281,7 +266,7 @@ describe("net-only Worker entry", () => {
       const response = await worker.fetch(new Request(`https://woo.test${path}`), env);
       expect(response.status, path).toBe(410);
     }
-    close();
+    await close();
   });
 
   it("mounts the operator admin dashboard without a WORLD binding", async () => {
@@ -307,6 +292,6 @@ describe("net-only Worker entry", () => {
     );
     expect(purge.status).toBe(410);
     expect(await purge.json()).toMatchObject({ error: { code: "E_GONE", detail: { net: true } } });
-    close();
+    await close();
   });
 });

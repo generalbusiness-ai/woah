@@ -24,7 +24,6 @@
 //   - client idempotency keys replay per the item-1 contract;
 //   - the authenticated GET reads (cell probe, relation roster) serve.
 import { describe, expect, it, vi } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -36,39 +35,12 @@ import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
 import { routedApiKeyId } from "../../src/core/api-key-id";
 import { hashSource } from "../../src/core/source-hash";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-client-api-test-secret";
 const EPOCH = "cat-net-capi-1";
 const KEY_ID = "capi-key";
 const KEY_SECRET = "capi-secret";
-
-function netState(name: string): {
-  state: NetScopeDurableState & NetGatewayDurableState;
-  settle: () => Promise<void>;
-  close: () => void;
-} {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 /** Unsigned client request straight at the gateway DO — the /net-api
  * surface must never require internal signing. */
@@ -198,7 +170,7 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   const clusterScope = `cluster:${actor}`;
   expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   const gateways = new Map<string, NetGatewayDO>();
   // Record actual DO crossings so boundary regressions can distinguish a
@@ -252,6 +224,14 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
     // Security regressions in this fixture normally require an exact read.
     // Cache behavior has its own test below.
     NET_CREDENTIAL_TTL_MS: options.credentialTtlMs ?? "0",
+    // The gateway subscribes to scopes under its OWN rpc destination, and
+    // scopes drain fanout back to exactly that name. Without this override the
+    // shard derives `gateway:gateway-net-api` from its DO id while the fixture
+    // registers it as `net-api`, so every fanout delivery threw
+    // `unresolvable destination` inside a deferred task -- silently, and the
+    // fanout leg of this whole suite was never delivered. The sibling MCP
+    // suites already pin this; net-client-api did not.
+    NET_GATEWAY_SELF: "gateway:net-api",
     METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
   };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
@@ -275,7 +255,7 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
       if (!instance) throw new Error(`missing credential authority ${scope}`);
       return signedTo(instance, "/net/ensure-credential", { actor: target, id, record });
     },
-    close: () => states.forEach((st) => st.close())
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -320,7 +300,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       expect(legacy.status).toBe(200);
       expect(legacy.body).toMatchObject({ actor: h.actor });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -358,7 +338,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       );
       expect(foreign.status).toBe(403);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -408,7 +388,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       );
       expect(own.status, JSON.stringify(own.body)).toBe(200);
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -482,7 +462,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
         }
       });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -593,7 +573,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
         error: { code: "E_NOSESSION", detail: { reason: "session_apikey_revoked" } }
       });
     } finally {
-      h.close();
+      await h.close();
     }
   });
 
@@ -619,8 +599,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(refused.status).toBe(503);
     expect(refused.body.error).toMatchObject({ code: "E_NOT_INSTALLED", detail: { reason: "not_installed" } });
 
-    catalogState.close();
-    gatewayState.close();
+    await closeQuiescent([catalogState, gatewayState]);
   });
 
   it("authenticates apikeys against the catalog identity cell and refuses namedly", async () => {
@@ -656,7 +635,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(viaHeader.status).toBe(401);
     expect(viaHeader.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "session_required" } });
 
-    h.close();
+    await h.close();
   });
 
   it("authorizes reads by presence and denies credential/foreign cells (B1)", async () => {
@@ -709,7 +688,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(noSession.status).toBe(401);
     expect(noSession.body.error).toMatchObject({ detail: { reason: "session_required" } });
 
-    h.close();
+    await h.close();
   });
 
   it("accepts bounded browser diagnostics on the net namespace without trusting payload identity", async () => {
@@ -735,7 +714,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       body: { metrics: [] }
     });
     expect(missingSession.status).toBe(401);
-    h.close();
+    await h.close();
   });
 
   it("mints a session, requires sessions on turns (CO14), and returns result/observations on the sessioned turn", async () => {
@@ -853,7 +832,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(roster.status).toBe(200);
     expect(Array.isArray(roster.body.members)).toBe(true);
 
-    h.close();
+    await h.close();
   });
 
   it("rejects a catalog-qualified target before target-scope pull or repair", async () => {
@@ -903,7 +882,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       detail: { field: "args[0]", reason: "invalid_object_id" }
     });
 
-    h.close();
+    await h.close();
   });
 
   it("v1 client-surface field names are pinned (Phase 5 contract freeze: add-only, never rename)", async () => {
@@ -941,7 +920,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(roster.status).toBe(200);
     for (const key of ["relation", "owner", "members"]) expect(Object.keys(roster.body), `relation.${key}`).toContain(key);
 
-    h.close();
+    await h.close();
   });
 
   it("rate-limits /net-api per authenticated actor: burst 100, named 429 E_RATE, refills (H4)", async () => {
@@ -975,7 +954,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     } finally {
       nowSpy.mockRestore();
     }
-    h.close();
+    await h.close();
   });
 
   it("gives session mint + ws-ticket a tighter shared bucket (H4 amplifier rule)", async () => {
@@ -1007,7 +986,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const read = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
     expect(read.status).toBe(401);
 
-    h.close();
+    await h.close();
   });
 });
 
@@ -1058,7 +1037,7 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
     expect(theirs.status).toBe(200);
     expect(theirs.body.partition).toBe("acct_other");
     expect(theirs.body.records).toEqual([]);
-    h.close();
+    await h.close();
   });
 
   it("a refused credential lands as a gateway edge record in the operator partition (AU1.2)", async () => {
@@ -1083,7 +1062,7 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
     };
     expect(res.records.length).toBeGreaterThan(0);
     expect(res.records[0]?.principal).toMatchObject({ attribution: "credentialed", credential: "no-such-key" });
-    h.close();
+    await h.close();
   });
 });
 
@@ -1162,6 +1141,6 @@ describe("AU10.3 join gate: one trace id across gateway span, scope span, and au
       expect(child.start_ms as number).toBeGreaterThanOrEqual(rootSpan.start_ms as number);
       expect(child.end_ms as number).toBeLessThanOrEqual(rootSpan.end_ms as number);
     }
-    h.close();
+    await h.close();
   });
 });

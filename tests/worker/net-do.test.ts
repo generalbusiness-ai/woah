@@ -9,36 +9,37 @@
 // over the SAME storage) with idempotent replay + head continuity; and
 // the scheduled-turn alarm re-arming from durable state alone (CO2.8).
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { cellKey, cellVersion } from "../../src/net/cells";
 import type { CommitReply, ScopeHead } from "../../src/net/scope";
 import { CATALOG_SCOPE } from "../../src/net/topology";
+import { closeQuiescent, quiescentNetState } from "./quiescent-do";
 
 const SECRET = "net-do-test-secret";
 const EPOCH = "cat-net-1";
 
 /** Fake DO state + the alarm slice the net DOs need (the base fake has
- * no alarm API); records armings so tests can assert re-arm behavior. */
-function netState(name: string): { state: NetScopeDurableState & NetGatewayDurableState; alarms: Array<number | null>; close: () => void } {
-  const fake = new FakeDurableObjectState(name);
+ * no alarm API); records armings so tests can assert re-arm behavior.
+ *
+ * This builds on the shared quiescent fixture rather than hand-rolling one.
+ * The earlier version supplied NO `waitUntil` at all, which is not a way of
+ * opting out of deferred work: `WorkerdHost.defer` runs the task first and
+ * only then calls `state.waitUntil?.(promise)`, so the optional-call simply
+ * discarded the handle and the work landed on storage this suite had closed.
+ */
+function netState(name: string): { state: NetScopeDurableState & NetGatewayDurableState; alarms: Array<number | null>; close: () => Promise<void> } {
   const alarms: Array<number | null> = [];
-  const state = {
-    id: fake.id,
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (at: number) => {
-        alarms.push(at);
-      },
-      deleteAlarm: () => {
-        alarms.push(null);
-      }
+  const host = quiescentNetState(name, {
+    setAlarm: (at: number) => {
+      alarms.push(at);
+    },
+    deleteAlarm: () => {
+      alarms.push(null);
     }
-  };
-  return { state, alarms, close: () => fake.close() };
+  });
+  return { state: host.state, alarms, close: async () => closeQuiescent([host]) };
 }
 
 function durableRows(state: NetScopeDurableState & NetGatewayDurableState, query: string, ...bindings: unknown[]): unknown[] {
@@ -88,7 +89,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     const scope = makeScope("room-a", env);
     const response = await scope.instance.fetch(new Request("https://do/net/head"));
     expect(response.status).toBe(401);
-    scope.close();
+    await scope.close();
   });
 
   it("seeds, serves head and lineage-closed closures, and isolates instances", async () => {
@@ -109,8 +110,8 @@ describe("NetScopeDO over fake-DO storage", () => {
 
     // Isolation: room-b has no state and no request-supplied identity.
     await expect(call(b.instance, env, "/head")).rejects.toThrow(/E_MISSING_STATE|no durable state/);
-    a.close();
-    b.close();
+    await a.close();
+    await b.close();
   });
 
   it("keeps concurrent read-only direct submits at one stable authority head", async () => {
@@ -156,7 +157,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     expect(replies.every((reply) => reply.status === "accepted")).toBe(true);
     expect(new Set(replies.map((reply) => reply.head.seq))).toEqual(new Set([0]));
     expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(0);
-    scope.close();
+    await scope.close();
   });
 
   it("crosses an alarm event before a direct submit calls subscriber gateways", async () => {
@@ -227,7 +228,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     await scope.instance.alarm();
     expect(deliveries).toEqual([{ destination: "gateway:peer", path: "/net/live" }]);
     expect((await call<{ head: ScopeHead }>(scope.instance, envWithGateways, "/head")).head).toEqual(head);
-    scope.close();
+    await scope.close();
   });
 
   it("cold restart over the same storage: head continuity + idempotent replay (CO2.5)", async () => {
@@ -286,7 +287,7 @@ describe("NetScopeDO over fake-DO storage", () => {
       known: ["object_lineage:#thing"]
     });
     expect(closure.cells[0]?.value).toEqual({ value: "new" });
-    first.close();
+    await first.close();
   });
 
   it("discards the in-memory sequencer when the durable transaction aborts (fix 3: memory follows durable)", async () => {
@@ -371,7 +372,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     expect(replayAgain).toEqual({ ...replay, replayed: true, replay_output: { actor: "#actor" } });
     const finalHead = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
     expect(finalHead.seq).toBe(1);
-    scope.close();
+    await scope.close();
   });
 
   it("routes foreign-anchored reads to attestation but still validates owned reads locally (owns wiring + CO2.3)", async () => {
@@ -465,7 +466,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     });
     expect(rejected.status).toBe("rejected");
     expect(rejected.status === "rejected" && rejected.reason).toBe("read_version_mismatch");
-    scope.close();
+    await scope.close();
   });
 
   it("a create that rides to another anchor leaves residue, not ownership (owns excludes the rider ledger)", async () => {
@@ -479,9 +480,25 @@ describe("NetScopeDO over fake-DO storage", () => {
     // E_NONCONVERGENT_READ. (That is the builder case: an object anchored to
     // its author's cluster, created from a room turn, invoked from a later
     // room turn.) The correct verdict is "foreign" — attest or refuse.
-    const scope = makeScope("room-a", env);
-    await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
-    const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    // The anchor is REACHABLE. The create rides `#ridden`'s cells to it via a
+    // durable `/adopt` outbox row; with no resolver that delivery throws
+    // `cannot resolve rpc destination` inside a deferred task, so the rider
+    // adopt leg was never actually delivered anywhere in this file and the
+    // failure was invisible. Resolving it does not weaken the scenario: the
+    // point is still that room-a keeps only a lineage COPY.
+    let elsewhere!: ReturnType<typeof makeScope>;
+    const riderEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination: string) => {
+        if (destination === "scope:cluster-elsewhere") return elsewhere.instance;
+        throw new Error(`unresolvable destination ${destination}`);
+      }
+    };
+    elsewhere = makeScope("cluster-elsewhere", riderEnv);
+    await call(elsewhere.instance, riderEnv, "/seed", { scope: "cluster-elsewhere", catalog_epoch: EPOCH, cells: [] });
+    const scope = makeScope("room-a", riderEnv);
+    await call(scope.instance, riderEnv, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, riderEnv, "/head")).head;
 
     const { applyTranscript } = await import("../../src/net/transcript");
     const { ScopeSequencer } = await import("../../src/net/scope");
@@ -521,7 +538,7 @@ describe("NetScopeDO over fake-DO storage", () => {
       incompleteReasons: [],
       hash: "net-do-residue-create"
     };
-    const created = await call<CommitReply>(scope.instance, env, "/submit", {
+    const created = await call<CommitReply>(scope.instance, riderEnv, "/submit", {
       submit: {
         kind: "woo.net.commit_submit.v1",
         scope: "room-a",
@@ -538,7 +555,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     });
     expect(created.status, JSON.stringify(created)).toBe("accepted");
     // The lineage copy IS here — the ownership question is what that means.
-    const residue = await call<{ cells: Array<{ key: string }> }>(scope.instance, env, "/closure", {
+    const residue = await call<{ cells: Array<{ key: string }> }>(scope.instance, riderEnv, "/closure", {
       keys: ["object_lineage:#ridden"],
       known: []
     });
@@ -546,7 +563,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 
     // Turn 2: read a cell of #ridden this scope does NOT hold. Foreign
     // classification means "attest it"; ownership would mean "absent, mismatch".
-    const head1 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    const head1 = (await call<{ head: ScopeHead }>(scope.instance, riderEnv, "/head")).head;
     const readRidden = {
       ...createTranscript,
       creates: [],
@@ -555,7 +572,7 @@ describe("NetScopeDO over fake-DO storage", () => {
       reads: [{ cell: { kind: "verb", object: "#ridden", name: "hi" }, version: "owner-verb-version", value: null }],
       writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "residue-check", op: "set", writer: WRITER }]
     };
-    const unattested = await call<CommitReply>(scope.instance, env, "/submit", {
+    const unattested = await call<CommitReply>(scope.instance, riderEnv, "/submit", {
       kind: "woo.net.commit_submit.v1",
       scope: "room-a",
       base: head1,
@@ -571,7 +588,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     expect(unattested.status === "rejected" && unattested.reason).toBe("rider_unattested");
 
     // With the owner's attestation the same turn commits.
-    const accepted = await call<CommitReply>(scope.instance, env, "/submit", {
+    const accepted = await call<CommitReply>(scope.instance, riderEnv, "/submit", {
       kind: "woo.net.commit_submit.v1",
       scope: "room-a",
       base: head1,
@@ -587,7 +604,8 @@ describe("NetScopeDO over fake-DO storage", () => {
       }
     });
     expect(accepted.status, JSON.stringify(accepted)).toBe("accepted");
-    scope.close();
+    await scope.close();
+    await elsewhere.close();
   });
 
   it("catalog authority rejects a same-epoch definition write even when the gateway guard is bypassed", async () => {
@@ -654,7 +672,7 @@ describe("NetScopeDO over fake-DO storage", () => {
       known: []
     });
     expect(roomResidue.cells).toEqual([]);
-    room.close();
+    await room.close();
 
     const scope = makeScope(CATALOG_SCOPE, env);
     const definitionCells = [
@@ -783,7 +801,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     });
     expect(replay).toEqual(expect.objectContaining({ applied: false }));
     expect(replay.rejected).toBeUndefined();
-    scope.close();
+    await scope.close();
   });
 
   it("scheduled turns arm the alarm durably and re-arm after restart (CO2.8)", async () => {
@@ -801,7 +819,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     await second.alarm();
     const rearmed = first.alarms[first.alarms.length - 1];
     expect(rearmed).not.toBeNull(); // parked turn still pending → re-armed
-    first.close();
+    await first.close();
   });
 });
 
@@ -955,8 +973,8 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
-    catalog.close();
-    gatewayState.close();
+    await catalog.close();
+    await gatewayState.close();
   });
 
   it("pulls a view, plans and submits a real turn, installs accepted cells; fanout no-ops replays", async () => {
@@ -1049,7 +1067,7 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     const gateway2 = new NetGatewayDO(gatewayState.state, gatewayEnv);
     expect((await call<{ applied: boolean }>(gateway2, gatewayEnv, "/fanout", body)).applied).toBe(false);
     expect((await call<{ applied: boolean }>(gateway2, gatewayEnv, "/fanout", removal)).applied).toBe(false);
-    scope.close();
+    await scope.close();
   });
 
   it("session-open mints at the cluster scope and installs the cell in the view (CO14)", async () => {
@@ -1226,7 +1244,7 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
       expect(expiredReply.reason).toBe("unauthorized");
       expect(expiredReply.detail).toMatchObject({ session: "s-open-dead", session_verdict: "expired" });
     }
-    cluster.close();
+    await cluster.close();
   });
 
   it("a pull advances the fanout high-water to the closure head, so stale pre-pull fanout rows no-op (fix 7)", async () => {
@@ -1317,6 +1335,6 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(
       (await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", { ...staleFanout, seq: 2 })).applied
     ).toBe(true);
-    scope.close();
+    await scope.close();
   });
 });
