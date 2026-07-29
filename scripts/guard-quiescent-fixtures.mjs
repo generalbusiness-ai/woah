@@ -23,20 +23,54 @@ const root = process.cwd();
 const workerTests = join(root, "tests", "worker");
 const SHARED = "quiescent-do";
 
-/** Deferring `waitUntil` hand-off: the promise is STORED rather than awaited or
- * discarded. `[^}]*` keeps the match inside the arrow body, so the common safe
- * form `waitUntil: () => {}` — which drops deferred work entirely and has
- * nothing to drain — does not trip on an unrelated `.push(` further down. */
-const DEFERS_WORK = /waitUntil\s*:\s*\([^)]*\)\s*=>\s*\{[^}]*\.push\(/;
+/** A hand-rolled DO state that supplies its own `waitUntil` at all.
+ *
+ * The earlier detector looked for the promise being STORED (`.push(` inside
+ * the arrow body) on the theory that `waitUntil: () => {}` "drops deferred
+ * work entirely and has nothing to drain". That theory is wrong, and it let
+ * two real offenders (net-install, net-install-doorway) off the register while
+ * they emitted eight `net_scope_outbox_delivery_failed` between them.
+ *
+ * `WorkerdHost.defer` calls `task()` FIRST and only then hands the resulting
+ * promise to `waitUntil`. The work is already running by the time the fixture
+ * sees it. An empty `waitUntil` therefore does not cancel anything — it throws
+ * away the only handle anyone had on live work, which is strictly worse than
+ * storing it: the suite cannot drain what it cannot reference, so the work
+ * lands on storage the suite has since closed.
+ *
+ * So the rule is simply: if a worker test defines `waitUntil`, it owns
+ * deferred DO work and must use the shared quiescent fixture. There is no
+ * safe hand-rolled form, which is the point.
+ *
+ * OMITTING `waitUntil` is not an escape either, and that hole was real too:
+ * net-do.test.ts built its DO state without one, so `state.waitUntil?.(p)` was
+ * a no-op that discarded the handle just as thoroughly — and the file matched
+ * no `waitUntil` token, so no register entry could even have been written for
+ * it. The trigger is therefore CONSTRUCTING the fake DO state at all. Anything
+ * that owns a `FakeDurableObjectState` and drives a net DO owns its deferred
+ * work; the shared fixture re-exports the raw fake as `host.fake` for the
+ * handful of suites that need DO-state surface it does not model. */
+const DEFERS_WORK = /waitUntil\s*:|new\s+FakeDurableObjectState\s*\(/;
 /** Uses the shared fixture (under any local alias). */
 const USES_SHARED = new RegExp(`from\\s+["'][./]*${SHARED}["']`);
 
 // Not yet converted. Each still hand-rolls the fixture and may be hiding
 // deferred failures. Remove entries as they are converted; do not add any.
 const UNCONVERTED = new Set([
+  "net-audit.test.ts",
   "net-client-api.test.ts",
   "net-demote-lifecycle.test.ts",
+  "net-do.test.ts",
   "net-gateway-repair.test.ts",
+  "net-identity-door.test.ts",
+  "net-install-doorway.test.ts",
+  "net-install.test.ts",
+  "net-load-asymptote.test.ts",
+  "net-only-entry.test.ts",
+  "net-ordered-children.test.ts",
+  "net-outliner-converge.test.ts",
+  "net-turn-structure.test.ts",
+  "net-wire-contract.test.ts",
   "net-help-migration-aged.test.ts",
   "net-help-topics-aged.test.ts",
   "net-kv-seed.test.ts",

@@ -21,9 +21,18 @@ import type { NetScopeDurableState } from "../../src/worker/net/scope-do";
 
 export type QuiescentHost = {
   state: NetScopeDurableState & NetGatewayDurableState;
+  /** The underlying fake, for suites that need DO-state surface this
+   * fixture does not model (WebSocket hibernation) or that read the
+   * storage directly. Do NOT call `fake.close()` — use `close()`, which
+   * drains first. */
+  readonly fake: FakeDurableObjectState;
   /** Deferred work that threw. Raised by `closeQuiescent`. */
   readonly failures: unknown[];
-  /** Drain deferred work to quiescence without closing. */
+  /** Deferred promises not yet awaited. `settleAll` loops on this so a
+   * cross-DO chain (scope drain enqueues a gateway fanout, which enqueues
+   * a scope reply) is drained to GLOBAL quiescence, not per-host. */
+  pending: () => number;
+  /** Drain this host's deferred work to quiescence without closing. */
   settle: () => Promise<void>;
   /** Drain, then close the underlying storage. */
   close: () => Promise<void>;
@@ -76,13 +85,31 @@ export function quiescentNetState(name: string, options: QuiescentOptions = {}):
   };
   return {
     state,
+    fake,
     failures,
+    pending: () => deferred.length,
     settle: drain,
     close: async () => {
       await drain();
       fake.close();
     }
   };
+}
+
+/**
+ * Drain a WHOLE fixture to quiescence without closing anything.
+ *
+ * Per-host draining is not enough once DOs talk to each other: host A's
+ * drain enqueues a fanout on host B, and if B was drained first its queue
+ * refills after it was declared quiet. So sweep every host repeatedly
+ * until no host has anything pending.
+ */
+export async function settleAll(hosts: readonly QuiescentHost[]): Promise<void> {
+  for (let pass = 0; pass < MAX_DRAIN_PASSES; pass += 1) {
+    for (const host of hosts) await host.settle();
+    if (hosts.every((host) => host.pending() === 0)) return;
+  }
+  throw new Error(`deferred work across ${hosts.length} host(s) never reached quiescence`);
 }
 
 /**
@@ -95,6 +122,10 @@ export function quiescentNetState(name: string, options: QuiescentOptions = {}):
  * them silently.
  */
 export async function closeQuiescent(hosts: readonly QuiescentHost[]): Promise<void> {
+  // Drain the WHOLE fixture before closing ANY of it. Closing host-by-host
+  // reintroduces the very bug this fixture exists to kill: host[1]'s drain
+  // can call back into host[0], whose storage is by then already shut.
+  await settleAll(hosts);
   for (const host of hosts) await host.close();
   const failures = hosts.flatMap((host) => [...host.failures]);
   if (failures.length === 0) return;
