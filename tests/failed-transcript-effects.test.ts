@@ -31,7 +31,11 @@ import { CellStore } from "../src/net/cells";
 import { planTurn } from "../src/net/plan";
 import type { ScopeClassifier } from "../src/net/route";
 import { ScopeSequencer, type CommitSubmit } from "../src/net/scope";
-import { applyTranscript, type EffectTranscript as NetEffectTranscript } from "../src/net/transcript";
+import {
+  NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+  applyTranscript,
+  type EffectTranscript as NetEffectTranscript
+} from "../src/net/transcript";
 
 const ERROR = { code: "E_TEST", message: "test failure", value: null, trace: [] };
 const ERROR_OBSERVATION = {
@@ -72,6 +76,64 @@ describe("failed transcript effect classifier", () => {
       complete: "integrity",
       incompleteReasons: "integrity",
       hash: "integrity"
+    });
+  });
+
+  it("classifies every Net intersection field instead of bypassing the core vocabulary", () => {
+    expect(NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION).toEqual({
+      ...FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+      exclusiveMint: "envelope",
+      sessionClose: "envelope",
+      orderingReads: "proof",
+      replayReads: "proof",
+      principal: "envelope",
+      trace: "envelope"
+    });
+  });
+
+  it("fails closed when a runtime or classified effect field lacks executable semantics", () => {
+    const unknownRuntimeField = {
+      ...failedTranscript({
+        failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+      }),
+      futureEffect: [{ secret: "must not leak" }],
+      // A transcript map is data, not a JavaScript namespace. This own field
+      // must not be mistaken for Object.prototype.toString.
+      toString: [{ secret: "also must not leak" }]
+    } as unknown as EffectTranscript;
+    const runtimeDrift = classifyFailedTranscriptEffects(unknownRuntimeField, {
+      ownsSequencingSpace: false
+    });
+    expect(runtimeDrift).toMatchObject({
+      policy: "enforce",
+      valid: false,
+      counts: { unclassified_fields: 2 },
+      reasons: ["unclassified_fields"]
+    });
+    expect(JSON.stringify(runtimeDrift)).not.toContain("futureEffect");
+    expect(JSON.stringify(runtimeDrift)).not.toContain("must not leak");
+    expect(JSON.stringify(runtimeDrift)).not.toContain("also must not leak");
+
+    // A future author cannot silence the runtime guard by merely labelling a
+    // new field "effect": it still needs executable counting/admission
+    // semantics. Core fields additionally have a compile-time exact inspector
+    // registry derived from FAILED_TRANSCRIPT_FIELD_CLASSIFICATION.
+    const classifiedButUnimplemented = classifyFailedTranscriptEffects(
+      unknownRuntimeField,
+      {
+        ownsSequencingSpace: false,
+        fieldClassification: {
+          ...FAILED_TRANSCRIPT_FIELD_CLASSIFICATION,
+          futureEffect: "effect" as const,
+          toString: "envelope" as const
+        }
+      }
+    );
+    expect(classifiedButUnimplemented).toMatchObject({
+      policy: "enforce",
+      valid: false,
+      counts: { unclassified_fields: 1 },
+      reasons: ["unclassified_fields"]
     });
   });
 
@@ -551,6 +613,23 @@ describe("failed transcript authority rollout", () => {
       { policy: "observe", valid: false },
       { policy: "enforce", valid: false }
     ]);
+  });
+
+  it("Net scope admits its classified intersection metadata on a clean failed turn", () => {
+    const sequencer = new ScopeSequencer("hall", "epoch-1");
+    const transcript = {
+      ...failedTranscript({
+        route: "direct",
+        scope: "hall",
+        failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION
+      }),
+      sessionClose: true,
+      orderingReads: [],
+      replayReads: []
+    } as NetEffectTranscript;
+
+    expect(sequencer.submit(netSubmit(sequencer, transcript, "net-intersections")))
+      .toMatchObject({ status: "accepted" });
   });
 
   it("Net scope accepts the marked owner allocation envelope and rejects it at a non-owner", () => {

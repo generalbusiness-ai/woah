@@ -25,7 +25,8 @@ export type FailedTranscriptEffectCategory =
   | "domain_observations"
   | "canonical_error_observations"
   | "untracked_effects"
-  | "results";
+  | "results"
+  | "unclassified_fields";
 
 export type FailedTranscriptEffectReason =
   | "behavior_writes"
@@ -44,7 +45,8 @@ export type FailedTranscriptEffectReason =
   | "allocation_shape"
   | "allocation_read"
   | "error_observation_count"
-  | "error_observation_shape";
+  | "error_observation_shape"
+  | "unclassified_fields";
 
 export type FailedTranscriptEffectsPolicy = "not_failed" | "observe" | "enforce";
 
@@ -66,6 +68,12 @@ export type FailedTranscriptEffectsReport = {
 export type FailedTranscriptEffectsOptions = {
   /** Whether this authority owns the semantic sequencing space. */
   ownsSequencingSpace: boolean;
+  /**
+   * The complete authority-visible transcript vocabulary. Net widens the
+   * core transcript at its bridge and supplies its own exhaustive map; the
+   * shadow authority uses the core map by default.
+   */
+  fieldClassification?: Readonly<Record<string, FailedTranscriptFieldClass>>;
 };
 
 /**
@@ -81,6 +89,10 @@ export type FailedTranscriptFieldClass =
   | "effect"
   | "outcome"
   | "integrity";
+
+export type FailedTranscriptFieldClassification<T extends object> = {
+  readonly [K in keyof T]-?: FailedTranscriptFieldClass;
+};
 
 export const FAILED_TRANSCRIPT_FIELD_CLASSIFICATION = {
   kind: "envelope",
@@ -110,7 +122,7 @@ export const FAILED_TRANSCRIPT_FIELD_CLASSIFICATION = {
   complete: "integrity",
   incompleteReasons: "integrity",
   hash: "integrity"
-} as const satisfies Record<keyof EffectTranscript, FailedTranscriptFieldClass>;
+} as const satisfies FailedTranscriptFieldClassification<EffectTranscript>;
 
 /**
  * Structural input shared by the core transcript and the net bridge's widened
@@ -147,7 +159,8 @@ const CATEGORY_ORDER: readonly FailedTranscriptEffectCategory[] = [
   "domain_observations",
   "canonical_error_observations",
   "untracked_effects",
-  "results"
+  "results",
+  "unclassified_fields"
 ];
 
 const REASON_ORDER: readonly FailedTranscriptEffectReason[] = [
@@ -167,8 +180,102 @@ const REASON_ORDER: readonly FailedTranscriptEffectReason[] = [
   "allocation_shape",
   "allocation_read",
   "error_observation_count",
-  "error_observation_shape"
+  "error_observation_shape",
+  "unclassified_fields"
 ];
+
+type FieldsOfClass<
+  Classification extends Record<string, FailedTranscriptFieldClass>,
+  Class extends FailedTranscriptFieldClass
+> = {
+  [Field in keyof Classification]: Classification[Field] extends Class ? Field : never
+}[keyof Classification] & string;
+
+type FailedTranscriptInspection = {
+  transcript: FailedTranscriptEffectsInput;
+  options: FailedTranscriptEffectsOptions;
+  counts: Record<FailedTranscriptEffectCategory, number>;
+  reasons: Set<FailedTranscriptEffectReason>;
+};
+
+type FailedTranscriptFieldInspector = (inspection: FailedTranscriptInspection) => void;
+
+/**
+ * This registry is derived from the exhaustive classification above. A new
+ * core field classified as an effect cannot compile until it has executable
+ * admission semantics; runtime iteration below cannot silently forget it.
+ */
+const CORE_EFFECT_FIELD_INSPECTORS = {
+  writes: (inspection) => {
+    const { transcript, options, counts, reasons } = inspection;
+    const allocationWrites = transcript.writes.filter((write) =>
+      isSequencedAllocationCell(transcript, write.cell)
+    );
+    const behaviorWrites = transcript.writes.length - allocationWrites.length;
+    counts.allocation_writes = allocationWrites.length;
+    counts.behavior_writes = behaviorWrites;
+    if (behaviorWrites > 0) reasons.add("behavior_writes");
+    classifyAllocation(transcript, allocationWrites, options, reasons);
+  },
+  creates: ({ transcript, counts, reasons }) => {
+    counts.creates = transcript.creates.length;
+    if (counts.creates > 0) reasons.add("creates");
+  },
+  moves: ({ transcript, counts, reasons }) => {
+    counts.moves = transcript.moves.length;
+    if (counts.moves > 0) reasons.add("moves");
+  },
+  recycles: ({ transcript, counts, reasons }) => {
+    counts.recycles = transcript.recycles?.length ?? 0;
+    if (counts.recycles > 0) reasons.add("recycles");
+  },
+  schedules: ({ transcript, counts, reasons }) => {
+    counts.schedules = transcript.schedules?.length ?? 0;
+    if (counts.schedules > 0) reasons.add("schedules");
+  },
+  cancellations: ({ transcript, counts, reasons }) => {
+    counts.cancellations = transcript.cancellations?.length ?? 0;
+    if (counts.cancellations > 0) reasons.add("cancellations");
+  },
+  sessionScopeTransition: ({ transcript, counts, reasons }) => {
+    counts.session_scope_transitions = transcript.sessionScopeTransition === undefined ? 0 : 1;
+    if (counts.session_scope_transitions > 0) reasons.add("session_scope_transition");
+  },
+  projectionWrites: ({ transcript, counts, reasons }) => {
+    counts.projection_writes = transcript.projectionWrites?.length ?? 0;
+    if (counts.projection_writes > 0) reasons.add("projection_writes");
+  },
+  untrackedEffects: ({ transcript, counts, reasons }) => {
+    counts.untracked_effects = transcript.untrackedEffects.length;
+    if (counts.untracked_effects > 0) reasons.add("untracked_effects");
+  }
+} satisfies Record<
+  FieldsOfClass<typeof FAILED_TRANSCRIPT_FIELD_CLASSIFICATION, "effect">,
+  FailedTranscriptFieldInspector
+>;
+
+/**
+ * Outcome fields are equally derived: `error` is the failed-turn premise,
+ * while observations and results have executable admission rules. This makes
+ * changing an outcome's classification a compile-time decision as well.
+ */
+const CORE_OUTCOME_FIELD_INSPECTORS = {
+  observations: ({ transcript, counts, reasons }) => {
+    if (transcript.error === undefined) return;
+    classifyObservations(transcript.error, transcript.route, transcript.observations, counts, reasons);
+  },
+  result: ({ transcript, counts, reasons }) => {
+    counts.results = transcript.result === undefined ? 0 : 1;
+    if (counts.results > 0) reasons.add("result_present");
+  },
+  error: () => {
+    // The early branch in classifyFailedTranscriptEffects establishes this
+    // as a failed turn; the error value itself is the canonical outcome input.
+  }
+} satisfies Record<
+  FieldsOfClass<typeof FAILED_TRANSCRIPT_FIELD_CLASSIFICATION, "outcome">,
+  FailedTranscriptFieldInspector
+>;
 
 /**
  * Classify the authority-visible effects of a failed transcript.
@@ -196,35 +303,35 @@ export function classifyFailedTranscriptEffects(
   }
 
   const reasons = new Set<FailedTranscriptEffectReason>();
-  const allocationWrites = transcript.writes.filter((write) =>
-    isSequencedAllocationCell(transcript, write.cell)
-  );
-  const behaviorWrites = transcript.writes.length - allocationWrites.length;
-  counts.allocation_writes = allocationWrites.length;
-  counts.behavior_writes = behaviorWrites;
-  counts.creates = transcript.creates.length;
-  counts.moves = transcript.moves.length;
-  counts.recycles = transcript.recycles?.length ?? 0;
-  counts.session_scope_transitions = transcript.sessionScopeTransition === undefined ? 0 : 1;
-  counts.projection_writes = transcript.projectionWrites?.length ?? 0;
-  counts.schedules = transcript.schedules?.length ?? 0;
-  counts.cancellations = transcript.cancellations?.length ?? 0;
-  counts.untracked_effects = transcript.untrackedEffects.length;
-  counts.results = transcript.result === undefined ? 0 : 1;
-
-  if (behaviorWrites > 0) reasons.add("behavior_writes");
-  if (counts.creates > 0) reasons.add("creates");
-  if (counts.moves > 0) reasons.add("moves");
-  if (counts.recycles > 0) reasons.add("recycles");
-  if (counts.session_scope_transitions > 0) reasons.add("session_scope_transition");
-  if (counts.projection_writes > 0) reasons.add("projection_writes");
-  if (counts.schedules > 0) reasons.add("schedules");
-  if (counts.cancellations > 0) reasons.add("cancellations");
-  if (counts.untracked_effects > 0) reasons.add("untracked_effects");
-  if (counts.results > 0) reasons.add("result_present");
-
-  classifyAllocation(transcript, allocationWrites, options, reasons);
-  classifyObservations(transcript.error, transcript.route, transcript.observations, counts, reasons);
+  const fieldClassification =
+    options.fieldClassification ?? FAILED_TRANSCRIPT_FIELD_CLASSIFICATION;
+  const unclassifiedFields = new Set<string>();
+  for (const field of Object.keys(transcript)) {
+    // Transcript keys are data, never host-language namespace members (V6).
+    // `in` would falsely classify inherited names such as `toString`.
+    if (!Object.prototype.hasOwnProperty.call(fieldClassification, field)) {
+      unclassifiedFields.add(field);
+    }
+  }
+  const inspection: FailedTranscriptInspection = { transcript, options, counts, reasons };
+  for (const [field, fieldClass] of Object.entries(fieldClassification)) {
+    if (!Object.prototype.hasOwnProperty.call(transcript, field)) continue;
+    if (fieldClass === "effect") {
+      const inspector = (
+        CORE_EFFECT_FIELD_INSPECTORS as Readonly<Record<string, FailedTranscriptFieldInspector>>
+      )[field];
+      if (inspector) inspector(inspection);
+      else unclassifiedFields.add(field);
+    } else if (fieldClass === "outcome") {
+      const inspector = (
+        CORE_OUTCOME_FIELD_INSPECTORS as Readonly<Record<string, FailedTranscriptFieldInspector>>
+      )[field];
+      if (inspector) inspector(inspection);
+      else unclassifiedFields.add(field);
+    }
+  }
+  counts.unclassified_fields = unclassifiedFields.size;
+  if (unclassifiedFields.size > 0) reasons.add("unclassified_fields");
 
   const orderedReasons = REASON_ORDER.filter((reason) => reasons.has(reason));
   return {
