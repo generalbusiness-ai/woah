@@ -8,6 +8,10 @@ import { installCatalogManifest, type CatalogManifest } from "../src/core/catalo
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { runShadowTurnCallTranscript } from "../src/core/shadow-turn-call";
+import {
+  createShadowExecutionNode,
+  executeShadowTurnCallOrNeedState
+} from "../src/core/shadow-turn-exec";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import type { ExecutorContext, NativeHandler, WooWorld } from "../src/core/world";
 import type { SerializedWorld, WorldRepository } from "../src/core/repository";
@@ -1385,6 +1389,90 @@ describe("native exception rollback", () => {
     expect(() => world.setProp("poison_subject", "first", 3)).toThrow(
       expect.objectContaining({ code: "E_WORLD_POISONED" })
     );
+  });
+
+  it("makes a shadow host discard a poisoned cached world after the original error frame", async () => {
+    const world = createWorld();
+    world.createObject({ id: "host_poison_subject", parent: "$thing", owner: "$wiz" });
+    world.defineProperty("host_poison_subject", {
+      name: "value",
+      defaultValue: 0,
+      owner: "$wiz",
+      perms: "rw",
+      typeHint: "int"
+    });
+    const internals = world as unknown as {
+      behaviorUndoScopes: Array<{ undos: Array<() => void> }>;
+    };
+    world.createObject({ id: "host_poison_controller", parent: "$thing", owner: "$wiz" });
+    world.addVerb("host_poison_controller", {
+      ...nativeVerb("fail_restore", "set_quota"),
+      perms: "rxd",
+      direct_callable: true,
+      skip_presence_check: true
+    });
+    // Reuse a transcript-tracked built-in slot so the authority accepts the
+    // clean failed transcript; otherwise the ordinary incomplete-native
+    // rejection would discard the cache independently of the poison signal.
+    world.registerNativeHandler("set_quota", () => {
+      world.setProp("host_poison_subject", "value", 1);
+      internals.behaviorUndoScopes.at(-1)?.undos.push(() => {
+        throw wooError("E_TEST_HOST_UNDO", "injected host inverse failure");
+      });
+      throw wooError("E_TEST_HOST_ORIGINAL", "preserve host behavior error");
+    });
+    const serialized = world.exportWorld();
+    const node = createShadowExecutionNode({
+      node: "host-poison-executor",
+      scope: "$wiz",
+      serialized,
+      authoritative_state: true
+    });
+    // The host cache already contains its warm execution world. The test-only
+    // native handler is intentionally not serializable; losing this exact
+    // reference is what proves the host performed the discard.
+    node.world = world;
+    const call = {
+      kind: "woo.turn_call.shadow.v1" as const,
+      id: "host-poison-call",
+      route: "direct" as const,
+      scope: "$wiz",
+      actor: "$wiz",
+      target: "host_poison_controller",
+      verb: "fail_restore",
+      args: []
+    };
+    const result = await executeShadowTurnCallOrNeedState(node, {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: call.id,
+      call,
+      key: {
+        kind: "woo.turn_key.shadow.v1",
+        scope: "$wiz",
+        epoch: "shadow",
+        actor: "$wiz",
+        target: call.target,
+        verb: call.verb,
+        effects: 0,
+        preimages: [],
+        atom_hashes: [],
+        read_preimages: [],
+        read_atom_hashes: [],
+        write_preimages: [],
+        write_atom_hashes: [],
+        accept_preimages: [],
+        accept_atom_hashes: []
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.frame).toMatchObject({
+      op: "error",
+      error: { code: "E_TEST_HOST_ORIGINAL" }
+    });
+    expect(world.behaviorRollbackRequiresReload()).toBe(true);
+    expect(node.world).toBeUndefined();
+    expect(node.serialized).toEqual(serialized);
   });
 
   it("refuses to discard staged durable acceptance under persistence deferral", () => {
