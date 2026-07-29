@@ -7,36 +7,26 @@
 // (tests/worker/net-install.test.ts covers those).
 import { describe, expect, it } from "vitest";
 import worker, { type NetOnlyEnv } from "../../src/worker/net-only-index";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-install-doorway-secret";
 const EPOCH = "cat-doorway-1";
 
 function buildHarness() {
-  const states: FakeDurableObjectState[] = [];
-  const scopeStates = new Map<string, FakeDurableObjectState>();
+  const states: QuiescentHost[] = [];
+  const scopeStates = new Map<string, QuiescentHost>();
   const scopeDOs = new Map<string, NetScopeDO>();
   const resolve = (destination: string) => {
     if (!destination.startsWith("scope:")) throw new Error(`unexpected destination ${destination}`);
     const name = destination.slice("scope:".length);
     let instance = scopeDOs.get(name);
     if (!instance) {
-      const fake = new FakeDurableObjectState(`scope-${name}`);
-      states.push(fake);
-      scopeStates.set(name, fake);
-      const state: NetScopeDurableState = {
-        id: fake.id,
-        waitUntil: () => {},
-        storage: {
-          sql: fake.storage.sql,
-          transactionSync: fake.storage.transactionSync,
-          setAlarm: () => {},
-          deleteAlarm: () => {}
-        }
-      };
-      instance = new NetScopeDO(state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetScopeEnv);
+      const host = quiescentNetState(`scope-${name}`);
+      states.push(host);
+      scopeStates.set(name, host);
+      instance = new NetScopeDO(host.state as NetScopeDurableState, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetScopeEnv);
       scopeDOs.set(name, instance);
     }
     return instance;
@@ -51,7 +41,7 @@ function buildHarness() {
     signedRequest: async (path: string, init?: RequestInit) =>
       worker.fetch(await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request(`https://woo.test${path}`, init)), env),
     scopeStates,
-    close: () => states.forEach((state) => state.close())
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -71,11 +61,11 @@ describe("the /net-install doorway (route level)", () => {
 
     const catalog = h.scopeStates.get("catalog");
     expect(catalog, "probe must route specifically to the catalog scope").toBeDefined();
-    const meta = catalog!.storage.sql.exec("SELECT body FROM net_scope_meta WHERE id = 'meta'").toArray();
-    const cells = catalog!.storage.sql.exec("SELECT key FROM net_scope_cell").toArray();
+    const meta = catalog!.state.storage.sql.exec("SELECT body FROM net_scope_meta WHERE id = 'meta'").toArray();
+    const cells = catalog!.state.storage.sql.exec("SELECT key FROM net_scope_cell").toArray();
     expect(meta).toEqual([]);
     expect(cells).toEqual([]);
-    h.close();
+    await h.close();
   });
 
   it("gates on the internal signature: unsigned, tampered, and header-injection callers are refused", async () => {
@@ -103,7 +93,7 @@ describe("the /net-install doorway (route level)", () => {
     for (const response of [unsigned, forged, wrongSecret]) {
       expect(await response.clone().text()).not.toContain(SECRET);
     }
-    h.close();
+    await h.close();
   });
 
   it("replay boundary: a stale-timestamped signature is refused; an in-window replay is idempotent by construction", async () => {
@@ -136,7 +126,7 @@ describe("the /net-install doorway (route level)", () => {
     expect(replayed.status).toBe(200);
     const head = await h.signedRequest("/net-install/scope/room%3Areplay/head");
     expect(((await head.json()) as { catalog_epoch?: string }).catalog_epoch).toBe(EPOCH);
-    h.close();
+    await h.close();
   });
 
   it("allow-lists probe (GET), scope install verbs, and no wider scope RPC surface", async () => {
@@ -152,7 +142,7 @@ describe("the /net-install doorway (route level)", () => {
     expect((await h.signedRequest("/net-install/gateway/g1/seed", seedBody("room:x"))).status).toBe(404);
     expect((await h.signedRequest("/net-install/scope//seed", seedBody("room:x"))).status).toBe(404);
     expect((await h.signedRequest("/net-install/scope/room%3Ax/seed/extra", seedBody("room:x"))).status).toBe(404);
-    h.close();
+    await h.close();
   });
 
   it("bounds the request body: an over-cap seed is refused, not forwarded", async () => {
@@ -165,7 +155,7 @@ describe("the /net-install doorway (route level)", () => {
       body: JSON.stringify({ scope: "room:x", catalog_epoch: EPOCH, cells: [] })
     });
     expect([413, 429]).toContain(oversized.status);
-    h.close();
+    await h.close();
   });
 
   it("forwards seed and head faithfully, and surfaces the scope's epoch-downgrade refusal", async () => {
@@ -185,7 +175,7 @@ describe("the /net-install doorway (route level)", () => {
     const downgraded = await h.signedRequest("/net-install/scope/room%3Adoor/seed", seedBody("room:door", "cat-older-0", cells));
     expect(downgraded.ok).toBe(false);
     expect(await downgraded.clone().text()).toContain("E_EPOCH_MISMATCH");
-    h.close();
+    await h.close();
   });
 
   it("repairs initial contents rows through the signed add-only operator path", async () => {
@@ -209,9 +199,9 @@ describe("the /net-install doorway (route level)", () => {
     expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", changed: ["relation:contents:repair_room:mounted_tool"] });
     const replayed = await h.signedRequest("/net-install/scope/room%3Arepair_room/repair-relations", repairBody);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", changed: [] });
-    const rows = h.scopeStates.get("room:repair_room")!.storage.sql.exec("SELECT body FROM net_scope_relation").toArray();
+    const rows = h.scopeStates.get("room:repair_room")!.state.storage.sql.exec("SELECT body FROM net_scope_relation").toArray();
     expect(rows).toHaveLength(1);
-    h.close();
+    await h.close();
   });
 
   it("repairs bootstrap definition pages at catalog authority and replays idempotently", async () => {
@@ -250,7 +240,15 @@ describe("the /net-install doorway (route level)", () => {
     // Model an already-subscribed gateway without letting the fake resolve
     // drain it; the operator event must enter the same durable fanout lane as
     // ordinary catalog authority changes.
-    h.scopeStates.get("catalog")!.storage.sql.exec(
+    //
+    // `gateway:aged` is DELIBERATELY unresolvable: the assertion below reads
+    // the retained `net_scope_outbox` row, which only survives because the
+    // delivery fails. So this test emits one expected
+    // `net_scope_outbox_delivery_failed` ("unexpected destination
+    // gateway:aged") -- inside the test body, against live storage, not after
+    // teardown. Do not confuse it with the post-close `database is not open`
+    // family that tests/worker/quiescent-do.ts exists to eliminate.
+    h.scopeStates.get("catalog")!.state.storage.sql.exec(
       "INSERT INTO net_scope_subscribers (destination, role) VALUES ('gateway:aged', 'fanout')"
     );
     const replacement = {
@@ -300,7 +298,7 @@ describe("the /net-install doorway (route level)", () => {
     });
     const replayed = await h.signedRequest("/net-install/scope/catalog/repair-definitions", body);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", head: { seq: 1 }, changed: [], removed: [] });
-    const durable = h.scopeStates.get("catalog")!.storage.sql;
+    const durable = h.scopeStates.get("catalog")!.state.storage.sql;
     const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'verb_bytecode:$player:ways'").toArray();
     expect(JSON.parse(String(stored[0]!.body))).toMatchObject({ value: replacement.value, stamp: { scope_head: expect.stringMatching(/^1:/) } });
     const storedProperty = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$player:current_slot'").toArray();
@@ -358,7 +356,7 @@ describe("the /net-install doorway (route level)", () => {
         remove: [{ kind: "verb_bytecode", object: "$missing_class", name: "retired" }]
       })
     })).status).toBe(400);
-    h.close();
+    await h.close();
   });
 
   it("gates and merges the seed-property repair: signed, owned, fingerprint-gated, idempotent", async () => {
@@ -405,7 +403,7 @@ describe("the /net-install doorway (route level)", () => {
       head: { seq: 1 },
       changed: ["property_cell:$helpdb:topics"]
     });
-    const durable = h.scopeStates.get("catalog")!.storage.sql;
+    const durable = h.scopeStates.get("catalog")!.state.storage.sql;
     const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$helpdb:topics'").toArray();
     expect(JSON.parse(String(stored[0]!.body))).toMatchObject({
       value: {
@@ -437,7 +435,7 @@ describe("the /net-install doorway (route level)", () => {
     await reject({ entries: [{ ...entries[0], supersedes: { stale: "not-a-list" } }] });
     await reject({ entries: [] });
     await reject({ entries: Array.from({ length: 33 }, () => entries[0]) });
-    h.close();
+    await h.close();
   });
 
   // Aged-world verb-slot repair (CO4.7). Worlds authored before 2026-07-27 hold
@@ -485,7 +483,7 @@ describe("the /net-install doorway (route level)", () => {
       changed: ["verb_bytecode:aged_box:mike", "verb_bytecode:aged_box:zulu"]
     });
 
-    const durable = h.scopeStates.get("room:aged")!.storage.sql;
+    const durable = h.scopeStates.get("room:aged")!.state.storage.sql;
     const slotOf = (key: string) => {
       const rows = durable.exec(`SELECT body FROM net_scope_cell WHERE key = '${key}'`).toArray();
       return (JSON.parse(String(rows[0]!.body)) as { value: { slot?: number } }).value.slot;
@@ -512,7 +510,7 @@ describe("the /net-install doorway (route level)", () => {
     expect(await (await h.signedRequest("/net-install/scope/room%3Aaged/repair-verb-slots", {
       ...body, body: JSON.stringify({ objects: ["elsewhere_box"] })
     })).json()).toMatchObject({ ok: true, status: "empty", skipped: ["elsewhere_box"] });
-    h.close();
+    await h.close();
   });
 
   it("keeps a production-sized definition repair in one ordered event", async () => {
@@ -555,7 +553,7 @@ describe("the /net-install doorway (route level)", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ cells: oversized })
     })).status).toBe(400);
-    h.close();
+    await h.close();
   });
 
   it("malformed seed bodies surface as errors, not crashes or silent success", async () => {
@@ -571,6 +569,6 @@ describe("the /net-install doorway (route level)", () => {
     const head = await h.signedRequest("/net-install/scope/room%3Abad/head");
     const headBody = (await head.json()) as { catalog_epoch?: string };
     expect(headBody.catalog_epoch).not.toBe(EPOCH);
-    h.close();
+    await h.close();
   });
 });

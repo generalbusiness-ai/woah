@@ -63,8 +63,6 @@ const UNCONVERTED = new Set([
   "net-do.test.ts",
   "net-gateway-repair.test.ts",
   "net-identity-door.test.ts",
-  "net-install-doorway.test.ts",
-  "net-install.test.ts",
   "net-load-asymptote.test.ts",
   "net-only-entry.test.ts",
   "net-ordered-children.test.ts",
