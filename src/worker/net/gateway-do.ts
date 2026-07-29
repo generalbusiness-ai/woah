@@ -10414,8 +10414,18 @@ const MCP_OPERATION_ID_SCHEMA = {
     + "changes the world. Allowed characters are letters, digits, and . _ - : (1-128 of them)."
 } as const;
 
+/**
+ * The presentation scope, defaulting when the caller supplied none.
+ *
+ * Absent and `null` both mean "not supplied" — `null` because every optional
+ * parameter is advertised nullable (§M4.3). Any other value has already been
+ * checked against the published `enum` by the time this runs, so the throw is
+ * a residual internal guard rather than the client-facing refusal; the empty
+ * string used to be defaulted here and is now refused by the enum, which is
+ * the honest answer since the advertisement never listed it.
+ */
 function mcpToolScope(value: unknown): NetMcpToolScope {
-  if (value === undefined || value === null || value === "") return "active";
+  if (value === undefined || value === null) return "active";
   if (value === "active" || value === "here" || value === "object" || value === "space") return value;
   throw new Error("scope must be one of active, here, object, space");
 }
