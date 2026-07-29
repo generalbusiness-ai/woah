@@ -1256,8 +1256,8 @@ npm run repair:local-account-state -- \
   [--candidate <suspected-orphan>]
 ```
 
-After reviewing a conflict-free plan, repeat the same command with `--apply
---review-token <token-from-dry-run>`.
+After reviewing a conflict-free plan, repeat the same command with `--apply`
+and `--review-token <token-from-dry-run>`.
 Candidate arguments expand inspection only; they do not authorize recycling or
 provide replacement values. Stop every process serving or otherwise holding
 the named local world before either command; the lease check refuses instead of
@@ -1275,6 +1275,6 @@ npm run repair:net-account-state -- \
   [--candidate <suspected-orphan>]
 ```
 
-After review, repeat it with `--apply --review-token
-<token-from-dry-run>`. The authority refuses a missing or stale token before
-mutation.
+After review, repeat it with `--apply` and
+`--review-token <token-from-dry-run>`. The authority refuses a missing or stale
+token before mutation.

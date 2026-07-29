@@ -1498,10 +1498,14 @@ npm run repair:net-account-state -- \
   [--candidate <suspected-orphan>]
 ```
 
-Dry-run is the default. Repeat the reviewed, conflict-free command with
-`--apply` to mutate. Conflicts never partially apply. An ordinary unregistered
-actor cannot be safely identified as a failed create from shape alone and is
-reported for operator disposition, never recycled.
+Dry-run is the default and returns an opaque review token for a conflict-free
+plan. Repeat the reviewed command with `--apply` and
+`--review-token <token-from-dry-run>` to mutate. The authority recomputes the
+complete plan and refuses a missing or stale token; a mismatch never returns a
+replacement token in lieu of a fresh diagnostic. Conflicts never partially
+apply. An ordinary unregistered actor cannot be safely identified as a failed
+create from shape alone and is reported for operator disposition, never
+recycled.
 
 **A freshly cut-over world needs THREE steps, in this order.** The provisioning
 command alone is not enough, and skipping either prerequisite fails with a
