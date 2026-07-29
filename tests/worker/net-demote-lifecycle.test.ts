@@ -6,7 +6,6 @@
 // from the same durable scope also shows no programmer tools — resolved via the
 // agent's self-routing n1_ key (its cells live in the human's cluster). Fake-DO lane.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -15,20 +14,11 @@ import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-demote-test-secret";
 const EPOCH = "cat-net-demote-1";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
-    storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
-  };
-  return { state, settle: async () => { while (deferred.length > 0) await deferred.shift(); }, close: () => fake.close() };
-}
 
 async function nextSseMessage(response: Response, timeoutMs = 1_000): Promise<Record<string, unknown> | null> {
   const reader = response.body?.getReader();
@@ -87,7 +77,7 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
     const relations = partitionInstallRelations(cells);
     partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     const gateways: NetGatewayDO[] = [];
     let auditDO: NetAuditDO;
@@ -121,9 +111,9 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
       return gw;
     };
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const s of scopeDOs.values()) await s.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     // An MCP session helper bound to one gateway.
@@ -206,6 +196,10 @@ describe("Net demotion lifecycle + cold reconstruction (fake-DO lane)", () => {
     const coldTools = await coldMcp.list();
     expect(coldTools, `${installTool} resurrected on a cold gateway`).not.toContain(installTool);
 
-    for (const st of states) st.close();
+    // closeQuiescent drains the WHOLE fixture before closing ANY of it.
+    // Order matters here specifically: `states[0]` is the audit DO, so a
+    // close-in-order teardown shut the audit storage while the cluster scope
+    // still had an undrained `/audit` outbox delivery addressed to it.
+    await closeQuiescent(states);
   });
 });

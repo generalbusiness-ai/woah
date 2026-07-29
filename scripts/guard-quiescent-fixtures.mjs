@@ -74,7 +74,6 @@ const USES_SHARED = new RegExp(`from\\s+["'][./]*${SHARED}["']`);
 // deferred failures. Remove entries as they are converted; do not add any.
 const UNCONVERTED = new Set([
   "net-audit.test.ts",
-  "net-demote-lifecycle.test.ts",
   "net-gateway-repair.test.ts",
   "net-help-migration-aged.test.ts",
   "net-help-topics-aged.test.ts",
