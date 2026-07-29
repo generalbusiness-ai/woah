@@ -320,7 +320,11 @@ describe("MCP gateway hardening", () => {
       const sessionless = await f.mcp({ jsonrpc: "2.0", method: "notifications/initialized" });
       expect(sessionless.status, JSON.stringify(sessionless.body)).not.toBe(202);
       expect(sessionless.status).toBe(401);
-      expect(sessionless.body?.error?.code).toBe("E_NOSESSION");
+      // §M1.2: the refusal is a JSON-RPC message with no id (a notification
+      // has none), and the woo code rides in `error.data`.
+      expect(sessionless.body?.jsonrpc).toBe("2.0");
+      expect(sessionless.body).not.toHaveProperty("id");
+      expect(sessionless.body?.error?.data?.code).toBe("E_NOSESSION");
 
       // A fabricated session id is refused on the same terms.
       const forged = await f.mcp(
