@@ -14,7 +14,6 @@
 // page removed, no human anywhere — and drives the whole operator runbook
 // through the real signed routes.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -23,6 +22,7 @@ import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 import { verbCellSlot } from "../../src/net/verb-slots";
 import { identityAnchorIds } from "../../src/net/identity-anchor";
 import { provisionNetWizard } from "../../scripts/net-provision-wizard";
@@ -31,21 +31,6 @@ const SECRET = "net-anchor-test-secret";
 const EPOCH = "cat-anchor-1";
 const AP11_VERB = "provision_wizard_agent";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
-    storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
-  };
-  return {
-    state,
-    pending: () => deferred.length,
-    settle: async () => { while (deferred.length > 0) await deferred.shift(); },
-    close: () => fake.close()
-  };
-}
 
 /** A world shaped like the deployed one: no human, and (optionally) without the
  * AP11 verb page or the published authoring-surface reference, so each aged-world
@@ -64,7 +49,7 @@ async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef
   const relations = partitionInstallRelations(cells);
   partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   let gateway!: NetGatewayDO;
   let auditDO!: NetAuditDO;
@@ -110,19 +95,11 @@ async function buildAgedWorld(options: { withPrimitive?: boolean; withSurfaceRef
   return {
     old, gateway, scopeDOs, scopeEnv, states, cells,
     settleAll: async () => {
-      for (const st of [...states]) await st.settle();
+      await settleHosts(states);
       for (const s of [...scopeDOs.values()]) await s.alarm();
-      for (const st of [...states]) await st.settle();
+      await settleHosts(states);
     },
-    close: async () => {
-      // A final accepted repair/provision call may still own fanout/audit
-      // work after its response. Teardown is part of the fixture contract:
-      // drain all such work before closing the SQLite handles.
-      while (states.some((state) => state.pending() > 0)) {
-        for (const st of [...states]) await st.settle();
-      }
-      for (const st of states) st.close();
-    }
+    close: async () => closeQuiescent(states)
   };
 }
 

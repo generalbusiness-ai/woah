@@ -3,8 +3,7 @@
 // is the commit record, not a catalog write (2b); the programmer flag commits
 // through the object_lineage lineage seam; and promote/demote are tracked
 // native primitives. Driven over the real /net-api/turn doorway. Fake-DO lane.
-import { afterEach, describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
+import { describe, expect, it } from "vitest";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -13,45 +12,10 @@ import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-promote-test-secret";
 const EPOCH = "cat-net-promote-1";
-type TestState = {
-  state: NetScopeDurableState & NetGatewayDurableState;
-  pending(): number;
-  settle(): Promise<void>;
-  close(): void;
-};
-const testStates: TestState[] = [];
-
-function netState(name: string): TestState {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (p: Promise<unknown>) => { deferred.push(p); },
-    storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
-  };
-  const fixture = {
-    state,
-    pending: () => deferred.length,
-    settle: async () => { while (deferred.length > 0) await deferred.shift(); },
-    close: () => fake.close()
-  };
-  testStates.push(fixture);
-  return fixture;
-}
-
-afterEach(async () => {
-  // The last accepted turn can enqueue fanout after its reply. Drain to
-  // quiescence even when an assertion throws, then close every fake DO.
-  while (testStates.some((state) => state.pending() > 0)) {
-    for (const state of testStates) await state.settle();
-  }
-  for (const state of testStates) state.close();
-  testStates.length = 0;
-});
-
 async function clientFetch(
   gateway: NetGatewayDO,
   method: string,
@@ -89,7 +53,7 @@ describe("Net promote/demote over /net-api/turn (fake-DO lane)", () => {
     const clusterScope = `cluster:${human}`;
     expect([...partitions.keys()]).toEqual(expect.arrayContaining([clusterScope, CATALOG_SCOPE]));
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     let auditDO: NetAuditDO;
@@ -119,9 +83,9 @@ describe("Net promote/demote over /net-api/turn (fake-DO lane)", () => {
     states.push(gwState);
     gateway = new NetGatewayDO(gwState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve, NET_AUDIT_SHARDS: "1" } as NetGatewayEnv);
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const s of scopeDOs.values()) await s.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     const humanToken = "apikey:promo-human-key:promo-human-secret";
@@ -177,5 +141,6 @@ describe("Net promote/demote over /net-api/turn (fake-DO lane)", () => {
     const afterDemote = await agentTools();
     expect(afterDemote).not.toContain(`${p}__install_verb`);
 
+    await closeQuiescent(states);
   });
 });

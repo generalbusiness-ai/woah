@@ -2,7 +2,6 @@
 // → a carried apikey mints a session through the REAL /net-api surface.
 // This is the §8 step-3 "prove the new namespace" shape, in-process.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
@@ -10,25 +9,11 @@ import { cellKey } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-install-test-secret";
 const KEY_ID = "install-key";
 const KEY_SECRET = "install-secret-1";
-
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: () => {},
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return { state, close: () => fake.close() };
-}
 
 describe("net install end-to-end (fake-DO lane)", () => {
   it("seeds every partition, verifies heads at the install epoch, and a carried apikey mints through /net-api", async () => {
@@ -54,11 +39,21 @@ describe("net install end-to-end (fake-DO lane)", () => {
 
     // Seed one scope DO per partition — what scripts/net-install.ts does
     // through the /net-install doorway, driven directly here.
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
+    // Gateways are resolvable too. A gateway that pulls a view SUBSCRIBES to
+    // the scope, and the scope then drains its outbox to `gateway:<name>`. A
+    // scope-only resolver makes every one of those deliveries fail, so the
+    // fanout leg of this test would be exercised only up to the throw --
+    // silently, because the failure lands in a deferred task.
+    const gatewayDOs = new Map<string, NetGatewayDO>();
     const resolve = (destination: string) => {
       if (destination.startsWith("scope:")) {
         const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) {
+        const instance = gatewayDOs.get(destination.slice("gateway:".length));
         if (instance) return instance;
       }
       throw new Error(`unresolvable destination ${destination}`);
@@ -107,7 +102,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       expect(staleSeed.ok).toBe(false);
       const refusal = (await staleSeed.json()) as { error?: { code?: string } };
       expect(refusal.error?.code).toBe("E_EPOCH_MISMATCH");
-      st.close();
+      await st.close();
     }
 
     // Verification 1: every head answers at the install epoch, and a
@@ -131,6 +126,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       WOO_INTERNAL_SECRET: SECRET,
       NET_RESOLVE: resolve
     } as NetGatewayEnv);
+    gatewayDOs.set("gateway-net-api", gateway);
     states.push(gatewayState);
     const minted = await gateway.fetch(
       new Request("https://do/net-api/session", {
@@ -223,7 +219,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(east.attempt).toBe(1);
     expect(east.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });
 
-    states.forEach((st) => st.close());
+    await closeQuiescent(states);
   });
 
   it("activation barrier: client traffic refuses until the verified epoch is published, and on epoch mismatch", async () => {
@@ -236,11 +232,21 @@ describe("net install end-to-end (fake-DO lane)", () => {
     // seeded (identity cells included) but no activation cell yet.
     const plan = await planNetInstall({ activate: false, graft: (fresh) => importIdentity(fresh, identity) });
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
+    // Gateways are resolvable too. A gateway that pulls a view SUBSCRIBES to
+    // the scope, and the scope then drains its outbox to `gateway:<name>`. A
+    // scope-only resolver makes every one of those deliveries fail, so the
+    // fanout leg of this test would be exercised only up to the throw --
+    // silently, because the failure lands in a deferred task.
+    const gatewayDOs = new Map<string, NetGatewayDO>();
     const resolve = (destination: string) => {
       if (destination.startsWith("scope:")) {
         const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) {
+        const instance = gatewayDOs.get(destination.slice("gateway:".length));
         if (instance) return instance;
       }
       throw new Error(`unresolvable destination ${destination}`);
@@ -271,6 +277,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       const st = netState(`gateway-${label}`);
       states.push(st);
       const gateway = new NetGatewayDO(st.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+      gatewayDOs.set(`gateway-${label}`, gateway);
       return gateway.fetch(
         new Request("https://do/net-api/session", {
           method: "POST",
@@ -342,6 +349,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       NET_RESOLVE: resolve,
       NET_ACTIVATION_TTL_MS: "0"
     } as NetGatewayEnv);
+    gatewayDOs.set("gateway-same", sameGateway);
     const mintOn = (gateway: NetGatewayDO) =>
       gateway.fetch(
         new Request("https://do/net-api/session", {
@@ -385,6 +393,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       NET_RESOLVE: flakyResolve,
       NET_ACTIVATION_TTL_MS: "0"
     } as NetGatewayEnv);
+    gatewayDOs.set("gateway-grace", graceGateway);
     await activate(plan.epoch);
     const graceMint = (key: string) =>
       graceGateway.fetch(
@@ -403,7 +412,6 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(((await unverifiable.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
       "activation_unverifiable"
     );
-    graceState.close();
-    states.forEach((st) => st.close());
+    await closeQuiescent([...states, graceState]);
   });
 });

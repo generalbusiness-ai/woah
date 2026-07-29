@@ -12,42 +12,17 @@
 // cannot see this class of bug at all — which is why it survived.
 import { describe, expect, it } from "vitest";
 import worker, { sanitizePublicHeaders, type NetOnlyEnv } from "../../src/worker/net-only-index";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 import { mcpOriginDecision, withPublicOrigin, PUBLIC_ORIGIN_HEADER } from "../../src/worker/public-origin";
 
 const SECRET = "net-mcp-origin-secret";
 const TOKEN = "apikey:origin-key-a:origin-secret-a";
-
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    pending: () => deferred.length,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -73,7 +48,7 @@ async function fixture(options: { allowedOrigins?: string } = {}) {
     }
   });
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
@@ -135,15 +110,7 @@ async function fixture(options: { allowedOrigins?: string } = {}) {
     };
   };
 
-  const close = async () => {
-    // Session creation can enqueue relation/fanout work after the HTTP reply.
-    // Drain every fake DO to a fixed point before closing SQLite so a failure
-    // belongs to this test instead of leaking into the next Origin case.
-    while (states.some((state) => state.pending() > 0)) {
-      for (const st of states) await st.settle();
-    }
-    for (const st of states) st.close();
-  };
+  const close = async () => closeQuiescent(states);
   return { edge, close };
 }
 

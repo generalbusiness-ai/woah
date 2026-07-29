@@ -24,7 +24,6 @@
 //   - client idempotency keys replay per the item-1 contract;
 //   - the authenticated GET reads (cell probe, relation roster) serve.
 import { describe, expect, it, vi } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -36,41 +35,12 @@ import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
 import { routedApiKeyId } from "../../src/core/api-key-id";
 import { hashSource } from "../../src/core/source-hash";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-client-api-test-secret";
 const EPOCH = "cat-net-capi-1";
 const KEY_ID = "capi-key";
 const KEY_SECRET = "capi-secret";
-
-function netState(name: string): {
-  state: NetScopeDurableState & NetGatewayDurableState;
-  settle: () => Promise<void>;
-  pending: () => number;
-  close: () => void;
-} {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    pending: () => deferred.length,
-    close: () => fake.close()
-  };
-}
 
 /** Unsigned client request straight at the gateway DO — the /net-api
  * surface must never require internal signing. */
@@ -200,7 +170,7 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   const clusterScope = `cluster:${actor}`;
   expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   const gateways = new Map<string, NetGatewayDO>();
   // Record actual DO crossings so boundary regressions can distinguish a
@@ -254,6 +224,14 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
     // Security regressions in this fixture normally require an exact read.
     // Cache behavior has its own test below.
     NET_CREDENTIAL_TTL_MS: options.credentialTtlMs ?? "0",
+    // The gateway subscribes to scopes under its OWN rpc destination, and
+    // scopes drain fanout back to exactly that name. Without this override the
+    // shard derives `gateway:gateway-net-api` from its DO id while the fixture
+    // registers it as `net-api`, so every fanout delivery threw
+    // `unresolvable destination` inside a deferred task -- silently, and the
+    // fanout leg of this whole suite was never delivered. The sibling MCP
+    // suites already pin this; net-client-api did not.
+    NET_GATEWAY_SELF: "gateway:net-api",
     METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
   };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
@@ -286,17 +264,7 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
       if (!instance) throw new Error(`missing credential authority ${scope}`);
       return signedTo(instance, "/net/ensure-credential", { actor: target, id, record });
     },
-    close: async () => {
-      let deferredFailure: unknown;
-      try {
-        await settleAll();
-      } catch (err) {
-        deferredFailure = err;
-      } finally {
-        states.forEach((state) => state.close());
-      }
-      if (deferredFailure !== undefined) throw deferredFailure;
-    }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -640,8 +608,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(refused.status).toBe(503);
     expect(refused.body.error).toMatchObject({ code: "E_NOT_INSTALLED", detail: { reason: "not_installed" } });
 
-    catalogState.close();
-    gatewayState.close();
+    await closeQuiescent([catalogState, gatewayState]);
   });
 
   it("authenticates apikeys against the catalog identity cell and refuses namedly", async () => {

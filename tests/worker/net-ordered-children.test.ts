@@ -13,7 +13,6 @@
 //   (c) it stays bounded (few rounds, envelope under the warm ceiling);
 //   (d) an absent/childless parent converges to [] with no repair loop.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -24,25 +23,12 @@ import type { WooValue } from "../../src/core/types";
 import { WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/scope";
 import type { AttemptTraceEntry } from "../../src/net/errors";
 import type { CommitReply } from "../../src/net/scope";
+import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
 
 const SECRET = "net-ordered-children-secret";
 const EPOCH = "cat-net-ordered-1";
 const SCOPE = "flat"; // one scope holds the whole flattened world
 
-function netState(name: string): { state: NetScopeDurableState & NetGatewayDurableState; close: () => void } {
-  const fake = new FakeDurableObjectState(name);
-  const state = {
-    id: fake.id,
-    waitUntil: (_promise: Promise<unknown>) => {},
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return { state, close: () => fake.close() };
-}
 
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };
 
@@ -127,7 +113,7 @@ async function harness() {
     });
   };
 
-  return { turn, rpcLog, close: () => { scopeState.close(); gatewayState.close(); } };
+  return { turn, rpcLog, close: async () => closeQuiescent([scopeState, gatewayState]) };
 }
 
 describe("ordered-children projection repair over the gateway", () => {
@@ -147,7 +133,7 @@ describe("ordered-children projection repair over the gateway", () => {
       // The repair issued the parent-scoped ordered-children fetch.
       expect(rpcLog.filter((p) => p === "/net/ordered-children").length).toBe(1);
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -165,7 +151,7 @@ describe("ordered-children projection repair over the gateway", () => {
       expect(result.attempt).toBe(3);
       expect(rpcLog.filter((p) => p === "/net/ordered-children").length).toBe(2);
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -177,7 +163,7 @@ describe("ordered-children projection repair over the gateway", () => {
       expect(result.attempt).toBeLessThanOrEqual(4); // O(parents read), not O(siblings)
       expect(result.structure?.envelope_bytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     } finally {
-      close();
+      await close();
     }
   });
 
@@ -192,7 +178,7 @@ describe("ordered-children projection repair over the gateway", () => {
       expect(result.attempt).toBe(2); // one fetch (empty), then success
       expect(rpcLog.filter((p) => p === "/net/ordered-children").length).toBe(1);
     } finally {
-      close();
+      await close();
     }
   });
 });

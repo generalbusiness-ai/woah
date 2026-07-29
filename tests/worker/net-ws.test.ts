@@ -26,7 +26,8 @@
 //   - sessions present elsewhere (or nowhere) receive nothing; a
 //     present session with no socket is skipped silently.
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { FakeDurableObjectState, FakeWebSocket, FakeWebSocketPair } from "./fake-do";
+import { FakeWebSocket, FakeWebSocketPair } from "./fake-do";
+import { closeQuiescent, quiescentNetState, settleAll, type QuiescentHost } from "./quiescent-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { installVerb } from "../../src/core/authoring";
@@ -80,37 +81,32 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
-/** One shared deferred queue for EVERY DO in the harness: cross-DO
- * deliveries chain (a scope drain enqueues a gateway fanout which may
- * enqueue nothing further), so settle() drains until quiescent. */
-function netState(name: string, deferred: Array<Promise<unknown>>) {
-  const fake = new FakeDurableObjectState(name);
+/** The shared quiescent host plus the two extras this suite needs: the
+ * WebSocket hibernation surface (which the shared fixture deliberately does
+ * not model -- it is grafted on from the raw fake) and a claimable due-alarm,
+ * because an incoming /relate crosses an alarm event before refan (CO2.7) and
+ * a no-op alarm fake would strand the final presence row. */
+type WsHost = QuiescentHost & { takeDueAlarm: (now: number) => boolean };
+
+function netState(name: string): WsHost {
   let alarmAt: number | null = null;
-  const state = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    acceptWebSocket: (ws: WebSocket, tags?: string[]) => fake.acceptWebSocket(ws, tags),
-    getWebSockets: (tag?: string) => fake.getWebSockets(tag),
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (at: number) => { alarmAt = at; },
-      deleteAlarm: () => { alarmAt = null; }
-    }
-  } satisfies NetScopeDurableState & NetGatewayDurableState & { acceptWebSocket: unknown; getWebSockets: unknown };
+  const host = quiescentNetState(name, {
+    setAlarm: (at: number) => { alarmAt = at; },
+    deleteAlarm: () => { alarmAt = null; }
+  });
+  Object.assign(host.state, {
+    acceptWebSocket: (ws: WebSocket, tags?: string[]) => host.fake.acceptWebSocket(ws, tags),
+    getWebSockets: (tag?: string) => host.fake.getWebSockets(tag)
+  });
   return {
-    state,
-    fake,
+    ...host,
     /** Claim one due durable alarm. Future session-reap alarms remain
      * parked; immediate outbox continuations fire through DO.alarm(). */
     takeDueAlarm: (now: number): boolean => {
       if (alarmAt === null || alarmAt > now) return false;
       alarmAt = null;
       return true;
-    },
-    close: () => fake.close()
+    }
   };
 }
 
@@ -315,10 +311,9 @@ async function buildHarness(
   const sideScope = "room:ws_side";
   const clusterScope = `cluster:${actor}`;
 
-  const deferred: Array<Promise<unknown>> = [];
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: WsHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
-  const scopeStates = new Map<string, ReturnType<typeof netState>>();
+  const scopeStates = new Map<string, WsHost>();
   let gateway: NetGatewayDO;
   let gatewayFanoutGate: Promise<void> | null = null;
   let releaseGatewayFanout: (() => void) | null = null;
@@ -349,7 +344,7 @@ async function buildHarness(
   };
   const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
   for (const scope of [roomScope, annexScope, sideScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
-    const st = netState(`scope-${scope}`, deferred);
+    const st = netState(`scope-${scope}`);
     const instance = new NetScopeDO(st.state, scopeEnv);
     const seedRequest = new Request("https://do/net/seed", {
       method: "POST",
@@ -363,7 +358,7 @@ async function buildHarness(
     scopeDOs.set(scope, instance);
   }
 
-  const gatewayState = netState("gateway-net-api", deferred);
+  const gatewayState = netState("gateway-net-api");
   // The fake state's id is `gateway-net-api`, but the harness resolver
   // deliberately registers the production-shaped logical destination
   // `gateway:net-api`. Pin self-subscription to that same name so the
@@ -395,9 +390,7 @@ async function buildHarness(
    * until an unrelated request happened to reactivate that scope. */
   const settle = async (): Promise<void> => {
     for (;;) {
-      while (deferred.length > 0) {
-        await deferred.shift()?.catch(() => {});
-      }
+      await settleAll(states);
       let fired = false;
       const now = Date.now();
       for (const [scope, instance] of scopeDOs) {
@@ -406,7 +399,7 @@ async function buildHarness(
         fired = true;
         await instance.alarm();
       }
-      if (!fired && deferred.length === 0) return;
+      if (!fired && states.every((st) => st.pending() === 0)) return;
     }
   };
 
@@ -471,16 +464,11 @@ async function buildHarness(
     pauseNextGatewayFanout,
     rehydrateGateway,
     rehydrateWithoutPeerCells,
+    // Drain the alarm-aware loop FIRST -- closeQuiescent only sweeps the
+    // deferred queues, and a parked due alarm would otherwise strand work.
     close: async () => {
-      let deferredFailure: unknown;
-      try {
-        await settle();
-      } catch (err) {
-        deferredFailure = err;
-      } finally {
-        states.forEach((st) => st.close());
-      }
-      if (deferredFailure !== undefined) throw deferredFailure;
+      await settle();
+      await closeQuiescent(states);
     }
   };
 }

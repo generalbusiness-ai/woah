@@ -97,8 +97,17 @@ export class NetAuditDO {
     );
   }
 
+  /** Audit shards are named by `auditShardFor` (`audit-0`, `audit-1`, ...),
+   * and the AE index must carry that NAME so per-shard diagnostics read the
+   * same way as the scope (`net-scope:<scope>`) and gateway
+   * (`net-gateway:<shard>`) lanes. `audit-${String(this.state.id)}` did not: a
+   * DurableObjectId stringifies to its opaque 64-hex id in production and to
+   * `[object Object]` under the fake-DO harness, so the audit lane's index
+   * was un-joinable in production and collapsed every shard into one bucket
+   * in tests. */
   private metric(event: AnalyticsMetric): void {
-    emitMetric(event, `audit-${String(this.state.id)}`, this.env.METRICS);
+    const name = (this.state.id as { name?: unknown } | null | undefined)?.name;
+    emitMetric(event, `net-audit:${typeof name === "string" && name.length > 0 ? name : "unnamed"}`, this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
