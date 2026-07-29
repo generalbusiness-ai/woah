@@ -366,6 +366,11 @@ Corroborating, non-normative: the
 [maintainer discussion](https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/2547)
 documents the transport-vs-application session confusion this note is about;
 [Microsoft App Service](https://techcommunity.microsoft.com/blog/appsonazureblog/mcp-just-went-stateless-%E2%80%94-what-the-2026-spec-changes-about-scaling-on-app-servic/4530222)
-independently reaches the same conclusion that removing affinity pushes handle
-state into durable shared storage. Practitioner commentary is anecdotal only and
-drives no claim here.
+covers the same scaling ground from the hosting side: it favours explicit
+handles, and says protocol session storage is no longer required — externalising
+shared state to a durable store where the workload actually needs it, and
+otherwise letting signed state travel with the request. That is narrower than
+"removing affinity pushes handle state into durable shared storage", which is
+this note's own conclusion and not something the article asserts; it is
+consistent with our design, not independent confirmation of it. Practitioner
+commentary is anecdotal only and drives no claim here.
