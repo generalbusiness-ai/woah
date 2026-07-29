@@ -45,6 +45,11 @@ export type NetErrorCode =
                        // is deliberate: the alternative is evicting a live guarantee,
                        // which turns a lost response into a silent second execution.
                        // The operation is untouched — nothing was planned or submitted
+  | "E_RETRY_CLASS"     // an operation id first used WITHOUT retry safety, reused WITH it.
+                       // The class of a key is immutable: its route is already transient
+                       // and freely evictable, and upgrading it in place cannot be made
+                       // failure-safe across the gateway and the authority. A fresh id is
+                       // the remedy. Terminal; nothing was planned or submitted
   | "E_INVARG";        // a malformed internal request field (wrong type/shape) —
                        // refused with the offending field named, never silently
                        // coerced into a different-but-valid request (Adv-a)
@@ -67,7 +72,8 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_INVARG: "terminal for this request; fix the malformed field the detail names",
   E_EPOCH_MISMATCH: "terminal; catalog install/migration must reconcile the epochs (operator concern)",
   E_SEED_COMMITTED: "terminal; a committed scope is never reseeded — a fresh namespace is the recovery (operator concern)",
-  E_RETRY_CAPACITY: "retry the same call unchanged shortly; the retry GUARANTEE was refused, not the operation, and nothing was submitted"
+  E_RETRY_CAPACITY: "retry the same call unchanged shortly; the retry GUARANTEE was refused, not the operation, and nothing was submitted",
+  E_RETRY_CLASS: "terminal; re-issue this call under a NEW operation id — the one sent is already bound to a route carrying no retry guarantee"
 };
 
 const RETRYABLE: ReadonlySet<NetErrorCode> = new Set([
