@@ -271,22 +271,39 @@ protocol faults answering at HTTP 200. When the codec lands it should ABSORB
 the argument validator rather than reimplement it — a second implementation
 would recreate the advertisement/validator drift this fix exists to prevent.
 
-**The routing-pin invariant is resolved, and the resolution bounds what may be
-claimed.** A 2026-07-28 review disproved the original pin ⊇ receipt claim with
-two persistence probes (a shard-wide ceiling that deletes by global rowid
-ignoring scope, and same-scope abandoned submissions evicting a live-receipt
-pin). Both are now regression tests. The two stores share a wall-clock lease
-instead of trying to size row counts against each other: outcomes expire at 10
-minutes, pins at 20, and an unexpired pin is never evicted — at capacity the
-shard refuses a new retry-safe admission (`E_RETRY_CAPACITY`) instead.
+**Retry safety: what may be claimed, after four rounds of narrowing.** Three
+successive strong claims about this were each falsified by direct probes, so the
+history matters as much as the current state:
 
-Retry safety is therefore exactly-once **within that lease, on the shard that
-admitted the operation**, and mcp.md §M4.2 lists the exclusions (cross-shard
-retries under a different credential, storage loss, gateway-minted keys). Do
-not describe it as unconditionally exactly-once. Note for this migration: the
-durable-handle direction it is heading toward would remove the two-store split,
-but not the ordering requirement — the pin is written before the submit, so no
-placement makes routing and outcome one atomic record at admission.
+1. `pin ⊇ receipt` by row counts — falsified: a shard-wide ceiling deleted by
+   global rowid ignoring scope, and same-scope abandoned submissions evicted a
+   live-receipt pin.
+2. A shared lease — falsified three ways: expiry was not checked at lookup, so a
+   quiet scope replayed a long-dead outcome; the lease was enforced only when
+   other work arrived; and the reply quota could evict an outcome inside its own
+   advertised window, running one operation twice.
+3. Legacy rows re-derived their age at every hydration, so an outcome and its
+   routing pin aged in opposite directions.
+
+What holds now (contract A): **within 10 minutes of a client-keyed operation
+being recorded, a retry under the same key does not execute again** — because an
+unexpired guarantee is never evicted for any reason, capacity is met by refusing
+a NEW admission at both the gateway and the authority, and expiry is enforced at
+lookup rather than by a sweep that a quiet scope never runs.
+
+It is bounded by named exclusions, listed in mcp.md §M4.2: a retry reaching a
+different gateway shard under a different credential, gateway storage loss,
+gateway-minted keys, a capacity refusal (in which case nothing ran), and
+ordinary lease expiry. Only the VERDICT is guaranteed; the outcome payload is
+best-effort and degrades to `replay_outcome:"none"`. So: **a client is always
+told correctly whether its operation ran; it is not always told what happened.**
+Do not describe this — or this migration — as unconditionally exactly-once.
+
+A durable idempotency coordinator remains the cleanest long-term model and is
+where the durable-handle direction leads. It would remove the two-store split,
+but not the ordering requirement: the pin is written before the submit, so no
+placement makes routing and outcome one atomic record at admission. The lease is
+what establishes the ordering either way.
 
 ## 6. Tool-list policy [revised]
 

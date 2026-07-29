@@ -6,7 +6,7 @@
 // the verb increments), not on reply shape alone — a fix that deduplicates
 // the reply while letting the effect happen twice must fail here.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
+import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -16,55 +16,6 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { signInternalRequest } from "../../src/worker/internal-auth";
 
 const SECRET = "net-mcp-idempotency-secret";
-
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  /** Deferred work that FAILED. A rejection raised after the assertions have
-   * run is invisible to vitest — the file reports green while `database is
-   * not open`, fanout and outbox errors scroll past. Collect them instead and
-   * fail the test on them at teardown. */
-  const failures: unknown[] = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise.catch((err) => {
-        failures.push(err);
-      }));
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  const drain = async () => {
-    // Deferred work enqueues more deferred work (a drain pass schedules the
-    // next one), so one sweep is not quiescence. Bounded so a genuinely
-    // self-feeding loop fails the test instead of hanging it.
-    for (let pass = 0; pass < 64; pass += 1) {
-      if (deferred.length === 0) {
-        // Give any already-scheduled microtask/timer a turn to enqueue.
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        if (deferred.length === 0) return;
-      }
-      while (deferred.length > 0) await deferred.shift();
-    }
-    throw new Error(`deferred work for ${name} never reached quiescence`);
-  };
-  return {
-    state,
-    failures,
-    settle: drain,
-    /** Drain to quiescence BEFORE the storage goes away. Closing under live
-     * deferred work is what produced the post-assertion error noise. */
-    close: async () => {
-      await drain();
-      fake.close();
-    }
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -268,16 +219,7 @@ async function fixture() {
      * previous behaviour (synchronous close, rejections dropped) reported
      * green over exactly these errors.
      */
-    close: async () => {
-      for (const st of states) await st.close();
-      const failures = states.flatMap((st) => st.failures);
-      if (failures.length > 0) {
-        throw new Error(
-          `${failures.length} deferred task(s) failed after the test body:\n` +
-            failures.map((err, i) => `  [${i}] ${err instanceof Error ? err.stack ?? err.message : String(err)}`).join("\n")
-        );
-      }
-    }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -559,7 +501,7 @@ describe("MCP mutation retry safety (CO2.5 / M4.2)", () => {
       expect(replay.result?.structuredContent?.result).toBe(5);
       expect(await f.hits()).toBe(5);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 

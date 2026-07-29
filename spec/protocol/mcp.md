@@ -606,72 +606,67 @@ WebSocket turn frame too, so identical strings from different clients are
 possible and must never become a read channel.
 
 **Past the retention window.** Idempotency is a bounded-window guarantee, not
-an eternal one, and the two classes of recorded outcome are retained by
-different rules because their growth is limited by different things.
+an eternal one. Within the window it is a real guarantee and not a best-effort
+one, which requires that nothing except the window's own clock can retract it.
 
-- **Turns that COMMITTED** (they consumed a sequence number) are retained for
-  **at least the scope's most recent 256 commits** — the recovery-tail window,
-  never pruned — and at most 1024. The sequencer itself rate-limits this class:
-  one reply per seq.
-- **Receipts and terminal rejections** advance nothing, so they are recorded at
-  whatever head is current and the seq-ordered rule above can never age them
-  out. They are retained as a flat **most-recent-256 per scope**, oldest first.
-  A bound of this kind is not optional: a receipt is the cheapest row an actor
-  can write (one keyed act of speech), so without it any authenticated client
-  could grow authority storage without limit. Receipt pressure never evicts a
-  committed turn's reply — the quotas are separate.
+**The window is a LEASE, and it is shared.** Two stores decide whether a retry
+is safe: the gateway's selection pin decides where the retry is routed, and the
+authority's recorded outcome decides whether it executes when it gets there. If
+either lapses while the other holds, a retry re-plans, may select a second
+scope, and commits there.
 
-The resulting per-scope window is **1280 recorded replies**, each retaining at
-most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
-of insertion, in memory and in durable storage together: a prune that can lag
-its insert is the unbounded cache it was meant to prevent.
+Row counts MUST NOT be used to establish that ordering, and MUST NOT be able to
+retract a guarantee already issued. Three successive attempts to build this on
+counting were each falsified by direct probes — a shard-wide ceiling deleting by
+global row order regardless of scope; a per-scope cap counting pins rather than
+pins with a live outcome; and a reply quota evicting an outcome inside its own
+advertised lease, which ran one operation twice. The boundary is therefore a
+clock both sides share:
 
-**The retention boundary is a LEASE, and it is shared.** Two stores decide
-whether a retry is safe: the gateway's selection pin decides where the retry is
-routed, and the authority's recorded reply decides whether it executes when it
-gets there. If the pin expires while the reply is live, the retry re-plans, may
-select a second scope, and commits there — the same double execution, by a
-different door.
+- a recorded outcome expires **10 minutes** after it is recorded;
+- a pin for a client-supplied operation id expires after **20 minutes**. The gap
+  is slack: the two stores are different Durable Objects with independent
+  clocks, and the pin must outlive the outcome even under skew;
+- expiry MUST be enforced when an outcome is LOOKED UP, not only by a retention
+  sweep. A sweep runs when other work arrives, so on a quiet scope it never runs
+  at all and a long-dead outcome would still replay;
+- an unexpired guarantee is **never** evicted — not by a row quota, not to make
+  room. At capacity each side REFUSES a new retry-safe admission instead: the
+  gateway with `E_RETRY_CAPACITY`, the authority with a terminal
+  `retry_capacity` rejection. Nothing is planned or submitted, and the client is
+  told that the retry *guarantee* was refused, not the operation. It MAY retry
+  shortly, or re-issue without an operation id and accept at-least-once
+  semantics knowingly.
 
-Row counts cannot establish that ordering and MUST NOT be used to try. The two
-stores prune on unrelated triggers, so a limit in one says nothing about age in
-the other; two successive attempts to size this were both disproved by direct
-probes (a shard-wide ceiling deleting by global row order regardless of scope,
-and a per-scope cap counting pins rather than pins with a live outcome). The
-boundary is therefore a clock both sides share:
+**What is guaranteed, and what degrades.** A recorded outcome has two parts, and
+only one of them is protected. The VERDICT — that this key already committed —
+is what makes a retry safe, and it is retained for the full lease. The OUTCOME
+PAYLOAD (`result`, `error`, `observations`) is what makes a retry *informative*,
+it is far larger, and it is best-effort: under pressure the oldest payloads are
+shed and those replays degrade to `replay_outcome:"none"`, which already means
+"the operation ran exactly once and its outcome was not retained". A client is
+therefore always told correctly *whether* its operation ran; it is not always
+told *what happened*.
 
-- a recorded outcome expires **10 minutes** after it is recorded, whatever the
-  count quotas above would allow;
-- a pin for a client-supplied operation id expires after **20 minutes**. The
-  gap is slack: the two stores are different Durable Objects with independent
-  clocks, and the pin must outlive the reply even under skew;
-- an unexpired pin is **never evicted**. At capacity the gateway REFUSES a new
-  retry-safe admission with `E_RETRY_CAPACITY` rather than drop a live one.
-  Nothing is planned or submitted; the client is told that the retry
-  *guarantee* was refused, not the operation, and MAY retry shortly or re-issue
-  without an operation id and accept at-least-once semantics knowingly. A
-  visible refusal is the intended cost — the alternative is a guarantee that
-  silently does not hold.
+**The guarantee, exactly.** Within 10 minutes of a client-keyed operation being
+recorded, a retry of that operation under the same key does not execute a second
+time. It does NOT hold, and MUST NOT be relied on, when:
 
-**The guarantee, exactly.** A recorded outcome younger than the 10-minute
-authority lease has a live pin routing its retry back to the scope that holds
-it. It does NOT hold, and MUST NOT be relied on, when:
-
-- the retry reaches a **different gateway shard** than the one that admitted
-  the operation. Shard routing follows the session, then the API key, so
-  retries on one credential are shard-stable; a retry presenting a *different*
-  credential for the same actor may land on a shard that never held the pin;
-- the admitting shard **lost its durable storage**;
+- the retry reaches a **different gateway shard** than the one that admitted the
+  operation. Shard routing follows the session, then the API key, so retries on
+  one credential are shard-stable; a retry presenting a *different* credential
+  for the same actor may land on a shard that never held the pin;
+- the admitting gateway shard **lost its durable storage**;
 - the operation id was **gateway-minted** rather than client-supplied. Minted
-  keys are never reusable by a client, so they carry no retained-route promise
-  and their pins are evicted freely;
-- either lease has **expired** — see the paragraph below, which is the ordinary
-  case and not a failure.
+  keys are never reusable by a client, carry no promise, and are evicted freely;
+- the admission was **refused** for capacity, above — in which case nothing ran;
+- either lease has **expired**, which is the ordinary case below and not a
+  failure.
 
-The converse containment is deliberately not claimed: a pin outliving its reply
-is expected and harmless. The pin is necessarily written BEFORE its submit —
-that is what makes it survive a lost response — so at write time there is no
-outcome to condition on.
+The converse containment is deliberately not claimed: a pin outliving its
+outcome is expected and harmless. The pin is necessarily written BEFORE its
+submit — that is what makes it survive a lost response — so at write time there
+is no outcome to condition on.
 
 A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read

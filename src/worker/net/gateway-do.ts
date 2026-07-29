@@ -1134,24 +1134,38 @@ export class NetGatewayDO {
     // Lease columns, added in place so an already-deployed shard keeps its
     // pins across the upgrade — dropping the table instead would blank every
     // in-flight route at exactly the moment the invariant is being repaired.
+    //
+    // Each column is probed INDEPENDENTLY and the whole step is one
+    // transaction. Gating both ALTERs on the presence of the FIRST one is a
+    // permanent brick: an interruption between the two statements leaves
+    // `expires_at` present and `guaranteed` absent, every later boot then sees
+    // `expires_at`, skips the block, and the index build below fails on the
+    // missing column — so the shard can never initialize again. A migration
+    // that is not resumable from its own halfway state is not a migration.
+    //
     // Legacy rows are backfilled with a full lease and treated as guaranteed:
     // conservative in the direction that matters, since it can only retain a
     // route that is no longer needed, never discard one that is.
-    const pinColumns = new Set(
-      sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
-    );
-    if (!pinColumns.has("expires_at")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
-      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
-    }
-    // Backfill unconditionally, not only when the columns are first added: any
-    // row that reaches this table without a lease is undateable, and an
-    // undateable row must not become an ageless one. Indexed on expires_at and
-    // a no-op once clean, so the steady-state cost is a lookup.
-    state.storage.sql.exec(
-      "UPDATE net_gateway_pin SET expires_at = ?, guaranteed = 1 WHERE expires_at IS NULL",
-      Date.now() + GATEWAY_PIN_LEASE_MS
-    );
+    state.storage.transactionSync(() => {
+      const pinColumns = new Set(
+        sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
+      );
+      if (!pinColumns.has("expires_at")) {
+        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
+      }
+      if (!pinColumns.has("guaranteed")) {
+        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
+      }
+      // Repairs BOTH columns, not just the one a fresh ALTER leaves null, so a
+      // shard that halted midway lands in the same state as one that never
+      // did. Unconditional rather than gated on the ALTERs: any row reaching
+      // this table undated must not become an ageless one.
+      state.storage.sql.exec(
+        "UPDATE net_gateway_pin SET expires_at = COALESCE(expires_at, ?), guaranteed = COALESCE(guaranteed, 1) " +
+          "WHERE expires_at IS NULL OR guaranteed IS NULL",
+        Date.now() + GATEWAY_PIN_LEASE_MS
+      );
+    });
     // Retention sweeps read by expiry and by class; both stay off a full-table
     // scan. Every SQLite index carries the rowid as its payload already, so
     // "oldest first within a class" is served by the class index — and naming
