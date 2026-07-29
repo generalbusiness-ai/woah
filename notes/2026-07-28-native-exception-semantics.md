@@ -30,23 +30,25 @@ table records the actual disposition.
 
 ### Adversarial re-review disposition
 
-The first implementation review found one P1 proof defect and the following
+Successive adversarial implementation reviews found a P1 proof defect, its
+inheritance-derived remnant, a shadow-lineage parity defect, and the following
 P2/defense-in-depth gaps. They are fixed on this branch:
 
 | Review finding | Disposition |
 |---|---|
-| Post-write read-backs survive abort | Recorder abort now invalidates proofs in execution order at cell granularity. A pre-mutation proof remains; a later property/version, location/contents, lifecycle, created-object, or exact-dispatch proof whose state was rolled back is pruned. The exact fresh write/read/raise transcript is accepted by the shadow authority, and the exact compacted gateway submission is accepted by both authority implementations. |
+| Post-write read-backs survive abort | Recorder abort now invalidates proofs in execution order by semantic dependency, not only by the cell that stores the proof. Property and verb resolution record every consulted lineage/definition namespace, so rolled-back `chparent`, verb replacement, alias dispatch, descendant dispatch, recycle, and create invalidate the derived proof even when its receiver cell was not directly written. A pre-mutation proof remains. Invalidating an untracked native dispatch preserves proof-free incompleteness evidence instead of laundering the failed transcript into a complete one. |
 | Authority reason-priority divergence | Completeness is the terminal step-4 envelope gate in both authorities and precedes generation-specific failed-effect admission. A transcript violating both rules returns `incomplete_transcript` from both. |
 | Failed-transcript grammar can drift | Exhaustive core and Net field maps assign every authority-visible transcript field to envelope, proof, effect, outcome, or integrity semantics. Runtime admission consumes those maps; core effect/outcome inspectors are derived from the classification, and an unknown or classified-but-unimplemented field fails closed with the bounded `unclassified_fields` reason. Compile-time and runtime drift tests cover both layers. |
 | Native contract guard is incomplete and outside the fast gate | All 50 built-in handlers register as `read_only`, `authoritative`, or `live_only`. The fast AST guard rejects direct unclassified registration and cross-checks every non-read-only handler against the complete failure-contract registry, including handlers deliberately untracked for Net admission. |
 | Proof-only transfer checks only the inner savepoint | Terminal command transfer sums mutations, staged acceptance, and disallowed recorder events over the complete active behavior-scope stack. An outer write hidden behind `$programmer:eval` now refuses `E_SCOPE_SPLIT` without sequence allocation. |
 | Programmer transition duplicates the flag planner | `setProgrammerAgentState`, `set_actor_flag`, and generic flag mutation now share `prepareObjectFlagPlan`/`applyObjectFlagPlan`; account quota/counter and profile audit wrap that one flag/surface plan. Surface-repair audit is derived from the observed membership change for the exact preflighted published surface, so an unpublished surface cannot fabricate `attached: true`. |
 | Catalog update claims rollback | `catalog_registry_update` declares `durable_progress`/`idempotent_progress`, matching its bounded migration-state recovery rather than promising rollback of already completed migration steps. |
-| AP11 ledger can undo an explicit demotion | `wizard = true` with `programmer = false` is treated as in-band evidence that AP11 completed and a later demotion preserved the wizard bit. The fully stripped state is indistinguishable from an interruption before AP11's first flag write, so it also conflicts rather than guessing toward privilege restoration. Reversible deactivation is likewise newer operator intent. Local and Net paths share the planner. |
+| AP11 ledger can undo an explicit demotion | `wizard = true` with `programmer = false` is treated as in-band evidence that AP11 completed and a later demotion preserved the wizard bit. For an already registered actor, the fully stripped state is likewise indistinguishable from an interruption before AP11's first flag write and therefore conflicts instead of guessing toward privilege restoration. An unregistered actor with mutual account/actor ledger evidence remains distinguishable as interrupted provisioning and is repairable. Reversible deactivation is newer operator intent. Local and Net paths share the planner. |
 | Local repair can race a live SQLite server | Every file-backed local repository holds a cooperative shared lifetime lease. The repair CLI requires the exclusive lease even for dry-run, then holds `BEGIN IMMEDIATE` across load/plan/apply. It refuses while a live server owns the world, closing the in-memory stale-flush race that a SQL transaction alone cannot see. |
 | Staged acceptance can be silently discarded | An outer behavior savepoint refuses if persistence deferral would pop it with unexecuted durable acceptance. Accepted-in-memory/absent-in-storage is not representable. |
 | Abort is not exception-safe | Abort attempts every inverse in LIFO order and preserves the original behavior error. Any restore failure latches `E_WORLD_POISONED`; later behavior and mutation refuse. Shadow execution hosts inspect the explicit reload signal after normal error frames and immediately discard a poisoned cache so the next request rebuilds from committed authority state. |
-| Test-matrix gaps | Tests now cover failed-call `meSnapshot` restore metadata, a real second refusal for promote/demote/revoke, failed-turn deterministic replay, exact producer-to-authority proof acceptance, and an automated 100-versus-5,000-object savepoint cost gate in `npm test`. |
+| Shadow authority cannot validate lineage turns | The shadow reader, versioner, validator, and applier now share one exact lifecycle value, `{parent, owner, name, anchor, flags}`. Existing-object `op:"set"` writes validate per-frame authority, apply the full semantic replacement, and re-derive parent/children projections; create remains a typed create plus lifecycle echo and recycle remains typed `TranscriptRecycle`. Successful `chparent`, rename, and flag turns are covered across twin authority, accepted-frame receiver, and cold reconstruction. |
+| Test-matrix gaps | Tests now cover failed-call `meSnapshot` restore metadata, a real second refusal for promote/demote/revoke, failed-turn deterministic replay, exact producer-to-authority proof acceptance, and automated 100-versus-5,000-object savepoint scaling in `npm test` without a contention-sensitive absolute microsecond threshold. |
 
 The bounded historical repair is implemented for local SQLite and Net account
 authorities. It walks only account-owned evidence, supports dry-run, refuses
@@ -101,12 +103,19 @@ Adversarial tests exposed and closed additional members of the same class:
   wrapper; a different request under the same live session/actor/frame id is
   refused before wrapper dispatch or sequence allocation.
 - a failed scope may retain durable pre-state proofs, but it cannot retain
-  a read or state probe made after a rolled-back mutation of that same cell.
-  Property/version, location/contents, lifecycle/recycle, created-object, and
-  exact-dispatch dependencies are invalidated in execution order across merged
-  nested scopes. Keeping such transient proofs either creates an
+  a read or state probe whose semantic resolution depends on rolled-back state.
+  Property/version, location/contents, lifecycle/recycle, created-object,
+  lineage ancestry, verb definition, alias, and descendant-dispatch
+  dependencies are invalidated in execution order across merged nested scopes.
+  Keeping such transient proofs either creates an
   authority-specific retry loop or records a value/version that never existed
   durably;
+- lifecycle parity exposed a distinct builder capability boundary:
+  `builder_create_object` and `builder_chparent` deliberately lower a
+  wizard-owned surface frame to a non-programmer actor. Their transcript
+  annotation selects the builder rule but does not grant it; shadow admission
+  independently proves the lowered principal, authenticated actor, recorded
+  definer, carried surface, and ordinary owner/fertile object policy;
 - restore itself is a safety boundary: every inverse is attempted, an inverse
   failure cannot mask the behavior error, and an instance whose restore failed
   becomes poisoned rather than serving partially restored state;
@@ -159,11 +168,11 @@ The final isolated branch passed the complete local ladder:
 
 | Lane | Result |
 |---|---|
-| Adversarial remediation focus (10 files) | 239/239 |
+| Adversarial remediation focus (11 files) | 248/248 |
 | `npm run typecheck` | passed |
 | `npm test` | 88 files, 1,063/1,063 |
-| `npm run test:worker` | 49 files, 392/392 |
-| `npm run test:full` | 168 files, 2,110/2,110 |
+| `npm run test:worker` | 49 files, 393/393 |
+| `npm run test:full` | 169 files, 2,124/2,124 |
 | `npm run load:net-dev` | 3/3 |
 | `npm run load:net-skew` | 6/6 |
 | `npm run smoke:net-dev` | 44/44 |
@@ -174,18 +183,49 @@ Adversarial reversion proved the late integration tests are causal:
 - restoring permissive proof retention leaves the transient
   `{ counter: 2, version: 2 }` read in the failed transcript and fails the
   authority-acceptance test;
+- reverting semantic dependency invalidation retains inherited property and
+  aliased/descendant dispatch proofs after a rolled-back lineage or definition
+  change, while dropping the independent incompleteness marker launders an
+  invalidated native dispatch; each focused probe fails on its corresponding
+  reversion;
+- restoring the shadow lifecycle presence sentinel/no-op applier rejects the
+  successful `chparent` control turn with lifecycle value mismatches and
+  `permission_denied` instead of materializing the accepted lineage;
+- before authenticated task-permission lowering, a genuine installed
+  `$builder:create` is rejected as `writer frame not recorded`; with only that
+  fix it is still rejected as `no recorded authority can create`. The complete
+  surface proof accepts real non-programmer create/reparent turns, while the
+  forged-marker control remains terminally refused;
+- bypassing runtime consumption of the field classification admits a
+  classified effect with no inspector, while omitting the Net extension
+  classification rejects a legitimate Net transcript; the respective grammar
+  tests fail;
+- restoring unconditional programmer-surface audit emission fabricates
+  `{attached:true}` on repeated grants when no surface is published and fails
+  the audit test;
 - checking only the innermost behavior scope lets the outer-write command
   transfer evade `E_SCOPE_SPLIT` and fails the nested-transfer test;
 - omitting a native classification or its failure contract fails the
   registry-exhaustiveness guard;
 - removing the AP11 explicit-demotion conflict re-promotes the deliberately
-  demoted agent and fails the local and Net repair tests;
+  demoted agent, while removing the registered fully-stripped ambiguity check
+  guesses toward privilege restoration; the corresponding local and Net
+  repair tests fail;
+- bypassing the dry-run review token lets a changed local or Net repair plan
+  apply without renewed operator review, and issuing a fresh token in a stale
+  Net conflict makes the unreviewed replacement transferable; each pinning
+  test fails;
+- raising the bounded Net repair member limit reaches the catalog authority
+  instead of refusing either an oversized source container or an oversized
+  de-duplicated union, failing the pre-RPC tests;
 - removing the exclusive repair lease lets a repair overlap a live local
   repository and fails the live-server refusal test;
 - allowing deferred staged acceptance to fall out of scope makes the
   persistence-deferral test return instead of throwing;
 - restoring fail-fast inverse replay lets `E_TEST_UNDO` mask
   `E_TEST_ORIGINAL` and fails the poisoned-rollback test;
+- retaining a poisoned shadow world in the execution cache fails the host-level
+  reload test after the accepted error frame;
 - reinstating the detached public-view metadata write makes the serialized
   workerd-fixture test fail; and
 - reverting created-object proof pruning exposes reads and dispatch proof for
