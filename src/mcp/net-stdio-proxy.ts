@@ -83,25 +83,35 @@ export class NetMcpStdioProxy {
       }
 
       const text = await response.text();
-      if (!text) throw new Error(`Net MCP returned ${response.status} with an empty body`);
-      const decoded = JSONRPCMessageSchema.parse(parseMcpBody(text, response.headers.get("content-type")));
       // Streamable HTTP may attach a useful JSON-RPC error to a non-2xx
-      // response. Preserve that protocol error; synthesize -32000 only when
-      // the response cannot be decoded as an MCP message at all.
-      if (response.ok && isInitialize(message)) {
-        const session = response.headers.get("mcp-session-id");
-        if (!session) throw new Error("Net MCP initialize response omitted mcp-session-id");
-        this.sessionId = session;
-        const negotiated = "result" in decoded
-          && decoded.result
-          && typeof decoded.result === "object"
-          && "protocolVersion" in decoded.result
-          && typeof decoded.result.protocolVersion === "string"
-          ? decoded.result.protocolVersion
-          : null;
-        this.protocolVersion = negotiated;
+      // response. `decodeNetMcpResponse` preserves whatever diagnosis the body
+      // carries — a JSON-RPC message, an older gateway's bare woo refusal, or
+      // failing both, a short summary — and never lets a schema-validation
+      // dump take the place of the server's own message.
+      const decoded = decodeNetMcpResponse(text, response);
+      if (decoded.kind === "message") {
+        // Only a message that actually carries a `result` establishes the
+        // session. An initialize the gateway ANSWERED with a JSON-RPC error
+        // reaches the error branch below, so the client is told why the key
+        // was refused instead of "initialize response omitted mcp-session-id".
+        if (response.ok && isInitialize(message)) {
+          const session = response.headers.get("mcp-session-id");
+          if (!session) throw new Error("Net MCP initialize response omitted mcp-session-id");
+          this.sessionId = session;
+          this.protocolVersion = protocolVersionOf(decoded.message);
+        }
+        return decoded.message;
       }
-      return decoded;
+      // An error, from any of the three shapes. A request gets it correlated
+      // to the id it sent — the gateway omits the id on a refusal raised
+      // before it could parse the body, and only this side still knows it.
+      if (hasRequestId(message)) return { jsonrpc: "2.0", id: message.id, error: decoded.error };
+      // A notification has no reply slot, so the refusal cannot be a message.
+      // It must still be legible: reporting it (stderr, via onError) is the
+      // only place the diagnosis can go, and throwing here would replace it
+      // with a bridge stack trace.
+      this.onError(new Error(`Net MCP refused ${methodOf(message) ?? "a notification"}: ${decoded.error.message}`));
+      return null;
     } catch (error) {
       const aborted = isAbortError(error) || this.requestAbort.signal.aborted;
       if (!hasRequestId(message)) {
@@ -191,7 +201,11 @@ export class NetMcpStdioProxy {
           return;
         }
         if (!response.ok) {
-          const detail = await response.text().catch(() => "");
+          // Same decode ladder the request path uses, so a refused carrier
+          // reports the gateway's own sentence rather than a raw body dump.
+          const text = await response.text().catch(() => "");
+          const decoded = decodeNetMcpResponse(text, response);
+          const detail = decoded.kind === "error" ? decoded.error.message : text;
           const error = new Error(`Net MCP notification stream returned ${response.status}: ${detail}`);
           // A dead/rejected session cannot recover by reopening the same GET.
           // Surface it once; later ordinary MCP calls will carry the correlated
@@ -241,6 +255,119 @@ function parseMcpBody(text: string, contentType: string | null): unknown {
   const data = text.split(/\r?\n/).find((line) => line.startsWith("data:"));
   if (!data) throw new Error("Net MCP event stream contained no message");
   return JSON.parse(data.slice("data:".length).trim());
+}
+
+/** The JSON-RPC error object shape this bridge produces or forwards. */
+type NetMcpErrorObject = { code: number; message: string; data?: unknown };
+
+type NetMcpDecoded =
+  | { kind: "message"; message: JSONRPCMessage }
+  | { kind: "error"; error: NetMcpErrorObject };
+
+/** JSON-RPC's implementation-defined server-error slot. The Net gateway uses
+ * the same number, and the woo code always rides in `error.data.code`. */
+const NET_MCP_SERVER_ERROR = -32000;
+
+/** Enough of a strange body to diagnose it, bounded so a stray HTML error page
+ * or a proxy dump cannot become a multi-kilobyte stdio message. */
+const NET_MCP_BODY_EXCERPT = 400;
+
+/**
+ * Decode one Streamable HTTP response body.
+ *
+ * Three shapes are accepted, in descending order of fidelity:
+ *
+ * 1. **A JSON-RPC message.** Returned as-is when it carries a result, and
+ *    unwrapped to its `error` when it is an error response — including the
+ *    id-less form the gateway uses for a refusal raised before it could read
+ *    the request (§M1.2), which only the caller can still correlate.
+ * 2. **A bare woo refusal**, `{error:{code,message,detail}}`. This is what
+ *    every gateway older than the §M1.2 envelope answers with on this route,
+ *    and what the rest of the woo HTTP surface still answers with. The bridge
+ *    and the worker version independently, so tolerating it is not legacy
+ *    kindness — it is the only thing that keeps a current bridge usable
+ *    against a deployed worker that has not been updated yet.
+ * 3. **Anything else.** A SHORT summary, with the unparseable material kept in
+ *    `data`. This is the case the previous implementation handled by letting a
+ *    schema validator throw and pasting its ~3 kB union report into the
+ *    user-facing `message`, which is how "apikey not found or revoked" reached
+ *    an agent as a wall of Zod output.
+ */
+function decodeNetMcpResponse(text: string, response: Response): NetMcpDecoded {
+  const status = response.status;
+  if (!text) {
+    return {
+      kind: "error",
+      error: {
+        code: NET_MCP_SERVER_ERROR,
+        message: `Net MCP returned ${status} with an empty body`,
+        data: { http_status: status }
+      }
+    };
+  }
+  let body: unknown;
+  try {
+    body = parseMcpBody(text, response.headers.get("content-type"));
+  } catch (error) {
+    return { kind: "error", error: unintelligibleBody(text, status, errorMessage(error)) };
+  }
+
+  const parsed = JSONRPCMessageSchema.safeParse(body);
+  if (parsed.success) {
+    const message = parsed.data;
+    if ("error" in message && message.error) return { kind: "error", error: message.error };
+    return { kind: "message", message };
+  }
+
+  const woo = bareWooRefusal(body);
+  if (woo) {
+    return {
+      kind: "error",
+      error: {
+        code: NET_MCP_SERVER_ERROR,
+        message: woo.message,
+        data: { code: woo.code, ...(woo.detail === undefined ? {} : { detail: woo.detail }), http_status: status }
+      }
+    };
+  }
+  // `parsed.error` is the schema report. It belongs in `data`, never in the
+  // message a client shows a human.
+  return { kind: "error", error: unintelligibleBody(text, status, parsed.error.message) };
+}
+
+/** The pre-envelope woo refusal body, or null when this is something else. */
+function bareWooRefusal(body: unknown): { code: string; message: string; detail?: unknown } | null {
+  if (typeof body !== "object" || body === null || !("error" in body)) return null;
+  const error = (body as { error: unknown }).error;
+  if (typeof error !== "object" || error === null) return null;
+  const code = (error as { code?: unknown }).code;
+  const message = (error as { message?: unknown }).message;
+  if (typeof code !== "string" || typeof message !== "string") return null;
+  return { code, message, detail: (error as { detail?: unknown }).detail };
+}
+
+function unintelligibleBody(text: string, status: number, reason: string): NetMcpErrorObject {
+  return {
+    code: NET_MCP_SERVER_ERROR,
+    message: `Net MCP returned an unrecognized ${status} response`,
+    data: {
+      http_status: status,
+      // Both are truncated: this string can end up on a terminal.
+      body: text.slice(0, NET_MCP_BODY_EXCERPT),
+      parse_error: reason.slice(0, NET_MCP_BODY_EXCERPT)
+    }
+  };
+}
+
+/** The negotiated protocol version from an initialize result, if it has one. */
+function protocolVersionOf(message: JSONRPCMessage): string | null {
+  if (!("result" in message) || !message.result || typeof message.result !== "object") return null;
+  const version = (message.result as { protocolVersion?: unknown }).protocolVersion;
+  return typeof version === "string" ? version : null;
+}
+
+function methodOf(message: JSONRPCMessage): string | null {
+  return "method" in message && typeof message.method === "string" ? message.method : null;
 }
 
 function errorMessage(error: unknown): string {
