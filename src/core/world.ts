@@ -2418,13 +2418,7 @@ export class WooWorld {
    *  commit apply preserves it from the prior cell. Shape mirrors the lineage
    *  payload bridge.cellsFromSerialized emits so post-state parity holds. */
   private lineageSemantic(obj: WooObject): Record<string, WooValue> {
-    return {
-      parent: obj.parent,
-      owner: obj.owner,
-      name: obj.name,
-      anchor: obj.anchor,
-      flags: { ...obj.flags } as unknown as WooValue
-    };
+    return this.effects.shadowLifecycleCellValue(obj) as unknown as Record<string, WooValue>;
   }
 
   /**

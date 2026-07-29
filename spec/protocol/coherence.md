@@ -527,6 +527,30 @@ whose effective programmer authority performed it (write authority is
 validated per-frame, **never** the union of verb owners in the transcript);
 `complete: false` transcripts are never accepted as durable turns.
 
+**Lifecycle-cell vocabulary.** An existing object's `lifecycle` cell is its
+complete semantic `object_lineage` value:
+`{parent, owner, name, anchor, flags}`. A lifecycle read validates that value
+and its content-derived version, never a presence sentinel. A runtime
+`chparent`, rename, flag change, or catalog lineage update records one
+`op:"set"` replacement of that complete value. Applying the replacement
+updates those five fields, preserves authority metadata not named by the
+semantic value (event schemas and epoch-immutable-definition markers in the
+Net representation), and re-derives the old/new parent's child projections.
+Object creation remains a `TranscriptCreate` plus its `op:"create"` lifecycle
+echo; recycle remains a typed `TranscriptRecycle`. An authority MUST NOT
+interpret an existing-object `op:"set"` as permission to create the object, nor
+accept another lifecycle op as an implicit lineage mutation.
+
+Lifecycle replacement authority is checked against the recorded VM frame.
+Wizard-owned frames may replace any semantic lineage field. A non-wizard frame
+may rename only an object it owns; it may also change that object's parent only
+while preserving owner, anchor, and flags, holding programmer authority, and
+being permitted to create an object it owns beneath the proposed fertile or
+owned parent. Recursive parentage is rejected. These checks are in addition to
+the exact pre-state lifecycle read and deterministic post-state re-derivation;
+the transcript is not a capability to synthesize a lineage state that the
+executed primitive could not have produced.
+
 `ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
 validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,
 which drop VTN18.2's stored `caller_perms` and add mandatory `armed_by`
@@ -604,6 +628,9 @@ buried in VTN):
   never re-runs verb bytecode; it re-applies recorded writes
   deterministically and constructs authoritative post-state from the
   transcript's creates/writes/moves/recycles and sequenced-log outcome. A
+  lifecycle `op:"set"` deterministically replaces the existing object's
+  semantic lineage fields and re-derives parent-child projections as specified
+  in CO3. A
   recycle replaces every authority cell owned by the object with one
   `object_tombstone` cell in the same commit, grafts its lineage children to
   its former parent, displaces its contained live objects to `$nowhere`, and

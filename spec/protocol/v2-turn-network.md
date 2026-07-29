@@ -761,12 +761,13 @@ pre-commit state `scope.next_seq == seq`, not as an ordinary stale property
 read, and applying the accepted transcript must materialize `scope.next_seq` to
 `seq + 1` alongside the sequenced log entry.
 
-The current transcript applier materializes object creation, property writes,
-location writes, contents writes, session-location side effects, and sequenced
-log entries. Lifecycle deletes and verb edits remain recorded/validated
-transcript cells but are not yet materialized by the shared applier; callers
-that need those effects must still treat the commit scope's serialized state as
-authoritative until the applier grows those cell kinds.
+The current transcript applier materializes object creation, existing-object
+lifecycle replacements (`op:"set"` over the complete semantic lineage value),
+property writes, location writes, contents writes, session-location side
+effects, and sequenced log entries. Lifecycle deletes and verb edits remain
+recorded/validated transcript cells but are not yet materialized by the shared
+applier; callers that need those effects must still treat the commit scope's
+serialized state as authoritative until the applier grows those cell kinds.
 
 ### VTN8.1 Movement is a placement transaction
 

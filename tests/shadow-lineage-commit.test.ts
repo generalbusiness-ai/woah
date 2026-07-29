@@ -1,0 +1,350 @@
+import { describe, expect, it } from "vitest";
+
+import { installVerb } from "../src/core/authoring";
+import { createWorld } from "../src/core/bootstrap";
+import {
+  readTranscriptCellFromSerializedWorld,
+  type EffectTranscript
+} from "../src/core/effect-transcript";
+import { authoritativePlanningWorld } from "../src/core/planning-world";
+import {
+  parseShadowLifecycleCellValue,
+  stableShadowJson
+} from "../src/core/shadow-cell-version";
+import {
+  applyAcceptedShadowFrame,
+  applyTranscriptWriteToSerializedObject,
+  createShadowCommitScope,
+  serializedFor,
+  submitShadowCommit
+} from "../src/core/shadow-commit-scope";
+import { runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { hashSource } from "../src/core/source-hash";
+import type { WooValue } from "../src/core/types";
+
+const PROGRAMMER = "lineage_programmer";
+
+function rehashTranscript(transcript: EffectTranscript): EffectTranscript {
+  const { hash: _prior, ...body } = transcript;
+  return {
+    ...body,
+    hash: hashSource(stableShadowJson(body as unknown as WooValue))
+  };
+}
+
+function lineageWorld() {
+  const world = createWorld();
+  world.createObject({
+    id: PROGRAMMER,
+    name: "Lineage programmer",
+    parent: "$player",
+    owner: PROGRAMMER,
+    flags: { programmer: true }
+  });
+  world.createObject({
+    id: "lineage_kind_a",
+    name: "Lineage kind A",
+    parent: "$thing",
+    owner: PROGRAMMER,
+    flags: { fertile: true }
+  });
+  world.createObject({
+    id: "lineage_kind_b",
+    name: "Lineage kind B",
+    parent: "$thing",
+    owner: PROGRAMMER,
+    flags: { fertile: true }
+  });
+  world.createObject({
+    id: "lineage_subject",
+    name: "Lineage subject",
+    parent: "lineage_kind_a",
+    owner: PROGRAMMER
+  });
+  const installed = installVerb(
+    world,
+    "lineage_subject",
+    "rekind",
+    "verb :rekind(parent) rxd { chparent(this, parent); return this; }",
+    null
+  );
+  if (!installed.ok) throw new Error(JSON.stringify(installed));
+  const renameInstalled = installVerb(
+    world,
+    "lineage_subject",
+    "relabel",
+    "verb :relabel(name) rxd { set_object_name(this, name); return this.name; }",
+    null
+  );
+  if (!renameInstalled.ok) throw new Error(JSON.stringify(renameInstalled));
+  return world;
+}
+
+async function lineageTurn(
+  world: ReturnType<typeof createWorld>,
+  input: Pick<ShadowTurnCall, "id" | "target" | "verb" | "args">
+) {
+  const serialized = world.exportWorld();
+  const call: ShadowTurnCall = {
+    kind: "woo.turn_call.shadow.v1",
+    route: "direct",
+    scope: "#-1",
+    session: null,
+    actor: PROGRAMMER,
+    ...input
+  };
+  const run = await runShadowTurnCallTranscript(authoritativePlanningWorld(serialized), call);
+  const scope = createShadowCommitScope({
+    node: "lineage-authority",
+    scope: call.scope,
+    serialized
+  });
+  const result = submitShadowCommit(scope, {
+    kind: "woo.commit.submit.shadow.v1",
+    id: call.id,
+    scope: call.scope,
+    expected: scope.head,
+    transcript: run.transcript
+  });
+  return { run, result, scope, before: serialized, call };
+}
+
+describe("shadow lineage commit authority", () => {
+  it("accepts and materializes a successful chparent turn", async () => {
+    const { run, result, scope, before, call } = await lineageTurn(lineageWorld(), {
+      id: "lineage-chparent",
+      target: "lineage_subject",
+      verb: "rekind",
+      args: ["lineage_kind_b"]
+    });
+
+    expect(run.frame).toMatchObject({ op: "result", result: "lineage_subject" });
+    expect(run.transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: "lineage_subject" },
+      op: "set"
+    }));
+    expect(readTranscriptCellFromSerializedWorld(before, {
+      kind: "lifecycle",
+      object: "lineage_subject"
+    })).toMatchObject({
+      ok: true,
+      value: {
+        parent: "lineage_kind_a",
+        owner: PROGRAMMER,
+        name: "Lineage subject",
+        anchor: null,
+        flags: {}
+      }
+    });
+    expect(result.kind, JSON.stringify(result)).toBe("woo.commit.accepted.shadow.v1");
+    const committed = serializedFor(scope);
+    expect(committed.objects.find((obj) => obj.id === "lineage_subject")?.parent).toBe("lineage_kind_b");
+    expect(committed.objects.find((obj) => obj.id === "lineage_kind_a")?.children).not.toContain("lineage_subject");
+    expect(committed.objects.find((obj) => obj.id === "lineage_kind_b")?.children).toContain("lineage_subject");
+
+    // The same accepted transcript is a pure function of the same authority
+    // pre-state. A second authority reaches byte-identical state/head, and a
+    // receiver applying the accepted frame reaches the same materialization.
+    const twin = createShadowCommitScope({ node: "lineage-twin", scope: call.scope, serialized: before });
+    const twinResult = submitShadowCommit(twin, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: call.id,
+      scope: call.scope,
+      expected: twin.head,
+      transcript: run.transcript
+    });
+    expect(twinResult.kind).toBe("woo.commit.accepted.shadow.v1");
+    expect(serializedFor(twin)).toEqual(committed);
+    expect(twin.head).toEqual(scope.head);
+
+    if (result.kind !== "woo.commit.accepted.shadow.v1") throw new Error(JSON.stringify(result));
+    const receiver = createShadowCommitScope({ node: "lineage-receiver", scope: call.scope, serialized: before });
+    applyAcceptedShadowFrame(receiver, result, run.transcript);
+    expect(serializedFor(receiver)).toEqual(committed);
+    const cold = createShadowCommitScope({
+      node: "lineage-cold",
+      scope: call.scope,
+      serialized: structuredClone(committed)
+    });
+    expect(serializedFor(cold).objects.find((obj) => obj.id === "lineage_subject")?.parent).toBe("lineage_kind_b");
+  });
+
+  it("accepts rename and flag turns through the same lifecycle vocabulary", async () => {
+    const renamed = await lineageTurn(lineageWorld(), {
+      id: "lineage-rename",
+      target: "lineage_subject",
+      verb: "relabel",
+      args: ["Renamed lineage subject"]
+    });
+    expect(renamed.result.kind, JSON.stringify(renamed.result)).toBe("woo.commit.accepted.shadow.v1");
+    const renamedObject = serializedFor(renamed.scope).objects.find((obj) => obj.id === "lineage_subject");
+    expect(renamedObject?.name).toBe("Renamed lineage subject");
+    expect(renamedObject?.properties).toContainEqual(["name", "Renamed lineage subject"]);
+
+    const flagWorld = createWorld();
+    const signup = await flagWorld.beginSignup("shadow-lineage@woo.dev", "password123");
+    const verified = flagWorld.verifySignup(signup.verification_token);
+    const human = verified.actor;
+    const account = flagWorld.propOrNull(human, "account") as string;
+    flagWorld.setProp(account, "programmer_grant_quota", 1);
+    const provisioned = await flagWorld.directCall(
+      "lineage-provision-agent",
+      human,
+      human,
+      "create_agent",
+      ["Lineage agent", "", false]
+    );
+    if (provisioned.op !== "result") throw new Error(JSON.stringify(provisioned));
+    const agent = (provisioned.result as { actor_id: string }).actor_id;
+    const before = flagWorld.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "lineage-flag",
+      route: "direct",
+      scope: "#-1",
+      session: null,
+      actor: human,
+      target: human,
+      verb: "promote_agent_to_programmer",
+      args: [agent]
+    };
+    const run = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), call);
+    expect(run.transcript.complete, run.transcript.incompleteReasons.join(",")).toBe(true);
+    expect(run.transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: agent },
+      op: "set"
+    }));
+    const scope = createShadowCommitScope({ node: "lineage-flag-authority", scope: call.scope, serialized: before });
+    const result = submitShadowCommit(scope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: call.id,
+      scope: call.scope,
+      expected: scope.head,
+      transcript: run.transcript
+    });
+    expect(result.kind, JSON.stringify(result)).toBe("woo.commit.accepted.shadow.v1");
+    expect(serializedFor(scope).objects.find((obj) => obj.id === agent)?.flags.programmer).toBe(true);
+  });
+
+  it("applies the complete lineage payload but refuses open or unauthorized replacements", async () => {
+    const original = await lineageTurn(lineageWorld(), {
+      id: "lineage-authority-probe",
+      target: "lineage_subject",
+      verb: "rekind",
+      args: ["lineage_kind_b"]
+    });
+    const lifecycleWrite = original.run.transcript.writes.find((write) =>
+      write.cell.kind === "lifecycle" && write.cell.object === "lineage_subject" && write.op === "set"
+    );
+    if (!lifecycleWrite) throw new Error("missing lifecycle replacement");
+
+    // Catalog-owned lineage updates use the same applier and may change every
+    // semantic field. Host-only row material is retained because it is not in
+    // the transcript namespace.
+    const row = structuredClone(original.before.objects.find((obj) => obj.id === "lineage_subject")!);
+    row.eventSchemas = [["retained", { value: "int" }]];
+    applyTranscriptWriteToSerializedObject(row, {
+      ...lifecycleWrite,
+      value: {
+        parent: "lineage_kind_b",
+        owner: "$wiz",
+        name: "Catalog replacement",
+        anchor: "lineage_kind_b",
+        flags: { fertile: true, programmer: false }
+      }
+    }, original.run.transcript);
+    expect(row).toMatchObject({
+      parent: "lineage_kind_b",
+      owner: "$wiz",
+      name: "Catalog replacement",
+      anchor: "lineage_kind_b",
+      flags: { fertile: true, programmer: false },
+      eventSchemas: [["retained", { value: "int" }]]
+    });
+    expect(parseShadowLifecycleCellValue({
+      parent: "lineage_kind_b",
+      owner: "$wiz",
+      name: "Bad namespace",
+      anchor: null,
+      flags: {},
+      host_private: true
+    })).toBeNull();
+    const inheritedOwner = Object.assign(Object.create({ owner: "$wiz" }), {
+      parent: "lineage_kind_b",
+      name: "Inherited authority",
+      anchor: null,
+      flags: {}
+    }) as WooValue;
+    expect(parseShadowLifecycleCellValue(inheritedOwner)).toBeNull();
+
+    // A programmer-owned frame may reparent/rename its object, but it cannot
+    // smuggle a privilege flag into that otherwise-valid replacement.
+    const forged = structuredClone(original.run.transcript);
+    forged.id = "lineage-forged-flag";
+    forged.writes = forged.writes.map((write) => {
+      if (write.cell.kind !== "lifecycle" || write.cell.object !== "lineage_subject" || write.op !== "set") return write;
+      return {
+        ...write,
+        value: {
+          ...(write.value as Record<string, WooValue>),
+          flags: { programmer: true }
+        }
+      };
+    });
+    const forgedTranscript = rehashTranscript(forged);
+    const forgedScope = createShadowCommitScope({
+      node: "lineage-forged-authority",
+      scope: forgedTranscript.scope,
+      serialized: original.before
+    });
+    const forgedResult = submitShadowCommit(forgedScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: forgedTranscript.id,
+      scope: forgedTranscript.scope,
+      expected: forgedScope.head,
+      transcript: forgedTranscript
+    });
+    expect(forgedResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "permission_denied"
+    });
+    if (forgedResult.kind !== "woo.commit.conflict.shadow.v1") throw new Error(JSON.stringify(forgedResult));
+    expect(forgedResult.errors).toContain("permission_denied: no recorded authority can replace lineage_subject.lifecycle");
+    expect(serializedFor(forgedScope)).toEqual(original.before);
+
+    // Authority follows lineage writes in transcript order. Two individually
+    // plausible reparentings cannot be combined to synthesize a recursive
+    // graph that the runtime's second chparent would have refused.
+    const forgedCycle = structuredClone(original.run.transcript);
+    forgedCycle.id = "lineage-forged-cycle";
+    forgedCycle.writes.push({
+      ...lifecycleWrite,
+      cell: { kind: "lifecycle", object: "lineage_kind_b" },
+      value: {
+        parent: "lineage_subject",
+        owner: PROGRAMMER,
+        name: "Lineage kind B",
+        anchor: null,
+        flags: { fertile: true }
+      }
+    });
+    const cycleTranscript = rehashTranscript(forgedCycle);
+    const cycleScope = createShadowCommitScope({
+      node: "lineage-cycle-authority",
+      scope: cycleTranscript.scope,
+      serialized: original.before
+    });
+    const cycleResult = submitShadowCommit(cycleScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: cycleTranscript.id,
+      scope: cycleTranscript.scope,
+      expected: cycleScope.head,
+      transcript: cycleTranscript
+    });
+    expect(cycleResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "permission_denied"
+    });
+    expect(serializedFor(cycleScope)).toEqual(original.before);
+  });
+});
