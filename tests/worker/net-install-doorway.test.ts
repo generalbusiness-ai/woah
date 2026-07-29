@@ -61,8 +61,8 @@ describe("the /net-install doorway (route level)", () => {
 
     const catalog = h.scopeStates.get("catalog");
     expect(catalog, "probe must route specifically to the catalog scope").toBeDefined();
-    const meta = catalog!.state.storage.sql.exec("SELECT body FROM net_scope_meta WHERE id = 'meta'").toArray();
-    const cells = catalog!.state.storage.sql.exec("SELECT key FROM net_scope_cell").toArray();
+    const meta = catalog!.fake.storage.sql.exec("SELECT body FROM net_scope_meta WHERE id = 'meta'").toArray();
+    const cells = catalog!.fake.storage.sql.exec("SELECT key FROM net_scope_cell").toArray();
     expect(meta).toEqual([]);
     expect(cells).toEqual([]);
     await h.close();
@@ -199,7 +199,7 @@ describe("the /net-install doorway (route level)", () => {
     expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", changed: ["relation:contents:repair_room:mounted_tool"] });
     const replayed = await h.signedRequest("/net-install/scope/room%3Arepair_room/repair-relations", repairBody);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", changed: [] });
-    const rows = h.scopeStates.get("room:repair_room")!.state.storage.sql.exec("SELECT body FROM net_scope_relation").toArray();
+    const rows = h.scopeStates.get("room:repair_room")!.fake.storage.sql.exec("SELECT body FROM net_scope_relation").toArray();
     expect(rows).toHaveLength(1);
     await h.close();
   });
@@ -248,7 +248,7 @@ describe("the /net-install doorway (route level)", () => {
     // gateway:aged") -- inside the test body, against live storage, not after
     // teardown. Do not confuse it with the post-close `database is not open`
     // family that tests/worker/quiescent-do.ts exists to eliminate.
-    h.scopeStates.get("catalog")!.state.storage.sql.exec(
+    h.scopeStates.get("catalog")!.fake.storage.sql.exec(
       "INSERT INTO net_scope_subscribers (destination, role) VALUES ('gateway:aged', 'fanout')"
     );
     const replacement = {
@@ -298,7 +298,7 @@ describe("the /net-install doorway (route level)", () => {
     });
     const replayed = await h.signedRequest("/net-install/scope/catalog/repair-definitions", body);
     expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", head: { seq: 1 }, changed: [], removed: [] });
-    const durable = h.scopeStates.get("catalog")!.state.storage.sql;
+    const durable = h.scopeStates.get("catalog")!.fake.storage.sql;
     const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'verb_bytecode:$player:ways'").toArray();
     expect(JSON.parse(String(stored[0]!.body))).toMatchObject({ value: replacement.value, stamp: { scope_head: expect.stringMatching(/^1:/) } });
     const storedProperty = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$player:current_slot'").toArray();
@@ -403,7 +403,7 @@ describe("the /net-install doorway (route level)", () => {
       head: { seq: 1 },
       changed: ["property_cell:$helpdb:topics"]
     });
-    const durable = h.scopeStates.get("catalog")!.state.storage.sql;
+    const durable = h.scopeStates.get("catalog")!.fake.storage.sql;
     const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$helpdb:topics'").toArray();
     expect(JSON.parse(String(stored[0]!.body))).toMatchObject({
       value: {
@@ -483,7 +483,7 @@ describe("the /net-install doorway (route level)", () => {
       changed: ["verb_bytecode:aged_box:mike", "verb_bytecode:aged_box:zulu"]
     });
 
-    const durable = h.scopeStates.get("room:aged")!.state.storage.sql;
+    const durable = h.scopeStates.get("room:aged")!.fake.storage.sql;
     const slotOf = (key: string) => {
       const rows = durable.exec(`SELECT body FROM net_scope_cell WHERE key = '${key}'`).toArray();
       return (JSON.parse(String(rows[0]!.body)) as { value: { slot?: number } }).value.slot;
