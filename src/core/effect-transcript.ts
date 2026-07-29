@@ -322,6 +322,9 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         });
         incompleteReasons.add(event.name);
         break;
+      case "incomplete_evidence":
+        incompleteReasons.add(event.reason);
+        break;
       case "schedule":
         schedules.set(event.request.id, {
           id: event.request.id,

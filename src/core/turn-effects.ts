@@ -105,6 +105,7 @@ export type { PlanningWorldProvenance } from "./planning-world";
 export type {
   ActiveTurnRecorder,
   RecordedCell,
+  RecordedProofDependency,
   RecordedWriteAuthority,
   TurnRecorder,
   TurnRecorderEvent,

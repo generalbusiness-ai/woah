@@ -67,6 +67,7 @@ import {
   type PlanningWorldProvenance,
   type ActiveTurnRecorder,
   type RecordedCell,
+  type RecordedProofDependency,
   type RecordedWriteAuthority,
   type TurnRecorder,
   type TurnRecorderEvent,
@@ -181,6 +182,7 @@ export type ShadowHostApplyResult = {
 type ResolvedVerb = {
   definer: ObjRef;
   verb: VerbDef;
+  dependencies: RecordedProofDependency[];
 };
 
 type ParsedToken = {
@@ -2346,7 +2348,14 @@ export class WooWorld {
 
   // Local bytecode-to-bytecode calls bypass dispatch(), so the VM uses this
   // hook to keep verb metadata reads complete for transcript validation.
-  recordTurnDispatch(target: ObjRef, verbName: string, startAt: ObjRef | null | undefined, definer: ObjRef, verb: VerbDef): void {
+  recordTurnDispatch(
+    target: ObjRef,
+    verbName: string,
+    startAt: ObjRef | null | undefined,
+    definer: ObjRef,
+    verb: VerbDef,
+    dependencies: RecordedProofDependency[] = []
+  ): void {
     this.recordTurnEvent({
       kind: "dispatch",
       target,
@@ -2358,12 +2367,20 @@ export class WooWorld {
       version: verb.version,
       source_hash: verb.source_hash,
       direct_callable: verb.direct_callable,
-      ...(verb.kind === "native" ? { native: verb.native } : {})
+      ...(verb.kind === "native" ? { native: verb.native } : {}),
+      ...(dependencies.length > 0 ? { dependencies } : {})
     });
   }
 
-  recordTurnStateProbe(cell: RecordedCell): void {
-    this.recordTurnEvent({ kind: "state_probe", cell });
+  recordTurnStateProbe(
+    cell: RecordedCell,
+    dependencies: RecordedProofDependency[] = []
+  ): void {
+    this.recordTurnEvent({
+      kind: "state_probe",
+      cell,
+      ...(dependencies.length > 0 ? { dependencies } : {})
+    });
   }
 
   private recordedEventWithWriter(event: TurnRecorderEvent): TurnRecorderEvent {
@@ -3397,8 +3414,55 @@ export class WooWorld {
       lookupParent: (parent, start) => this.parentWalkLookup(start, parent),
       propertyNotFound: (missing) => wooError("E_PROPNF", `property not found: ${missing}`, missing)
     });
-    this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value, version: this.propertyVersionForRecording(objRef, name) });
+    const dependencies = this.propertyResolutionDependenciesForRecording(objRef, name);
+    this.recordTurnEvent({
+      kind: "prop_read",
+      object: objRef,
+      name,
+      value,
+      version: this.propertyVersionForRecording(objRef, name),
+      ...(dependencies.length > 0 ? { dependencies } : {})
+    });
     return value;
+  }
+
+  /**
+   * Capture the semantic lookup path behind a property proof. The transcript
+   * stores the proof at the receiver's cell, but an inherited value also
+   * depends on the lineage edges and property-definition namespaces actually
+   * consulted. Recording that path at read time lets an aborted scope prune a
+   * later proof after a transient chparent/definition edit without enumerating
+   * descendants or retaining a live world capability in the recorder.
+   */
+  private propertyResolutionDependenciesForRecording(
+    objRef: ObjRef,
+    name: string
+  ): RecordedProofDependency[] {
+    const object = this.objectLive(objRef);
+    if (name === "owner" || (name === "name" && !object.properties.has(name))) {
+      return [{ kind: "lineage", object: objRef }];
+    }
+    if (object.properties.has(name)) return [];
+
+    const dependencies: RecordedProofDependency[] = [
+      { kind: "lineage", object: objRef }
+    ];
+    let current = object.parent;
+    const seen = new Set<ObjRef>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const ancestor = this.parentWalkLookup(objRef, current);
+      if (!ancestor) break;
+      dependencies.push({
+        kind: "property_resolution",
+        object: current,
+        name
+      });
+      if (ancestor.propertyDefs.has(name)) break;
+      dependencies.push({ kind: "lineage", object: current });
+      current = ancestor.parent;
+    }
+    return dependencies;
   }
 
   /**
@@ -3860,7 +3924,11 @@ export class WooWorld {
 
   resolveVerb(objRef: ObjRef, name: string): ResolvedVerb {
     const resolved = this.resolveVerbLive(objRef, name);
-    return { definer: resolved.definer, verb: this.cloneVerbSharingBytecode(resolved.verb) };
+    return {
+      definer: resolved.definer,
+      verb: this.cloneVerbSharingBytecode(resolved.verb),
+      dependencies: structuredClone(resolved.dependencies)
+    };
   }
 
   private resolveVerbLive(objRef: ObjRef, name: string): ResolvedVerb {
@@ -3872,13 +3940,24 @@ export class WooWorld {
     // "no stale-dispatch window" guarantee that tests/recycle.test.ts
     // relies on for callers that hold the target ULID after recycle.
     if (!this.objects.has(objRef)) throw wooError("E_OBJNF", `object not found: ${objRef}`, objRef);
-    const parentMatch = this.resolveVerbFromLive(objRef, name, false);
-    if (parentMatch) return parentMatch;
+    const parentSearch = this.resolveVerbChainLive(objRef, name);
+    if (parentSearch.resolved) return {
+      ...parentSearch.resolved,
+      dependencies: parentSearch.dependencies
+    };
+    const dependencies = parentSearch.dependencies;
     if (this.canCarryFeatures(objRef)) {
+      // The feature vector itself is inherited property data. Its lookup
+      // closure is part of dispatch resolution just as the feature chains are.
+      dependencies.push(...this.propertyResolutionDependenciesForRecording(objRef, "features"));
       const features = this.featureList(objRef);
       for (const feature of features) {
-        const featureMatch = this.resolveVerbFromLive(feature, name, false);
-        if (featureMatch) return featureMatch;
+        const featureSearch = this.resolveVerbChainLive(feature, name, dependencies);
+        dependencies.push(...featureSearch.dependencies);
+        if (featureSearch.resolved) return {
+          ...featureSearch.resolved,
+          dependencies
+        };
       }
     }
     throw wooError("E_VERBNF", `verb not found: ${objRef}:${name}`, { obj: objRef, name });
@@ -3891,24 +3970,63 @@ export class WooWorld {
       ? this.resolveVerbFromLive(startRef, name)
       : this.resolveVerbFromLive(startRef, name, false);
     return resolved
-      ? { definer: resolved.definer, verb: this.cloneVerbSharingBytecode(resolved.verb) }
+      ? {
+          definer: resolved.definer,
+          verb: this.cloneVerbSharingBytecode(resolved.verb),
+          dependencies: structuredClone(resolved.dependencies)
+        }
       : null;
   }
 
   private resolveVerbFromLive(startRef: ObjRef | null, name: string): ResolvedVerb;
   private resolveVerbFromLive(startRef: ObjRef | null, name: string, required: false): ResolvedVerb | null;
   private resolveVerbFromLive(startRef: ObjRef | null, name: string, required = true): ResolvedVerb | null {
+    const search = this.resolveVerbChainLive(startRef, name);
+    if (search.resolved) {
+      return {
+        ...search.resolved,
+        dependencies: search.dependencies
+      };
+    }
+    if (!required) return null;
+    throw wooError("E_VERBNF", `verb not found: ${startRef ?? "#-1"}:${name}`, { obj: startRef ?? "#-1", name });
+  }
+
+  /**
+   * Resolve one inheritance chain while retaining precisely the namespaces
+   * consulted before the winning page. A page lookup depends on every verb
+   * vocabulary checked (canonical names, aliases, and slots share it), and on
+   * a lineage edge only when lookup had to follow that edge.
+   */
+  private resolveVerbChainLive(
+    startRef: ObjRef | null,
+    name: string,
+    proofPrefix: readonly RecordedProofDependency[] = []
+  ): {
+    resolved: Omit<ResolvedVerb, "dependencies"> | null;
+    dependencies: RecordedProofDependency[];
+  } {
+    const dependencies: RecordedProofDependency[] = [];
     let current: ObjRef | null = startRef;
     while (current) {
       const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
       if (!obj) break;
-      if (current !== startRef) this.recordTurnStateProbe({ kind: "verb", object: current, name });
+      dependencies.push({ kind: "verb_resolution", object: current });
+      if (current !== startRef) {
+        this.recordTurnStateProbe(
+          { kind: "verb", object: current, name },
+          [...proofPrefix, ...dependencies]
+        );
+      }
       const verb = this.ownVerbNamed(current, name);
-      if (verb) return { definer: current, verb };
+      if (verb) return {
+        resolved: { definer: current, verb },
+        dependencies
+      };
+      dependencies.push({ kind: "lineage", object: current });
       current = obj.parent;
     }
-    if (!required) return null;
-    throw wooError("E_VERBNF", `verb not found: ${startRef ?? "#-1"}:${name}`, { obj: startRef ?? "#-1", name });
+    return { resolved: null, dependencies };
   }
 
   describe(objRef: ObjRef): Record<string, WooValue> {
@@ -7595,9 +7713,11 @@ export class WooWorld {
         // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
         // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
         // as "no parent override" and fall back to the standard resolveVerb walk.
-        const { definer, verb } = startAt == null ? this.resolveVerbLive(target, verbName) : this.resolveVerbFromLive(startAt, verbName);
+        const { definer, verb, dependencies } = startAt == null
+          ? this.resolveVerbLive(target, verbName)
+          : this.resolveVerbFromLive(startAt, verbName);
         this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-        this.recordTurnDispatch(target, verbName, startAt, definer, verb);
+        this.recordTurnDispatch(target, verbName, startAt, definer, verb, dependencies);
         const runCtx: CallContext = {
           ...ctx,
           thisObj: target,
@@ -9247,7 +9367,7 @@ export class WooWorld {
     while (current) {
       const match = this.ownVerbNamed(current, name);
       walk.push({ id: current, kind: "parent", matched: match !== null });
-      if (match) return { definer: current, verb: match };
+      if (match) return { definer: current, verb: match, dependencies: [] };
       const obj = this.parentWalkLookup(objRef, current);
       if (!obj) break;
       current = obj.parent;
@@ -9258,7 +9378,7 @@ export class WooWorld {
         while (featureCurrent) {
           const match = this.ownVerbNamed(featureCurrent, name);
           walk.push({ id: featureCurrent, kind: "feature", feature, matched: match !== null });
-          if (match) return { definer: featureCurrent, verb: match };
+          if (match) return { definer: featureCurrent, verb: match, dependencies: [] };
           const obj = this.parentWalkLookup(feature, featureCurrent);
           if (!obj) break;
           featureCurrent = obj.parent;
@@ -9275,7 +9395,7 @@ export class WooWorld {
     const verb = obj.verbs.find((entry) => entry.slot === slot);
     walk.push({ id: objRef, kind: "slot", slot, matched: verb !== undefined });
     if (!verb) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${slot}`, { obj: objRef, slot, actor });
-    return { definer: objRef, verb };
+    return { definer: objRef, verb, dependencies: [] };
   }
 
   private selectOwnVerbForInstall(

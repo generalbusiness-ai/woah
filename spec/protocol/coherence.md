@@ -97,9 +97,30 @@ attempts. During an attempt they are immutable inputs. Attempt-local derived
 state and behavior-domain recorder effects follow the same savepoint stack as
 the state they describe: an inner success merges provisionally into its parent,
 and an aborted inner or outer scope cannot influence later reads or contribute
-a domain effect to the submitted transcript. Reads, dispatch proofs, state
-probes, deterministic logical inputs, and untracked-effect evidence may remain
-after abort when the authority needs them to validate the failed attempt.
+a domain effect to the submitted transcript.
+
+Proof retention after abort is **execution-ordered and dependency-closed**. A
+read, dispatch proof, or state probe may remain only when every cell and
+resolution namespace it depended on still describes the restored durable
+pre-scope state. The recorder walks the aborted trace in execution order:
+proofs observed before a rolled-back mutation remain, while later proofs whose
+dependency closure intersects that mutation are discarded. For an inherited
+property read, the closure includes the receiver cell plus every lineage edge
+followed and same-named property-definition namespace consulted. For dispatch,
+it includes every lineage edge followed and each visited object's complete verb
+vocabulary — canonical names, aliases, and slot precedence are one namespace —
+including feature-vector/property resolution and visited feature chains.
+Therefore a rolled-back `chparent` invalidates later descendant reads and
+dispatches that traversed the changed edge, and a rolled-back definition edit
+invalidates later inherited/aliased resolution even when the transcript proof
+is stored under a different receiver or invocation name. This is bounded by the
+already-materialized resolution path; it never enumerates all descendants.
+
+Deterministic logical inputs and incompleteness/untracked-effect evidence may
+remain independently because they are not claims about restored cell values.
+In particular, pruning a transient untracked-native dispatch proof MUST retain
+proof-free incompleteness evidence; rollback cannot turn an incomplete attempt
+into a complete transcript.
 
 ### CO2.3 Commit scope by write set, with ride-along
 
@@ -524,11 +545,14 @@ the canonically hashed transcript body. Generation 1 promises that a failed
 direct transcript carries no effects, and that a failed sequenced transcript
 carries only its sequencing-space owner's exact `next_seq` allocation
 read/write pair plus the canonical `$error` observation. Reads, state probes,
-logical inputs, and dispatch proofs may remain because they do not mutate
-domain state. Every create, behavior write, move, recycle, session transition,
-projection write, schedule, cancellation, domain observation, result, or
-untracked effect violates that promise. A sequencing allocation at any
-non-owner violates it as well.
+logical inputs, and dispatch proofs may remain only under CO2.2's
+execution-ordered dependency-closure rule: non-mutating proof material is not
+admissible when it describes state seen only after a rolled-back
+lineage/definition/value mutation. Proof-free incompleteness evidence also
+remains and keeps the transcript incomplete. Every create, behavior write,
+move, recycle, session transition, projection write, schedule, cancellation,
+domain observation, result, or untracked effect violates that promise. A
+sequencing allocation at any non-owner violates it as well.
 
 Authorities classify every failed transcript into fixed-vocabulary effect
 counts and reasons without recording world values or observation/error

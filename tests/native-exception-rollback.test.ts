@@ -1205,6 +1205,56 @@ describe("native exception rollback", () => {
     ]);
   });
 
+  it("preserves incompleteness when a transient lineage invalidates an untracked native dispatch proof", () => {
+    const recorder = new InMemoryTurnRecorder();
+    const active = recorder.startTurn({
+      route: "direct",
+      scope: "room",
+      seq: 0,
+      actor: "$wiz",
+      target: "controller",
+      verb: "untracked_after_chparent",
+      args: []
+    });
+
+    active.beginBehaviorScope();
+    active.event({
+      kind: "cell_write",
+      cell: { kind: "lifecycle", object: "subject" },
+      value: { parent: "transient_parent" },
+      op: "set"
+    });
+    active.event({
+      kind: "dispatch",
+      target: "subject",
+      verb: "untracked",
+      definer: "transient_parent",
+      implementation: "native",
+      native: "unregistered_test_native",
+      owner: "$wiz",
+      dependencies: [{ kind: "lineage", object: "subject" }]
+    });
+    active.abortBehaviorScope();
+    active.event({
+      kind: "turn_finish",
+      ok: false,
+      error: { code: "E_EXPECTED", message: "expected", value: null, trace: [] }
+    });
+
+    expect(recorder.turns[0].events).toContainEqual({
+      kind: "incomplete_evidence",
+      reason: "native:subject:untracked"
+    });
+    expect(recorder.turns[0].events).not.toContainEqual(expect.objectContaining({
+      kind: "dispatch",
+      verb: "untracked"
+    }));
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.reads).toEqual([]);
+    expect(transcript.complete).toBe(false);
+    expect(transcript.incompleteReasons).toContain("native:subject:untracked");
+  });
+
   it("does not retain a failed create as a same-run ordered parent", async () => {
     const world = createWorld();
     world.setRequireOrderedChildrenProjection(true);

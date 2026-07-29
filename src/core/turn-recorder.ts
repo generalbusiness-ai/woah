@@ -1,5 +1,6 @@
 import type { ErrorValue, ObjRef, Observation, WooObject, WooValue } from "./types";
 import type { ProjectionWrite } from "./projection-delta";
+import { nativePrimitiveIsTranscriptTracked } from "./native-primitive-contract";
 
 export type TurnRoute = "direct" | "sequenced";
 
@@ -12,6 +13,17 @@ export type RecordedCell =
 
 export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace" | "delete";
 export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "tombstones" | "counters" }>;
+
+/**
+ * A semantic dependency of a proof, distinct from the cell eventually placed
+ * in the transcript. Inherited lookup proofs are stored at the receiver, but
+ * their value/definer also depends on every lineage and definition namespace
+ * consulted while resolving them.
+ */
+export type RecordedProofDependency =
+  | { kind: "lineage"; object: ObjRef }
+  | { kind: "property_resolution"; object: ObjRef; name: string }
+  | { kind: "verb_resolution"; object: ObjRef };
 
 // Authority is captured at the VM-frame boundary so commit validation can
 // authorize each mutation against the exact `progr` that performed it.
@@ -43,7 +55,7 @@ export type TurnRecorderEvent =
   | { kind: "turn_finish"; ok: false; error: ErrorValue }
   | { kind: "cell_read"; cell: RecordedCell; value: WooValue; version?: string }
   | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string; writer?: RecordedWriteAuthority }
-  | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number | string }
+  | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number | string; dependencies?: RecordedProofDependency[] }
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string; writer?: RecordedWriteAuthority }
   | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; writer?: RecordedWriteAuthority }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef; writer?: RecordedWriteAuthority }
@@ -55,10 +67,14 @@ export type TurnRecorderEvent =
   | { kind: "session_scope"; session: string; actor: ObjRef; from: ObjRef | null; to: ObjRef | null; rosterVisible?: false }
   | { kind: "projection_write"; write: RecordedProjectionWrite }
   | { kind: "observe"; observation: Observation }
-  | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }
-  | { kind: "state_probe"; cell: RecordedCell }
+  | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string; dependencies?: RecordedProofDependency[] }
+  | { kind: "state_probe"; cell: RecordedCell; dependencies?: RecordedProofDependency[] }
   | { kind: "logical_input"; name: string; value: WooValue }
   | { kind: "untracked_effect"; name: string; detail?: WooValue }
+  // Proof-free evidence that an invalidated native dispatch was untracked.
+  // Rollback may discard the transient verb-page proof, but completeness must
+  // still fail closed rather than laundering the native through pruning.
+  | { kind: "incomplete_evidence"; reason: string }
   // CO16.2: arming and cancelling a scheduled turn are authority-bearing
   // effects, not writes. They carry the same per-frame `writer` provenance a
   // write does, and for the same reason: the commit scope must be able to
@@ -218,7 +234,8 @@ function recorderEventSurvivesBehaviorAbort(event: TurnRecorderEvent): boolean {
     event.kind === "dispatch" ||
     event.kind === "state_probe" ||
     event.kind === "logical_input" ||
-    event.kind === "untracked_effect"
+    event.kind === "untracked_effect" ||
+    event.kind === "incomplete_evidence"
   );
 }
 
@@ -233,16 +250,41 @@ function recorderEventsSurvivingBehaviorAbort(events: readonly TurnRecorderEvent
   const invalidatedCells = new Set<string>();
   const invalidatedObjects = new Set<ObjRef>();
   const invalidatedDispatchTargets = new Set<ObjRef>();
+  const invalidatedDependencies = new Set<string>();
   const surviving: TurnRecorderEvent[] = [];
 
   for (const event of events) {
-    if (
-      recorderEventSurvivesBehaviorAbort(event) &&
-      !recorderProofWasInvalidated(event, invalidatedCells, invalidatedObjects, invalidatedDispatchTargets)
-    ) {
-      surviving.push(event);
+    if (recorderEventSurvivesBehaviorAbort(event)) {
+      const invalidated = recorderProofWasInvalidated(
+        event,
+        invalidatedCells,
+        invalidatedObjects,
+        invalidatedDispatchTargets,
+        invalidatedDependencies
+      );
+      if (!invalidated) {
+        surviving.push(event);
+      } else if (
+        event.kind === "dispatch" &&
+        event.implementation === "native" &&
+        !nativePrimitiveIsTranscriptTracked(event.native)
+      ) {
+        // The dispatch proof describes transient resolution state and cannot
+        // survive, but its negative completeness evidence is independent of
+        // that proof and must remain terminal.
+        surviving.push({
+          kind: "incomplete_evidence",
+          reason: `native:${event.target}:${event.verb}`
+        });
+      }
     }
-    recordRolledBackProofInvalidations(event, invalidatedCells, invalidatedObjects, invalidatedDispatchTargets);
+    recordRolledBackProofInvalidations(
+      event,
+      invalidatedCells,
+      invalidatedObjects,
+      invalidatedDispatchTargets,
+      invalidatedDependencies
+    );
   }
   return surviving;
 }
@@ -281,9 +323,20 @@ function recorderProofWasInvalidated(
   event: TurnRecorderEvent,
   invalidatedCells: ReadonlySet<string>,
   invalidatedObjects: ReadonlySet<ObjRef>,
-  invalidatedDispatchTargets: ReadonlySet<ObjRef>
+  invalidatedDispatchTargets: ReadonlySet<ObjRef>,
+  invalidatedDependencies: ReadonlySet<string>
 ): boolean {
+  // Object existence is an implicit prerequisite of every dispatch even
+  // though the transcript read is stored at the resolved definer's verb cell.
   if (event.kind === "dispatch" && invalidatedDispatchTargets.has(event.target)) return true;
+  if (
+    (event.kind === "prop_read" || event.kind === "dispatch" || event.kind === "state_probe") &&
+    event.dependencies?.some((dependency) =>
+      invalidatedDependencies.has(recordedProofDependencyKey(dependency))
+    )
+  ) {
+    return true;
+  }
   const cell = recorderProofCell(event);
   return cell !== null && (
     invalidatedObjects.has(cell.object) ||
@@ -295,10 +348,14 @@ function recordRolledBackProofInvalidations(
   event: TurnRecorderEvent,
   invalidatedCells: Set<string>,
   invalidatedObjects: Set<ObjRef>,
-  invalidatedDispatchTargets: Set<ObjRef>
+  invalidatedDispatchTargets: Set<ObjRef>,
+  invalidatedDependencies: Set<string>
 ): void {
   const invalidate = (cell: RecordedCell): void => {
     invalidatedCells.add(recordedCellKey(cell));
+  };
+  const invalidateDependency = (dependency: RecordedProofDependency): void => {
+    invalidatedDependencies.add(recordedProofDependencyKey(dependency));
   };
   const invalidateContents = (object: ObjRef | null): void => {
     if (object !== null) invalidate({ kind: "contents", object });
@@ -311,14 +368,32 @@ function recordRolledBackProofInvalidations(
     case "cell_write":
       invalidate(event.cell);
       if (event.cell.kind === "lifecycle") {
-        // Lineage/lifecycle state participates in method resolution even when
-        // the resolved verb page itself belongs to a durable ancestor.
-        invalidatedDispatchTargets.add(event.cell.object);
+        // A lineage edge participates in every inherited property/verb lookup
+        // whose recorded dependency closure visited this object.
+        invalidateDependency({ kind: "lineage", object: event.cell.object });
         if (event.op === "create" || event.op === "delete") invalidatedObjects.add(event.cell.object);
+        if (event.op === "delete") invalidatedDispatchTargets.add(event.cell.object);
+      } else if (event.cell.kind === "verb") {
+        // Canonical names, aliases, and slot precedence share one vocabulary
+        // namespace. Replacing any page can change a later dispatch whose
+        // invocation name differs from the page's canonical name.
+        invalidateDependency({ kind: "verb_resolution", object: event.cell.object });
+      } else if (
+        event.cell.kind === "prop" &&
+        (event.op === "replace" || event.op === "delete")
+      ) {
+        // Authored definition/default changes affect descendant inherited
+        // reads. Ordinary instance value writes remain exact-cell effects.
+        invalidateDependency({
+          kind: "property_resolution",
+          object: event.cell.object,
+          name: event.cell.name
+        });
       }
       return;
     case "object_create":
       invalidatedObjects.add(event.object);
+      invalidateDependency({ kind: "lineage", object: event.object });
       invalidateContents(event.location);
       return;
     case "object_move":
@@ -333,9 +408,20 @@ function recordRolledBackProofInvalidations(
         // cell and dispatch edge for the object can be attested.
         invalidatedObjects.add(event.write.key);
         invalidatedDispatchTargets.add(event.write.key);
+        invalidateDependency({ kind: "lineage", object: event.write.key });
       }
       return;
     default:
       return;
+  }
+}
+
+function recordedProofDependencyKey(dependency: RecordedProofDependency): string {
+  switch (dependency.kind) {
+    case "lineage":
+    case "verb_resolution":
+      return `${dependency.kind}\u0000${dependency.object}`;
+    case "property_resolution":
+      return `${dependency.kind}\u0000${dependency.object}\u0000${dependency.name}`;
   }
 }

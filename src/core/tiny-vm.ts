@@ -234,7 +234,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       push(value);
       return;
     }
-    const { definer, verb } = startAt === undefined ? caller.ctx.world.resolveVerb(obj, name) : caller.ctx.world.resolveVerbFrom(startAt, name);
+    const { definer, verb, dependencies } = startAt === undefined
+      ? caller.ctx.world.resolveVerb(obj, name)
+      : caller.ctx.world.resolveVerbFrom(startAt, name);
     caller.ctx.world.assertCanExecuteVerb(caller.ctx.progr, obj, name, verb);
     const callCtx: CallContext = {
       ...caller.ctx,
@@ -251,7 +253,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       push(value);
       return;
     }
-    caller.ctx.world.recordTurnDispatch(obj, name, startAt, definer, verb);
+    caller.ctx.world.recordTurnDispatch(obj, name, startAt, definer, verb, dependencies);
     pushFrame(callCtx, verb.bytecode, callArgs);
   };
 

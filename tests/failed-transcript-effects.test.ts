@@ -443,6 +443,186 @@ describe("clean failed-transcript producers", () => {
     expect(replay.transcript).toEqual(fresh.transcript);
     expect(world.getProp("failed_replay_probe", "counter")).toBe(1);
   });
+
+  it("prunes an inherited property proof resolved after a rolled-back chparent", async () => {
+    const world = createWorld();
+    world.createObject({ id: "proof_parent_a", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "proof_parent_b", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "proof_child", parent: "proof_parent_a", owner: "$wiz" });
+    world.defineProperty("proof_parent_a", {
+      name: "p",
+      defaultValue: 1,
+      owner: "$wiz",
+      perms: "rw",
+      typeHint: "int"
+    });
+    world.defineProperty("proof_parent_b", {
+      name: "p",
+      defaultValue: 99,
+      owner: "$wiz",
+      perms: "rw",
+      typeHint: "int"
+    });
+    expect(installVerb(
+      world,
+      "proof_child",
+      "chparent_read_raise",
+      `verb :chparent_read_raise(parent) rxd {
+        chparent(this, parent);
+        let transient = this.p;
+        raise({ code: "E_DERIVED_PROPERTY_PROOF", message: "expected rollback" });
+      }`,
+      null
+    ).ok).toBe(true);
+
+    const fresh = await runShadowTurnCallOnWorldTranscript(world, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "derived-property-proof",
+      route: "direct",
+      scope: "proof_child",
+      actor: "$wiz",
+      target: "proof_child",
+      verb: "chparent_read_raise",
+      args: ["proof_parent_b"]
+    });
+
+    expect(world.object("proof_child").parent).toBe("proof_parent_a");
+    expect(world.getProp("proof_child", "p")).toBe(1);
+    expect(fresh.transcript).toMatchObject({
+      failureEffectsGeneration: FAILED_TRANSCRIPT_EFFECTS_CLEAN_GENERATION,
+      error: { code: "E_DERIVED_PROPERTY_PROOF" },
+      writes: [],
+      complete: true
+    });
+    expect(fresh.transcript.reads.filter((read) =>
+      read.cell.kind === "prop" &&
+      read.cell.object === "proof_child" &&
+      read.cell.name === "p"
+    )).toEqual([]);
+    expect(classifyFailedTranscriptEffects(fresh.transcript, {
+      ownsSequencingSpace: false
+    })).toMatchObject({ policy: "enforce", valid: true, reasons: [] });
+  });
+
+  it("keeps pre-mutation alias dispatch proof and prunes the transient alias", async () => {
+    const world = createWorld();
+    world.createObject({ id: "alias_definer", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "alias_receiver", parent: "alias_definer", owner: "$wiz" });
+    world.createObject({ id: "alias_controller", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(
+      world,
+      "alias_definer",
+      "canonical",
+      `verb :canonical() rxd { return 7; }`,
+      null
+    ).ok).toBe(true);
+    world.setVerbInfoForActor("$wiz", "alias_definer", "canonical", {
+      aliases: ["durable_alias"]
+    });
+    expect(installVerb(
+      world,
+      "alias_controller",
+      "replace_alias_then_raise",
+      `verb :replace_alias_then_raise(definer, receiver) rxd {
+        let durable = dispatch(receiver, "durable_alias", []);
+        set_verb_info(definer, "canonical", { aliases: ["transient_alias"] });
+        let transient = dispatch(receiver, "transient_alias", []);
+        raise({ code: "E_DERIVED_ALIAS_PROOF", message: "expected rollback" });
+      }`,
+      null
+    ).ok).toBe(true);
+    world.setRecordAuthoringCellWrites(true);
+
+    const fresh = await runShadowTurnCallOnWorldTranscript(world, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "derived-alias-proof",
+      route: "direct",
+      scope: "alias_controller",
+      actor: "$wiz",
+      target: "alias_controller",
+      verb: "replace_alias_then_raise",
+      args: ["alias_definer", "alias_receiver"]
+    });
+
+    expect(world.resolveVerb("alias_receiver", "durable_alias").definer).toBe("alias_definer");
+    expect(() => world.resolveVerb("alias_receiver", "transient_alias")).toThrow();
+    expect(fresh.transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "alias_definer", name: "durable_alias" }
+    }));
+    expect(fresh.transcript.reads).not.toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "alias_definer", name: "transient_alias" }
+    }));
+    expect(fresh.transcript.stateProbes).toContainEqual({
+      kind: "verb",
+      object: "alias_definer",
+      name: "durable_alias"
+    });
+    expect(fresh.transcript.stateProbes).not.toContainEqual({
+      kind: "verb",
+      object: "alias_definer",
+      name: "transient_alias"
+    });
+  });
+
+  it("keeps pre-mutation descendant dispatch and prunes resolution through a transient ancestor parent", async () => {
+    const world = createWorld();
+    world.createObject({ id: "dispatch_root_a", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "dispatch_root_b", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "dispatch_ancestor", parent: "dispatch_root_a", owner: "$wiz" });
+    world.createObject({ id: "dispatch_descendant", parent: "dispatch_ancestor", owner: "$wiz" });
+    world.createObject({ id: "dispatch_controller", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(
+      world,
+      "dispatch_root_a",
+      "answer",
+      `verb :answer() rxd { return 1; }`,
+      null
+    ).ok).toBe(true);
+    expect(installVerb(
+      world,
+      "dispatch_root_b",
+      "answer",
+      `verb :answer() rxd { return 99; }`,
+      null
+    ).ok).toBe(true);
+    expect(installVerb(
+      world,
+      "dispatch_controller",
+      "ancestor_chparent_then_raise",
+      `verb :ancestor_chparent_then_raise(ancestor, descendant, parent) rxd {
+        let durable = dispatch(descendant, "answer", []);
+        chparent(ancestor, parent);
+        let transient = dispatch(descendant, "answer", []);
+        raise({ code: "E_DERIVED_DISPATCH_PROOF", message: "expected rollback" });
+      }`,
+      null
+    ).ok).toBe(true);
+
+    const fresh = await runShadowTurnCallOnWorldTranscript(world, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "derived-dispatch-proof",
+      route: "direct",
+      scope: "dispatch_controller",
+      actor: "$wiz",
+      target: "dispatch_controller",
+      verb: "ancestor_chparent_then_raise",
+      args: ["dispatch_ancestor", "dispatch_descendant", "dispatch_root_b"]
+    });
+
+    expect(world.object("dispatch_ancestor").parent).toBe("dispatch_root_a");
+    expect(world.resolveVerb("dispatch_descendant", "answer").definer).toBe("dispatch_root_a");
+    expect(fresh.transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "dispatch_root_a", name: "answer" }
+    }));
+    expect(fresh.transcript.reads).not.toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "dispatch_root_b", name: "answer" }
+    }));
+    expect(fresh.transcript.stateProbes).not.toContainEqual({
+      kind: "verb",
+      object: "dispatch_root_b",
+      name: "answer"
+    });
+  });
 });
 
 describe("failed transcript authority rollout", () => {
