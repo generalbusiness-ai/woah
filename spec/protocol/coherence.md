@@ -356,10 +356,21 @@ retract a guarantee already issued. The two stores prune on unrelated triggers,
 so a bound on rows in one implies nothing about age in the other. An
 implementation MUST NOT evict an unexpired retry guarantee for any reason,
 including quota pressure. At capacity it MUST refuse a NEW retry-safe admission,
-before planning or submitting anything, and report that refusal. A refusal
+before planning or submitting anything, and report that refusal. Deciding it
+only after planning leaves a saturated host payable through its whole planning
+path on every attempt, which is the load the refusal exists to shed. A refusal
 issued for capacity MUST NOT itself be recorded under the key, or it consumes
 the room it is refusing for and answers the client's later legitimate retry with
 a stale verdict.
+
+The retry class of an idempotency key MUST be immutable. A key admitted WITHOUT
+a retry guarantee MUST NOT later acquire one: the routing record for such a key
+is deliberately weaker — sooner-expiring and freely evictable — and a guaranteed
+outcome recorded behind it is unprotected in exactly the way this section
+forbids. Such a reuse MUST be refused before planning. Upgrading the class in
+place would require an atomic rewrite spanning both stores, which no boundary
+provides, and a half-applied upgrade is indistinguishable from the state being
+forbidden.
 
 An implementation MAY shed the informational payload of a recorded outcome —
 return value, error, observations — under pressure while retaining the verdict

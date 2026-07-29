@@ -200,6 +200,7 @@ async function fixture() {
 
   return {
     alice, bob, aliceSession, bobSession, gateway: () => gateway, gatewayState, gatewayEnv, scopeStates,
+    epoch: plan.epoch,
     /** Evict a scope DO: a fresh instance over the SAME durable state, so it
      * rehydrates its reply cache from SQL instead of keeping the live map.
      * `resolve` reads the map at call time, so the swap is enough. */
@@ -1033,6 +1034,129 @@ describe("selection pin and recorded reply retain together (H2a/H2c)", () => {
       ) as { toArray(): Array<{ n: number }> }).toArray()[0];
       expect(Number(transient?.n)).toBeLessThanOrEqual(4096);
       assertLiveRepliesArePinned(f, ["op-guaranteed", "op-guaranteed-sweep"]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  /** Capture the `net_turn_structure` metrics a block of work emits. Planning
+   * cost is observable there — `plan_cells` is the planner's input size — so a
+   * refusal that precedes planning is provable rather than asserted. */
+  const capturedStructures = async (body: () => Promise<unknown>) => {
+    const seen: Array<Record<string, any>> = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      if (args[0] === "woo.metric" && typeof args[1] === "string") {
+        try {
+          const event = JSON.parse(args[1]) as Record<string, any>;
+          if (event.kind === "net_turn_structure") seen.push(event);
+        } catch {
+          // not our event; fall through to the original sink
+        }
+      }
+      original(...(args as []));
+    };
+    try {
+      await body();
+    } finally {
+      console.log = original;
+    }
+    return seen;
+  };
+
+  // FINDING 1. `pinScope` inserts ON CONFLICT DO NOTHING and the caller skips
+  // admission whenever a live pin exists, so an existing TRANSIENT pin is
+  // never upgraded. A key first used without retry safety and then reused WITH
+  // it acquired a guaranteed authority outcome sitting behind an evictable,
+  // sooner-expiring route — the cross-scope double execution again, reached
+  // through the class system.
+  it("refuses a transient operation id being reused as a guaranteed one", async () => {
+    const f = await fixture();
+    try {
+      // The state a key acquires when it is FIRST used without retry safety:
+      // a live route that is transient, sooner-expiring and freely evictable.
+      // (Written directly because the mechanism under test is the admission
+      // decision made FROM this state — the reviewer's probe confirmed the
+      // row shape itself, `guaranteed=0` with the original expiry.)
+      const operationId = "class-probe";
+      const key = `mcp:${f.alice}:${operationId}`;
+      f.gatewayState.state.storage.sql.exec(
+        "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) VALUES (?, ?, ?, 0)",
+        key,
+        "room:the_chatroom",
+        Date.now() + 20 * 60_000
+      );
+      expect(await f.hits()).toBe(0);
+
+      // Reusing it WITH retry safety (an MCP operation_id always asks for the
+      // guarantee) must be refused. Before this it was silently accepted, and
+      // the guaranteed authority outcome it minted sat behind the evictable
+      // route above — so once that route was dropped a retry could re-plan and
+      // commit at a second scope, inside the window advertised as guaranteed.
+      const upgraded = await f.bump(f.aliceSession, operationId);
+      expect(JSON.stringify(upgraded)).toContain("E_RETRY_CLASS");
+      await f.settleAll();
+
+      // Nothing executed, and the route is untouched rather than half-upgraded.
+      expect(await f.hits()).toBe(0);
+      const after = (f.gatewayState.state.storage.sql.exec(
+        "SELECT guaranteed FROM net_gateway_pin WHERE idempotency_key = ?",
+        key
+      ) as { toArray(): Array<{ guaranteed: number }> }).toArray()[0];
+      expect(Number(after?.guaranteed)).toBe(0);
+      // No authority outcome was recorded under it either — the mismatch
+      // between a guaranteed outcome and a transient route is what the
+      // refusal exists to prevent.
+      const recorded = [...f.scopeStates.values()].flatMap((st) =>
+        (st.state.storage.sql.exec(
+          "SELECT idempotency_key FROM net_scope_reply WHERE idempotency_key = ?",
+          key
+        ) as { toArray(): Array<{ idempotency_key: string }> }).toArray()
+      );
+      expect(recorded).toEqual([]);
+
+      // A FRESH id is the remedy the refusal names, and it works.
+      const fresh = await f.bump(f.aliceSession, "class-probe-fresh");
+      expect(fresh.result?.isError, JSON.stringify(fresh).slice(0, 300)).not.toBe(true);
+      await f.settleAll();
+      expect(await f.hits()).toBe(1);
+    } finally {
+      await f.close();
+    }
+  });
+
+  // FINDING 2. mcp.md says of a capacity refusal "Nothing is planned or
+  // submitted". Planning used to be complete before the check ran, so a
+  // saturated shard could be driven through the full planning and
+  // authority-read path on every attempt — the load the refusal exists to shed.
+  it("refuses at capacity BEFORE planning, not after", async () => {
+    const f = await fixture();
+    try {
+      const sql = f.gatewayState.state.storage.sql;
+      const far = Date.now() + 60 * 60_000;
+      sql.exec(
+        "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) " +
+          "SELECT 'held-' || value, 'some_scope', ?, 1 FROM (" +
+          "WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < 65536) " +
+          "SELECT value FROM c)",
+        far
+      );
+
+      let refused: Record<string, any> | undefined;
+      const structures = await capturedStructures(async () => {
+        refused = await f.bump(f.aliceSession, "op-precheck");
+      });
+      expect(JSON.stringify(refused)).toContain("E_RETRY_CAPACITY");
+      await f.settleAll();
+      expect(await f.hits()).toBe(0);
+
+      // The refused turn planned NOTHING: no planner input, no authority RPC.
+      const own = structures.filter((event) => event.idempotency_key?.endsWith("op-precheck"));
+      expect(own.length, "the refused turn emitted its structure metric").toBeGreaterThan(0);
+      for (const event of own) {
+        expect(event.plan_cells, "a refusal must not pay for a plan").toBe(0);
+        expect(event.sync_rpc, "a refusal must not reach the authority").toBe(0);
+      }
     } finally {
       await f.close();
     }
