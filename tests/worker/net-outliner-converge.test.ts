@@ -9,7 +9,7 @@
 // harness and assert bounded convergence (not merely under-budget).
 import { afterEach, describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
-import { FakeDurableObjectState } from "./fake-do";
+import { closeQuiescent, quiescentNetState, type QuiescentHost } from "./quiescent-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -22,35 +22,19 @@ import type { WooWorld } from "../../src/core/world";
 
 const SECRET = "net-outliner-converge-secret";
 
-const testStates: Array<{ fake: FakeDurableObjectState; deferred: Array<Promise<unknown>> }> = [];
+const testHosts: QuiescentHost[] = [];
 
 function netState(name: string): NetScopeDurableState & NetGatewayDurableState {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  testStates.push({ fake, deferred });
-  return {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => { deferred.push(promise); },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
-    }
-  };
+  const host = quiescentNetState(name);
+  testHosts.push(host);
+  return host.state;
 }
 
 afterEach(async () => {
-  // Fanout/adoption work can enqueue more work on a different fake DO. Drain
-  // the whole fixture to a fixed point before closing any SQLite handle, and
-  // propagate a rejected deferred task into the owning test.
-  while (testStates.some(({ deferred }) => deferred.length > 0)) {
-    for (const { deferred } of testStates) {
-      while (deferred.length > 0) await deferred.shift();
-    }
-  }
-  for (const { fake } of testStates) fake.close();
-  testStates.length = 0;
+  // Fanout/adoption work can enqueue more work on a different fake DO. The
+  // shared fixture drains each host to quiescence before closing any SQLite
+  // handle, and propagates a rejected deferred task into the owning test.
+  await closeQuiescent(testHosts.splice(0));
 });
 
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };

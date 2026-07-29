@@ -229,6 +229,9 @@ export type RejectReason =
   | "stale_head"          // base behind current head
   | "incomplete_transcript" // step 4 — terminal envelope refusal; outranks failed-effect admission
   | "idempotency_conflict" // step 3 — key reused for a different request; terminal
+  | "retry_capacity"      // step 3b — this scope holds its full complement of UNEXPIRED
+                          // retry guarantees and will not evict one to issue another;
+                          // terminal, and deliberately NOT recorded (see reject)
   | "read_version_mismatch" // step 7
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
   | "catalog_mutation"    // step 5 — epoch-immutable definition write without an epoch transition
@@ -259,6 +262,17 @@ export function scheduledTurnBytes(turn: ScheduledTurn): number {
   // payloads by up to ~4x against a byte cap the spec states in bytes.
   return SCHEDULE_BYTE_ENCODER.encode(JSON.stringify(turn)).length;
 }
+
+/**
+ * Terminal verdicts that are deliberately NOT recorded under their key.
+ *
+ * `retry_capacity` refuses BECAUSE the scope has no room for another
+ * guarantee; recording the refusal would consume exactly the room it is
+ * refusing for, and would then answer the client's later, legitimate retry
+ * with the stale refusal instead of executing it. It is terminal for this
+ * attempt and forgotten immediately.
+ */
+const UNRECORDED_VERDICTS: ReadonlySet<RejectReason> = new Set(["retry_capacity"]);
 
 const RETRYABLE_VERDICTS: ReadonlySet<RejectReason> = new Set([
   "stale_epoch",
@@ -315,8 +329,12 @@ export type CommitReply =
       /** H2c: when this outcome was recorded, for the shared retention lease
        * (IDEMPOTENCY_LEASE_MS). Stored only, never returned. Absent on rows
        * written before the lease existed; the sequencer stamps those at
-       * hydration rather than treating them as ageless. */
+       * hydration and writes the stamp back durably. */
       recorded_at?: number;
+      /** Contract A: the client chose this key and may reuse it
+       * (`submit.retry_receipt`). Such an outcome is never evicted by quota
+       * while its lease runs — that is the whole guarantee. Stored only. */
+      replay_guaranteed?: true;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -335,6 +353,9 @@ export type CommitReply =
       /** H2c: when this refusal was recorded — same retention lease as an
        * accepted outcome, for the same reason. Stored only. */
       recorded_at?: number;
+      /** Contract A: a refusal recorded under a client-chosen key is protected
+       * from quota eviction exactly like an accepted outcome. Stored only. */
+      replay_guaranteed?: true;
       /** Structured repair input: the cells whose reads mismatched, so the
        * gateway refreshes exactly those instead of grinding the budget. */
       mismatched_reads?: TranscriptCell[];
@@ -446,6 +467,13 @@ export type ScopeSequencerOptions = {
    * count quotas allow (default IDEMPOTENCY_LEASE_MS). Shared boundary with
    * the gateway's selection pin — see IDEMPOTENCY_LEASE_MS. */
   replyLeaseMs?: number;
+  /** How many recorded outcomes keep their `replay_output` payload
+   * (default RETAINED_PAYLOAD_CAP). Verdicts are protected for the full
+   * lease; payloads are best-effort — see RETAINED_PAYLOAD_CAP. */
+  retainedPayloadCap?: number;
+  /** How many UNEXPIRED guaranteed outcomes this scope issues before refusing
+   * a new one (default GUARANTEED_OUTCOME_CAPACITY). */
+  guaranteedOutcomeCapacity?: number;
   /** Durability (Phase 3): when provided, the sequencer hydrates from the
    * store at construction and writes through on every state change (CO5
    * copy #1). Without it, behavior is identical to the in-memory Phase-2
@@ -502,6 +530,44 @@ export const RECEIPT_CACHE_CAP = 256;
  * mcp.md §M4.2.
  */
 export const IDEMPOTENCY_LEASE_MS = 10 * 60_000;
+
+/**
+ * How many UNEXPIRED guaranteed outcomes one scope holds before it refuses to
+ * issue another (contract A, the authority half of the gateway's
+ * GATEWAY_GUARANTEED_PIN_CAPACITY).
+ *
+ * A guarantee that quota pressure can evict is not a guarantee — a reviewer's
+ * probe ran the same operation twice inside the advertised window simply by
+ * setting `replyLimit:1`. So an unexpired guaranteed outcome is never evicted
+ * to make room, and at capacity a NEW guaranteed key is refused instead.
+ *
+ * The number is a rate as much as a size: sustaining more than
+ * `capacity / lease` ≈ 27 client-keyed operations per second at ONE scope for a
+ * full ten minutes is what it takes to reach the refusal. Affordable because
+ * what is protected is the VERDICT (~150 bytes — enough to answer "this
+ * already committed"), not the outcome payload, which is bounded separately.
+ */
+export const GUARANTEED_OUTCOME_CAPACITY = 16384;
+
+/**
+ * How many recorded outcomes keep their `replay_output` payload.
+ *
+ * The two things a recorded reply carries have very different costs and very
+ * different importance. The VERDICT — "this key already committed" — is what
+ * makes retries safe, and it is small. The PAYLOAD — up to
+ * REPLAY_OUTPUT_BYTE_CAP of result, error and observations — is what makes a
+ * retry *informative*, and it is 25× larger.
+ *
+ * Protecting every payload for a full lease would cost
+ * `GUARANTEED_OUTCOME_CAPACITY * REPLAY_OUTPUT_BYTE_CAP` = 64 MiB per scope,
+ * which is not affordable in a Durable Object. Protecting every verdict costs
+ * ~2.5 MiB, which is. So payloads are best-effort and shed oldest-first under
+ * pressure, degrading to the `replay_outcome:"none"` state mcp.md §M4.2
+ * already defines — the client is told the operation ran exactly once and that
+ * the outcome was not retained. Safety is preserved; only the convenience
+ * degrades, and it degrades legibly.
+ */
+export const RETAINED_PAYLOAD_CAP = 1024;
 
 /**
  * H2a: which retention quota a recorded reply belongs to.
@@ -608,15 +674,32 @@ export class ScopeSequencer {
         this.attribution = meta.attribution ?? null;
       }
       for (const cell of durable.readCells()) this.store.install(cell);
+      // Rows written before the lease existed carry no `recorded_at`, and
+      // there is no honest age to infer for them. Treat them as recorded at
+      // hydration: they expire one lease later instead of never, and none is
+      // dropped at the instant of the upgrade (which would blank every
+      // in-flight retry).
+      //
+      // The stamp is written back DURABLY, once. An in-memory-only stamp
+      // renewed the row's apparent age on every cold start, so a legacy
+      // outcome could live indefinitely while its gateway pin — which got a
+      // single durable expiry — aged out normally. The two stores drifted in
+      // opposite directions, which is precisely the ordering the lease exists
+      // to establish.
+      const undated: Array<{ key: string; reply: CommitReply }> = [];
       for (const { key, reply } of durable.readReplies()) {
-        // Rows written before the lease existed carry no `recorded_at`, and
-        // there is no honest age to infer for them. Treat them as recorded at
-        // hydration: they then expire one lease later instead of never, and no
-        // reply is dropped at the instant of the upgrade (which would blank
-        // every in-flight retry). Purely an in-memory stamp — the durable row
-        // is untouched until it is rewritten, so a cold start re-stamps, and
-        // the count quotas bound them meanwhile.
-        this.replies.set(key, reply.recorded_at === undefined ? { ...reply, recorded_at: hydratedAt } : reply);
+        if (reply.recorded_at === undefined) {
+          const stamped = { ...reply, recorded_at: hydratedAt };
+          this.replies.set(key, stamped);
+          undated.push({ key, reply: stamped });
+        } else {
+          this.replies.set(key, reply);
+        }
+      }
+      if (undated.length > 0) {
+        durable.transaction(() => {
+          for (const row of undated) durable.writeReply(row.key, row.reply);
+        });
       }
       for (const entry of durable.readTail()) this.tail.push(entry);
       // The scheduled family deliberately does NOT hydrate (review #1):
@@ -1055,7 +1138,7 @@ export class ScopeSequencer {
     // gateway knows authoritatively that this round committed nothing and
     // must not fabricate output. The stored reply's own `replayed` stays
     // unset, so replay-of-a-replay remains stable.
-    const recorded = this.replies.get(submit.idempotency_key);
+    const recorded = this.recordedReply(submit.idempotency_key);
     if (recorded) {
       // An idempotency key answers ONE request. Reusing it for a different
       // call must never hand back the first call's reply — a confidently
@@ -1074,7 +1157,12 @@ export class ScopeSequencer {
       // client's request is not this caller's business, and the retention
       // stamp is bookkeeping. Both are stripped from every replayed copy,
       // whatever its verdict.
-      const { replay_request: recordedRequest, recorded_at: _leased, ...replayableAll } = recorded;
+      const {
+        replay_request: recordedRequest,
+        recorded_at: _leased,
+        replay_guaranteed: _guaranteed,
+        ...replayableAll
+      } = recorded;
       if (
         recordedRequest !== undefined &&
         submit.request_fingerprint !== undefined &&
@@ -1107,6 +1195,28 @@ export class ScopeSequencer {
         return { ...verdict, replayed: true };
       }
       return { ...replayable, replayed: true };
+    }
+
+    // Step 3b — capacity, and the reason contract A is a guarantee rather than
+    // a hope. An unexpired guaranteed outcome is never evicted to make room
+    // (pruneReplies rule 1), so room can genuinely run out; when it does the
+    // honest answer is to refuse a NEW guarantee, exactly as the gateway
+    // refuses a new pin. Silently issuing one the scope will have to discard
+    // is how the same operation runs twice inside the advertised window.
+    //
+    // Only NEW client-keyed submits are gated: a replay was answered above,
+    // and an unkeyed turn is asking for no guarantee and consumes none.
+    if (submit.retry_receipt === true) {
+      const capacity = this.options.guaranteedOutcomeCapacity ?? GUARANTEED_OUTCOME_CAPACITY;
+      if (this.guaranteedOutcomeCount((this.options.now ?? Date.now)()) >= capacity) {
+        return this.reject(submit, "retry_capacity", {
+          reason: "guaranteed_outcome_capacity",
+          capacity,
+          remediation:
+            "this scope cannot issue another retry guarantee until one expires; " +
+            "retry the call unchanged shortly, or re-issue it without an operation id"
+        });
+      }
     }
 
     // Step 1: envelope/actor/session authority (CO14: the shell wires
@@ -1742,12 +1852,20 @@ export class ScopeSequencer {
     const recordedReply: CommitReply = {
       ...reply,
       replay_output: this.recordedOutput(submit),
-      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {})
+      ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {}),
+      // Contract A: only a CLIENT-chosen key can ever be presented again, so
+      // only that outcome is worth protecting from quota eviction. A
+      // gateway-minted key is unreusable and stays evictable.
+      ...(submit.retry_receipt === true ? { replay_guaranteed: true as const } : {})
     };
     // H2a: bound the reply cache on each accepted commit. `transact:false`
     // because this path has more durable work to keep atomic with the reply
     // (cells, head, tail, log) — the pruned keys join that transaction below.
-    const { pruned: prunedReplies, stored: storedReply } = this.recordReply(submit.idempotency_key, recordedReply, false);
+    const {
+      pruned: prunedReplies,
+      rewritten: rewrittenReplies,
+      stored: storedReply
+    } = this.recordReply(submit.idempotency_key, recordedReply, false);
 
     // Write-through (CO5 copy #1): one atomic transaction covering cells,
     // head, reply, and tail — a crash between the reply and the fanout
@@ -1767,6 +1885,7 @@ export class ScopeSequencer {
         durable.trimTail(this.options.tailLimit);
         if (logEntry) durable.appendLogEntry(logEntry);
         for (const key of prunedReplies) durable.deleteReply(key);
+        for (const row of rewrittenReplies) durable.writeReply(row.key, row.reply);
         for (const key of changedRelationKeys) {
           const row = this.relationRows.get(key);
           if (row) durable.writeRelation(key, row);
@@ -2965,7 +3084,10 @@ export class ScopeSequencer {
       // the CURRENT head, so nothing about its stored shape distinguishes it
       // from an accept later on — and an unclassified receipt is exactly the
       // row the seq-ordered rule can never reach.
-      replay_receipt: true
+      replay_receipt: true,
+      // A receipt only exists because the client opted in with a stable key,
+      // so it is guaranteed by construction.
+      replay_guaranteed: true as const
     };
     this.recordReply(submit.idempotency_key, recorded);
   }
@@ -2983,23 +3105,72 @@ export class ScopeSequencer {
    * accept path: cells, head, tail, log) pass `transact:false` and fold the
    * returned pruned keys into their own transaction instead.
    */
-  private recordReply(key: string, reply: CommitReply, transact = true): { pruned: string[]; stored: CommitReply } {
+  /**
+   * The recorded reply for a key, or undefined once its lease has run out.
+   *
+   * Expiry is enforced HERE, at the lookup, and not only in the retention
+   * sweep. The sweep runs when another outcome is recorded, so a quiet scope
+   * never runs it: a probe with a 60-second lease replayed a 120-second-old
+   * outcome, because nothing had happened in between to trigger a prune. An
+   * outcome that outlives its lease outlives the gateway pin routing to it,
+   * which is the cross-scope double execution reached through the lease
+   * instead of around it.
+   *
+   * The expired row is dropped as it is read, so the storage follows the
+   * answer rather than waiting for unrelated traffic.
+   */
+  private recordedReply(key: string): CommitReply | undefined {
+    const reply = this.replies.get(key);
+    if (reply === undefined) return undefined;
+    if (!this.replyExpired(reply)) return reply;
+    this.replies.delete(key);
+    const durable = this.options.durable;
+    if (durable) durable.transaction(() => durable.deleteReply(key));
+    return undefined;
+  }
+
+  /** Whether a recorded outcome has outlived the shared retention lease.
+   * A row with no stamp is treated as live: hydration stamps every row it
+   * loads, so an unstamped one is newer than any sweep, not older. */
+  private replyExpired(reply: CommitReply, at?: number): boolean {
+    if (reply.recorded_at === undefined) return false;
+    const lease = this.options.replyLeaseMs ?? IDEMPOTENCY_LEASE_MS;
+    return reply.recorded_at + lease <= (at ?? (this.options.now ?? Date.now)());
+  }
+
+  /** Unexpired outcomes recorded under a client-chosen key. These are the rows
+   * contract A protects from quota eviction, so they are also the rows that
+   * decide when a new guarantee has to be refused. */
+  private guaranteedOutcomeCount(at: number): number {
+    let count = 0;
+    for (const reply of this.replies.values()) {
+      if (reply.replay_guaranteed === true && !this.replyExpired(reply, at)) count += 1;
+    }
+    return count;
+  }
+
+  private recordReply(
+    key: string,
+    reply: CommitReply,
+    transact = true
+  ): { pruned: string[]; rewritten: Array<{ key: string; reply: CommitReply }>; stored: CommitReply } {
     // H2c: stamp the retention lease at the single point every recorded
     // outcome passes through, so no record site can forget it and become the
     // ageless row the routing guarantee cannot account for.
     const stored: CommitReply = { ...reply, recorded_at: (this.options.now ?? Date.now)() };
     this.replies.set(key, stored);
-    const pruned = this.pruneReplies();
+    const { pruned, rewritten } = this.pruneReplies();
     const durable = this.options.durable;
-    if (!durable || !transact) return { pruned, stored };
+    if (!durable || !transact) return { pruned, rewritten, stored };
     durable.transaction(() => {
       durable.writeReply(key, stored);
       // A quota of zero can prune the row just written. Writing then deleting
       // it inside one transaction leaves durable and memory agreeing (both
       // absent), which is the only property that matters here.
       for (const pruneKey of pruned) durable.deleteReply(pruneKey);
+      for (const row of rewritten) durable.writeReply(row.key, row.reply);
     });
-    return { pruned, stored };
+    return { pruned, rewritten, stored };
   }
 
   private recordedOutput(submit: CommitSubmit): ReplayOutput {
@@ -3033,61 +3204,60 @@ export class ScopeSequencer {
     };
   }
 
-  private pruneReplies(): string[] {
+  private pruneReplies(): { pruned: string[]; rewritten: Array<{ key: string; reply: CommitReply }> } {
     const limit = this.options.replyLimit ?? REPLY_CACHE_CAP;
     const receiptLimit = this.options.receiptLimit ?? Math.min(RECEIPT_CACHE_CAP, limit);
+    const payloadCap = this.options.retainedPayloadCap ?? RETAINED_PAYLOAD_CAP;
     const pruned: string[] = [];
-
-    // Quota 0 — the LEASE, and the only rule of the three that the routing
-    // guarantee depends on. The count quotas below bound storage; they cannot
-    // bound age, and a quiet scope comfortably inside them would otherwise
-    // hold a recorded outcome forever — long after every gateway pin routing a
-    // retry to it had gone. Expiring here is what lets a gateway conclude, from
-    // the absence of its own pin, that no authority still holds an answer.
-    const lease = this.options.replyLeaseMs ?? IDEMPOTENCY_LEASE_MS;
+    const rewritten: Array<{ key: string; reply: CommitReply }> = [];
     const now = (this.options.now ?? Date.now)();
+
+    // Rule 0 — the LEASE. The count quotas below bound storage; they cannot
+    // bound age, and a quiet scope comfortably inside them would otherwise
+    // hold an outcome forever, long after every gateway pin routing a retry to
+    // it had gone. (Lookups expire independently — see recordedReply — because
+    // this sweep only runs when another outcome is recorded, and a quiet scope
+    // records nothing.)
     for (const [key, reply] of this.replies) {
-      // `recorded_at` is stamped by recordReply and back-filled at hydration,
-      // so an absent one means a row this process has not seen written or
-      // loaded — treat it as fresh rather than dropping it unread.
-      if (reply.recorded_at === undefined) continue;
-      if (reply.recorded_at + lease > now) continue;
+      if (!this.replyExpired(reply, now)) continue;
       this.replies.delete(key);
       pruned.push(key);
     }
 
-    // Both count quotas are now measured over what SURVIVED the lease. Below
-    // the smaller of them neither can be exceeded whatever the mix, so the
-    // classification pass is skipped; above it that pass is O(cache size),
-    // itself bounded by the quotas being enforced here.
-    if (this.replies.size <= Math.min(limit, receiptLimit)) return pruned;
+    // Rule 1 — GUARANTEED outcomes are exempt from every count quota below
+    // while their lease runs. This is contract A, and it is the whole
+    // difference between a guarantee and a hope: a reviewer set `replyLimit:1`
+    // and ran the same operation twice inside the advertised ten-minute
+    // window, because quota pressure evicted the record that would have
+    // deduplicated it. Capacity is handled by REFUSING a new guarantee
+    // (see submit), never by discarding one already issued.
+    const evictable: Array<{ key: string; reply: CommitReply }> = [];
+    for (const [key, reply] of this.replies) {
+      if (reply.replay_guaranteed === true) continue;
+      evictable.push({ key, reply });
+    }
 
-    // Two quotas, because the two kinds of row are bounded by different
-    // things. Map iteration is insertion order, which for advancing replies is
-    // also seq order (one accepted commit, one seq) — so a single pass in
-    // insertion order gives "oldest first" for both classes.
+    // Rule 2 — the count quotas, applied ONLY to what is evictable. Two of
+    // them, because the two kinds of row are bounded by different things.
+    // Map iteration is insertion order, which for advancing replies is also
+    // seq order (one accepted commit, one seq), so a single pass gives
+    // "oldest first" for both classes.
     const advancing: Array<{ key: string; seq: number }> = [];
     const nonAdvancing: string[] = [];
     const claimedSeq = new Set<number>();
-    for (const [key, reply] of this.replies) {
+    for (const { key, reply } of evictable) {
       if (isNonAdvancingReply(reply)) {
         nonAdvancing.push(key);
         continue;
       }
-      // AGED-ROW REPAIR, and the reason the marker is not load-bearing on its
-      // own. At most ONE reply per scope can be advancing at a given seq: the
-      // commit that consumed seq N is the only thing that could have produced
-      // head N. So a SECOND unmarked row carrying that seq is necessarily a
-      // receipt written before `replay_receipt` was recorded — the rows a
-      // deployed world is already holding.
-      //
+      // AGED-ROW REPAIR. At most ONE reply per scope can be advancing at a
+      // given seq: the commit that consumed seq N is the only thing that could
+      // have produced head N. A SECOND unmarked row carrying that seq is
+      // necessarily a receipt written before `replay_receipt` was recorded.
       // First-wins is the correct tiebreak, not an arbitrary one: a receipt
       // takes the head an accept had ALREADY set, so in insertion order (which
       // rehydration preserves — scope-do reads ORDER BY rowid) the genuine
-      // accept always precedes the receipts that share its seq. Without this,
-      // an aged pile at a QUIET scope would be permanent: unmarked receipts sit
-      // at the current head, the seq-ordered cutoff never reaches them, and no
-      // new commit ever moves it.
+      // accept always precedes the receipts that share its seq.
       if (claimedSeq.has(reply.head.seq)) {
         nonAdvancing.push(key);
         continue;
@@ -3096,30 +3266,22 @@ export class ScopeSequencer {
       advancing.push({ key, seq: reply.head.seq });
     }
 
-    // Quota 1 — NON-ADVANCING (direct receipts, terminal rejections). Pure
-    // FIFO, no window immunity: these rows are recorded at whatever head is
-    // current and never consume a seq, so "still inside the recovery-tail
-    // window" is true of every one of them forever. That is precisely the
-    // hole an actor exploits by repeating cheap keyed speech.
+    // Non-advancing (receipts, terminal rejections): pure FIFO, no window
+    // immunity. These are recorded at whatever head is current and never
+    // consume a seq, so "still inside the recovery-tail window" is true of
+    // every one of them forever — the hole an actor exploits by repeating
+    // cheap keyed speech.
     let overflow = nonAdvancing.length - receiptLimit;
     for (let i = 0; i < nonAdvancing.length && overflow > 0; i += 1, overflow -= 1) {
       this.replies.delete(nonAdvancing[i]);
       pruned.push(nonAdvancing[i]);
     }
 
-    // Quota 2 — ADVANCING replies, unchanged rule. A reply whose seq is still
-    // covered by the retained recovery tail is never a candidate, so
-    // recovery-tail replay always finds its replies; outside the window the
-    // oldest prune until the advancing set is back within `limit`. This one is
-    // safe to leave soft-capped because seq is scarce: at most `tailLimit`
-    // distinct seqs can be in the window, so the retained total is bounded by
-    // `max(limit, tailLimit)` — a hard bound, not a hope.
+    // Advancing: never pruned inside the recovery-tail window, oldest-first
+    // beyond it. Safe to leave soft-capped because seq is scarce — at most
+    // `tailLimit` distinct seqs can be in the window.
     if (advancing.length > limit) {
       const cutoff = this.headState.seq - this.options.tailLimit;
-      // Ordered by seq explicitly rather than trusting insertion order: after
-      // a rehydration the map is filled from durable rows, and an aged row
-      // predating the retention class (below) can land among the advancing set
-      // out of seq order. Oldest-first must stay true of what is actually held.
       const candidates = advancing.filter((entry) => entry.seq <= cutoff).sort((a, b) => a.seq - b.seq);
       let remaining = advancing.length;
       for (const entry of candidates) {
@@ -3129,7 +3291,31 @@ export class ScopeSequencer {
         remaining -= 1;
       }
     }
-    return pruned;
+
+    // Rule 3 — PAYLOAD shedding. Verdicts are protected for a full lease;
+    // their payloads are not, because a payload is 25× the size and only
+    // informational. Beyond the cap the OLDEST rows lose `replay_output` and
+    // keep everything that makes a retry safe, degrading to the
+    // `replay_outcome:"none"` state mcp.md §M4.2 already defines. Without this
+    // split, protecting every guaranteed outcome would cost
+    // GUARANTEED_OUTCOME_CAPACITY * REPLAY_OUTPUT_BYTE_CAP = 64 MiB per scope.
+    const carrying: string[] = [];
+    for (const [key, reply] of this.replies) {
+      if (reply.status === "accepted" && reply.replay_output !== undefined) carrying.push(key);
+    }
+    let shed = carrying.length - payloadCap;
+    for (let i = 0; i < carrying.length && shed > 0; i += 1, shed -= 1) {
+      const key = carrying[i];
+      const reply = this.replies.get(key);
+      if (reply === undefined || reply.status !== "accepted") continue;
+      const { replay_output: _dropped, ...stripped } = reply;
+      this.replies.set(key, stripped);
+      // Rewritten durably by the caller, inside the same transaction as the
+      // insertion that triggered this sweep — memory and storage must not
+      // disagree about what a replay can still show.
+      rewritten.push({ key, reply: stripped });
+    }
+    return { pruned, rewritten };
   }
 
   /** Whether `base` is the current head or an exact ancestor proven by
@@ -3187,15 +3373,20 @@ export class ScopeSequencer {
     // request arriving under a used key — and overwriting the receipt there
     // would destroy the original caller's proof and let ITS retry execute a
     // second time. The refusal is returned; the receipt stands.
-    if (!RETRYABLE_VERDICTS.has(reason) && !this.replies.has(submit.idempotency_key)) {
+    if (
+      !RETRYABLE_VERDICTS.has(reason) &&
+      !UNRECORDED_VERDICTS.has(reason) &&
+      !this.replies.has(submit.idempotency_key)
+    ) {
       // CO2.5: the RECORDED rejection carries the fingerprint of the request
       // it refused, so a later submit reusing this key for a DIFFERENT call is
       // met with `idempotency_conflict` instead of this refusal. The RETURNED
       // reply does not carry it — a stored request hash is never wire output.
-      const recorded: CommitReply =
-        submit.request_fingerprint !== undefined
-          ? { ...reply, replay_request: submit.request_fingerprint }
-          : reply;
+      const recorded: CommitReply = {
+        ...reply,
+        ...(submit.request_fingerprint !== undefined ? { replay_request: submit.request_fingerprint } : {}),
+        ...(submit.retry_receipt === true ? { replay_guaranteed: true as const } : {})
+      };
       // H2a: recorded rejections are bounded like receipts. Before this they
       // were inserted with no prune at all, which made "submit something
       // terminally invalid under a fresh key" an unbounded storage write.

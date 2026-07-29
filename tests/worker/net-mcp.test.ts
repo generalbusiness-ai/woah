@@ -278,9 +278,12 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     expect(initialToolNames.some((name: string) => /^guest_[2-8]__/.test(name))).toBe(false);
     expect(initialToolNames).not.toContain(`${alice}__command_only_probe`);
     const waitDefinition = listed.body?.result?.tools?.find((tool: { name: string }) => tool.name === "woo_wait");
+    // Both are OPTIONAL, so both are advertised NULLABLE (mcp.md §M4.3):
+    // `null` is accepted for an unset optional, and the published type has to
+    // say so or the accepted set is wider than the advertised one.
     expect(waitDefinition?.inputSchema?.properties).toMatchObject({
-      timeout_ms: { type: "number" },
-      limit: { type: "number" }
+      timeout_ms: { type: ["number", "null"] },
+      limit: { type: ["number", "null"] }
     });
     const sayDefinition = listed.body?.result?.tools?.find((tool: { name: string }) => tool.name === "the_chatroom__say");
     expect(sayDefinition?.inputSchema).toMatchObject({

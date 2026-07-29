@@ -11,7 +11,7 @@
 // stay empty. A "fix" that lets the turn run and then reports an error must
 // fail here.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
+import { closeQuiescent, quiescentNetState as netState, type QuiescentHost } from "./quiescent-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -26,53 +26,6 @@ const SECRET = "net-mcp-argval-secret";
 const WIDGET = "the_widget";
 const BUMP_TOOL = "the_widget__note_bump";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  // `waitUntil` failures are part of the test result. Letting a rejected
-  // fanout surface after SQLite closes can otherwise print an error after a
-  // green assertion and make the next fixture appear responsible.
-  const failures: unknown[] = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise.catch((err) => {
-        failures.push(err);
-      }));
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  const drain = async () => {
-    // A deferred task can enqueue the next pass. One empty observation is not
-    // yet quiescence, so give scheduled microtasks/timers a turn and bound the
-    // process to make a self-feeding loop fail instead of hanging the suite.
-    for (let pass = 0; pass < 64; pass += 1) {
-      if (deferred.length === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        if (deferred.length === 0) return;
-      }
-      while (deferred.length > 0) await deferred.shift();
-    }
-    throw new Error(`deferred work for ${name} never reached quiescence`);
-  };
-  return {
-    state,
-    failures,
-    settle: drain,
-    close: async () => {
-      try {
-        await drain();
-      } finally {
-        fake.close();
-      }
-    }
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number | string; method: string; params?: unknown };
 
@@ -151,9 +104,9 @@ async function fixture() {
     }
   });
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
-  const scopeStates = new Map<string, ReturnType<typeof netState>>();
+  const scopeStates = new Map<string, QuiescentHost>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
     if (destination === "gateway:net-api") return gateway;
@@ -264,30 +217,7 @@ async function fixture() {
 
   return {
     alice, aliceSession, mcp, call, drain, hits, settleAll, worldSnapshot,
-    close: async () => {
-      const teardownFailures: unknown[] = [];
-      try {
-        await settleAll();
-      } catch (err) {
-        teardownFailures.push(err);
-      }
-      for (const st of states) {
-        try {
-          await st.close();
-        } catch (err) {
-          teardownFailures.push(err);
-        }
-      }
-      teardownFailures.push(...states.flatMap((st) => st.failures));
-      if (teardownFailures.length > 0) {
-        throw new Error(
-          `${teardownFailures.length} deferred task(s) failed after the test body:\n` +
-            teardownFailures
-              .map((err, i) => `  [${i}] ${err instanceof Error ? err.stack ?? err.message : String(err)}`)
-              .join("\n")
-        );
-      }
-    }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -340,8 +270,12 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       } while (cursor && !schema);
       expect(schema, `${BUMP_TOOL} was not advertised`).toBeTruthy();
       expect(schema!.required).toEqual(["text"]);
+      // Required parameter: the plain declared type.
       expect(schema!.properties.text).toMatchObject({ type: "string" });
-      expect(schema!.properties.amount).toMatchObject({ type: "integer" });
+      // OPTIONAL parameter: advertised NULLABLE, because it really does
+      // accept null (mcp.md §M4.3). Before this the accepted set was wider
+      // than the advertised one — drift with the sign flipped.
+      expect(schema!.properties.amount.type).toEqual(["integer", "null"]);
       // The reserved retry-safety property rides the protocol view, and the
       // validator sees the same object — so sending it is never "unknown".
       expect(schema!.properties.operation_id).toBeTruthy();
@@ -394,7 +328,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.code).toBe("E_INVARG");
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("amount");
-      expect(refusal.detail.expected).toBe("integer");
+      expect(refusal.detail.expected).toBe("integer or null");
       expect(refusal.detail.received).toBe("number");
       expect(refusal.message).toContain("amount");
       expect(await f.hits()).toBe(0);
@@ -480,7 +414,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("amount");
       expect(refusal.detail.position).toBe(1);
-      expect(refusal.detail.expected).toBe("integer");
+      expect(refusal.detail.expected).toBe("integer or null");
       expect(refusal.detail.received).toBe("string");
       expect(String(refusal.detail.remediation)).toContain("args[1]");
       expect(await f.hits()).toBe(0);
@@ -518,7 +452,8 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       });
       expect(wrongArgs.detail.reason).toBe("argument_type_mismatch");
       expect(wrongArgs.detail.field).toBe("args");
-      expect(wrongArgs.detail.expected).toBe("array");
+      // `args` is optional, so its advertised type is the nullable union.
+      expect(wrongArgs.detail.expected).toBe("array or null");
 
       // `object` declared `string`. Pre-fix a non-string was coerced to ""
       // and reported as though it had been omitted.
@@ -592,7 +527,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.code).toBe("E_INVARG");
       expect(refusal.detail.reason).toBe("argument_type_mismatch");
       expect(refusal.detail.field).toBe("timeout_ms");
-      expect(refusal.detail.expected).toBe("number");
+      expect(refusal.detail.expected).toBe("number or null");
       expect(refusal.detail.received).toBe("string");
       // Pre-fix this parked for the 1000ms default and told the client
       // nothing — a client that asked for five seconds got one.
@@ -618,6 +553,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(ok.result?.isError, JSON.stringify(ok).slice(0, 400)).not.toBe(true);
     } finally {
       await f.close();
+
     }
   });
 });

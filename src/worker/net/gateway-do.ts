@@ -1132,24 +1132,38 @@ export class NetGatewayDO {
     // Lease columns, added in place so an already-deployed shard keeps its
     // pins across the upgrade — dropping the table instead would blank every
     // in-flight route at exactly the moment the invariant is being repaired.
+    //
+    // Each column is probed INDEPENDENTLY and the whole step is one
+    // transaction. Gating both ALTERs on the presence of the FIRST one is a
+    // permanent brick: an interruption between the two statements leaves
+    // `expires_at` present and `guaranteed` absent, every later boot then sees
+    // `expires_at`, skips the block, and the index build below fails on the
+    // missing column — so the shard can never initialize again. A migration
+    // that is not resumable from its own halfway state is not a migration.
+    //
     // Legacy rows are backfilled with a full lease and treated as guaranteed:
     // conservative in the direction that matters, since it can only retain a
     // route that is no longer needed, never discard one that is.
-    const pinColumns = new Set(
-      sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
-    );
-    if (!pinColumns.has("expires_at")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
-      state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
-    }
-    // Backfill unconditionally, not only when the columns are first added: any
-    // row that reaches this table without a lease is undateable, and an
-    // undateable row must not become an ageless one. Indexed on expires_at and
-    // a no-op once clean, so the steady-state cost is a lookup.
-    state.storage.sql.exec(
-      "UPDATE net_gateway_pin SET expires_at = ?, guaranteed = 1 WHERE expires_at IS NULL",
-      Date.now() + GATEWAY_PIN_LEASE_MS
-    );
+    state.storage.transactionSync(() => {
+      const pinColumns = new Set(
+        sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
+      );
+      if (!pinColumns.has("expires_at")) {
+        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
+      }
+      if (!pinColumns.has("guaranteed")) {
+        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
+      }
+      // Repairs BOTH columns, not just the one a fresh ALTER leaves null, so a
+      // shard that halted midway lands in the same state as one that never
+      // did. Unconditional rather than gated on the ALTERs: any row reaching
+      // this table undated must not become an ageless one.
+      state.storage.sql.exec(
+        "UPDATE net_gateway_pin SET expires_at = COALESCE(expires_at, ?), guaranteed = COALESCE(guaranteed, 1) " +
+          "WHERE expires_at IS NULL OR guaranteed IS NULL",
+        Date.now() + GATEWAY_PIN_LEASE_MS
+      );
+    });
     // Retention sweeps read by expiry and by class; both stay off a full-table
     // scan. Every SQLite index carries the rowid as its payload already, so
     // "oldest first within a class" is served by the class index — and naming
@@ -5496,7 +5510,36 @@ export class NetGatewayDO {
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     const name = typeof params.name === "string" ? params.name : "";
-    const args = (params.arguments ?? {}) as Record<string, unknown>;
+    // M4.3: validate the ROOT value before treating it as a property bag.
+    // `(params.arguments ?? {})` cast a string, an array, a number, or an
+    // explicit `null` straight through as though it were an empty object, so
+    // a control with no required properties silently ran on its defaults —
+    // the same silent-substitution class as the `Array.isArray(args) ? args :
+    // []` bug this validation already closed for woo_call, one level up.
+    //
+    // ABSENT stays legal: MCP declares `arguments` optional. It is only the
+    // supplied-but-not-an-object case that is refused, `null` included —
+    // MCP's own CallToolRequest declares the field optional, not nullable,
+    // and "no arguments" is spelled by omitting it. (Our OWN optional
+    // parameters are advertised as nullable and do accept `null`; the
+    // difference is that this envelope's schema is MCP's to define, not
+    // ours.)
+    const suppliedArguments = params.arguments;
+    if (suppliedArguments !== undefined && !isMcpArgumentObject(suppliedArguments)) {
+      return this.mcpToolError(id, {
+        code: "E_INVARG",
+        message: `${name || "tools/call"}: "arguments" must be a JSON object of named parameters, received ${mcpJsonTypeOf(suppliedArguments)}`,
+        detail: {
+          reason: "invalid_arguments_object",
+          tool: name,
+          field: "arguments",
+          expected: "object",
+          received: mcpJsonTypeOf(suppliedArguments),
+          remediation: "pass arguments as a JSON object keyed by parameter name, or omit it entirely when the tool takes none"
+        }
+      });
+    }
+    const args = (suppliedArguments ?? {}) as Record<string, unknown>;
 
     if (name === "woo_wait") {
       // M4.3: the advertised schema is enforced before anything else happens.
@@ -5548,26 +5591,32 @@ export class NetGatewayDO {
     }
     if (name === "woo_call") {
       // M4.3, gate 1: woo_call's OWN schema — `object`/`verb` required
-      // strings, `args` an array. This replaced a coercing presence check
-      // that reported a non-string `object` as "missing" and silently turned
-      // a non-array `args` into an empty list, dispatching the verb with no
-      // arguments instead of saying the payload was malformed.
+      // non-empty strings, `args` an array. This replaced a coercing presence
+      // check that reported a non-string `object` as "missing" and silently
+      // turned a non-array `args` into an empty list, dispatching the verb
+      // with no arguments instead of saying the payload was malformed.
+      //
+      // The non-empty rule is the schema's advertised `minLength: 1`, not a
+      // separate hand-rolled branch: it used to be enforced here and
+      // published nowhere, so a client that satisfied the printed schema
+      // could still be refused.
+      //
+      // The operation id is adjudicated FIRST, and deliberately. It rides two
+      // carriers (`_meta` and `arguments`, §M4.2) and only one of them has a
+      // published schema, so letting the generic validator reach it first
+      // would report the SAME malformed value under two different
+      // `detail.reason`s depending on which carrier a client happened to use.
+      // mcpOperationId enforces `MCP_OPERATION_ID_PATTERN` — the same regex
+      // the schema publishes — so the accepted set is identical either way;
+      // this only fixes which refusal a client is told about.
+      // `woo_call` carries verb arguments positionally inside `args`, so its
+      // own argument namespace never collides with the reserved name.
+      const operation = mcpOperationId(params, args, []);
+      if (!operation.ok) return this.mcpToolError(id, operation.error);
       const controlRefusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
       if (controlRefusal) return this.mcpToolError(id, controlRefusal);
       const requested = args.object as string;
       const verb = args.verb as string;
-      if (!requested || !verb) {
-        return this.mcpToolError(id, {
-          code: "E_INVARG",
-          message: "woo_call: \"object\" and \"verb\" must be non-empty",
-          detail: {
-            reason: "empty_required_argument",
-            tool: name,
-            field: requested ? "verb" : "object",
-            remediation: "name a reachable object id (or $me/$here) and a verb on its dispatch chain"
-          }
-        });
-      }
       // `$me`/`$here` are the forms every user doc uses for "the session
       // actor" and "the space I am in". They resolved nowhere, so each of
       // those documented examples refused. They are transport-level session
@@ -5602,10 +5651,6 @@ export class NetGatewayDO {
         positional
       );
       if (argRefusal) return this.mcpToolError(id, argRefusal);
-      // `woo_call` carries verb arguments positionally inside `args`, so its
-      // own argument namespace never collides with the reserved name.
-      const operation = mcpOperationId(params, args, []);
-      if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
         id,
         actor,
@@ -5620,13 +5665,15 @@ export class NetGatewayDO {
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
     if (dynamic) {
+      // The operation id goes first for the carrier-uniformity reason spelled
+      // out in the woo_call branch above.
+      const operation = mcpOperationId(params, args, dynamic.argNames);
+      if (!operation.ok) return this.mcpToolError(id, operation.error);
       // M4.3: validate against `mcpProtocolTool`'s schema — the exact object
       // `tools/list` advertised for this tool, reserved `operation_id`
       // included — so the accepted set and the advertised set are one thing.
       const refusal = mcpValidateNamedArguments(name, mcpProtocolTool(dynamic).inputSchema, args);
       if (refusal) return this.mcpToolError(id, refusal);
-      const operation = mcpOperationId(params, args, dynamic.argNames);
-      if (!operation.ok) return this.mcpToolError(id, operation.error);
       return this.mcpInvokeTurn(
         id,
         actor,
@@ -10355,18 +10402,42 @@ function mcpOperationId(
   return { ok: true, value: raw };
 }
 
-/** The `operation_id` property advertised on a tool's input schema. */
+/**
+ * The `operation_id` property advertised on a tool's input schema.
+ *
+ * `pattern` is `MCP_OPERATION_ID_PATTERN.source` — the enforced regex itself,
+ * not a restatement of it — because this rule is load-bearing rather than
+ * cosmetic: it is what keeps `mcp:<actor>:<operation_id>` injective in
+ * (actor, operation id), and a published approximation that admitted one
+ * character the enforced rule rejects would advertise a key shape the turn
+ * layer cannot honour. Deriving it from the RegExp makes drift impossible.
+ *
+ * The type is nullable because the property is optional and `null` is
+ * accepted as "no id" (mcpOperationId). The bound `{1,128}` lives inside the
+ * pattern, so no separate length facet is published.
+ */
 const MCP_OPERATION_ID_SCHEMA = {
-  type: "string",
+  type: ["string", "null"],
+  pattern: MCP_OPERATION_ID_PATTERN.source,
   description:
     "Optional client-chosen id for THIS operation. Reuse the exact same value when you retry after a lost or "
     + "ambiguous response: the retry is then deduplicated and returns the original outcome instead of running the "
     + "call a second time. Use a fresh value for a genuinely new operation. Strongly recommended for anything that "
-    + "changes the world."
+    + "changes the world. Allowed characters are letters, digits, and . _ - : (1-128 of them)."
 } as const;
 
+/**
+ * The presentation scope, defaulting when the caller supplied none.
+ *
+ * Absent and `null` both mean "not supplied" — `null` because every optional
+ * parameter is advertised nullable (§M4.3). Any other value has already been
+ * checked against the published `enum` by the time this runs, so the throw is
+ * a residual internal guard rather than the client-facing refusal; the empty
+ * string used to be defaulted here and is now refused by the enum, which is
+ * the honest answer since the advertisement never listed it.
+ */
 function mcpToolScope(value: unknown): NetMcpToolScope {
-  if (value === undefined || value === null || value === "") return "active";
+  if (value === undefined || value === null) return "active";
   if (value === "active" || value === "here" || value === "object" || value === "space") return value;
   throw new Error("scope must be one of active, here, object, space");
 }
@@ -10401,6 +10472,13 @@ function mcpPlacedScope(location: string): string | null {
  */
 function mcpRequestKey(id: number | string): string {
   return typeof id === "number" ? `n:${id}` : `s:${id}`;
+}
+
+/** The `arguments` envelope must be a JSON object — not an array, and not
+ * `null`. Arrays are objects to `typeof`, which is exactly how a positional
+ * list used to pass for a property bag. */
+function isMcpArgumentObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function mcpSanitizeId(value: string): string {
@@ -10573,9 +10651,14 @@ function mcpInputSchema(argSpec: Record<string, unknown>): { schema: Record<stri
     if (!name) continue;
     args.push(name);
     const explicitHint = typeof types[name] === "string" ? types[name] as string : "";
-    properties[name] = explicitHint
+    const declared = explicitHint
       ? mcpSchemaForHint(explicitHint)
       : mcpSchemaForCommandSource(argumentSources[index]);
+    // An optional parameter is advertised as nullable, because it genuinely
+    // accepts `null` — that is what an absent property becomes on the way to
+    // the verb (mcpNamedArgs). Publishing it keeps the advertised set and the
+    // accepted set equal instead of leaving the leniency undeclared.
+    properties[name] = optional ? mcpNullableSchema(declared) : declared;
     if (!optional) required.push(name);
   }
   return {
@@ -10638,14 +10721,24 @@ function mcpSchemaForHint(raw: string): Record<string, unknown> {
  */
 type McpArgRefusal = { code: string; message: string; detail: Record<string, unknown> };
 
-/** True when `value` satisfies the shallow schema fragment. An empty or
- * unrecognized fragment accepts everything — see the fail-open rule above. */
-function mcpSchemaAccepts(schema: Record<string, unknown>, value: unknown): boolean {
-  if (Array.isArray(schema.anyOf)) {
-    return schema.anyOf.some((branch) => mcpSchemaAccepts(mcpRecord(branch), value));
+/** Which constraint a value failed. Distinguished so the refusal can name the
+ * rule that was broken rather than reporting every failure as a type error. */
+type McpSchemaViolation =
+  | { kind: "type" }
+  | { kind: "pattern"; pattern: string }
+  | { kind: "min_length"; minLength: number };
+
+/** The declared JSON type names, accepting both the single-name and the union
+ * form. We emit the union form for every optional parameter (see
+ * `mcpNullableSchema`), so the union case is ours, not merely tolerated. */
+function mcpDeclaredTypes(schema: Record<string, unknown>): string[] {
+  if (Array.isArray(schema.type)) {
+    return schema.type.filter((entry): entry is string => typeof entry === "string");
   }
-  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => allowed === value)) return false;
-  const type = typeof schema.type === "string" ? schema.type : "";
+  return typeof schema.type === "string" && schema.type ? [schema.type] : [];
+}
+
+function mcpTypeAccepts(type: string, value: unknown): boolean {
   switch (type) {
     case "string": return typeof value === "string";
     case "boolean": return typeof value === "boolean";
@@ -10656,8 +10749,59 @@ function mcpSchemaAccepts(schema: Record<string, unknown>, value: unknown): bool
     case "object": return typeof value === "object" && value !== null && !Array.isArray(value);
     case "array": return Array.isArray(value);
     case "null": return value === null;
+    // An unrecognized type keyword constrains nothing — the fail-open rule.
     default: return true;
   }
+}
+
+/** Compiled `pattern` sources. Patterns come only from our own hand-written
+ * advertisements (never from catalog `arg_spec`), so this is a fixed, small
+ * set and cannot be grown by a client. */
+const MCP_PATTERN_CACHE = new Map<string, RegExp>();
+function mcpCompiledPattern(source: string): RegExp | null {
+  const cached = MCP_PATTERN_CACHE.get(source);
+  if (cached) return cached;
+  try {
+    const compiled = new RegExp(source);
+    MCP_PATTERN_CACHE.set(source, compiled);
+    return compiled;
+  } catch {
+    // An unusable pattern constrains nothing rather than refusing everything.
+    return null;
+  }
+}
+
+/** `null` when `value` satisfies the shallow schema fragment, else which
+ * constraint it broke. An empty or unrecognized fragment accepts everything —
+ * see the fail-open rule above. */
+function mcpSchemaViolation(schema: Record<string, unknown>, value: unknown): McpSchemaViolation | null {
+  if (Array.isArray(schema.anyOf)) {
+    for (const branch of schema.anyOf) {
+      if (mcpSchemaViolation(mcpRecord(branch), value) === null) return null;
+    }
+    return { kind: "type" };
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => allowed === value)) {
+    return { kind: "type" };
+  }
+  const declared = mcpDeclaredTypes(schema);
+  if (declared.length > 0 && !declared.some((entry) => mcpTypeAccepts(entry, value))) {
+    return { kind: "type" };
+  }
+  // String facets apply only to strings: JSON Schema treats a facet as
+  // vacuously satisfied by a value of any other type, and the union types we
+  // publish for optional parameters depend on that (`null` must not have to
+  // satisfy `minLength`).
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+      return { kind: "min_length", minLength: schema.minLength };
+    }
+    if (typeof schema.pattern === "string") {
+      const compiled = mcpCompiledPattern(schema.pattern);
+      if (compiled && !compiled.test(value)) return { kind: "pattern", pattern: schema.pattern };
+    }
+  }
+  return null;
 }
 
 /** What a refusal should say the parameter had to be. */
@@ -10670,7 +10814,40 @@ function mcpSchemaExpectation(schema: Record<string, unknown>): string {
     return "any";
   }
   if (Array.isArray(schema.enum)) return `one of ${schema.enum.map((value) => JSON.stringify(value)).join(", ")}`;
-  return typeof schema.type === "string" && schema.type ? schema.type : "any";
+  const declared = mcpDeclaredTypes(schema);
+  if (declared.length > 0) return declared.join(" or ");
+  return "any";
+}
+
+/**
+ * The published schema for an OPTIONAL parameter: the declared schema widened
+ * to admit `null`.
+ *
+ * Optional means "omit it, or send null" — the transport itself substitutes
+ * `null` for an absent property when mapping named arguments onto positional
+ * ones (§M2.2), and LLM clients routinely spell an unset optional as an
+ * explicit `null`. That acceptance used to live as a carve-out inside the
+ * validator, which made the accepted set WIDER than the advertised one. The
+ * widening now happens in the schema instead, so the advertisement states it
+ * and the validator needs no special case.
+ *
+ * Idempotent: re-widening an already-nullable schema is a no-op.
+ */
+function mcpNullableSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  if (Array.isArray(schema.anyOf)) {
+    if (schema.anyOf.some((branch) => mcpDeclaredTypes(mcpRecord(branch)).includes("null"))) return schema;
+    return { ...schema, anyOf: [...schema.anyOf, { type: "null" }] };
+  }
+  const out: Record<string, unknown> = { ...schema };
+  if (Array.isArray(schema.enum) && !schema.enum.some((value) => value === null)) {
+    out.enum = [...schema.enum, null];
+  }
+  const declared = mcpDeclaredTypes(schema);
+  // An unconstrained fragment already admits null; a union that names it is
+  // already done.
+  if (declared.length === 0 || declared.includes("null")) return out;
+  out.type = [...declared, "null"];
+  return out;
 }
 
 /** The JSON type name to report back for a rejected value. */
@@ -10706,7 +10883,6 @@ function mcpValidateNamedArguments(
   const required = Array.isArray(schema.required)
     ? schema.required.filter((value): value is string => typeof value === "string")
     : [];
-  const requiredSet = new Set(required);
   // `undefined` is not a JSON value, but a hand-built client object can carry
   // it; treat it as absent rather than as a value that fails every type.
   const supplied = (name: string) =>
@@ -10740,27 +10916,64 @@ function mcpValidateNamedArguments(
   for (const [name, declared] of Object.entries(properties)) {
     if (!supplied(name)) continue;
     const value = values[name];
-    // `null` on an OPTIONAL parameter means "not supplied". It is exactly
-    // what mcpNamedArgs substitutes for an absent property, so refusing the
-    // transport's own encoding of absence would be incoherent.
-    if (value === null && !requiredSet.has(name)) continue;
     const declaredSchema = mcpRecord(declared);
-    if (mcpSchemaAccepts(declaredSchema, value)) continue;
-    const expected = mcpSchemaExpectation(declaredSchema);
+    const violation = mcpSchemaViolation(declaredSchema, value);
+    if (!violation) continue;
+    const terms = mcpViolationTerms(violation, declaredSchema, value);
     return {
       code: "E_INVARG",
-      message: `${tool}: argument "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      message: `${tool}: ${terms.message(`argument "${name}"`)}`,
       detail: {
-        reason: "argument_type_mismatch",
+        reason: terms.reason,
         tool,
         field: name,
-        expected,
-        received: mcpJsonTypeOf(value),
-        remediation: `pass "${name}" as ${expected}`
+        expected: terms.expected,
+        ...terms.detail,
+        remediation: `pass "${name}" as ${terms.expected}`
       }
     };
   }
   return null;
+}
+
+/**
+ * How one broken constraint is reported: its `detail.reason`, a human phrase
+ * for what was required, the message tail, and any constraint-specific detail
+ * fields. Shared by the named and positional validators so a `pattern`
+ * failure reads the same through either door.
+ */
+function mcpViolationTerms(
+  violation: McpSchemaViolation,
+  schema: Record<string, unknown>,
+  value: unknown
+): { reason: string; expected: string; message: (subject: string) => string; detail: Record<string, unknown> } {
+  if (violation.kind === "pattern") {
+    const expected = `a string matching ${violation.pattern}`;
+    return {
+      reason: "argument_pattern_mismatch",
+      expected,
+      message: (subject) => `${subject} does not match the required format ${violation.pattern}`,
+      detail: { pattern: violation.pattern }
+    };
+  }
+  if (violation.kind === "min_length") {
+    const expected = violation.minLength === 1
+      ? "a non-empty string"
+      : `a string of at least ${violation.minLength} characters`;
+    return {
+      reason: "argument_too_short",
+      expected,
+      message: (subject) => `${subject} must be ${expected}`,
+      detail: { min_length: violation.minLength, received_length: String(value).length }
+    };
+  }
+  const expected = mcpSchemaExpectation(schema);
+  return {
+    reason: "argument_type_mismatch",
+    expected,
+    message: (subject) => `${subject} must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+    detail: { received: mcpJsonTypeOf(value) }
+  };
 }
 
 /**
@@ -10842,25 +11055,25 @@ function mcpValidatePositionalArguments(
   for (const [index, name] of derived.args.entries()) {
     if (index >= values.length) break;
     const value = values[index];
-    // Same absence rule as the named path: `null` in an optional slot is how
-    // "not supplied" is spelled positionally.
-    if (value === null && !requiredSet.has(name)) continue;
+    // No `null` carve-out here either: an optional parameter's DERIVED schema
+    // already admits null (mcpNullableSchema), so the check is uniform.
     const declaredSchema = mcpRecord(properties[name]);
-    if (mcpSchemaAccepts(declaredSchema, value)) continue;
-    const expected = mcpSchemaExpectation(declaredSchema);
+    const violation = mcpSchemaViolation(declaredSchema, value);
+    if (!violation) continue;
+    const terms = mcpViolationTerms(violation, declaredSchema, value);
     return {
       code: "E_INVARG",
-      message: `${target}: argument #${index + 1} "${name}" must be ${expected}, received ${mcpJsonTypeOf(value)}`,
+      message: `${target}: ${terms.message(`argument #${index + 1} "${name}"`)}`,
       detail: {
-        reason: "argument_type_mismatch",
+        reason: terms.reason,
         obj: object,
         name: verb,
         field: name,
         position: index,
-        expected,
-        received: mcpJsonTypeOf(value),
+        expected: terms.expected,
+        ...terms.detail,
         declared: derived.args,
-        remediation: `pass args[${index}] ("${name}") as ${expected}`
+        remediation: `pass args[${index}] ("${name}") as ${terms.expected}`
       }
     };
   }
@@ -10914,8 +11127,16 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
 }
 
 /** The tool set the walkthrough's client contract uses — an ENVELOPE
- * around the net client surface, never a second path. */
-const MCP_TOOL_DEFS = [
+ * around the net client surface, never a second path.
+ *
+ * Written in CORE form: each property declares only its own constraints, and
+ * optionality is expressed once, by omission from `required`. `MCP_TOOL_DEFS`
+ * below is this run through `mcpControlSchema`, which widens every optional
+ * property to admit `null` using the same helper `mcpInputSchema` applies to
+ * optional verb parameters. Hand-writing the nullable unions here instead
+ * would be six chances to describe optionality differently from the dynamic
+ * door. */
+const MCP_TOOL_DEFS_CORE = [
   {
     name: "woo_call",
     description:
@@ -10925,8 +11146,12 @@ const MCP_TOOL_DEFS = [
     inputSchema: {
       type: "object",
       properties: {
-        object: { type: "string", description: "Canonical object id. `$me` is the session actor; `$here` is the space you are in." },
-        verb: { type: "string", description: "Verb name or alias." },
+        // `minLength: 1` is advertised because it is ENFORCED: an empty id or
+        // verb name resolves nowhere, and the gateway refused it long before
+        // this schema said so. Publishing the bound is what lets a client
+        // predict that refusal.
+        object: { type: "string", minLength: 1, description: "Canonical object id. `$me` is the session actor; `$here` is the space you are in." },
+        verb: { type: "string", minLength: 1, description: "Verb name or alias." },
         args: { type: "array", items: {}, description: "Positional arguments, in the verb's declared order." },
         operation_id: MCP_OPERATION_ID_SCHEMA
       },
@@ -10969,6 +11194,30 @@ const MCP_TOOL_DEFS = [
   }
 ] as const;
 
+/** Widen a control's OPTIONAL properties to admit `null`, by the same rule
+ * and the same helper the dynamic door uses for optional verb parameters. */
+function mcpControlSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const properties = mcpRecord(schema.properties);
+  const required = new Set(
+    Array.isArray(schema.required)
+      ? schema.required.filter((value): value is string => typeof value === "string")
+      : []
+  );
+  const widened: Record<string, unknown> = {};
+  for (const [name, declared] of Object.entries(properties)) {
+    widened[name] = required.has(name) ? declared : mcpNullableSchema(mcpRecord(declared));
+  }
+  return { ...schema, properties: widened };
+}
+
+/** The PUBLISHED stable-control descriptors — what `tools/list` returns. */
+const MCP_TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> =
+  MCP_TOOL_DEFS_CORE.map((definition) => ({
+    name: definition.name,
+    description: definition.description,
+    inputSchema: mcpControlSchema(definition.inputSchema as unknown as Record<string, unknown>)
+  }));
+
 /**
  * The advertised input schema of each stable control, keyed by tool name.
  *
@@ -10978,5 +11227,5 @@ const MCP_TOOL_DEFS = [
  * this validation exists to close for dynamic tools.
  */
 const MCP_CONTROL_SCHEMAS: Record<string, Record<string, unknown>> = Object.fromEntries(
-  MCP_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema as unknown as Record<string, unknown>])
+  MCP_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema])
 );

@@ -607,72 +607,67 @@ WebSocket turn frame too, so identical strings from different clients are
 possible and must never become a read channel.
 
 **Past the retention window.** Idempotency is a bounded-window guarantee, not
-an eternal one, and the two classes of recorded outcome are retained by
-different rules because their growth is limited by different things.
+an eternal one. Within the window it is a real guarantee and not a best-effort
+one, which requires that nothing except the window's own clock can retract it.
 
-- **Turns that COMMITTED** (they consumed a sequence number) are retained for
-  **at least the scope's most recent 256 commits** — the recovery-tail window,
-  never pruned — and at most 1024. The sequencer itself rate-limits this class:
-  one reply per seq.
-- **Receipts and terminal rejections** advance nothing, so they are recorded at
-  whatever head is current and the seq-ordered rule above can never age them
-  out. They are retained as a flat **most-recent-256 per scope**, oldest first.
-  A bound of this kind is not optional: a receipt is the cheapest row an actor
-  can write (one keyed act of speech), so without it any authenticated client
-  could grow authority storage without limit. Receipt pressure never evicts a
-  committed turn's reply — the quotas are separate.
+**The window is a LEASE, and it is shared.** Two stores decide whether a retry
+is safe: the gateway's selection pin decides where the retry is routed, and the
+authority's recorded outcome decides whether it executes when it gets there. If
+either lapses while the other holds, a retry re-plans, may select a second
+scope, and commits there.
 
-The resulting per-scope window is **1280 recorded replies**, each retaining at
-most 4 KiB of outcome. An implementation MUST enforce both quotas at the moment
-of insertion, in memory and in durable storage together: a prune that can lag
-its insert is the unbounded cache it was meant to prevent.
+Row counts MUST NOT be used to establish that ordering, and MUST NOT be able to
+retract a guarantee already issued. Three successive attempts to build this on
+counting were each falsified by direct probes — a shard-wide ceiling deleting by
+global row order regardless of scope; a per-scope cap counting pins rather than
+pins with a live outcome; and a reply quota evicting an outcome inside its own
+advertised lease, which ran one operation twice. The boundary is therefore a
+clock both sides share:
 
-**The retention boundary is a LEASE, and it is shared.** Two stores decide
-whether a retry is safe: the gateway's selection pin decides where the retry is
-routed, and the authority's recorded reply decides whether it executes when it
-gets there. If the pin expires while the reply is live, the retry re-plans, may
-select a second scope, and commits there — the same double execution, by a
-different door.
+- a recorded outcome expires **10 minutes** after it is recorded;
+- a pin for a client-supplied operation id expires after **20 minutes**. The gap
+  is slack: the two stores are different Durable Objects with independent
+  clocks, and the pin must outlive the outcome even under skew;
+- expiry MUST be enforced when an outcome is LOOKED UP, not only by a retention
+  sweep. A sweep runs when other work arrives, so on a quiet scope it never runs
+  at all and a long-dead outcome would still replay;
+- an unexpired guarantee is **never** evicted — not by a row quota, not to make
+  room. At capacity each side REFUSES a new retry-safe admission instead: the
+  gateway with `E_RETRY_CAPACITY`, the authority with a terminal
+  `retry_capacity` rejection. Nothing is planned or submitted, and the client is
+  told that the retry *guarantee* was refused, not the operation. It MAY retry
+  shortly, or re-issue without an operation id and accept at-least-once
+  semantics knowingly.
 
-Row counts cannot establish that ordering and MUST NOT be used to try. The two
-stores prune on unrelated triggers, so a limit in one says nothing about age in
-the other; two successive attempts to size this were both disproved by direct
-probes (a shard-wide ceiling deleting by global row order regardless of scope,
-and a per-scope cap counting pins rather than pins with a live outcome). The
-boundary is therefore a clock both sides share:
+**What is guaranteed, and what degrades.** A recorded outcome has two parts, and
+only one of them is protected. The VERDICT — that this key already committed —
+is what makes a retry safe, and it is retained for the full lease. The OUTCOME
+PAYLOAD (`result`, `error`, `observations`) is what makes a retry *informative*,
+it is far larger, and it is best-effort: under pressure the oldest payloads are
+shed and those replays degrade to `replay_outcome:"none"`, which already means
+"the operation ran exactly once and its outcome was not retained". A client is
+therefore always told correctly *whether* its operation ran; it is not always
+told *what happened*.
 
-- a recorded outcome expires **10 minutes** after it is recorded, whatever the
-  count quotas above would allow;
-- a pin for a client-supplied operation id expires after **20 minutes**. The
-  gap is slack: the two stores are different Durable Objects with independent
-  clocks, and the pin must outlive the reply even under skew;
-- an unexpired pin is **never evicted**. At capacity the gateway REFUSES a new
-  retry-safe admission with `E_RETRY_CAPACITY` rather than drop a live one.
-  Nothing is planned or submitted; the client is told that the retry
-  *guarantee* was refused, not the operation, and MAY retry shortly or re-issue
-  without an operation id and accept at-least-once semantics knowingly. A
-  visible refusal is the intended cost — the alternative is a guarantee that
-  silently does not hold.
+**The guarantee, exactly.** Within 10 minutes of a client-keyed operation being
+recorded, a retry of that operation under the same key does not execute a second
+time. It does NOT hold, and MUST NOT be relied on, when:
 
-**The guarantee, exactly.** A recorded outcome younger than the 10-minute
-authority lease has a live pin routing its retry back to the scope that holds
-it. It does NOT hold, and MUST NOT be relied on, when:
-
-- the retry reaches a **different gateway shard** than the one that admitted
-  the operation. Shard routing follows the session, then the API key, so
-  retries on one credential are shard-stable; a retry presenting a *different*
-  credential for the same actor may land on a shard that never held the pin;
-- the admitting shard **lost its durable storage**;
+- the retry reaches a **different gateway shard** than the one that admitted the
+  operation. Shard routing follows the session, then the API key, so retries on
+  one credential are shard-stable; a retry presenting a *different* credential
+  for the same actor may land on a shard that never held the pin;
+- the admitting gateway shard **lost its durable storage**;
 - the operation id was **gateway-minted** rather than client-supplied. Minted
-  keys are never reusable by a client, so they carry no retained-route promise
-  and their pins are evicted freely;
-- either lease has **expired** — see the paragraph below, which is the ordinary
-  case and not a failure.
+  keys are never reusable by a client, carry no promise, and are evicted freely;
+- the admission was **refused** for capacity, above — in which case nothing ran;
+- either lease has **expired**, which is the ordinary case below and not a
+  failure.
 
-The converse containment is deliberately not claimed: a pin outliving its reply
-is expected and harmless. The pin is necessarily written BEFORE its submit —
-that is what makes it survive a lost response — so at write time there is no
-outcome to condition on.
+The converse containment is deliberately not claimed: a pin outliving its
+outcome is expected and harmless. The pin is necessarily written BEFORE its
+submit — that is what makes it survive a lost response — so at write time there
+is no outcome to condition on.
 
 A retry arriving after its reply has pruned is a NEW turn by every observable
 measure: it validates fresh against the current head and current read
@@ -688,6 +683,27 @@ dispatch.** A refused call runs no verb: it emits no observation, writes no
 cell, and consumes no sequence number. This is a correctness rule, not a
 conformance one — an unvalidated argument otherwise reaches the VM, which
 makes the schema published to a model decorative.
+
+**The advertised set and the accepted set are the same set.** That is the
+governing rule, and it binds in both directions: the gateway never accepts
+what the published schema forbids, and never refuses what the published
+schema permits. A constraint that is enforced but unpublished is as much a
+defect as one that is published but unenforced — an agent that satisfies the
+printed schema and is refused anyway has no way to comply. Where the two have
+disagreed, the resolution has been to publish the real rule rather than to
+weaken it, except where the leniency itself was the correct behaviour (see
+optional parameters below), in which case the leniency is published.
+
+**The `arguments` envelope is validated before its properties are.** MCP
+declares `arguments` an optional object, so omitting it is legal and means
+"this call has no arguments". Supplying it as anything other than a JSON
+object — a string, a number, a boolean, an array, or an explicit `null` — is
+refused with `invalid_arguments_object`. It is not silently read as an empty
+object: for a tool with no required properties there is nothing further to
+object, so the call would otherwise run on its defaults and report success to
+a client whose payload was malformed. `null` is refused here even though our
+own optional *parameters* accept `null`, because this envelope's schema is
+MCP's to define and it is declared optional, not nullable.
 
 The validator reads the **same object that was advertised**, never a second
 derivation of it. A dynamic tool is checked against the protocol schema
@@ -705,14 +721,24 @@ closes.
 | `type` | `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`. `integer` is the narrower assertion over JSON's single number type. |
 | `enum` | The value must be one of the listed values. |
 | `anyOf` | At least one branch must accept (the form a `a\|b` type hint derives). |
+| `type` as a union | An array of type names, any of which may match. This is how a nullable optional parameter is published. |
+| `minLength` | Minimum string length. Published on `woo_call`'s `object` and `verb`, which must be non-empty. Applies only to strings. |
+| `pattern` | The value must match. Published on `operation_id`. Applies only to strings. |
 
 **What is deliberately NOT checked**, because no advertisement can express
 it: nested object properties, array element schemas (`items` is always `{}`),
-`additionalProperties`, `format`, numeric or length bounds, `pattern`,
-`oneOf`/`allOf`/`not`, and `$ref`. A schema fragment the validator does not
-recognize **constrains nothing** rather than refusing, so a future
+`additionalProperties`, `format`, numeric bounds, `maxLength`,
+`oneOf`/`allOf`/`not`, and schema references. A schema fragment the validator
+does not recognize **constrains nothing** rather than refusing, so a future
 advertisement can never begin rejecting calls that were valid before the
 validator learned about it.
+
+A published `pattern` must be the regex that is actually enforced, not a
+restatement of it. `operation_id`'s is emitted from the enforcing expression
+itself. The rule is load-bearing rather than cosmetic — it is what keeps the
+turn key `mcp:<actor>:<operation id>` injective in (actor, operation id) — so
+a published approximation admitting one character the enforced rule rejects
+would advertise a key shape the turn layer cannot honour.
 
 **Unknown properties are ignored, not rejected.** Advertised schemas do not
 set `additionalProperties:false`, so JSON Schema's own reading of them permits
@@ -723,11 +749,15 @@ caught, because the correctly spelled parameter is then *missing*: that
 refusal lists the unrecognized properties under `detail.unknown_properties` so
 the typo is diagnosable.
 
-**`null` in an optional slot means "not supplied."** It is precisely what the
+**Every optional parameter is advertised nullable, and accepts `null`.**
+`null` in an optional slot means "not supplied": it is precisely what the
 transport substitutes for an absent property when mapping named arguments onto
-positional ones (§M2.2), so refusing it would refuse the protocol's own
-encoding of absence. A `null` supplied for a *required*, type-declared
-parameter is a type mismatch.
+positional ones (§M2.2), and clients routinely spell an unset optional that
+way. That acceptance is therefore stated in the schema — an optional
+parameter's published `type` is a union including `"null"`, and an optional
+`enum` includes `null` among its values — rather than living as an undeclared
+leniency inside the validator. A `null` supplied for a *required* parameter is
+a type mismatch, because a required parameter is not widened.
 
 **Refusal shape.** `E_INVARG` with a `detail.reason`, the offending parameter,
 what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
@@ -737,10 +767,21 @@ what was expected, and a `remediation` — the vocabulary §M2.1.1 uses:
 | A required parameter is absent | `missing_required_argument` | `field`, `expected`, `missing`, `required`, `unknown_properties?` |
 | A supplied value has the wrong type | `argument_type_mismatch` | `field`, `expected`, `received` |
 | More positional args than the verb declares | `too_many_arguments` | `declared`, `maximum_arity`, `received_arity` |
-| `woo_call` `object`/`verb` supplied but empty | `empty_required_argument` | `field` |
+| A string is shorter than the published `minLength` | `argument_too_short` | `field`, `expected`, `min_length`, `received_length` |
+| A string fails the published `pattern` | `argument_pattern_mismatch` | `field`, `expected`, `pattern` |
+| `arguments` was supplied but is not a JSON object | `invalid_arguments_object` | `field`, `expected`, `received` |
+
+`operation_id` is adjudicated before the generic schema check and keeps its
+own `invalid_operation_id` reason (§M4.2). It rides two carriers — `_meta` and
+`arguments` — and only one of them has a published schema, so letting the
+generic validator reach it first would report the same malformed value under
+two different reasons depending on which carrier a client used. Both paths
+enforce the identical expression, so this fixes only which refusal is
+reported, never which values are accepted.
 
 **`woo_call` is validated in two stages, and carries a residual.** Its own
-schema (`object` and `verb` required strings, `args` an array) is checked
+schema (`object` and `verb` required non-empty strings, `args` an array) is
+checked
 first. Its `args` list is free-form by construction — the tool cannot
 advertise the parameters of a verb chosen at call time — so the second stage
 runs *after* verb resolution, against the resolved page's own `arg_spec`,
