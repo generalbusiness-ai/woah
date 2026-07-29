@@ -13,6 +13,10 @@ export type RecordedCell =
 
 export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace" | "delete";
 export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "tombstones" | "counters" }>;
+/** Producer provenance for the controlled generic surface primitives. This is
+ * never a capability by itself; commit authority re-derives the surface from
+ * the recorded frame and authoritative actor lineage/features. */
+export type RecordedSurfaceAuthority = "builder_surface";
 
 /**
  * A semantic dependency of a proof, distinct from the cell eventually placed
@@ -54,10 +58,10 @@ export type TurnRecorderEvent =
   | { kind: "turn_finish"; ok: true; result?: WooValue }
   | { kind: "turn_finish"; ok: false; error: ErrorValue }
   | { kind: "cell_read"; cell: RecordedCell; value: WooValue; version?: string }
-  | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string; writer?: RecordedWriteAuthority }
+  | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string; authority?: RecordedSurfaceAuthority; writer?: RecordedWriteAuthority }
   | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number | string; dependencies?: RecordedProofDependency[] }
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string; writer?: RecordedWriteAuthority }
-  | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; writer?: RecordedWriteAuthority }
+  | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; authority?: RecordedSurfaceAuthority; writer?: RecordedWriteAuthority }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef; writer?: RecordedWriteAuthority }
   // A session's active scope changed (the actor entered/left a space). This is a
   // first-class routing/presence effect, distinct from the physical
@@ -210,7 +214,7 @@ export class InMemoryTurnRecorder implements TurnRecorder {
   }
 }
 
-export function objectCreateEvent(object: WooObject): TurnRecorderEvent {
+export function objectCreateEvent(object: WooObject, authority?: RecordedSurfaceAuthority): TurnRecorderEvent {
   return {
     kind: "object_create",
     object: object.id,
@@ -219,7 +223,8 @@ export function objectCreateEvent(object: WooObject): TurnRecorderEvent {
     owner: object.owner,
     anchor: object.anchor,
     location: object.location,
-    flags: { ...object.flags }
+    flags: { ...object.flags },
+    ...(authority ? { authority } : {})
   };
 }
 

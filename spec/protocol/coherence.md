@@ -544,12 +544,20 @@ accept another lifecycle op as an implicit lineage mutation.
 Lifecycle replacement authority is checked against the recorded VM frame.
 Wizard-owned frames may replace any semantic lineage field. A non-wizard frame
 may rename only an object it owns; it may also change that object's parent only
-while preserving owner, anchor, and flags, holding programmer authority, and
-being permitted to create an object it owns beneath the proposed fertile or
-owned parent. Recursive parentage is rejected. These checks are in addition to
-the exact pre-state lifecycle read and deterministic post-state re-derivation;
-the transcript is not a capability to synthesize a lineage state that the
-executed primitive could not have produced.
+while preserving owner, anchor, and flags, being permitted to create an object
+it owns beneath the proposed fertile or owned parent, and either holding
+programmer authority or using the generic builder-surface primitive.
+Builder-surface creates and parent changes carry a `builder_surface` producer
+marker, but the marker is not authority: the commit scope independently binds
+it to a valid recorded frame whose effective principal is the authenticated
+actor (a wizard-owned wrapper must be lowered exactly to that actor), and
+proves from authority state that the actor carries that frame's definer through
+ancestry or an attached feature. Generic creates without that combined proof
+retain the programmer requirement. Recursive parentage is rejected.
+These checks are in addition to the exact pre-state lifecycle read and
+deterministic post-state re-derivation; the transcript is not a capability to
+synthesize a lineage state that the executed primitive could not have
+produced.
 
 `ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
 validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,

@@ -2,7 +2,7 @@ import type { SerializedWorld } from "./repository";
 import { shadowLifecycleCellValue, shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, PresenceProjectionDef, WooValue } from "./types";
-import type { RecordedCell, RecordedCellWriteOp, RecordedProjectionWrite, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
+import type { RecordedCell, RecordedCellWriteOp, RecordedProjectionWrite, RecordedSurfaceAuthority, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
 import { nativePrimitiveContractValue, nativePrimitiveIsTranscriptTracked } from "./native-primitive-contract";
 import { readObjectPropertyValue, type PropertyReadableObject } from "./property-read";
 
@@ -20,6 +20,7 @@ export type TranscriptWrite = {
   next?: string;
   value: WooValue;
   op: RecordedCellWriteOp;
+  authority?: RecordedSurfaceAuthority;
   writer?: RecordedWriteAuthority;
 };
 
@@ -35,6 +36,9 @@ export type TranscriptCreate = {
     programmer?: boolean;
     fertile?: boolean;
   };
+  /** Present only for the generic surface-gated creation primitive that
+   * intentionally does not require programmer authority. */
+  authority?: RecordedSurfaceAuthority;
   writer?: RecordedWriteAuthority;
 };
 
@@ -222,6 +226,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           next: event.next,
           value: event.value,
           op: event.op,
+          ...(event.authority ? { authority: event.authority } : {}),
           writer: event.writer
         });
         break;
@@ -251,6 +256,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           anchor: event.anchor,
           location: event.location,
           flags: event.flags,
+          ...(event.authority ? { authority: event.authority } : {}),
           writer: event.writer
         });
         writes.push({

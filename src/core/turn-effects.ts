@@ -108,6 +108,7 @@ export type {
   ActiveTurnRecorder,
   RecordedCell,
   RecordedProofDependency,
+  RecordedSurfaceAuthority,
   RecordedWriteAuthority,
   TurnRecorder,
   TurnRecorderEvent,
