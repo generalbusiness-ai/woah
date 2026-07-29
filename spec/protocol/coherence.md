@@ -538,6 +538,16 @@ deterministic post-state re-derivation; the transcript is not a capability to
 synthesize a lineage state that the executed primitive could not have
 produced.
 
+An inherited property read after a lifecycle replacement is validated against
+the lineage topology produced by that same turn, because its value may not
+exist through the authoritative pre-state parent chain. The commit scope may
+use this derived view only after every recorded mutation frame has
+independently passed authority validation, and the view may apply only
+existing-object lifecycle `op:"set"` topology—not creates, ordinary property,
+placement, or other effects. The lifecycle write's `prior` still validates
+against authoritative pre-state. This is not a general rule that a write may
+justify its own read-back.
+
 `ScheduledTurnRequest` is **not** carried from VTN7 unchanged: its shape,
 validation, and authority rules are [CO16.2](#co162-schedules-are-transcript-effects)'s,
 which drop VTN18.2's stored `caller_perms` and add mandatory `armed_by`

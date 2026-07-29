@@ -62,6 +62,26 @@ function lineageWorld() {
     parent: "lineage_kind_a",
     owner: PROGRAMMER
   });
+  world.createObject({
+    id: "lineage_descendant",
+    name: "Lineage descendant",
+    parent: "lineage_subject",
+    owner: PROGRAMMER
+  });
+  world.defineProperty("lineage_kind_a", {
+    name: "inherited_value",
+    defaultValue: 1,
+    owner: PROGRAMMER,
+    perms: "r",
+    typeHint: "int"
+  });
+  world.defineProperty("lineage_kind_b", {
+    name: "inherited_value",
+    defaultValue: 99,
+    owner: PROGRAMMER,
+    perms: "r",
+    typeHint: "int"
+  });
   const installed = installVerb(
     world,
     "lineage_subject",
@@ -70,6 +90,27 @@ function lineageWorld() {
     null
   );
   if (!installed.ok) throw new Error(JSON.stringify(installed));
+  const readInstalled = installVerb(
+    world,
+    "lineage_subject",
+    "rekind_and_read",
+    "verb :rekind_and_read(parent) rxd { chparent(this, parent); return this.inherited_value; }",
+    null
+  );
+  if (!readInstalled.ok) throw new Error(JSON.stringify(readInstalled));
+  const descendantReadInstalled = installVerb(
+    world,
+    "lineage_descendant",
+    "rekind_ancestor_and_read",
+    [
+      "verb :rekind_ancestor_and_read(ancestor, parent) rxd {",
+      "  chparent(ancestor, parent);",
+      "  return this.inherited_value;",
+      "}"
+    ].join("\n"),
+    null
+  );
+  if (!descendantReadInstalled.ok) throw new Error(JSON.stringify(descendantReadInstalled));
   const renameInstalled = installVerb(
     world,
     "lineage_subject",
@@ -348,6 +389,144 @@ describe("shadow lineage commit authority", () => {
       serialized: structuredClone(committed)
     });
     expect(serializedFor(cold).objects.find((obj) => obj.id === "lineage_subject")?.parent).toBe("lineage_kind_b");
+  });
+
+  it("accepts an inherited read resolved through the same-turn parent", async () => {
+    const { run, result, scope, before, call } = await lineageTurn(lineageWorld(), {
+      id: "lineage-chparent-derived-read",
+      target: "lineage_subject",
+      verb: "rekind_and_read",
+      args: ["lineage_kind_b"]
+    });
+
+    expect(run.frame).toMatchObject({ op: "result", result: 99 });
+    expect(run.transcript.reads).toContainEqual(expect.objectContaining({
+      cell: {
+        kind: "prop",
+        object: "lineage_subject",
+        name: "inherited_value"
+      },
+      value: 99
+    }));
+    expect(result.kind, JSON.stringify(result)).toBe("woo.commit.accepted.shadow.v1");
+    expect(serializedFor(scope).objects.find((obj) => obj.id === "lineage_subject")?.parent)
+      .toBe("lineage_kind_b");
+
+    // The lineage write is the bounded explanation for this proof. Removing
+    // it leaves no alternate topology and must restore the ordinary stale-read
+    // refusal rather than making post-write validation generic.
+    const noLineageWrite = structuredClone(run.transcript);
+    noLineageWrite.id = "lineage-derived-read-without-write";
+    noLineageWrite.writes = noLineageWrite.writes.filter((write) =>
+      write.cell.kind !== "lifecycle" || write.cell.object !== "lineage_subject"
+    );
+    const noLineageTranscript = rehashTranscript(noLineageWrite);
+    const noLineageScope = createShadowCommitScope({
+      node: "lineage-no-write-authority",
+      scope: call.scope,
+      serialized: before
+    });
+    const noLineageResult = submitShadowCommit(noLineageScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: noLineageTranscript.id,
+      scope: call.scope,
+      expected: noLineageScope.head,
+      transcript: noLineageTranscript
+    });
+    expect(noLineageResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "read_version_mismatch"
+    });
+    expect(serializedFor(noLineageScope)).toEqual(before);
+
+    // Even an authorized lineage view cannot hide a stale CAS on the lineage
+    // mutation that produced it.
+    const staleLineage = structuredClone(run.transcript);
+    staleLineage.id = "lineage-derived-read-stale-write";
+    staleLineage.writes = staleLineage.writes.map((write) =>
+      write.cell.kind === "lifecycle" && write.cell.object === "lineage_subject"
+        ? { ...write, prior: "stale-lineage-version" }
+        : write
+    );
+    const staleTranscript = rehashTranscript(staleLineage);
+    const staleScope = createShadowCommitScope({
+      node: "lineage-stale-write-authority",
+      scope: call.scope,
+      serialized: before
+    });
+    const staleResult = submitShadowCommit(staleScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: staleTranscript.id,
+      scope: call.scope,
+      expected: staleScope.head,
+      transcript: staleTranscript
+    });
+    expect(staleResult.kind).toBe("woo.commit.conflict.shadow.v1");
+    if (staleResult.kind !== "woo.commit.conflict.shadow.v1") {
+      throw new Error(JSON.stringify(staleResult));
+    }
+    expect(staleResult.errors).toContainEqual(expect.stringContaining(
+      "write prior mismatch lineage_subject.lifecycle"
+    ));
+    expect(serializedFor(staleScope)).toEqual(before);
+
+    // The overlay is conditional on independently valid recorded writers.
+    // A forged principal gets neither mutation authority nor the derived-read
+    // exception.
+    const unauthorized = structuredClone(run.transcript);
+    unauthorized.id = "lineage-derived-read-unauthorized";
+    unauthorized.writes = unauthorized.writes.map((write) => ({
+      ...write,
+      writer: write.writer
+        ? { ...write.writer, progr: "lineage_missing_principal" }
+        : undefined
+    }));
+    const unauthorizedTranscript = rehashTranscript(unauthorized);
+    const unauthorizedScope = createShadowCommitScope({
+      node: "lineage-unauthorized-derived-read",
+      scope: call.scope,
+      serialized: before
+    });
+    const unauthorizedResult = submitShadowCommit(unauthorizedScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: unauthorizedTranscript.id,
+      scope: call.scope,
+      expected: unauthorizedScope.head,
+      transcript: unauthorizedTranscript
+    });
+    expect(unauthorizedResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "permission_denied"
+    });
+    if (unauthorizedResult.kind !== "woo.commit.conflict.shadow.v1") {
+      throw new Error(JSON.stringify(unauthorizedResult));
+    }
+    expect(unauthorizedResult.errors).toContain(
+      "read value mismatch lineage_subject.inherited_value"
+    );
+    expect(serializedFor(unauthorizedScope)).toEqual(before);
+  });
+
+  it("resolves same-turn lineage reads through descendants of the reparented object", async () => {
+    const { run, result, scope } = await lineageTurn(lineageWorld(), {
+      id: "lineage-descendant-derived-read",
+      target: "lineage_descendant",
+      verb: "rekind_ancestor_and_read",
+      args: ["lineage_subject", "lineage_kind_b"]
+    });
+
+    expect(run.frame).toMatchObject({ op: "result", result: 99 });
+    expect(run.transcript.reads).toContainEqual(expect.objectContaining({
+      cell: {
+        kind: "prop",
+        object: "lineage_descendant",
+        name: "inherited_value"
+      },
+      value: 99
+    }));
+    expect(result.kind, JSON.stringify(result)).toBe("woo.commit.accepted.shadow.v1");
+    expect(serializedFor(scope).objects.find((obj) => obj.id === "lineage_subject")?.parent)
+      .toBe("lineage_kind_b");
   });
 
   it("accepts rename and flag turns through the same lifecycle vocabulary", async () => {

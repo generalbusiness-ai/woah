@@ -317,7 +317,22 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
 
   const stateBefore = ensureShadowCommitScopeState(scope);
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
-  const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
+  // A lifecycle replacement can legitimately change an inherited property
+  // read later in the same turn. Build that alternate proof view only after
+  // every recorded mutation frame has independently passed authority checks;
+  // otherwise an untrusted lineage write could manufacture its own read proof.
+  // The view applies topology only, never ordinary property writes or other
+  // effects, so this is not a generic post-write-read escape hatch.
+  const writeAuthorityErrors = validateShadowWriteAuthorityIndex(
+    serializedAuthorityIndexFromState(stateBefore),
+    submit.transcript
+  );
+  const sameTurnLineageReader = writeAuthorityErrors.length === 0
+    ? createSameTurnLineageReader(stateBefore, submit.transcript)
+    : undefined;
+  const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript, {
+    sameTurnLineageReader
+  });
   const preStateHash = transcriptTouchedStateHashWithReader(beforeReader, submit.transcript);
   const failureEffects = classifyFailedTranscriptEffects(submit.transcript, {
     ownsSequencingSpace:
@@ -352,10 +367,6 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   if (failureEffects.policy === "enforce" && !failureEffects.valid) {
     envelopeErrors.push(`invalid_error_effects:${failureEffects.reasons.join(",")}`);
   }
-  const writeAuthorityErrors = validateShadowWriteAuthorityIndex(
-    serializedAuthorityIndexFromState(stateBefore),
-    submit.transcript
-  );
   const preApplyErrors = [...envelopeErrors, ...writeAuthorityErrors];
   const preApplyReason = preApplyErrors.length > 0 ? shadowConflictReason(preApplyErrors) : null;
   // stale_head / scope_mismatch / incomplete_transcript / permission_denied
@@ -941,6 +952,101 @@ function cloneShadowCommitScopeState(current: ShadowCommitScopeState): ShadowCom
 
 function createCommitScopeStateCellReader(state: ShadowCommitScopeState): TranscriptCellReader {
   return createTranscriptCellReaderFromObjectMap(serializedShellFromCommitScopeState(state), state.objectsById);
+}
+
+function createSameTurnLineageReader(
+  current: ShadowCommitScopeState,
+  transcript: EffectTranscript
+): TranscriptCellReader | undefined {
+  const createdObjects = new Set(transcript.creates.map((create) => create.object));
+  if (!transcript.writes.some((write) =>
+    write.cell.kind === "lifecycle" &&
+    write.op === "set" &&
+    !createdObjects.has(write.cell.object)
+  )) {
+    return undefined;
+  }
+
+  // Overlay only rows whose semantic lineage changes. This keeps the commit
+  // hot path proportional to the turn instead of copying the Big World merely
+  // to validate one derived read.
+  const changedObjects = new Map<ObjRef, SerializedObject>();
+  const objectById = readonlyMapOverlay(current.objectsById, changedObjects);
+  const mutableObjects = new Set<ObjRef>();
+  const mutableObject = (id: ObjRef): SerializedObject | null => {
+    const existing = changedObjects.get(id) ?? current.objectsById.get(id);
+    if (!existing) return null;
+    if (mutableObjects.has(id)) return existing;
+    const clone = structuredClone(existing) as SerializedObject;
+    changedObjects.set(id, clone);
+    mutableObjects.add(id);
+    return clone;
+  };
+
+  for (const write of transcript.writes) {
+    if (
+      write.cell.kind !== "lifecycle" ||
+      write.op !== "set" ||
+      createdObjects.has(write.cell.object)
+    ) continue;
+    const replacement = parseShadowLifecycleCellValue(write.value);
+    // Authority validation ran first and rejects this shape. Keep this helper
+    // fail-closed as well in case its call site is later rearranged.
+    if (!replacement) return undefined;
+    const target = mutableObject(write.cell.object);
+    if (!target) return undefined;
+    target.parent = replacement.parent;
+    target.owner = replacement.owner;
+    target.name = replacement.name;
+    target.anchor = replacement.anchor;
+    target.flags = structuredClone(replacement.flags) as SerializedObject["flags"];
+  }
+  return createTranscriptCellReaderFromObjectMap(
+    serializedShellFromCommitScopeState(current),
+    objectById
+  );
+}
+
+function readonlyMapOverlay<K, V>(
+  base: ReadonlyMap<K, V>,
+  changed: ReadonlyMap<K, V>
+): ReadonlyMap<K, V> {
+  const overlay: ReadonlyMap<K, V> = {
+    get size() {
+      let added = 0;
+      for (const key of changed.keys()) if (!base.has(key)) added += 1;
+      return base.size + added;
+    },
+    get(key: K): V | undefined {
+      return changed.has(key) ? changed.get(key) : base.get(key);
+    },
+    has(key: K): boolean {
+      return changed.has(key) || base.has(key);
+    },
+    *entries(): MapIterator<[K, V]> {
+      for (const [key, value] of base) {
+        yield [key, changed.has(key) ? changed.get(key)! : value];
+      }
+      for (const [key, value] of changed) {
+        if (!base.has(key)) yield [key, value];
+      }
+    },
+    *keys(): MapIterator<K> {
+      for (const [key] of overlay.entries()) yield key;
+    },
+    *values(): MapIterator<V> {
+      for (const [, value] of overlay.entries()) yield value;
+    },
+    forEach(callbackfn: (value: V, key: K, map: ReadonlyMap<K, V>) => void, thisArg?: unknown): void {
+      for (const [key, value] of overlay.entries()) {
+        callbackfn.call(thisArg, value, key, overlay);
+      }
+    },
+    [Symbol.iterator](): MapIterator<[K, V]> {
+      return overlay.entries();
+    }
+  };
+  return overlay;
 }
 
 export function applyShadowTranscriptToIndexedState(

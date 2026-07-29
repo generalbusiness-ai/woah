@@ -190,6 +190,16 @@ export type TranscriptCellReader = {
   verbsByObject: Map<ObjRef, SerializedWorld["objects"][number]["verbs"]>;
 };
 
+export type TranscriptValidationOptions = {
+  /**
+   * Optional authority-derived view after independently authorized same-turn
+   * lineage replacements. This is deliberately not a generic post-write
+   * reader: only inheritance topology may explain a property proof that could
+   * not exist in the authoritative pre-state.
+   */
+  sameTurnLineageReader?: TranscriptCellReader;
+};
+
 export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTranscript {
   const reads: TranscriptRead[] = [];
   const writes: TranscriptWrite[] = [];
@@ -413,7 +423,11 @@ export function validateTranscriptAgainstSerializedWorld(serializedBefore: Seria
   return validateTranscriptWithCellReader(createTranscriptCellReader(serializedBefore), transcript);
 }
 
-export function validateTranscriptWithCellReader(reader: TranscriptCellReader, transcript: EffectTranscript): TranscriptValidation {
+export function validateTranscriptWithCellReader(
+  reader: TranscriptCellReader,
+  transcript: EffectTranscript,
+  options: TranscriptValidationOptions = {}
+): TranscriptValidation {
   const errors: string[] = [];
   // Cells whose recorded read version/value disagreed with the authoritative
   // cell. Collected alongside the existing error STRINGS so the repair path can
@@ -443,11 +457,18 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     // stops a derived read model from gating an unrelated turn.
     if (isProjectionReadCell(reader, read.cell)) continue;
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
-    if (!readMatchesOwnWrite && read.version !== actual.version) {
+    const readMatchesLineageView =
+      !readMatchesOwnWrite &&
+      sameTurnLineageReadMatches(options.sameTurnLineageReader, read);
+    if (!readMatchesOwnWrite && !readMatchesLineageView && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
       recordMismatch(read.cell);
     }
-    if (!readMatchesOwnWrite && !transcriptReadValuesMatch(read.cell, actual.value, read.value)) {
+    if (
+      !readMatchesOwnWrite &&
+      !readMatchesLineageView &&
+      !transcriptReadValuesMatch(read.cell, actual.value, read.value)
+    ) {
       errors.push(`read value mismatch ${cellLabel(read.cell)}`);
       recordMismatch(read.cell);
     }
@@ -510,6 +531,21 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
   }
 
   return { ok: errors.length === 0, errors, mismatchedReadCells };
+}
+
+function sameTurnLineageReadMatches(
+  reader: TranscriptCellReader | undefined,
+  read: TranscriptRead
+): boolean {
+  // Lineage can change inherited property resolution. Lifecycle cells already
+  // have the exact same-cell-write rule, while location/contents are unrelated
+  // to inheritance. Verb reads name the resolved definer rather than the
+  // receiver, so they remain ordinary pre-state proofs.
+  if (!reader || read.cell.kind !== "prop") return false;
+  const actual = readTranscriptCell(reader, read.cell);
+  return actual.ok &&
+    read.version === actual.version &&
+    transcriptReadValuesMatch(read.cell, actual.value, read.value);
 }
 
 function projectionWriteShapeError(write: RecordedProjectionWrite): string | null {
