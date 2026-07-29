@@ -5,7 +5,6 @@
 // observations — driven end-to-end against the INSTALLED world with two
 // carried (apikey) actors born present in the chatroom.
 import { describe, expect, it, vi } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -16,32 +15,10 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { turnEchoId } from "../../src/net/turn-echo";
 import { PUBLIC_ORIGIN_HEADER } from "../../src/worker/public-origin";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-mcp-test-secret";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -145,7 +122,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const taskPassTool = `${taskRef.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_")}__pass`;
 
     // Seed every partition; the gateway self-resolves for subscriptions.
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeStates = new Map<string, ReturnType<typeof netState>>();
     const scopeDOs = new Map<string, NetScopeDO>();
     const resolvedDestinations: string[] = [];
@@ -184,11 +161,11 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
 
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       // Incoming adopt/relate deliveries continue from a fresh alarm
       // event, matching production's CF subrequest-depth boundary.
       for (const scope of scopeDOs.values()) await scope.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     let nextId = 10;
@@ -619,10 +596,10 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     }));
     expect(eventsAfterClose.status).toBe(404);
 
-    states.forEach((st) => st.close());
+    await closeQuiescent(states);
   });
 
-  it("bounds abandoned per-session transport state, reaping expired entries before LRU eviction", () => {
+  it("bounds abandoned per-session transport state, reaping expired entries before LRU eviction", async () => {
     const state = netState("gateway-mcp-state-bound");
     const gateway = new NetGatewayDO(state.state, {
       WOO_INTERNAL_SECRET: SECRET,
@@ -687,6 +664,6 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     expect(queues.has("s_state_2")).toBe(false);
     expect(queues.has("s_state_513")).toBe(true);
 
-    state.close();
+    await closeQuiescent([state]);
   });
 });

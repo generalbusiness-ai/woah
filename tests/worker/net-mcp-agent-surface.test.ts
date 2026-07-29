@@ -17,13 +17,13 @@
 // demo object (`the_outline`, `the_dubspace`, `the_chatroom`, ...), which is
 // exactly the case the old ordering lost.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-mcp-agent-surface-secret";
 const STRANDED_ACTOR = "zz_stranded_agent";
@@ -31,29 +31,6 @@ const STRANDED_ACTOR = "zz_stranded_agent";
 const MCP_PAGE = 128;
 const MCP_STATIC_TOOLS = 3;
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -77,7 +54,7 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
       }
     });
 
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -111,9 +88,9 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     } as NetGatewayEnv);
 
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const scope of scopeDOs.values()) await scope.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     let nextId = 10;
@@ -341,6 +318,6 @@ describe("MCP agent surface: actor tool ordering and help-topic accuracy", () =>
     // databases — logging "database is not open" and net_deferred_task_error,
     // and leaking async work into whatever runs next in this worker.
     await settleAll();
-    for (const st of states) st.close();
+    await closeQuiescent(states);
   });
 });

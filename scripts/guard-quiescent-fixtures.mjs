@@ -21,6 +21,17 @@
 // nowhere), one leak (net-scheduled never closed thirteen of its hosts), and
 // one product defect in `NetAuditDO`'s AE index. So they are done deliberately
 // and not in one sweep.
+//
+// But do NOT judge a conversion by whether the noise counter moves. The five
+// MCP suites moved it by zero, and were still worth converting: probing their
+// teardown showed three tests reaching `close()` with live deferred work, and
+// simulating the old close-without-draining teardown on those same five
+// produced zero events when they run ALONE. That is the whole shape of this
+// bug. The full lane runs `isolate: false`, so undrained work outlives the
+// suite that queued it and lands on whichever suite's storage is closed next —
+// the damage is cross-suite and timing-dependent, so a quiet counter on one
+// sample means "did not fire this run", not "was never a hazard". The register
+// shrinking is the guarantee; the counter is only ever a lower bound.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
@@ -63,7 +74,6 @@ const USES_SHARED = new RegExp(`from\\s+["'][./]*${SHARED}["']`);
 // deferred failures. Remove entries as they are converted; do not add any.
 const UNCONVERTED = new Set([
   "net-audit.test.ts",
-  "net-demote-lifecycle.test.ts",
   "net-gateway-repair.test.ts",
   "net-help-migration-aged.test.ts",
   "net-help-topics-aged.test.ts",
@@ -72,11 +82,6 @@ const UNCONVERTED = new Set([
   "net-legacy-split-refusal.test.ts",
   "net-load-asymptote.test.ts",
   "net-load-skew.test.ts",
-  "net-mcp-agent-surface.test.ts",
-  "net-mcp-hardening.test.ts",
-  "net-mcp-legibility.test.ts",
-  "net-mcp-programmer.test.ts",
-  "net-mcp.test.ts",
   "net-outbox-bounded.test.ts",
   "net-programmer-lifecycle.test.ts",
   "net-provision-wizard.test.ts",

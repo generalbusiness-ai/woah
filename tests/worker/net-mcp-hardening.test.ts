@@ -23,7 +23,6 @@
 //   `String(id)`, so a cancellation for `"1"` released a wait parked under
 //   the DISTINCT JSON-RPC id `1`.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -31,6 +30,7 @@ import { planNetInstall } from "../../src/net/install";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-mcp-hardening-secret";
 
@@ -47,29 +47,6 @@ const SECRET = "net-mcp-hardening-secret";
 const COLLIDING = ["probe-collide", "probe+collide", "probe_collide"] as const;
 const COLLIDING_BASE = "probe_collide__ping";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number | string; method: string; params?: unknown };
 
@@ -107,7 +84,7 @@ async function fixture() {
     }
   });
 
-  const states: Array<ReturnType<typeof netState>> = [];
+  const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
@@ -140,9 +117,9 @@ async function fixture() {
   } as NetGatewayEnv);
 
   const settleAll = async () => {
-    for (const st of states) await st.settle();
+    await settleHosts(states);
     for (const scope of scopeDOs.values()) await scope.alarm();
-    for (const st of states) await st.settle();
+    await settleHosts(states);
   };
 
   let nextId = 1000;
@@ -184,7 +161,7 @@ async function fixture() {
     call,
     settleAll,
     gateway: () => gateway,
-    close: () => { for (const st of states) st.close(); }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -331,7 +308,7 @@ describe("MCP gateway hardening", () => {
         expect(ping?.name, `scope:object ${id} advertised ${ping?.name}, canonical is ${expected}`).toBe(expected);
       }
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -394,7 +371,7 @@ describe("MCP gateway hardening", () => {
       expect(accepted, "no notification was accepted at all").toBeGreaterThan(0);
       expect(refused, "300 notifications from one actor consumed no rate budget").toBeGreaterThan(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -431,7 +408,7 @@ describe("MCP gateway hardening", () => {
       expect(await sseEnded(bobStream, 200), "another session's GETs closed this one").toBe(false);
       await bobStream.body?.cancel();
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -496,7 +473,7 @@ describe("MCP gateway hardening", () => {
       );
       await parkedString;
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });

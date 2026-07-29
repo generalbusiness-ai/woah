@@ -19,39 +19,16 @@
 // Between them the session receives a real tools/list_changed on its SSE
 // stream, so the agent learns about its own new tool without polling.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { closeQuiescent, quiescentNetState as netState, settleAll as settleHosts, type QuiescentHost } from "./quiescent-do";
 
 const SECRET = "net-mcp-programmer-secret";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
@@ -115,7 +92,7 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const plainToken = "apikey:plain-key:plain-secret";
 
     // --- wire the Net DOs (fake-DO lane) ---
-    const states: Array<ReturnType<typeof netState>> = [];
+    const states: QuiescentHost[] = [];
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -145,9 +122,9 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     gateway = new NetGatewayDO(gatewayState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve, NET_GATEWAY_SELF: "gateway:net-api" } as NetGatewayEnv);
 
     const settleAll = async () => {
-      for (const st of states) await st.settle();
+      await settleHosts(states);
       for (const scope of scopeDOs.values()) await scope.alarm();
-      for (const st of states) await st.settle();
+      await settleHosts(states);
     };
 
     let nextId = 10;
@@ -326,6 +303,6 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     expect(tracedText).toContain("list_verb");
     expect(tracedText).not.toContain("E_PERM");
 
-    for (const st of states) st.close();
+    await closeQuiescent(states);
   });
 });
