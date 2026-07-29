@@ -35,8 +35,17 @@ what to do about it — and nothing happens in the world, so a refusal is always
 safe to fix and retry. Extra properties the tool does not declare are ignored
 rather than refused, so you can decorate a call with your own bookkeeping
 fields; but that also means a *misspelled* argument name reads as "missing",
-and the refusal lists the unrecognized names so you can spot the typo. An
-optional argument may be omitted or passed as `null`.
+and the refusal lists the unrecognized names so you can spot the typo.
+
+**Whatever the schema says is exactly what is enforced** — in both
+directions. Anything it permits is accepted, and nothing it omits is secretly
+required, so you can comply by reading it alone. An optional argument may be
+omitted or passed as `null`, and its published type says so (`["string",
+"null"]`). Where a value has a real format rule the schema carries it too:
+`minLength` where a name cannot be empty, and `pattern` on `operation_id`.
+The `arguments` field itself must be a JSON object keyed by parameter name —
+or omitted when the tool takes none. Sending it as a string, a list, a number,
+or `null` is refused rather than read as "no arguments".
 
 `woo_call` is checked the same way once its target verb resolves: too few or
 too many positional arguments, or one of the wrong type, are refused before
@@ -136,6 +145,9 @@ Refusals name one condition each, with a `detail.reason` and a
 | `missing_required_argument` | Supply the named argument; `detail.expected` gives its type. |
 | `argument_type_mismatch` | Re-send the named argument as `detail.expected`. |
 | `too_many_arguments` | `detail.declared` lists the arguments the verb actually takes. |
+| `argument_too_short` | The value is below the published `minLength` — usually an empty string where a name was needed. |
+| `argument_pattern_mismatch` | The value does not match the published `pattern`; `detail.pattern` is the exact rule. |
+| `invalid_arguments_object` | `arguments` must be a JSON object keyed by parameter name, or omitted entirely. |
 
 An `E_SCOPE_SPLIT` means the target is a mounted space with its own shared
 scope — an outliner or board sitting in your room. One turn cannot write both
