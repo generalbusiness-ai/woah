@@ -13,9 +13,14 @@
 // quiescence before closing and fails the owning test on a deferred rejection.
 // This guard stops a NEW hand-rolled copy from appearing. Files still carrying
 // their own copy are listed below as an explicit, shrinking debt register
-// rather than silently tolerated — converting them is mechanical, but each one
-// can surface real hidden failures, so they are done deliberately and not in
-// one sweep.
+// rather than silently tolerated. Converting one is NOT mechanical: draining
+// makes previously invisible work visible, and the first eleven conversions
+// turned up three genuinely undelivered legs (net-install's gateways were
+// unresolvable, net-client-api's gateway was registered under the wrong
+// destination so no fanout ever reached it, net-do's rider `/adopt` went
+// nowhere), one leak (net-scheduled never closed thirteen of its hosts), and
+// one product defect in `NetAuditDO`'s AE index. So they are done deliberately
+// and not in one sweep.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
