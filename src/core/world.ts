@@ -66,6 +66,7 @@ import {
   type PlanningWorldProvenance,
   type ActiveTurnRecorder,
   type RecordedCell,
+  type RecordedSurfaceAuthority,
   type RecordedWriteAuthority,
   type TurnRecorder,
   type TurnRecorderEvent,
@@ -2410,7 +2411,11 @@ export class WooWorld {
    * pre-net authoritative construction, recorded (if at all) by the install
    * pipeline, not by a runtime turn transcript.
    */
-  private mutateLineage(objRef: ObjRef, mutate: () => void): void {
+  private mutateLineage(
+    objRef: ObjRef,
+    mutate: () => void,
+    authority?: RecordedSurfaceAuthority
+  ): void {
     const obj = this.objectLive(objRef);
     const priorVersion = this.effects.shadowStructuralCellVersion("lifecycle", obj);
     this.recordTurnEvent({
@@ -2427,7 +2432,8 @@ export class WooWorld {
       value: this.lineageSemantic(obj),
       op: "set",
       prior: priorVersion,
-      next: nextVersion
+      next: nextVersion,
+      ...(authority ? { authority } : {})
     });
   }
 
@@ -2713,6 +2719,9 @@ export class WooWorld {
     location?: ObjRef | null;
     anchor?: ObjRef | null;
     flags?: WooObject["flags"];
+    /** Controlled runtime creation seam used for transcript authority. Generic
+     * create omits this; only the surface-gated builder primitive stamps it. */
+    createAuthority?: RecordedSurfaceAuthority;
     /** Reconstructing an object that already exists somewhere else (identity
      * import, world adoption) rather than minting a new one. The id was chosen
      * by whatever world produced it — possibly before the reservation below —
@@ -2764,7 +2773,7 @@ export class WooWorld {
     if (obj.parent) this.persistObject(obj.parent);
     if (obj.location) this.persistObject(obj.location);
     this.persist();
-    this.recordTurnEvent(this.effects.objectCreateEvent(obj));
+    this.recordTurnEvent(this.effects.objectCreateEvent(obj, input.createAuthority));
     // `objects.set` detaches and wraps the row so caller-owned construction
     // records never become authoritative by alias. Return that stored row;
     // handing out `obj` here would be a raw, non-journaled mutation bypass.
@@ -8168,7 +8177,7 @@ export class WooWorld {
     const previousParent = this.objectLive(objRef).parent;
     const result = { ok: true, dry_run: dryRun, id: objRef, parent: parentRef, previous_parent: previousParent };
     if (dryRun) return result;
-    this.chparentLocal(objRef, parentRef);
+    this.chparentLocal(objRef, parentRef, "builder_surface");
     return result;
   }
 
@@ -10151,14 +10160,18 @@ export class WooWorld {
     this.chparentLocal(objRef, parentRef);
   }
 
-  private chparentLocal(objRef: ObjRef, parentRef: ObjRef): void {
+  private chparentLocal(
+    objRef: ObjRef,
+    parentRef: ObjRef,
+    authority?: RecordedSurfaceAuthority
+  ): void {
     const obj = this.objectLive(objRef);
     this.withBehaviorMutationPermit(() => {
       if (obj.parent && this.objects.has(obj.parent)) this.objectLive(obj.parent).children.delete(objRef);
       // `parent` lives in the object_lineage cell. Route it through the seam so a
       // runtime @chparent records the lineage write over Net. Off-turn callers
       // (bootstrap, host-scoped migrations) no-op the recorder — see mutateLineage.
-      this.mutateLineage(objRef, () => { obj.parent = parentRef; });
+      this.mutateLineage(objRef, () => { obj.parent = parentRef; }, authority);
       this.objectLive(parentRef).children.add(objRef);
       obj.modified = Date.now();
     });
@@ -10198,7 +10211,8 @@ export class WooWorld {
       anchor: effectiveAnchor,
       location: options.location,
       name: options.name,
-      flags: { fertile: options.fertile }
+      flags: { fertile: options.fertile },
+      createAuthority: "builder_surface"
     });
     // See createRuntimeObject for rationale.
     if (selfHosted) {

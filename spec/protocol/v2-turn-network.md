@@ -509,6 +509,7 @@ type TranscriptWrite = {
   value_hash: Hash;
   value?: WooValue;
   op: "set" | "delete" | "append" | "add" | "remove" | "move" | "replace" | "create";
+  authority?: "builder_surface";
   writer: RecordedWriteAuthority;
 };
 
@@ -516,6 +517,7 @@ type TranscriptCreate = {
   object: ObjRef;
   parent: ObjRef;
   owner: ObjRef;
+  authority?: "builder_surface";
   initial_cells: TranscriptWrite[];
   writer: RecordedWriteAuthority;
 };
@@ -552,6 +554,14 @@ authority performed it. The commit scope validates that frame against recorded
 dispatch/verb metadata reads, then checks property, movement, creation, and
 lease authority for that single frame. It MUST NOT authorize a write by taking
 the union of all verb owners mentioned anywhere in the transcript.
+
+The optional `builder_surface` marker is emitted only by the controlled
+builder-create and builder-chparent primitives. It selects their non-programmer
+object-policy rule but is never sufficient evidence: commit validation also
+requires a valid recorded frame whose effective principal is the authenticated
+actor (including exact lowering for a wizard-owned wrapper), and authority
+state to prove that actor carries the frame's definer as an ancestry or feature
+surface.
 
 `complete: false` means the recorder observed an untracked native effect or an
 execution boundary that cannot be validated. A commit scope MUST NOT accept an

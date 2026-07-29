@@ -6,6 +6,7 @@ import {
   readTranscriptCellFromSerializedWorld,
   type EffectTranscript
 } from "../src/core/effect-transcript";
+import { installLocalCatalogs } from "../src/core/local-catalogs";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import {
   parseShadowLifecycleCellValue,
@@ -110,6 +111,186 @@ async function lineageTurn(
 }
 
 describe("shadow lineage commit authority", () => {
+  it("accepts non-programmer builder-surface create and chparent turns", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "prog"]);
+    const builder = "lineage_builder";
+    world.createObject({
+      id: builder,
+      name: "Lineage builder",
+      parent: "$builder",
+      owner: builder
+    });
+    world.createObject({
+      id: "lineage_builder_parent",
+      name: "Builder parent",
+      parent: "$thing",
+      owner: builder
+    });
+    world.createObject({
+      id: "lineage_builder_subject",
+      name: "Builder subject",
+      parent: "$thing",
+      owner: builder
+    });
+    world.createObject({
+      id: "lineage_builder_outsider",
+      name: "Builder outsider",
+      parent: "$player",
+      owner: "lineage_builder_outsider"
+    });
+    expect(world.object(builder).flags.programmer).not.toBe(true);
+    const before = world.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "lineage-builder-create",
+      route: "direct",
+      scope: "#-1",
+      session: null,
+      actor: builder,
+      target: builder,
+      verb: "create",
+      args: ["$thing", { name: "Builder child", location: null }]
+    };
+    const run = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), call);
+    expect(run.frame).toMatchObject({
+      op: "result",
+      result: { ok: true, parent: "$thing", owner: builder }
+    });
+    expect(run.transcript.creates).toHaveLength(1);
+    expect(run.transcript.creates[0]?.writer?.progr).toBe(builder);
+    expect(run.transcript.creates[0]?.authority).toBe("builder_surface");
+
+    const scope = createShadowCommitScope({
+      node: "lineage-builder-authority",
+      scope: call.scope,
+      serialized: before
+    });
+    const result = submitShadowCommit(scope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: call.id,
+      scope: call.scope,
+      expected: scope.head,
+      transcript: run.transcript
+    });
+    expect(result.kind, JSON.stringify(result)).toBe("woo.commit.accepted.shadow.v1");
+    const created = run.transcript.creates[0]!;
+    expect(serializedFor(scope).objects).toContainEqual(expect.objectContaining({
+      id: created.object,
+      parent: "$thing",
+      owner: builder
+    }));
+    const unmarked = structuredClone(run.transcript);
+    unmarked.id = "lineage-builder-unmarked-create";
+    unmarked.creates = unmarked.creates.map(({ authority: _authority, ...entry }) => entry);
+    unmarked.writes = unmarked.writes.map(({ authority: _authority, ...write }) => write);
+    const unmarkedTranscript = rehashTranscript(unmarked);
+    const unmarkedScope = createShadowCommitScope({
+      node: "lineage-builder-unmarked-authority",
+      scope: unmarkedTranscript.scope,
+      serialized: before
+    });
+    const unmarkedResult = submitShadowCommit(unmarkedScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: unmarkedTranscript.id,
+      scope: unmarkedTranscript.scope,
+      expected: unmarkedScope.head,
+      transcript: unmarkedTranscript
+    });
+    expect(unmarkedResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "permission_denied"
+    });
+    expect(serializedFor(unmarkedScope)).toEqual(before);
+
+    const chparentCall: ShadowTurnCall = {
+      ...call,
+      id: "lineage-builder-chparent",
+      verb: "chparent",
+      args: ["lineage_builder_subject", "lineage_builder_parent", {}]
+    };
+    const chparentRun = await runShadowTurnCallTranscript(
+      authoritativePlanningWorld(before),
+      chparentCall
+    );
+    expect(chparentRun.frame).toMatchObject({
+      op: "result",
+      result: {
+        ok: true,
+        id: "lineage_builder_subject",
+        parent: "lineage_builder_parent"
+      }
+    });
+    expect(chparentRun.transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "lifecycle", object: "lineage_builder_subject" },
+      op: "set",
+      authority: "builder_surface"
+    }));
+    const chparentScope = createShadowCommitScope({
+      node: "lineage-builder-chparent-authority",
+      scope: chparentCall.scope,
+      serialized: before
+    });
+    const chparentResult = submitShadowCommit(chparentScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: chparentCall.id,
+      scope: chparentCall.scope,
+      expected: chparentScope.head,
+      transcript: chparentRun.transcript
+    });
+    expect(chparentResult.kind, JSON.stringify(chparentResult)).toBe("woo.commit.accepted.shadow.v1");
+    expect(
+      serializedFor(chparentScope).objects.find((row) => row.id === "lineage_builder_subject")?.parent
+    ).toBe("lineage_builder_parent");
+
+    // The executor marker is not itself a capability. Rebind the otherwise
+    // genuine frame to an actor that does not carry its recorded surface: the
+    // authority must refuse even though object policy beneath $thing is fertile.
+    const outsider = "lineage_builder_outsider";
+    const forged = structuredClone(run.transcript);
+    forged.id = "lineage-builder-forged-surface";
+    forged.call.actor = outsider;
+    forged.call.target = outsider;
+    forged.creates = forged.creates.map((entry) => ({
+      ...entry,
+      owner: outsider,
+      anchor: outsider,
+      writer: entry.writer ? {
+        ...entry.writer,
+        progr: outsider,
+        thisObj: outsider,
+        callerPerms: outsider
+      } : undefined
+    }));
+    forged.writes = forged.writes.map((write) => ({
+      ...write,
+      writer: write.writer ? {
+        ...write.writer,
+        progr: outsider,
+        thisObj: outsider,
+        callerPerms: outsider
+      } : undefined
+    }));
+    const forgedTranscript = rehashTranscript(forged);
+    const forgedScope = createShadowCommitScope({
+      node: "lineage-builder-forged-authority",
+      scope: forgedTranscript.scope,
+      serialized: before
+    });
+    const forgedResult = submitShadowCommit(forgedScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: forgedTranscript.id,
+      scope: forgedTranscript.scope,
+      expected: forgedScope.head,
+      transcript: forgedTranscript
+    });
+    expect(forgedResult).toMatchObject({
+      kind: "woo.commit.conflict.shadow.v1",
+      reason: "permission_denied"
+    });
+    expect(serializedFor(forgedScope)).toEqual(before);
+  });
+
   it("accepts and materializes a successful chparent turn", async () => {
     const { run, result, scope, before, call } = await lineageTurn(lineageWorld(), {
       id: "lineage-chparent",

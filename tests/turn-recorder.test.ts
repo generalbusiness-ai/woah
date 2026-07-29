@@ -191,6 +191,9 @@ describe("turn recorder", () => {
     expect(result).toMatchObject({ op: "result", result: 1 });
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(transcript.recycles).toEqual([{ object: "recycle_target" }]);
+    // Recycle owns a typed lifecycle lane. It must not masquerade as a
+    // lifecycle-cell write with a third op alongside create/set.
+    expect(transcript.writes.filter((write) => write.cell.kind === "lifecycle")).toEqual([]);
     expect(transcript.projectionWrites).toEqual(expect.arrayContaining([
       expect.objectContaining({
         table: "tombstones",

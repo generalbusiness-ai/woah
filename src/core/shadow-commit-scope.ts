@@ -26,7 +26,7 @@ import {
 import type { AuthorityPageProvenance } from "./shadow-state-pages";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
-import type { RecordedWriteAuthority } from "./turn-recorder";
+import type { RecordedSurfaceAuthority, RecordedWriteAuthority } from "./turn-recorder";
 import type { MetricEvent, ObjRef, WooValue } from "./types";
 import {
   coalesceProjectionWrites,
@@ -801,7 +801,7 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
       errors.push(`permission_denied: writer frame not recorded ${writerFrameLabel(create.writer)} for create ${create.object}`);
       continue;
     }
-    if (canWriterCreateObject(index, create.writer.progr, create.parent, create.owner)) {
+    if (canWriterCreateObject(index, transcript, create)) {
       authorizedCreates.set(create.object, create);
       lineageState.set(create.object, lifecycleValueFromCreate(create));
     } else {
@@ -848,6 +848,8 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
         canWriterReplaceLineage(
           index,
           lineageState,
+          transcript,
+          write,
           write.writer.progr,
           write.cell.object,
           before,
@@ -2054,7 +2056,18 @@ function recordedWriterIsValid(
     transcript.reads.some((read) => {
       if (read.cell.kind !== "verb" || read.cell.object !== writer.definer || read.cell.name !== writer.verb) return false;
       if (!read.value || typeof read.value !== "object" || Array.isArray(read.value)) return false;
-      return (read.value as Record<string, WooValue>).owner === writer.progr;
+      const frameOwner = (read.value as Record<string, WooValue>).owner;
+      if (frameOwner === writer.progr) return true;
+      // set_task_perms may safely lower a wizard-owned wrapper to the caller's
+      // effective principal. `callerPerms` is the frame input captured before
+      // bytecode runs; requiring both it and `progr` to equal the authenticated
+      // turn actor proves a reduction to that bounded principal, never an
+      // executor-asserted third party.
+      return typeof frameOwner === "string" &&
+        isWizard(index, frameOwner) &&
+        writer.progr === transcript.call.actor &&
+        writer.progr === writer.callerPerms &&
+        serializedObject(index, writer.callerPerms) !== undefined;
     });
   validWriters.set(key, valid);
   return valid;
@@ -2062,6 +2075,25 @@ function recordedWriterIsValid(
 
 function writerFrameLabel(writer: RecordedWriteAuthority): string {
   return `${writer.progr} ${writer.definer}:${writer.verb} this=${writer.thisObj}`;
+}
+
+/** Validate the generic surface capability used by builder_create_object and
+ * builder_chparent. The executor's marker selects this rule; it does not grant
+ * it. Authority state must independently prove that the authenticated actor
+ * carries the recorded frame's definer through ancestry or an attached feature,
+ * and that the frame lowered task perms exactly to that actor. */
+function writerHasRecordedSurfaceAuthority(
+  index: SerializedAuthorityIndex,
+  transcript: EffectTranscript,
+  writer: RecordedWriteAuthority,
+  authority: RecordedSurfaceAuthority | undefined
+): boolean {
+  if (authority !== "builder_surface") return false;
+  const actor = transcript.call.actor;
+  return writer.progr === actor &&
+    writer.callerPerms === actor &&
+    actor !== writer.definer &&
+    serializedActorHasSurface(index, actor, writer.definer);
 }
 
 function canWriterWriteProperty(index: SerializedAuthorityIndex, writer: ObjRef, object: ObjRef, name: string): boolean {
@@ -2079,15 +2111,34 @@ function canWriterControlObject(index: SerializedAuthorityIndex, writer: ObjRef,
   return isWizard(index, writer) || target.owner === writer;
 }
 
-function canWriterCreateObject(index: SerializedAuthorityIndex, writer: ObjRef, parent: ObjRef | null, owner: ObjRef): boolean {
-  if (!parent) return false;
+function canWriterCreateObject(
+  index: SerializedAuthorityIndex,
+  transcript: EffectTranscript,
+  create: TranscriptCreate
+): boolean {
+  if (!create.writer || !create.parent) return false;
+  const writer = create.writer.progr;
   const writerObj = serializedObject(index, writer);
-  const parentObj = serializedObject(index, parent);
+  const parentObj = serializedObject(index, create.parent);
   if (!writerObj || !parentObj) return false;
   if (isWizard(index, writer)) return true;
-  return writerObj.flags.programmer === true &&
-    owner === writer &&
-    (parentObj.owner === writer || parentObj.flags.fertile === true);
+  if (
+    create.owner !== writer ||
+    (parentObj.owner !== writer && parentObj.flags.fertile !== true)
+  ) {
+    return false;
+  }
+  if (writerObj.flags.programmer === true) return true;
+  // The builder primitive intentionally uses object policy instead of the
+  // programmer bit. The marker alone is never authority: bind it to the exact
+  // recorded frame, the authenticated turn actor, and an authority-state proof
+  // that the actor carries that frame's generic surface class.
+  return writerHasRecordedSurfaceAuthority(
+    index,
+    transcript,
+    create.writer,
+    create.authority
+  );
 }
 
 function writerCanInitializeCreatedObject(index: SerializedAuthorityIndex, writer: ObjRef, create: TranscriptCreate): boolean {
@@ -2141,6 +2192,8 @@ function lifecycleValueFromCreate(create: TranscriptCreate): ShadowLifecycleCell
 function canWriterReplaceLineage(
   index: SerializedAuthorityIndex,
   lineageState: ReadonlyMap<ObjRef, ShadowLifecycleCellValue>,
+  transcript: EffectTranscript,
+  write: TranscriptWrite,
   writer: ObjRef,
   object: ObjRef,
   before: ShadowLifecycleCellValue,
@@ -2158,7 +2211,10 @@ function canWriterReplaceLineage(
     return false;
   }
   if (after.parent === before.parent) return true; // owner rename
-  if (writerObj.flags.programmer !== true || after.owner !== writer || !after.parent) return false;
+  const mayBuild = writerObj.flags.programmer === true ||
+    (write.writer !== undefined &&
+      writerHasRecordedSurfaceAuthority(index, transcript, write.writer, write.authority));
+  if (!mayBuild || after.owner !== writer || !after.parent) return false;
   const parent = lifecycleValueInAuthorityState(index, lineageState, after.parent);
   return parent !== null && (parent.owner === writer || parent.flags.fertile === true);
 }
@@ -2207,6 +2263,52 @@ function serializedPropertyInfo(index: SerializedAuthorityIndex, object: ObjRef,
     current = current.parent ? serializedObject(index, current.parent) : undefined;
   }
   return null;
+}
+
+function serializedActorHasSurface(
+  index: SerializedAuthorityIndex,
+  actor: ObjRef,
+  surface: ObjRef
+): boolean {
+  if (serializedInheritsFrom(index, actor, surface)) return true;
+  const rawFeatures = serializedPropertyValue(index, actor, "features");
+  if (!Array.isArray(rawFeatures)) return false;
+  return rawFeatures.some((feature) =>
+    typeof feature === "string" && serializedInheritsFrom(index, feature, surface)
+  );
+}
+
+function serializedInheritsFrom(
+  index: SerializedAuthorityIndex,
+  object: ObjRef,
+  ancestor: ObjRef
+): boolean {
+  const seen = new Set<ObjRef>();
+  let cursor: ObjRef | null = object;
+  while (cursor !== null && !seen.has(cursor)) {
+    if (cursor === ancestor) return true;
+    seen.add(cursor);
+    cursor = serializedObject(index, cursor)?.parent ?? null;
+  }
+  return false;
+}
+
+function serializedPropertyValue(
+  index: SerializedAuthorityIndex,
+  object: ObjRef,
+  name: string
+): WooValue | undefined {
+  const seen = new Set<ObjRef>();
+  let cursor: ObjRef | null = object;
+  while (cursor !== null && !seen.has(cursor)) {
+    seen.add(cursor);
+    const row = serializedObject(index, cursor);
+    if (!row) return undefined;
+    const own = row.properties.find(([prop]) => prop === name);
+    if (own) return own[1];
+    cursor = row.parent;
+  }
+  return undefined;
 }
 
 type SerializedAuthorityIndex = {
