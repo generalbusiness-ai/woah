@@ -150,6 +150,49 @@ describe("schema_version durable stamps (Phase 5)", () => {
     scope.close();
   });
 
+  // The pin lease columns are added to a LIVE table on already-deployed
+  // shards, so the migration has to be resumable from its own halfway state.
+  // Gating both ALTERs on the presence of the first one was not: an
+  // interruption between them left `expires_at` present and `guaranteed`
+  // absent, and every later boot skipped the block and then failed building an
+  // index on the missing column — a shard that can never initialize again.
+  it("resumes a PARTIAL pin migration: a table with only expires_at still initializes", () => {
+    const gw = netState("wire-gateway-partial");
+    const env = { WOO_INTERNAL_SECRET: SECRET, NET_GATEWAY_SELF: "gateway:partial" } as NetGatewayEnv;
+    // Exactly the state an interruption between the two ALTERs leaves behind,
+    // with a live pin row already in it.
+    gw.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+    );
+    gw.state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
+    gw.state.storage.sql.exec(
+      "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES ('half-migrated', 'room:somewhere')"
+    );
+
+    expect(() => new NetGatewayDO(gw.state, env)).not.toThrow();
+    // And again: the repair is idempotent, not a one-shot that leaves the next
+    // boot in a different state.
+    expect(() => new NetGatewayDO(gw.state, env)).not.toThrow();
+
+    const columns = (
+      gw.state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)") as {
+        toArray(): Array<{ name: string }>;
+      }
+    ).toArray().map((row) => row.name);
+    expect(columns).toContain("expires_at");
+    expect(columns).toContain("guaranteed");
+
+    // The row that survived the halt is dated and classed, not left undateable.
+    const row = (
+      gw.state.storage.sql.exec(
+        "SELECT expires_at, guaranteed FROM net_gateway_pin WHERE idempotency_key = 'half-migrated'"
+      ) as { toArray(): Array<{ expires_at: number | null; guaranteed: number | null }> }
+    ).toArray()[0];
+    expect(row?.expires_at, "a halted migration must not leave an undated pin").not.toBeNull();
+    expect(Number(row?.guaranteed)).toBe(1);
+    gw.close();
+  });
+
   it("gateway construction stamps net_gateway_meta schema_version v2, once", () => {
     const gw = netState("wire-gateway");
     const env: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
