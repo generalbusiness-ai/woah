@@ -11,7 +11,7 @@
 // stay empty. A "fix" that lets the turn run and then reports an error must
 // fail here.
 import { describe, expect, it } from "vitest";
-import { FakeDurableObjectState } from "./fake-do";
+import { closeQuiescent, quiescentNetState as netState } from "./quiescent-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -26,29 +26,6 @@ const SECRET = "net-mcp-argval-secret";
 const WIDGET = "the_widget";
 const BUMP_TOOL = "the_widget__note_bump";
 
-function netState(name: string) {
-  const fake = new FakeDurableObjectState(name);
-  const deferred: Array<Promise<unknown>> = [];
-  const state: NetScopeDurableState & NetGatewayDurableState = {
-    id: fake.id,
-    waitUntil: (promise: Promise<unknown>) => {
-      deferred.push(promise);
-    },
-    storage: {
-      sql: fake.storage.sql,
-      transactionSync: fake.storage.transactionSync,
-      setAlarm: () => {},
-      deleteAlarm: () => {}
-    }
-  };
-  return {
-    state,
-    settle: async () => {
-      while (deferred.length > 0) await deferred.shift();
-    },
-    close: () => fake.close()
-  };
-}
 
 type Rpc = { jsonrpc: "2.0"; id?: number | string; method: string; params?: unknown };
 
@@ -240,7 +217,7 @@ async function fixture() {
 
   return {
     alice, aliceSession, mcp, call, drain, hits, settleAll, worldSnapshot,
-    close: () => { for (const st of states) st.close(); }
+    close: async () => closeQuiescent(states)
   };
 }
 
@@ -299,7 +276,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       // validator sees the same object — so sending it is never "unknown".
       expect(schema!.properties.operation_id).toBeTruthy();
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -322,7 +299,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       // through to the verb, which happily bumped it.
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -334,7 +311,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.detail.unknown_properties).toEqual(["txet"]);
       expect(String(refusal.detail.remediation)).toContain("misspelling");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -359,7 +336,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(wrongText.detail.received).toBe("integer");
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -396,7 +373,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(6);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -417,7 +394,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.detail.declared).toEqual(["text", "amount"]);
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -438,7 +415,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(String(refusal.detail.remediation)).toContain("args[1]");
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -455,7 +432,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(refusal.detail.received_arity).toBe(3);
       expect(await f.hits()).toBe(0);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -483,7 +460,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(missingVerb.detail.reason).toBe("missing_required_argument");
       expect(missingVerb.detail.field).toBe("verb");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -511,7 +488,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       await f.settleAll();
       expect(await f.hits()).toBe(4);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -531,7 +508,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       expect(surplus.result?.isError, JSON.stringify(surplus).slice(0, 400)).not.toBe(true);
       expect(surplus.result?.structuredContent?.result).toBe("poked");
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -552,7 +529,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       const ok = await f.call(f.aliceSession, "woo_wait", { timeout_ms: 0, limit: 1 });
       expect(ok.result?.isError).not.toBe(true);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 
@@ -570,7 +547,7 @@ describe("MCP argument validation (mcp.md §M4.3)", () => {
       const ok = await f.call(f.aliceSession, "woo_list_reachable_tools", { scope: "active", limit: 5 });
       expect(ok.result?.isError, JSON.stringify(ok).slice(0, 400)).not.toBe(true);
     } finally {
-      f.close();
+      await f.close();
     }
   });
 });
