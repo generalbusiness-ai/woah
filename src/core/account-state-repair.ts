@@ -1,4 +1,6 @@
 import type { WooValue } from "./types";
+import { hashSource } from "./source-hash";
+import { stableShadowJson } from "./shadow-cell-version";
 
 /** Hard upper bound for every adapter's account-authority snapshot.
  *
@@ -90,9 +92,23 @@ export type AccountRepairResult = Omit<AccountRepairPlan, "status" | "patches"> 
   patches: AccountRepairPatchSummary[];
   dry_run: boolean;
   changed: string[];
+  /** Opaque digest of the complete value-bearing plan. Operators pass this
+   * from dry-run to apply so a changed plan cannot be accepted merely because
+   * its redacted patch summary still looks similar. */
+  review_token: string | null;
 };
 
 type CredentialRecord = Record<string, WooValue>;
+
+/** Bind a reviewed operator action to the complete pure plan, including
+ * redacted before/after values. The token exposes no plan values and is stable
+ * across adapters because both call the same planner and canonical encoder. */
+export function accountRepairReviewToken(plan: AccountRepairPlan): string {
+  return `sha256:${hashSource(stableShadowJson({
+    kind: "woo.account_state_repair_review.v1",
+    plan
+  } as unknown as WooValue))}`;
+}
 
 /**
  * Derive the only repairs whose intended value follows from durable account
@@ -270,6 +286,23 @@ export function planAccountStateRepair(snapshot: AccountRepairSnapshot): Account
         // It is reversible, so the repair cannot infer whether an operator
         // wants reactivation, retirement, or continued suspension.
         conflict(conflicts, "operator_agent_deactivated", id, "deactivated_at");
+      } else if (
+        registryBefore.includes(id) &&
+        nextFlags.wizard !== true &&
+        nextFlags.programmer !== true &&
+        (!surface || !nextFeatures.includes(surface))
+      ) {
+        // This is byte-identical for two histories: AP11 stopped before its
+        // first flag write, or an owner later cleared both flags and removed
+        // the surface. An unregistered ledger actor is still distinguishable
+        // as AP11 residue, but a registered actor is not. The provisioning
+        // ledger records original intent, not a perpetual grant, so historical
+        // repair must not choose privilege restoration for the ambiguous case.
+        conflict(conflicts, "operator_agent_programmer_intent_ambiguous", id, "object_lineage", {
+          wizard: false,
+          programmer: false,
+          surface_present: false
+        });
       } else if (!surface) {
         conflict(conflicts, "operator_agent_missing_programmer_surface", id, "features");
       } else {

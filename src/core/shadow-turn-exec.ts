@@ -757,6 +757,12 @@ export async function executeAuthoritativeShadowTurnCall(
     node.world = undefined;
     throw err;
   }
+  // A failed inverse preserves the original ErrorFrame, so it does not throw
+  // through this host boundary. Consult the explicit fail-stop signal and
+  // discard the cached execution world now; the next request rebuilds it from
+  // node.serialized / the authoritative commit scope instead of waiting for a
+  // Durable Object eviction.
+  if (world.behaviorRollbackRequiresReload()) node.world = undefined;
 
   const key = shadowTurnKeyFromTranscript(run.transcript);
   const request: ShadowTurnExecRequest = {
@@ -915,6 +921,9 @@ export async function executeShadowTurnCallOrNeedState(
     }
     throw err;
   }
+  // Normal behavior errors return frames. A restore failure therefore needs
+  // this explicit host check rather than the catch path above.
+  if (world.behaviorRollbackRequiresReload()) node.world = undefined;
   if (!skipAtomChecks) {
     const needState = missingAtomsFromNeedStateTranscript(run.transcript);
     if (needState.length > 0) {

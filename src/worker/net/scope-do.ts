@@ -119,11 +119,13 @@ import type { ApiKeyVerifierRow } from "../../net/api-key-index";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import {
   ACCOUNT_REPAIR_MEMBER_LIMIT,
+  accountRepairReviewToken,
   planAccountStateRepair,
   summarizeAccountRepairPatches,
   type AccountRepairMember,
   type AccountRepairPatch
 } from "../../core/account-state-repair";
+import { constantTimeEqual } from "../../core/source-hash";
 import { applySeedScalarProperty, mergeSeedMapProperty, type SeedMapSupersedes } from "../../core/seed-property-merge";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { repairedVerbSlots, verbCellSlot } from "../../net/verb-slots";
@@ -1833,6 +1835,7 @@ export class NetScopeDO {
           human?: unknown;
           candidates?: unknown;
           dry_run?: unknown;
+          review_token?: unknown;
           }
           : {};
         const account = typeof body.account === "string" ? body.account : "";
@@ -1843,8 +1846,16 @@ export class NetScopeDO {
           ? [...new Set(body.candidates as string[])]
           : null;
         const dryRun = body.dry_run;
+        const reviewToken = typeof body.review_token === "string" ? body.review_token : null;
         const seq = this.ensureSequencer();
-        if (!account || !human || !explicitCandidates || typeof dryRun !== "boolean" || !seq.scope.startsWith("cluster:")) {
+        if (
+          !account ||
+          !human ||
+          !explicitCandidates ||
+          typeof dryRun !== "boolean" ||
+          (body.review_token !== undefined && typeof body.review_token !== "string") ||
+          !seq.scope.startsWith("cluster:")
+        ) {
           throw netError("E_INVARG", "account repair requires account, primary human, bounded candidates, and explicit dry_run on a cluster authority", {
             scope: seq.scope
           });
@@ -1983,6 +1994,9 @@ export class NetScopeDO {
           ? cellKey("property_cell", patch.object, patch.name)
           : cellKey("object_lineage", patch.object));
         const patches = summarizeAccountRepairPatches(plan.patches);
+        const expectedReviewToken = plan.status === "would_apply"
+          ? accountRepairReviewToken(plan)
+          : null;
         if (dryRun || plan.status !== "would_apply") {
           return json({
             ok: plan.status !== "conflict",
@@ -1991,8 +2005,32 @@ export class NetScopeDO {
             scope: seq.scope,
             dry_run: dryRun,
             changed,
+            review_token: expectedReviewToken,
             head: seq.head()
           }, plan.status === "conflict" ? 409 : 200);
+        }
+        if (
+          !reviewToken ||
+          !expectedReviewToken ||
+          !constantTimeEqual(reviewToken, expectedReviewToken)
+        ) {
+          return json({
+            ok: false,
+            kind: "woo.account_state_repair.v1",
+            scope: seq.scope,
+            account,
+            status: "stale_review",
+            dry_run: false,
+            changed: [],
+            patches: [],
+            conflicts: [{
+              code: "review_token_mismatch",
+              object: account,
+              field: "review_token"
+            }],
+            review_token: expectedReviewToken,
+            head: seq.head()
+          }, 409);
         }
         const cells = this.accountRepairCells(seq, plan.patches);
         const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
@@ -2026,6 +2064,7 @@ export class NetScopeDO {
           status: repaired.status,
           dry_run: false,
           changed: repaired.cells.map((cell) => cell.key).sort(),
+          review_token: expectedReviewToken,
           head: repaired.head
         });
       }

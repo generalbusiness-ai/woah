@@ -1187,7 +1187,13 @@ The operation derives these facts:
   completed and a later explicit demotion preserved the wizard bit (§AP11.7),
   so repair reports a conflict and never re-promotes it. A later reversible
   deactivation/suspension is likewise a conflict rather than permission for
-  repair to reactivate.
+  repair to reactivate. When `wizard`, `programmer`, and the published surface
+  are all absent on an actor already present in `account.actors`, an AP11
+  interruption before the first flag write is indistinguishable from a later
+  full privilege strip. Repair therefore also reports a conflict for that
+  ambiguous registered state; the old provisioning ledger never overrides
+  possible newer owner intent. An unregistered mutually attested ledger actor
+  remains distinguishable as interrupted provisioning residue and may finish.
 
 Every other disagreement is a conflict and suppresses the whole apply. This
 includes malformed features, missing registry objects, wrong owners/authority
@@ -1197,11 +1203,16 @@ no object is recycled or registered merely because its shape resembles F4:
 without a durable operation identity there is insufficient evidence of whether
 creation failed or registration did.
 
-Dry-run and apply execute the same pure plan. Both CLIs default to dry-run and
-require an explicit `--apply` on the reviewed second invocation. The internal
-method requires exactly one mode, so an omitted boolean can never become an
-implicit apply. A Net apply is one ordered owner event and one Durable Object
-SQLite transaction.
+Dry-run and apply execute the same pure plan. A conflict-free dry-run returns
+an opaque `review_token`, a canonical digest of the complete value-bearing
+plan (including the before/after values redacted from operator output). Both
+CLIs default to dry-run and require that token together with explicit
+`--apply` on the reviewed second invocation. Apply recomputes the plan under
+its authority lock and refuses if the token differs, so changed state cannot
+turn a reviewed diagnostic into a different repair. An already-converged
+retry remains an `empty` no-op. The internal method requires exactly one mode,
+so an omitted boolean can never become an implicit apply. A Net apply is one
+ordered owner event and one Durable Object SQLite transaction.
 
 The local SQLite CLI is an **offline operation**, including dry-run. Every live
 `LocalSQLiteRepository` holds a cooperative per-world owner lease for its
@@ -1245,7 +1256,8 @@ npm run repair:local-account-state -- \
   [--candidate <suspected-orphan>]
 ```
 
-After reviewing a conflict-free plan, repeat the same command with `--apply`.
+After reviewing a conflict-free plan, repeat the same command with `--apply
+--review-token <token-from-dry-run>`.
 Candidate arguments expand inspection only; they do not authorize recycling or
 provide replacement values. Stop every process serving or otherwise holding
 the named local world before either command; the lease check refuses instead of
@@ -1262,3 +1274,7 @@ npm run repair:net-account-state -- \
   --human <primary-human> \
   [--candidate <suspected-orphan>]
 ```
+
+After review, repeat it with `--apply --review-token
+<token-from-dry-run>`. The authority refuses a missing or stale token before
+mutation.

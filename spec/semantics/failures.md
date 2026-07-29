@@ -82,6 +82,12 @@ it matches its durable state, so the world instance becomes poisoned: all
 subsequent behavior and mutation MUST refuse with `E_WORLD_POISONED` until the
 host discards the instance and reloads it from persistence. A poisoned instance
 MUST NOT continue serving writes from partially restored state.
+The shadow execution host checks the world's reload signal after every normal
+behavior frame and immediately drops a poisoned cached execution world; the
+next request rebuilds from the committed authority snapshot. An in-memory
+embedder that owns no reloadable host remains fail-stop and MUST replace its
+world explicitly. Process restart is recovery for a standalone local embedder,
+not the recovery mechanism for a Durable Object execution cache.
 
 Failure-prone transport work belongs after acceptance. A session-ended
 notification, socket closure, or other host callback runs only after the

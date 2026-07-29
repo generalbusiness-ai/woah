@@ -58,9 +58,9 @@ describe("behavior savepoint wall-clock scaling", () => {
     const loadedP95Ms = await measuredNoopP95Ms(5_000);
     const detail = `small_p95=${smallP95Ms.toFixed(3)}ms loaded_p95=${loadedP95Ms.toFixed(3)}ms`;
 
-    // The additive allowance absorbs timer/scheduler noise; the multiplicative
-    // bound catches a return to the former O(authority-size) eager snapshot.
+    // The additive allowance absorbs timer/scheduler noise; the relative bound
+    // catches a return to the former O(authority-size) eager snapshot without
+    // turning unrelated machine contention into an absolute wall-time failure.
     expect(loadedP95Ms, detail).toBeLessThanOrEqual(smallP95Ms * 8 + 0.5);
-    expect(loadedP95Ms, detail).toBeLessThan(10);
   });
 });

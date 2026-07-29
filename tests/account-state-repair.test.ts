@@ -124,16 +124,29 @@ describe("bounded historical account-state repair", () => {
       expect(() => repairLocalAccountState([
         "--db", path,
         "--account", account,
-        "--apply"
+        "--apply",
+        "--review-token", dry.review_token!
       ], () => {})).toThrow(/requires a stopped server/);
       expect(afterFailure.propOrNull(agent, "deactivated_at")).toBeNull();
       expect(afterFailure.propOrNull(account, "agent_count")).toBe(9);
       afterFailureRepo.close();
 
+      const cliDry = repairLocalAccountState([
+        "--db", path,
+        "--account", account
+      ], () => {});
+      expect(cliDry.review_token).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(() => repairLocalAccountState([
+        "--db", path,
+        "--account", account,
+        "--apply",
+        "--review-token", `sha256:${"0".repeat(64)}`
+      ], () => {})).toThrow(/review token no longer matches/);
       const applied = repairLocalAccountState([
         "--db", path,
         "--account", account,
-        "--apply"
+        "--apply",
+        "--review-token", cliDry.review_token!
       ], () => {});
       expect(applied.status).toBe("applied");
 
@@ -182,8 +195,14 @@ describe("bounded historical account-state repair", () => {
     expect(parseLocalAccountRepairArgs([
       "--db", "./world.sqlite",
       "--account", "account_2",
-      "--apply"
+      "--apply",
+      "--review-token", `sha256:${"a".repeat(64)}`
     ])).toMatchObject({ apply: true });
+    expect(() => parseLocalAccountRepairArgs([
+      "--db", "./world.sqlite",
+      "--account", "account_2",
+      "--apply"
+    ])).toThrow(/requires --review-token/);
     expect(() => parseLocalAccountRepairArgs([
       "--db", "./world.sqlite",
       "--account", "account_2",
@@ -259,7 +278,13 @@ describe("bounded historical account-state repair", () => {
     expect(parseAccountRepairArgs([...common, "--candidate", "agent_4"]))
       .toMatchObject({ candidates: ["agent_4"] });
     expect(parseAccountRepairArgs([...common, "--dry-run"])).toMatchObject({ apply: false });
-    expect(parseAccountRepairArgs([...common, "--apply"])).toMatchObject({ apply: true });
+    expect(parseAccountRepairArgs([
+      ...common,
+      "--apply",
+      "--review-token", `sha256:${"b".repeat(64)}`
+    ])).toMatchObject({ apply: true });
+    expect(() => parseAccountRepairArgs([...common, "--apply"]))
+      .toThrow(/requires --review-token/);
     expect(() => parseAccountRepairArgs([...common, "--dry-run", "--apply"]))
       .toThrow(/mutually exclusive/);
     expect(() => parseAccountRepairArgs([...common, "--agent-count", "4"]))
@@ -382,6 +407,17 @@ describe("bounded historical account-state repair", () => {
     world.setProp("demoted_operator_agent", "provision_id", "demoted-ledger-1");
     world.setProp("demoted_operator_agent", "features", []);
     world.createObject({
+      id: "fully_stripped_operator_agent",
+      name: "Fully stripped operator",
+      parent: "$agent",
+      owner: human,
+      anchor: human,
+      location: "$nowhere",
+      flags: { wizard: false, programmer: false }
+    });
+    world.setProp("fully_stripped_operator_agent", "provision_id", "stripped-ledger-1");
+    world.setProp("fully_stripped_operator_agent", "features", []);
+    world.createObject({
       id: "suspended_operator_agent",
       name: "Suspended operator",
       parent: "$agent",
@@ -393,10 +429,16 @@ describe("bounded historical account-state repair", () => {
     world.setProp("suspended_operator_agent", "deactivated_at", 42);
     world.setProp(account, "operator_provisioned_agents", {
       "demoted-ledger-1": "demoted_operator_agent",
+      "stripped-ledger-1": "fully_stripped_operator_agent",
       "suspended-ledger-1": "suspended_operator_agent"
     });
-    world.setProp(account, "actors", [human, "demoted_operator_agent", "suspended_operator_agent"]);
-    world.setProp(account, "agent_count", 2);
+    world.setProp(account, "actors", [
+      human,
+      "demoted_operator_agent",
+      "fully_stripped_operator_agent",
+      "suspended_operator_agent"
+    ]);
+    world.setProp(account, "agent_count", 3);
     world.setProp(account, "programmer_agent_count", 0);
 
     const before = world.exportWorld();
@@ -412,6 +454,10 @@ describe("bounded historical account-state repair", () => {
       object: "demoted_operator_agent",
       field: "object_lineage"
     }), expect.objectContaining({
+      code: "operator_agent_programmer_intent_ambiguous",
+      object: "fully_stripped_operator_agent",
+      field: "object_lineage"
+    }), expect.objectContaining({
       code: "operator_agent_deactivated",
       object: "suspended_operator_agent",
       field: "deactivated_at"
@@ -422,6 +468,11 @@ describe("bounded historical account-state repair", () => {
       programmer: false
     });
     expect(world.propOrNull("demoted_operator_agent", "features")).toEqual([]);
+    expect(world.object("fully_stripped_operator_agent").flags).toMatchObject({
+      wizard: false,
+      programmer: false
+    });
+    expect(world.propOrNull("fully_stripped_operator_agent", "features")).toEqual([]);
     expect(world.propOrNull(account, "programmer_agent_count")).toBe(0);
   });
 

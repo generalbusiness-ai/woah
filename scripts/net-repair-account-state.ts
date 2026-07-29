@@ -19,11 +19,19 @@ type Args = {
   human: string;
   candidates: string[];
   apply: boolean;
+  reviewToken: string | null;
 };
 
 export function parseAccountRepairArgs(argv: string[]): Args {
   const values = new Map<string, string>();
-  const valueFlags = new Set(["--base-url", "--authority-scope", "--account", "--human", "--candidate"]);
+  const valueFlags = new Set([
+    "--base-url",
+    "--authority-scope",
+    "--account",
+    "--human",
+    "--candidate",
+    "--review-token"
+  ]);
   const candidates: string[] = [];
   let apply = false;
   let explicitDryRun = false;
@@ -55,6 +63,13 @@ export function parseAccountRepairArgs(argv: string[]): Args {
     throw new Error("--authority-scope cluster:<root>, --account, and --human are required");
   }
   if (apply && explicitDryRun) throw new Error("--dry-run and --apply are mutually exclusive");
+  const reviewToken = values.get("review-token") ?? null;
+  if (apply && !reviewToken) {
+    throw new Error("--apply requires --review-token from the reviewed dry-run");
+  }
+  if (!apply && reviewToken) {
+    throw new Error("--review-token is valid only with --apply");
+  }
   if (candidates.length > 256) throw new Error("at most 256 explicit --candidate objects may be inspected");
   return {
     baseUrl: (values.get("base-url") ?? "https://woah1.generalbusiness.ai").replace(/\/+$/, ""),
@@ -62,7 +77,8 @@ export function parseAccountRepairArgs(argv: string[]): Args {
     account,
     human,
     candidates: [...new Set(candidates)],
-    apply
+    apply,
+    reviewToken
   };
 }
 
@@ -101,7 +117,8 @@ export async function repairNetAccountState(
       account: args.account,
       human: args.human,
       candidates: args.candidates,
-      dry_run: !args.apply
+      dry_run: !args.apply,
+      ...(args.reviewToken ? { review_token: args.reviewToken } : {})
     })
   });
   const response = await (deps.fetch ?? fetch)(

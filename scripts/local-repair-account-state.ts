@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import { existsSync, statSync } from "node:fs";
 import { createWorldFromSerialized } from "../src/core/bootstrap";
 import type { AccountRepairResult } from "../src/core/account-state-repair";
+import { constantTimeEqual } from "../src/core/source-hash";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
 export type LocalAccountRepairArgs = {
@@ -18,6 +19,7 @@ export type LocalAccountRepairArgs = {
   account: string;
   candidates: string[];
   apply: boolean;
+  reviewToken: string | null;
 };
 
 export function parseLocalAccountRepairArgs(argv: string[]): LocalAccountRepairArgs {
@@ -25,6 +27,7 @@ export function parseLocalAccountRepairArgs(argv: string[]): LocalAccountRepairA
   let account = "";
   let apply = false;
   let explicitDryRun = false;
+  let reviewToken: string | null = null;
   const candidates: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -43,6 +46,7 @@ export function parseLocalAccountRepairArgs(argv: string[]): LocalAccountRepairA
     if (flag === "--db") database = resolve(value);
     else if (flag === "--account") account = value;
     else if (flag === "--candidate") candidates.push(value);
+    else if (flag === "--review-token") reviewToken = value;
     else throw new Error(`unknown account-repair argument: ${flag}`);
     index += 1;
   }
@@ -50,8 +54,14 @@ export function parseLocalAccountRepairArgs(argv: string[]): LocalAccountRepairA
     throw new Error("--db /absolute/or/relative/world.sqlite and --account are required");
   }
   if (apply && explicitDryRun) throw new Error("--dry-run and --apply are mutually exclusive");
+  if (apply && !reviewToken) {
+    throw new Error("--apply requires --review-token from the reviewed dry-run");
+  }
+  if (!apply && reviewToken) {
+    throw new Error("--review-token is valid only with --apply");
+  }
   if (candidates.length > 256) throw new Error("at most 256 explicit --candidate objects may be inspected");
-  return { database, account, candidates: [...new Set(candidates)], apply };
+  return { database, account, candidates: [...new Set(candidates)], apply, reviewToken };
 }
 
 export function repairLocalAccountState(
@@ -82,6 +92,24 @@ export function repairLocalAccountState(
       // createWorld() performs local-boot migration/repair before returning and
       // may persist those unrelated changes even when this command is probing.
       const world = createWorldFromSerialized(stored, { repository: repo, persist: false });
+      if (args.apply) {
+        const current = world.repairAccountState(args.account, {
+          dryRun: true,
+          candidateActors: args.candidates
+        });
+        if (
+          current.status === "would_apply" &&
+          (
+            !current.review_token ||
+            !args.reviewToken ||
+            !constantTimeEqual(current.review_token, args.reviewToken)
+          )
+        ) {
+          throw new Error(
+            "account repair review token no longer matches; run dry-run again and review the current plan"
+          );
+        }
+      }
       return world.repairAccountState(args.account, {
         ...(args.apply ? { apply: true as const } : { dryRun: true as const }),
         candidateActors: args.candidates

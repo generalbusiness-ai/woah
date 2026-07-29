@@ -42,16 +42,19 @@ P2/defense-in-depth gaps. They are fixed on this branch:
 | Proof-only transfer checks only the inner savepoint | Terminal command transfer sums mutations, staged acceptance, and disallowed recorder events over the complete active behavior-scope stack. An outer write hidden behind `$programmer:eval` now refuses `E_SCOPE_SPLIT` without sequence allocation. |
 | Programmer transition duplicates the flag planner | `setProgrammerAgentState`, `set_actor_flag`, and generic flag mutation now share `prepareObjectFlagPlan`/`applyObjectFlagPlan`; account quota/counter and profile audit wrap that one flag/surface plan. |
 | Catalog update claims rollback | `catalog_registry_update` declares `durable_progress`/`idempotent_progress`, matching its bounded migration-state recovery rather than promising rollback of already completed migration steps. |
-| AP11 ledger can undo an explicit demotion | `wizard = true` with `programmer = false` is treated as in-band evidence that AP11 completed and a later demotion preserved the wizard bit. Repair reports a conflict and does not re-promote; reversible deactivation is likewise newer operator intent. Local and Net paths share the planner. |
+| AP11 ledger can undo an explicit demotion | `wizard = true` with `programmer = false` is treated as in-band evidence that AP11 completed and a later demotion preserved the wizard bit. The fully stripped state is indistinguishable from an interruption before AP11's first flag write, so it also conflicts rather than guessing toward privilege restoration. Reversible deactivation is likewise newer operator intent. Local and Net paths share the planner. |
 | Local repair can race a live SQLite server | Every file-backed local repository holds a cooperative shared lifetime lease. The repair CLI requires the exclusive lease even for dry-run, then holds `BEGIN IMMEDIATE` across load/plan/apply. It refuses while a live server owns the world, closing the in-memory stale-flush race that a SQL transaction alone cannot see. |
 | Staged acceptance can be silently discarded | An outer behavior savepoint refuses if persistence deferral would pop it with unexecuted durable acceptance. Accepted-in-memory/absent-in-storage is not representable. |
-| Abort is not exception-safe | Abort attempts every inverse in LIFO order and preserves the original behavior error. Any restore failure latches `E_WORLD_POISONED`; later behavior and mutation refuse until the host discards and reloads the instance. |
+| Abort is not exception-safe | Abort attempts every inverse in LIFO order and preserves the original behavior error. Any restore failure latches `E_WORLD_POISONED`; later behavior and mutation refuse. Shadow execution hosts inspect the explicit reload signal after normal error frames and immediately discard a poisoned cache so the next request rebuilds from committed authority state. |
 | Test-matrix gaps | Tests now cover failed-call `meSnapshot` restore metadata, a real second refusal for promote/demote/revoke, failed-turn deterministic replay, exact producer-to-authority proof acceptance, and an automated 100-versus-5,000-object savepoint cost gate in `npm test`. |
 
 The bounded historical repair is implemented for local SQLite and Net account
 authorities. It walks only account-owned evidence, supports dry-run, refuses
 ambiguous or oversized candidates, runs apply in a real savepoint, never
 rewrites coherence versions for appearance, and converges to `empty` on retry.
+Conflict-free dry-run returns a digest of the complete unredacted plan; apply
+requires that review token and refuses if recomputation differs, closing the
+operator review-to-apply race without exposing credential values.
 
 The principled close is implemented at the mutation boundary:
 

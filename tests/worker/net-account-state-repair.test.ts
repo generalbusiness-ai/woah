@@ -91,6 +91,99 @@ function lookalikeIdentityRoleCells() {
 }
 
 describe("Net account-state historical repair", () => {
+  it("refuses oversized source containers and de-duplicated member unions before catalog RPC", async () => {
+    const cases = [
+      {
+        label: "source",
+        actors: Array.from({ length: 1_025 }, (_, index) => `source_actor_${index}`),
+        ledger: {}
+      },
+      {
+        label: "union",
+        actors: [HUMAN, ...Array.from({ length: 800 }, (_, index) => `union_actor_${index}`)],
+        ledger: Object.fromEntries(
+          Array.from({ length: 224 }, (_, index) => [`union_provision_${index}`, `union_ledger_${index}`])
+        )
+      }
+    ];
+
+    for (const testCase of cases) {
+      const clusterState = netState(`account-repair-member-limit-${testCase.label}`);
+      let catalogReads = 0;
+      const env: NetScopeEnv = {
+        WOO_INTERNAL_SECRET: SECRET,
+        NET_RESOLVE: () => {
+          catalogReads += 1;
+          throw new Error("oversized repair must refuse before catalog RPC");
+        }
+      };
+      const cluster = new NetScopeDO(clusterState.state, env);
+      const seeded = await cluster.fetch(await signInternalRequest(env, new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: CLUSTER,
+          catalog_epoch: `member-limit-${testCase.label}`,
+          cells: [
+            {
+              kind: "object_lineage",
+              object: HUMAN,
+              value: { parent: "$human", owner: "$wiz", name: "Human", anchor: null, flags: {} }
+            },
+            {
+              kind: "object_lineage",
+              object: ACCOUNT,
+              value: { parent: "$account", owner: "$wiz", name: "Account", anchor: HUMAN, flags: {} }
+            },
+            prop(HUMAN, "account", ACCOUNT),
+            prop(ACCOUNT, "primary_actor", HUMAN),
+            prop(ACCOUNT, "actors", testCase.actors),
+            prop(ACCOUNT, "operator_provisioned_agents", testCase.ledger),
+            prop(ACCOUNT, "agent_count", 0),
+            prop(ACCOUNT, "programmer_agent_count", 0)
+          ],
+          relations: []
+        })
+      })));
+      expect(seeded.status, await seeded.clone().text()).toBe(200);
+      const before = await (await cluster.fetch(await signInternalRequest(
+        env,
+        new Request("https://do/net/head")
+      ))).json() as { head: unknown };
+
+      const response = await cluster.fetch(await signInternalRequest(env, new Request(
+        "https://do/net/repair-account-state",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            account: ACCOUNT,
+            human: HUMAN,
+            candidates: [],
+            dry_run: true
+          })
+        }
+      )));
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        status: "conflict",
+        changed: [],
+        conflicts: [{
+          code: "authority_member_limit",
+          detail: { limit: 1024 }
+        }]
+      });
+      const after = await (await cluster.fetch(await signInternalRequest(
+        env,
+        new Request("https://do/net/head")
+      ))).json() as { head: unknown };
+      expect(after.head).toEqual(before.head);
+      expect(catalogReads).toBe(0);
+      clusterState.close();
+    }
+  });
+
   it("dry-runs, commits atomically on the owning scope, and replays as empty", async () => {
     const catalogState = netState("account-repair-catalog");
     const clusterState = netState("account-repair-cluster");
@@ -181,12 +274,24 @@ describe("Net account-state historical repair", () => {
       prop(AGENT, "deactivated_at", null)
     ]);
 
-    const call = async (dryRun: boolean) => {
-      return cluster.fetch(await signInternalRequest(env, new Request("https://do/net/repair-account-state", {
+    let reviewedToken: string | null = null;
+    const call = async (dryRun: boolean, reviewToken = reviewedToken) => {
+      const response = await cluster.fetch(await signInternalRequest(env, new Request("https://do/net/repair-account-state", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ account: ACCOUNT, human: HUMAN, candidates: [], dry_run: dryRun })
+        body: JSON.stringify({
+          account: ACCOUNT,
+          human: HUMAN,
+          candidates: [],
+          dry_run: dryRun,
+          ...(reviewToken ? { review_token: reviewToken } : {})
+        })
       })));
+      if (dryRun && response.ok) {
+        const receipt = await response.clone().json() as { review_token?: unknown };
+        reviewedToken = typeof receipt.review_token === "string" ? receipt.review_token : null;
+      }
+      return response;
     };
     const credentialRecord = async () => {
       const response = await cluster.fetch(await signInternalRequest(env, new Request("https://do/net/credential-record", {
@@ -246,6 +351,7 @@ describe("Net account-state historical repair", () => {
       dry_run: true,
       conflicts: []
     });
+    expect(reviewedToken).toMatch(/^sha256:[0-9a-f]{64}$/);
     const dryReceipt = await (await call(true)).json() as Record<string, any>;
     expect(JSON.stringify(dryReceipt)).not.toContain("a".repeat(64));
     expect(JSON.stringify(dryReceipt)).not.toContain("b".repeat(32));
@@ -258,6 +364,16 @@ describe("Net account-state historical repair", () => {
     expect(dryReceipt.patches.some((patch: Record<string, unknown>) =>
       "before" in patch || "after" in patch
     )).toBe(false);
+
+    const beforeUnpinnedHead = await authorityHead();
+    const unpinned = await call(false, null);
+    expect(unpinned.status).toBe(409);
+    expect(await unpinned.json()).toMatchObject({
+      ok: false,
+      status: "stale_review",
+      conflicts: [{ code: "review_token_mismatch" }]
+    });
+    expect(await authorityHead()).toEqual(beforeUnpinnedHead);
 
     // Fault the last leg of the owner transaction after the public api_keys
     // cell and its authority-private verifier row have both been mutated.

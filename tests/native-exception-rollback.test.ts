@@ -1371,6 +1371,7 @@ describe("native exception rollback", () => {
     const failed = await world.directCall("poison-fail", "$wiz", "poison_controller", "fail_restore", []);
 
     expect(failed).toMatchObject({ op: "error", error: { code: "E_TEST_ORIGINAL" } });
+    expect(world.behaviorRollbackRequiresReload()).toBe(true);
     expect(world.getProp("poison_subject", "first")).toBe(0);
     expect(world.getProp("poison_subject", "second")).toBe(0);
     const refused = await world.directCall("poison-after", "$wiz", "poison_controller", "after", []);

@@ -53,6 +53,7 @@ import { SCHEDULE_CLOCK_INPUT, SCHEDULE_MAX_HORIZON_MS, SCHEDULE_MAX_PER_TURN, S
 import { parseRoutedApiKeyId, routedApiKeyId } from "./api-key-id";
 import {
   ACCOUNT_REPAIR_MEMBER_LIMIT,
+  accountRepairReviewToken,
   planAccountStateRepair,
   summarizeAccountRepairPatches,
   type AccountRepairMember,
@@ -7760,12 +7761,16 @@ export class WooWorld {
     });
     const changed = plan.patches.map(accountRepairPatchKey);
     const patches = summarizeAccountRepairPatches(plan.patches);
+    const reviewToken = plan.status === "would_apply"
+      ? accountRepairReviewToken(plan)
+      : null;
     if (options.dryRun === true || plan.status !== "would_apply") {
       return {
         ...plan,
         patches,
         dry_run: options.dryRun === true,
-        changed
+        changed,
+        review_token: reviewToken
       };
     }
 
@@ -7797,7 +7802,8 @@ export class WooWorld {
       patches,
       status: "applied",
       dry_run: false,
-      changed
+      changed,
+      review_token: reviewToken
     };
   }
 
@@ -13622,6 +13628,18 @@ export class WooWorld {
   private behaviorJournalPoisonError(): ErrorValue {
     return this.behaviorJournalPoison
       ?? wooError("E_WORLD_POISONED", "authority rollback failed; reload this world before further use");
+  }
+
+  /** Host-facing fail-stop signal.
+   *
+   * A rollback restore failure is returned as the behavior's original error,
+   * not thrown through the host boundary, so a cache owner cannot infer poison
+   * from the frame. Hosts that retain a WooWorld across requests use this bit
+   * to discard the instance and rebuild from their durable committed snapshot.
+   * Embedders without a reload owner still receive E_WORLD_POISONED on every
+   * later mutation and must replace the instance themselves. */
+  behaviorRollbackRequiresReload(): boolean {
+    return this.behaviorJournalPoison !== null;
   }
 
   private assertBehaviorJournalHealthy(): void {

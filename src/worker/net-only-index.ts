@@ -394,11 +394,12 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
             human?: unknown;
             candidates?: unknown;
             dry_run?: unknown;
+            review_token?: unknown;
           }
         : {};
       const bodyKeys = Object.keys(body);
       if (
-        bodyKeys.some((key) => !["authority_scope", "account", "human", "candidates", "dry_run"].includes(key)) ||
+        bodyKeys.some((key) => !["authority_scope", "account", "human", "candidates", "dry_run", "review_token"].includes(key)) ||
         typeof body.authority_scope !== "string" ||
         !body.authority_scope.startsWith("cluster:") ||
         typeof body.account !== "string" ||
@@ -408,7 +409,8 @@ async function handleNetOperator(request: Request, env: NetOnlyEnv, url: URL): P
         !Array.isArray(body.candidates) ||
         body.candidates.length > 256 ||
         body.candidates.some((candidate) => typeof candidate !== "string" || !candidate) ||
-        typeof body.dry_run !== "boolean"
+        typeof body.dry_run !== "boolean" ||
+        (body.review_token !== undefined && typeof body.review_token !== "string")
       ) {
         return json({
           error: {
