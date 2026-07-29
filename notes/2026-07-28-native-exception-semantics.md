@@ -9,8 +9,8 @@ Audited base: main `fb8bfe85`
 
 Implementation base: main `6cbeb490`
 
-Current merge target included: main `2749da4b` (retry-lease and MCP
-argument-validation successor)
+Current merge target included: main `5521cb90` (shared quiescent fake-DO
+fixture and guard)
 
 Deployed worker reported during the audit: `02bbc479`
 
@@ -47,7 +47,8 @@ P2/defense-in-depth gaps. They are fixed on this branch:
 | Local repair can race a live SQLite server | Every file-backed local repository holds a cooperative shared lifetime lease. The repair CLI requires the exclusive lease even for dry-run, then holds `BEGIN IMMEDIATE` across load/plan/apply. It refuses while a live server owns the world, closing the in-memory stale-flush race that a SQL transaction alone cannot see. |
 | Staged acceptance can be silently discarded | An outer behavior savepoint refuses if persistence deferral would pop it with unexecuted durable acceptance. Accepted-in-memory/absent-in-storage is not representable. |
 | Abort is not exception-safe | Abort attempts every inverse in LIFO order and preserves the original behavior error. Any restore failure latches `E_WORLD_POISONED`; later behavior, mutation, and explicit or acceptance-time persistence entry points refuse. Shadow execution hosts inspect the explicit reload signal after normal error frames and immediately discard a poisoned cache so the next request rebuilds from committed authority state. |
-| Shadow authority cannot validate lineage turns | The shadow reader, versioner, validator, and applier now share one exact lifecycle value, `{parent, owner, name, anchor, flags}`. Existing-object `op:"set"` writes validate per-frame authority, apply the full semantic replacement, and re-derive parent/children projections; create remains a typed create plus lifecycle echo and recycle remains typed `TranscriptRecycle`. Successful `chparent`, rename, and flag turns are covered across twin authority, accepted-frame receiver, and cold reconstruction. |
+| Shadow authority cannot validate lineage turns | The shadow reader, versioner, validator, and applier now share one exact lifecycle value, `{parent, owner, name, anchor, flags}`. Existing-object `op:"set"` writes validate per-frame authority, apply the full semantic replacement, and re-derive parent/children projections; create remains a typed create plus lifecycle echo and recycle remains typed `TranscriptRecycle`. Successful `chparent`, rename, and flag turns are covered across twin authority, accepted-frame receiver, and cold reconstruction. A derived property read after a same-turn lineage mutation is checked against a bounded topology-only alternate view, but only after the lifecycle writer and CAS have independently validated; missing, stale, and forged lineage authority remain refused. |
+| Create followed by lineage mutation loops at both authorities | A lifecycle read after same-turn create describes turn-derived state, not durable authority pre-state, so the transcript producer omits it by construction. The ordered create and lifecycle-set writes still preserve every transition and determine the final parent. Net uses the create collision guard as the absence proof and does not compare created-object reads to the store. Shadow validates the create's post-state against the final same-turn lifecycle replacement rather than the initial parent. Repeated replacement (`create; chparent A; chparent B`) is covered, and no `"present"` or `"created"` lifecycle sentinel is accepted as proof. |
 | Test-matrix gaps | Tests now cover failed-call `meSnapshot` restore metadata, a real second refusal for promote/demote/revoke, failed-turn deterministic replay, exact producer-to-authority proof acceptance, and automated 100-versus-5,000-object savepoint scaling in `npm test` without a contention-sensitive absolute microsecond threshold. |
 
 The bounded historical repair is implemented for local SQLite and Net account
@@ -78,6 +79,22 @@ Authority validation remains the independent trust-boundary backstop. This is
 important even with the by-construction producer close: stale, imported, or
 defective producers must not be trusted merely because they claim generation
 1.
+
+### Current-main integration
+
+Main `5521cb90` was merged into the isolated branch. The four textual
+conflicts were mechanical: the note retained this branch's remediation
+disposition, `package.json` retained both
+`guard:native-failure-contracts` and `guard:quiescent-fixtures`, and the two MCP
+worker suites plus `net-outliner-converge` adopted main's shared quiescent-DO
+fixture. The resulting guard reports the existing 30 hand-rolled suites and
+confirms this branch added none.
+
+The round-three authority changes alter transcript construction and validation,
+not persisted world shape. They add no Durable Object binding, catalog major
+version, bootstrap-ledger entry, or world-spec rewrite; no migration is
+required. In particular, lifecycle value/version derivation for aged worlds is
+unchanged.
 
 ### Findings widened during implementation
 
@@ -110,6 +127,15 @@ Adversarial tests exposed and closed additional members of the same class:
   Keeping such transient proofs either creates an
   authority-specific retry loop or records a value/version that never existed
   durably;
+- state derived after same-turn creation is not a proof about authority
+  pre-state. Lifecycle reads after create are omitted, including repeated
+  same-turn lineage replacements; the ordered writes carry the final state and
+  the authority's create-collision check proves prior absence;
+- an existing object's same-turn lineage mutation can legitimately change a
+  later inherited read. Shadow validation therefore constructs a bounded
+  topology-only read view after independently validating the recorded lineage
+  writer and lifecycle CAS. It never uses the proposed view to authorize its
+  own mutation;
 - lifecycle parity exposed a distinct builder capability boundary:
   `builder_create_object` and `builder_chparent` deliberately lower a
   wizard-owned surface frame to a non-programmer actor. Their transcript
@@ -164,15 +190,17 @@ still requires separate deployment authorization.
 
 ### Local validation evidence
 
-The final isolated branch passed the complete local ladder:
+The final isolated branch, including current main, passed the complete local
+ladder:
 
 | Lane | Result |
 |---|---|
-| Adversarial remediation focus (11 files) | 248/248 |
+| Round-two adversarial remediation focus (11 files) | 248/248 |
+| Round-three create/lineage authority focus (4 files) | 115/115 |
 | `npm run typecheck` | passed |
-| `npm test` | 88 files, 1,063/1,063 |
-| `npm run test:worker` | 49 files, 393/393 |
-| `npm run test:full` | 169 files, 2,124/2,124 |
+| `npm test` | 88 files, 1,071/1,071 |
+| `npm run test:worker` | 49 files, 394/394 |
+| `npm run test:full` | 169 files, 2,135/2,135 |
 | `npm run load:net-dev` | 3/3 |
 | `npm run load:net-skew` | 6/6 |
 | `npm run smoke:net-dev` | 44/44 |
@@ -191,6 +219,18 @@ Adversarial reversion proved the late integration tests are causal:
 - restoring the shadow lifecycle presence sentinel/no-op applier rejects the
   successful `chparent` control turn with lifecycle value mismatches and
   `permission_denied` instead of materializing the accepted lineage;
+- the original `create; chparent` producer is rejected by shadow as
+  `read unavailable ...lifecycle: object not found` and by Net as
+  `read_version_mismatch` because the post-create version is not durable
+  pre-state. Admitting that exact read exposes a second shadow defect,
+  `post_state_mismatch ...: parent`; accepting only one replacement then fails
+  the repeated `create; chparent A; chparent B` probe. Omitting all
+  post-create lifecycle reads and validating the final replacement closes the
+  class, while forged `"present"` and `"created"` reads remain refused;
+- removing the topology-only shadow view rejects a legitimate existing-object
+  `chparent` followed by an inherited read. The negative controls prove the
+  view cannot be reached without the lineage write, a current lifecycle CAS,
+  and an authorized writer;
 - before authenticated task-permission lowering, a genuine installed
   `$builder:create` is rejected as `writer frame not recorded`; with only that
   fix it is still rejected as `no recorded authority can create`. The complete
@@ -226,6 +266,11 @@ Adversarial reversion proved the late integration tests are causal:
   `E_TEST_ORIGINAL` and fails the poisoned-rollback test;
 - retaining a poisoned shadow world in the execution cache fails the host-level
   reload test after the accepted error frame;
+- removing the explicit poison gates lets both `persist()` and incremental
+  flush write after a failed restore, contrary to the fail-stop contract;
+- restoring unconditional dependency capture performs a second lineage walk
+  and detached dependency cloning on ordinary no-recorder property/dispatch
+  calls; the no-recorder causal probes observe those calls and fail;
 - reinstating the detached public-view metadata write makes the serialized
   workerd-fixture test fail; and
 - reverting created-object proof pruning exposes reads and dispatch proof for
