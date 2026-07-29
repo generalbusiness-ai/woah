@@ -17,7 +17,12 @@ import {
   type TranscriptValidation,
   type TranscriptWrite
 } from "./effect-transcript";
-import { stableShadowJson } from "./shadow-cell-version";
+import {
+  parseShadowLifecycleCellValue,
+  shadowLifecycleCellValue,
+  stableShadowJson,
+  type ShadowLifecycleCellValue
+} from "./shadow-cell-version";
 import type { AuthorityPageProvenance } from "./shadow-state-pages";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
@@ -777,6 +782,7 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
   const errors: string[] = [];
   const validWriters = new Map<string, boolean>();
   const authorizedCreates = new Map<ObjRef, TranscriptCreate>();
+  const lineageState = new Map<ObjRef, ShadowLifecycleCellValue>();
   if (transcript.session) {
     const session = index.sessionById.get(transcript.session);
     if (!session) errors.push(`permission_denied: session not found ${transcript.session}`);
@@ -797,6 +803,7 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
     }
     if (canWriterCreateObject(index, create.writer.progr, create.parent, create.owner)) {
       authorizedCreates.set(create.object, create);
+      lineageState.set(create.object, lifecycleValueFromCreate(create));
     } else {
       errors.push(`permission_denied: no recorded authority can create ${create.object}`);
     }
@@ -821,15 +828,49 @@ function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, tran
     }
     const createdObject = authorizedCreates.get(write.cell.object);
     if (write.cell.kind === "lifecycle") {
-      if (!createdObject || !writerCanInitializeCreatedObject(index, write.writer.progr, createdObject)) {
-        errors.push(`permission_denied: no recorded authority can create ${write.cell.object}`);
+      if (write.op === "create") {
+        if (!createdObject || !writerCanInitializeCreatedObject(index, write.writer.progr, createdObject)) {
+          errors.push(`permission_denied: no recorded authority can create ${write.cell.object}`);
+        }
+        continue;
+      }
+      if (write.op !== "set") {
+        errors.push(`permission_denied: unsupported lifecycle op ${write.op} for ${write.cell.object}`);
+        continue;
+      }
+      const replacement = parseShadowLifecycleCellValue(write.value);
+      if (!replacement) {
+        errors.push(`permission_denied: invalid lifecycle replacement ${write.cell.object}`);
+        continue;
+      }
+      const before = lifecycleValueInAuthorityState(index, lineageState, write.cell.object);
+      const authorized = before !== null &&
+        canWriterReplaceLineage(
+          index,
+          lineageState,
+          write.writer.progr,
+          write.cell.object,
+          before,
+          replacement
+        );
+      if (!authorized) {
+        errors.push(`permission_denied: no recorded authority can replace ${write.cell.object}.lifecycle`);
+      } else {
+        // Validate later replacements against the exact lineage state produced
+        // by earlier writes. Besides matching runtime order, this makes a
+        // two-object A→B / B→A forged cycle fail on its second edge.
+        lineageState.set(write.cell.object, replacement);
       }
       continue;
     }
     if (createdObject && writerCanInitializeCreatedObject(index, write.writer.progr, createdObject)) {
       continue;
     }
-    if (write.cell.kind === "prop" && !canWriterWriteProperty(index, write.writer.progr, write.cell.object, write.cell.name)) {
+    if (
+      write.cell.kind === "prop" &&
+      !canWriterWriteProperty(index, write.writer.progr, write.cell.object, write.cell.name) &&
+      !isAuthorizedLineageNameMirror(transcript, write)
+    ) {
       errors.push(`permission_denied: no recorded authority can write ${cellLabel(write.cell)}`);
     }
     if (write.cell.kind === "location" && !canWriterControlObject(index, write.writer.progr, write.cell.object)) {
@@ -952,7 +993,29 @@ export function applyShadowTranscriptToIndexedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
+    if (!target) continue;
+    if (write.cell.kind === "lifecycle" && write.op === "set") {
+      const priorParent = target.parent;
+      applyTranscriptWriteToSerializedObject(target, write, transcript, options);
+      if (priorParent !== target.parent) {
+        if (priorParent) {
+          const oldParent = mutableObject(priorParent);
+          if (oldParent) {
+            oldParent.children = oldParent.children.filter((id) => id !== target.id);
+            touchSerializedObject(oldParent, options.objectTimestamp);
+          }
+        }
+        if (target.parent) {
+          const newParent = mutableObject(target.parent);
+          if (newParent) {
+            addUniqueObjectRef(newParent.children, target.id);
+            touchSerializedObject(newParent, options.objectTimestamp);
+          }
+        }
+      }
+      continue;
+    }
+    applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   applyMovementProjectionToIndexedState(transcript, mutableObject, options.objectTimestamp);
   applyMovementPresenceProjectionToIndexedState(next, transcript, mutableObject, options.objectTimestamp);
@@ -1774,9 +1837,23 @@ export function applyTranscriptWriteToSerializedObject(
       touchSerializedObject(target, options.objectTimestamp);
       return;
     case "lifecycle": {
-      // Recycle/delete materialization is still outside the shadow applier.
-      // The transcript records the cell for validation, but the commit scope's
-      // full serialized state remains the authority for that effect.
+      // Object creation is materialized from transcript.creates before writes;
+      // its lifecycle write is only the recorder's echo. Existing-object
+      // lineage mutations are full semantic replacements. Do not merge an
+      // arbitrary map: accepting an open namespace here would let a transcript
+      // smuggle host-only metadata into the authority row.
+      if (write.op === "create") return;
+      if (write.op !== "set") {
+        throw new Error(`unsupported lifecycle write op ${write.op} for ${write.cell.object}`);
+      }
+      const replacement = parseShadowLifecycleCellValue(write.value);
+      if (!replacement) throw new Error(`invalid lifecycle replacement for ${write.cell.object}`);
+      target.parent = replacement.parent;
+      target.owner = replacement.owner;
+      target.name = replacement.name;
+      target.anchor = replacement.anchor;
+      target.flags = structuredClone(replacement.flags) as SerializedObject["flags"];
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     }
     case "verb":
@@ -2004,14 +2081,122 @@ function canWriterControlObject(index: SerializedAuthorityIndex, writer: ObjRef,
 
 function canWriterCreateObject(index: SerializedAuthorityIndex, writer: ObjRef, parent: ObjRef | null, owner: ObjRef): boolean {
   if (!parent) return false;
+  const writerObj = serializedObject(index, writer);
   const parentObj = serializedObject(index, parent);
-  if (!parentObj) return false;
+  if (!writerObj || !parentObj) return false;
   if (isWizard(index, writer)) return true;
-  return owner === writer && (parentObj.owner === writer || parentObj.flags.fertile === true);
+  return writerObj.flags.programmer === true &&
+    owner === writer &&
+    (parentObj.owner === writer || parentObj.flags.fertile === true);
 }
 
 function writerCanInitializeCreatedObject(index: SerializedAuthorityIndex, writer: ObjRef, create: TranscriptCreate): boolean {
   return isWizard(index, writer) || create.owner === writer;
+}
+
+/** set_object_name deliberately keeps the lineage display name and inherited
+ * `name` property in lockstep. The inherited property definition is normally
+ * read-only, so its mirror write is authorized only when the same recorded
+ * frame also carries an authorized full-lineage replacement naming the exact
+ * same value. This is a narrow compound-effect rule, not a general exception
+ * for writes to `name`. */
+function isAuthorizedLineageNameMirror(transcript: EffectTranscript, write: TranscriptWrite): boolean {
+  if (
+    write.cell.kind !== "prop" ||
+    write.cell.name !== "name" ||
+    write.op !== "set" ||
+    typeof write.value !== "string" ||
+    !write.writer
+  ) {
+    return false;
+  }
+  return transcript.writes.some((candidate) => {
+    if (
+      candidate.cell.kind !== "lifecycle" ||
+      candidate.cell.object !== write.cell.object ||
+      candidate.op !== "set" ||
+      !candidate.writer ||
+      stableShadowJson(candidate.writer as unknown as WooValue) !==
+        stableShadowJson(write.writer as unknown as WooValue)
+    ) {
+      return false;
+    }
+    return parseShadowLifecycleCellValue(candidate.value)?.name === write.value;
+  });
+}
+
+function lifecycleValueFromCreate(create: TranscriptCreate): ShadowLifecycleCellValue {
+  return {
+    parent: create.parent,
+    owner: create.owner,
+    name: create.name,
+    anchor: create.anchor,
+    flags: { ...create.flags }
+  };
+}
+
+/** Validate an existing-object lineage replacement against the same semantic
+ * capabilities exposed by the runtime. A recorded frame proves who performed
+ * the write; it does not turn the transcript into a free-form lineage editor. */
+function canWriterReplaceLineage(
+  index: SerializedAuthorityIndex,
+  lineageState: ReadonlyMap<ObjRef, ShadowLifecycleCellValue>,
+  writer: ObjRef,
+  object: ObjRef,
+  before: ShadowLifecycleCellValue,
+  after: ShadowLifecycleCellValue
+): boolean {
+  if (lineageParentWouldCycle(index, lineageState, object, after.parent)) return false;
+  if (isWizard(index, writer)) return lineageParentExists(index, lineageState, after.parent);
+  const writerObj = serializedObject(index, writer);
+  if (!writerObj || before.owner !== writer) return false;
+  if (
+    after.owner !== before.owner ||
+    after.anchor !== before.anchor ||
+    stableShadowJson(after.flags as unknown as WooValue) !== stableShadowJson(before.flags as unknown as WooValue)
+  ) {
+    return false;
+  }
+  if (after.parent === before.parent) return true; // owner rename
+  if (writerObj.flags.programmer !== true || after.owner !== writer || !after.parent) return false;
+  const parent = lifecycleValueInAuthorityState(index, lineageState, after.parent);
+  return parent !== null && (parent.owner === writer || parent.flags.fertile === true);
+}
+
+function lineageParentExists(
+  index: SerializedAuthorityIndex,
+  lineageState: ReadonlyMap<ObjRef, ShadowLifecycleCellValue>,
+  parent: ObjRef | null
+): boolean {
+  return parent === null || lifecycleValueInAuthorityState(index, lineageState, parent) !== null;
+}
+
+function lineageParentWouldCycle(
+  index: SerializedAuthorityIndex,
+  lineageState: ReadonlyMap<ObjRef, ShadowLifecycleCellValue>,
+  object: ObjRef,
+  parent: ObjRef | null
+): boolean {
+  const seen = new Set<ObjRef>();
+  let cursor = parent;
+  while (cursor !== null) {
+    if (cursor === object) return true;
+    if (seen.has(cursor)) return true;
+    seen.add(cursor);
+    cursor = lifecycleValueInAuthorityState(index, lineageState, cursor)?.parent ?? null;
+  }
+  return false;
+}
+
+function lifecycleValueInAuthorityState(
+  index: SerializedAuthorityIndex,
+  lineageState: ReadonlyMap<ObjRef, ShadowLifecycleCellValue>,
+  object: ObjRef
+): ShadowLifecycleCellValue | null {
+  const changed = lineageState.get(object);
+  if (changed) return changed;
+  const existing = serializedObject(index, object);
+  return existing ? shadowLifecycleCellValue(existing) : null;
 }
 
 function serializedPropertyInfo(index: SerializedAuthorityIndex, object: ObjRef, name: string): { owner: ObjRef; perms: string } | null {
@@ -2052,7 +2237,11 @@ function isWizard(index: SerializedAuthorityIndex, id: ObjRef): boolean {
 }
 
 function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue, transcript: EffectTranscript): boolean {
-  if (write.cell.kind === "lifecycle" && write.op === "create") return actual === "present";
+  if (write.cell.kind === "lifecycle" && write.op === "create") {
+    const create = transcript.creates.find((item) => item.object === write.cell.object);
+    return create !== undefined &&
+      stableShadowJson(actual) === stableShadowJson(lifecycleValueFromCreate(create) as unknown as WooValue);
+  }
   if (write.cell.kind === "contents") return contentsWriteMatchesPostState(write, actual, transcript);
   return stableShadowJson(write.value) === stableShadowJson(actual);
 }

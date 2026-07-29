@@ -19,7 +19,7 @@
  * silent fork.
  */
 import { buildSerializedAuthorityCellSlice } from "./authority-slice";
-import { shadowOwnerCellVersion, shadowStructuralCellVersion } from "./shadow-cell-version";
+import { shadowLifecycleCellValue, shadowOwnerCellVersion, shadowStructuralCellVersion } from "./shadow-cell-version";
 import { shadowAtomHash } from "./turn-key";
 import { planningCellKey } from "./planning-world";
 import { objectCreateEvent } from "./turn-recorder";
@@ -50,6 +50,7 @@ export interface TurnEffects {
   planningCellKey: typeof planningCellKey;
   shadowAtomHash: typeof shadowAtomHash;
   shadowOwnerCellVersion: typeof shadowOwnerCellVersion;
+  shadowLifecycleCellValue: typeof shadowLifecycleCellValue;
   shadowStructuralCellVersion: typeof shadowStructuralCellVersion;
 
   // Turn-recording inputs.
@@ -79,6 +80,7 @@ export function createV2TurnEffects(): TurnEffects {
     planningCellKey,
     shadowAtomHash,
     shadowOwnerCellVersion,
+    shadowLifecycleCellValue,
     shadowStructuralCellVersion,
     objectCreateEvent,
     remoteBridgeUntrackedEffect,

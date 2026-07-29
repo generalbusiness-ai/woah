@@ -1,5 +1,5 @@
 import type { SerializedWorld } from "./repository";
-import { shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
+import { shadowLifecycleCellValue, shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, PresenceProjectionDef, WooValue } from "./types";
 import type { RecordedCell, RecordedCellWriteOp, RecordedProjectionWrite, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
@@ -851,7 +851,11 @@ export function readTranscriptCell(reader: TranscriptCellReader, cell: Transcrip
       case "lifecycle": {
         const obj = serializedObject(reader, cell.object);
         if (!obj) return { ok: false, error: `read unavailable ${cellLabel(cell)}: object not found` };
-        return { ok: true, version: shadowStructuralCellVersion("lifecycle", obj), value: "present" };
+        return {
+          ok: true,
+          version: shadowStructuralCellVersion("lifecycle", obj),
+          value: shadowLifecycleCellValue(obj) as unknown as WooValue
+        };
       }
     }
   } catch (err) {
