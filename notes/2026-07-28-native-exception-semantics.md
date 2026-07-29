@@ -9,7 +9,8 @@ Audited base: main `fb8bfe85`
 
 Implementation base: main `6cbeb490`
 
-Current merge target included: main `29ff95d1` (note-only successor)
+Current merge target included: main `2749da4b` (retry-lease and MCP
+argument-validation successor)
 
 Deployed worker reported during the audit: `02bbc479`
 
@@ -120,6 +121,11 @@ Adversarial tests exposed and closed additional members of the same class:
 - fake-DO fixture teardown is part of the correctness boundary. Deferred
   tasks are drained to quiescence before SQLite closes, and deferred rejection
   is propagated into the test result rather than printed after a green run;
+- the later MCP argument-validation fixture repeated the old teardown defect:
+  raw `waitUntil` promises, a single queue pass, synchronous close, and
+  unawaited `finally` calls produced a late `database is not open` error during
+  target integration. It now uses the same bounded quiescence and
+  deferred-failure discipline;
 - the data-path analyzer now classifies all native-atomicity and post-accept
   metric kinds. Its test derives the current `MetricEvent` vocabulary so a new
   unclassified smoke-tail event fails the reporting gate.
@@ -150,11 +156,11 @@ The final isolated branch passed the complete local ladder:
 
 | Lane | Result |
 |---|---|
-| Adversarial remediation focus (10 files) | 237/237 |
+| Adversarial remediation focus (10 files) | 239/239 |
 | `npm run typecheck` | passed |
-| `npm test` | 88 files, 1,061/1,061 |
-| `npm run test:worker` | 48 files, 374/374 |
-| `npm run test:full` | 167 files, 2,090/2,090 |
+| `npm test` | 88 files, 1,063/1,063 |
+| `npm run test:worker` | 49 files, 392/392 |
+| `npm run test:full` | 168 files, 2,110/2,110 |
 | `npm run load:net-dev` | 3/3 |
 | `npm run load:net-skew` | 6/6 |
 | `npm run smoke:net-dev` | 44/44 |
