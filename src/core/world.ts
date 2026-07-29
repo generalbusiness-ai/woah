@@ -528,8 +528,22 @@ type ObjectFlagPlan = {
   target: ObjRef;
   changes: Record<string, { from: boolean; to: boolean }>;
   reconcileAuthorSurface: boolean;
+  authorSurface: ObjRef | null;
   authorSurfaceBefore: boolean;
   authorSurfaceDesired: boolean;
+};
+
+type ObjectFlagApplyResult = {
+  flags: WooObject["flags"];
+  /**
+   * The observed membership transition for the exact published surface that
+   * was preflighted. Null means reconciliation changed no surface membership.
+   */
+  authorSurfaceChange: {
+    surface: ObjRef;
+    from: boolean;
+    to: boolean;
+  } | null;
 };
 
 type ObjectFlagApplyOptions = {
@@ -5913,18 +5927,21 @@ export class WooWorld {
      * authority operation already permitted to set the programmer flag. No-op
      * when no surface is published or it is already attached.
      */
-    private attachProgrammerSurface(actor: ObjRef): void {
-      const surface = this.programmerSurface();
-      if (!surface || !this.canCarryFeatures(actor)) return;
+    private attachProgrammerSurface(
+      actor: ObjRef,
+      surface: ObjRef | null = this.programmerSurface()
+    ): boolean {
+      if (!surface || !this.canCarryFeatures(actor)) return false;
       // Bounded collision check FIRST — before the already-present short-circuit
       // — so a surface a bypass (generic add_feature) attached to a shadowing
       // kind is still caught on the next reconcile, not silently accepted. This
       // choke point covers createAgent, promote, and wizard set_object_flags.
       this.assertSurfaceComposable(actor, surface);
       const features = this.featureList(actor);
-      if (features.includes(surface)) return;
+      if (features.includes(surface)) return false;
       this.setProp(actor, "features", [...features, surface]);
       this.bumpFeaturesVersion(actor);
+      return true;
     }
 
     /**
@@ -5932,13 +5949,16 @@ export class WooWorld {
      * when unpublished or not attached. A separately granted builder feature is
      * untouched; only the published programmer surface is removed.
      */
-    private removeProgrammerSurface(actor: ObjRef): void {
-      const surface = this.programmerSurface();
-      if (!surface || !this.canCarryFeatures(actor)) return;
+    private removeProgrammerSurface(
+      actor: ObjRef,
+      surface: ObjRef | null = this.programmerSurface()
+    ): boolean {
+      if (!surface || !this.canCarryFeatures(actor)) return false;
       const features = this.featureList(actor);
-      if (!features.includes(surface)) return;
+      if (!features.includes(surface)) return false;
       this.setProp(actor, "features", features.filter((item) => item !== surface));
       this.bumpFeaturesVersion(actor);
+      return true;
     }
 
     /**
@@ -6037,7 +6057,7 @@ export class WooWorld {
       // Apply only after every ordinary validation and cross-host check has
       // succeeded. Lineage and surface mutation now use the exact same
       // implementation as setObjectFlags and set_actor_flag.
-      this.applyObjectFlagPlan(caller, flagPlan, { audit: false });
+      const applied = this.applyObjectFlagPlan(caller, flagPlan, { audit: false });
       if (transition) {
         this.setProp(account, "programmer_agent_count", nextProgrammerCount!);
         // The caller (the human/wizard) is the acting principal; the agent is
@@ -6054,10 +6074,11 @@ export class WooWorld {
       }
       // Surface reconciliation is unconditional so partial legacy state heals.
       // A repair without a flag transition is itself auditable.
-      if (!transition && flagPlan.authorSurfaceBefore !== flagPlan.authorSurfaceDesired) {
+      if (!transition && applied.authorSurfaceChange !== null) {
         this.recordProvisioningAudit(caller, "programmer_surface_repaired", {
           target: actor,
-          attached: flagPlan.authorSurfaceDesired,
+          surface: applied.authorSurfaceChange.surface,
+          attached: applied.authorSurfaceChange.to,
           transition: false
         });
       }
@@ -12626,7 +12647,7 @@ export class WooWorld {
   setObjectFlags(actor: ObjRef, target: ObjRef, flags: Record<string, unknown>): WooObject["flags"] {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to set object flags", { actor, target });
     const plan = this.prepareObjectFlagPlan(target, flags);
-    return this.applyObjectFlagPlan(actor, plan);
+    return this.applyObjectFlagPlan(actor, plan).flags;
   }
 
   /**
@@ -12663,9 +12684,11 @@ export class WooWorld {
       (changes.programmer?.to ?? (before.programmer === true)) ||
       (changes.wizard?.to ?? (before.wizard === true))
     );
+    let authorSurface: ObjRef | null = null;
     if (reconcileAuthorSurface && this.canCarryFeatures(target)) {
       const surface = this.programmerSurface();
       if (surface) {
+        authorSurface = surface;
         // Both attach and remove consume this list. Shape validation belongs in
         // prepare even when the desired state is false.
         const features = this.featureList(target);
@@ -12680,6 +12703,7 @@ export class WooWorld {
       target,
       changes,
       reconcileAuthorSurface,
+      authorSurface,
       authorSurfaceBefore,
       authorSurfaceDesired
     };
@@ -12689,7 +12713,7 @@ export class WooWorld {
     actor: ObjRef,
     plan: ObjectFlagPlan,
     options: ObjectFlagApplyOptions = {}
-  ): WooObject["flags"] {
+  ): ObjectFlagApplyResult {
     // This is the apply half of a validated authority mutation. `object()` is
     // deliberately detached at the public boundary; mutate the guarded live
     // row so the journal records and can reverse the lineage change.
@@ -12715,9 +12739,9 @@ export class WooWorld {
         }
       });
     }
-    if (plan.reconcileAuthorSurface) {
-      this.reconcileProgrammerSurface(target, plan.authorSurfaceDesired);
-    }
+    const authorSurfaceChanged = plan.reconcileAuthorSurface
+      ? this.reconcileProgrammerSurface(target, plan.authorSurfaceDesired, plan.authorSurface)
+      : false;
     // Raw wizard flag changes keep the local wizard-action audit. Account-bound
     // programmer transitions suppress it here and let setProgrammerAgentState
     // emit the profile-aware audit after the shared flag/surface apply.
@@ -12730,15 +12754,30 @@ export class WooWorld {
       );
     }
     if (changed) this.markObjectDirty(target);
-    return { ...obj.flags };
+    return {
+      flags: { ...obj.flags },
+      authorSurfaceChange:
+        plan.authorSurface !== null && authorSurfaceChanged
+          ? {
+              surface: plan.authorSurface,
+              from: plan.authorSurfaceBefore,
+              to: plan.authorSurfaceDesired
+            }
+          : null
+    };
   }
 
   /** Attach or remove the published programmer surface to match a flag state.
    *  Both directions are idempotent; used by the wizard flag path and shared
    *  provisioning transition so flag and surface never drift apart. */
-  private reconcileProgrammerSurface(actor: ObjRef, programmer: boolean): void {
-    if (programmer) this.attachProgrammerSurface(actor);
-    else this.removeProgrammerSurface(actor);
+  private reconcileProgrammerSurface(
+    actor: ObjRef,
+    programmer: boolean,
+    surface: ObjRef | null = this.programmerSurface()
+  ): boolean {
+    return programmer
+      ? this.attachProgrammerSurface(actor, surface)
+      : this.removeProgrammerSurface(actor, surface);
   }
 
   private bumpFeaturesVersion(objRef: ObjRef): void {
@@ -13950,7 +13989,7 @@ export class WooWorld {
           action: "actor_flag_changed",
           detail: { target, flag, old: before, new: value }
         }
-      }) as unknown as WooValue;
+      }).flags as unknown as WooValue;
     });
     this.registerBuiltinNativeHandler("set_quota", "authoritative", (ctx, args) => {
       if (!this.canBypassPerms(ctx.actor)) throw wooError("E_PERM", "wizard authority required to set quotas", { actor: ctx.actor });

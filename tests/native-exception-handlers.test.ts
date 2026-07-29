@@ -188,6 +188,71 @@ describe("native handler prepare/apply failure boundaries", () => {
     ]);
   });
 
+  it("audits only an actual programmer-surface membership repair", async () => {
+    const world = createWorld();
+    const { human, account } = await provisionHuman(world, "native-flag-no-surface@woo.dev");
+    const agent = await createAgent(world, human, "native-flag-no-surface", false);
+    const surface = world.propOrNull("$system", "programmer_surface");
+    expect(surface).toBe("$programmer");
+    if (typeof surface !== "string") throw new Error("programmer surface fixture missing");
+    world.setProp("$system", "programmer_surface", null);
+
+    const promote = await world.directCall(
+      "native-set-flag-no-surface-up",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", true]
+    ) as CallResult;
+    const repeat = await world.directCall(
+      "native-set-flag-no-surface-repeat",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", true]
+    ) as CallResult;
+
+    expect(promote.op).toBe("result");
+    expect(repeat.op).toBe("result");
+    expect(world.object(agent).flags.programmer).toBe(true);
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(false);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    let audits = world.propOrNull("$system", "wizard_actions") as Array<Record<string, unknown>>;
+    expect(audits.filter((entry) => entry.action === "programmer_surface_repaired")).toEqual([]);
+
+    // Once a surface is genuinely published, the next identical grant heals
+    // the aged half-state and records exactly that observed membership change.
+    world.setProp("$system", "programmer_surface", surface);
+    const repair = await world.directCall(
+      "native-set-flag-surface-repair",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", true]
+    ) as CallResult;
+    const repairedRepeat = await world.directCall(
+      "native-set-flag-surface-repaired-repeat",
+      "$wiz",
+      "$system",
+      "set_actor_flag",
+      [agent, "programmer", true]
+    ) as CallResult;
+    expect(repair.op).toBe("result");
+    expect(repairedRepeat.op).toBe("result");
+    expect(world.actorHasSurface(agent, "$programmer")).toBe(true);
+    expect(world.propOrNull(account, "programmer_agent_count")).toBe(1);
+    audits = world.propOrNull("$system", "wizard_actions") as Array<Record<string, unknown>>;
+    expect(audits.filter((entry) => entry.action === "programmer_surface_repaired")).toEqual([
+      expect.objectContaining({
+        actor: "$wiz",
+        target: agent,
+        surface: "$programmer",
+        attached: true,
+        transition: false
+      })
+    ]);
+  });
+
   it("preflights the prospective $agent surface before consuming an object id", async () => {
     let world = createWorld();
     const baseline = createWorld();
