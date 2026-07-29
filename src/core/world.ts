@@ -2357,6 +2357,10 @@ export class WooWorld {
     verb: VerbDef,
     dependencies: RecordedProofDependency[] = []
   ): void {
+    // Dispatch proofs do not participate in terminal-transfer's negative
+    // effect classifier. Without a recorder there is therefore no consumer
+    // for either the event wrapper or its semantic dependency path.
+    if (!this.activeTurnRecorder) return;
     this.recordTurnEvent({
       kind: "dispatch",
       target,
@@ -2377,6 +2381,7 @@ export class WooWorld {
     cell: RecordedCell,
     dependencies: RecordedProofDependency[] = []
   ): void {
+    if (!this.activeTurnRecorder) return;
     this.recordTurnEvent({
       kind: "state_probe",
       cell,
@@ -3417,15 +3422,20 @@ export class WooWorld {
       lookupParent: (parent, start) => this.parentWalkLookup(start, parent),
       propertyNotFound: (missing) => wooError("E_PROPNF", `property not found: ${missing}`, missing)
     });
-    const dependencies = this.propertyResolutionDependenciesForRecording(objRef, name);
-    this.recordTurnEvent({
-      kind: "prop_read",
-      object: objRef,
-      name,
-      value,
-      version: this.propertyVersionForRecording(objRef, name),
-      ...(dependencies.length > 0 ? { dependencies } : {})
-    });
+    // The property resolver already walked inheritance to produce `value`.
+    // Reconstructing that path below is proof-only work, so ordinary local
+    // reads must not pay a second lineage walk when no recorder can retain it.
+    if (this.activeTurnRecorder) {
+      const dependencies = this.propertyResolutionDependenciesForRecording(objRef, name);
+      this.recordTurnEvent({
+        kind: "prop_read",
+        object: objRef,
+        name,
+        value,
+        version: this.propertyVersionForRecording(objRef, name),
+        ...(dependencies.length > 0 ? { dependencies } : {})
+      });
+    }
     return value;
   }
 
@@ -3930,7 +3940,12 @@ export class WooWorld {
     return {
       definer: resolved.definer,
       verb: this.cloneVerbSharingBytecode(resolved.verb),
-      dependencies: structuredClone(resolved.dependencies)
+      // A no-recorder resolution deliberately returns the same empty proof
+      // path used by authoring helpers. Cloning an empty path on every local
+      // dispatch is pure overhead; active recorder paths remain detached.
+      dependencies: resolved.dependencies.length > 0
+        ? structuredClone(resolved.dependencies)
+        : []
     };
   }
 
@@ -3952,7 +3967,9 @@ export class WooWorld {
     if (this.canCarryFeatures(objRef)) {
       // The feature vector itself is inherited property data. Its lookup
       // closure is part of dispatch resolution just as the feature chains are.
-      dependencies.push(...this.propertyResolutionDependenciesForRecording(objRef, "features"));
+      if (this.activeTurnRecorder) {
+        dependencies.push(...this.propertyResolutionDependenciesForRecording(objRef, "features"));
+      }
       const features = this.featureList(objRef);
       for (const feature of features) {
         const featureSearch = this.resolveVerbChainLive(feature, name, dependencies);
@@ -3976,7 +3993,9 @@ export class WooWorld {
       ? {
           definer: resolved.definer,
           verb: this.cloneVerbSharingBytecode(resolved.verb),
-          dependencies: structuredClone(resolved.dependencies)
+          dependencies: resolved.dependencies.length > 0
+            ? structuredClone(resolved.dependencies)
+            : []
         }
       : null;
   }
@@ -4009,13 +4028,16 @@ export class WooWorld {
     resolved: Omit<ResolvedVerb, "dependencies"> | null;
     dependencies: RecordedProofDependency[];
   } {
+    const captureDependencies = this.activeTurnRecorder !== null;
     const dependencies: RecordedProofDependency[] = [];
     let current: ObjRef | null = startRef;
     while (current) {
       const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
       if (!obj) break;
-      dependencies.push({ kind: "verb_resolution", object: current });
-      if (current !== startRef) {
+      if (captureDependencies) {
+        dependencies.push({ kind: "verb_resolution", object: current });
+      }
+      if (captureDependencies && current !== startRef) {
         this.recordTurnStateProbe(
           { kind: "verb", object: current, name },
           [...proofPrefix, ...dependencies]
@@ -4026,7 +4048,9 @@ export class WooWorld {
         resolved: { definer: current, verb },
         dependencies
       };
-      dependencies.push({ kind: "lineage", object: current });
+      if (captureDependencies) {
+        dependencies.push({ kind: "lineage", object: current });
+      }
       current = obj.parent;
     }
     return { resolved: null, dependencies };
@@ -11919,6 +11943,10 @@ export class WooWorld {
   }
 
   persist(force = false): void {
+    // A failed inverse means the in-memory graph may no longer describe any
+    // durable generation. Persistence is a write capability, not a recovery
+    // operation: only the host may discard this instance and reload it.
+    this.assertBehaviorJournalHealthy();
     if (!this.repository) return;
     // Public persistence is never an escape hatch from a live behavior
     // transaction, even with force=true. The outermost behavior acceptance
@@ -12232,6 +12260,9 @@ export class WooWorld {
   }
 
   private flushIncrementalState(): void {
+    // Keep this refusal independent of persist(): behavior acceptance invokes
+    // the incremental flush directly inside its repository transaction.
+    this.assertBehaviorJournalHealthy();
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (!this.persistenceDirty) return;

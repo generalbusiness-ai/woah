@@ -1439,6 +1439,14 @@ describe("native exception rollback", () => {
     expect(() => world.setProp("poison_subject", "first", 3)).toThrow(
       expect.objectContaining({ code: "E_WORLD_POISONED" })
     );
+    expect(() => world.persist(true)).toThrow(
+      expect.objectContaining({ code: "E_WORLD_POISONED" })
+    );
+    expect(() => (
+      world as unknown as { flushIncrementalState(): void }
+    ).flushIncrementalState()).toThrow(
+      expect.objectContaining({ code: "E_WORLD_POISONED" })
+    );
   });
 
   it("makes a shadow host discard a poisoned cached world after the original error frame", async () => {

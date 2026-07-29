@@ -116,6 +116,12 @@ invalidates later inherited/aliased resolution even when the transcript proof
 is stored under a different receiver or invocation name. This is bounded by the
 already-materialized resolution path; it never enumerates all descendants.
 
+Semantic dependency derivation is recorder-only work. Outside an active turn
+recorder, ordinary property and verb resolution MUST return the same value,
+definer, and verb without a second proof-only lineage walk or a clone of an
+unused dependency path. With a recorder active, the complete path above remains
+mandatory; this optimization cannot weaken or approximate recorded proofs.
+
 Deterministic logical inputs and incompleteness/untracked-effect evidence may
 remain independently because they are not claims about restored cell values.
 In particular, pruning a transient untracked-native dispatch proof MUST retain
