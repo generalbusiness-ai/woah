@@ -9,8 +9,8 @@ Audited base: main `fb8bfe85`
 
 Implementation base: main `6cbeb490`
 
-Current merge target included: main `5521cb90` (shared quiescent fake-DO
-fixture and guard)
+Current merge target included: main `a9f829ca` (expanded shared quiescent
+fake-DO fixture/guard and corrected NetAudit Analytics Engine index)
 
 Deployed worker reported during the audit: `02bbc479`
 
@@ -82,13 +82,25 @@ defective producers must not be trusted merely because they claim generation
 
 ### Current-main integration
 
-Main `5521cb90` was merged into the isolated branch. The four textual
+Main `5521cb90` was first merged into the isolated branch. Its four textual
 conflicts were mechanical: the note retained this branch's remediation
 disposition, `package.json` retained both
 `guard:native-failure-contracts` and `guard:quiescent-fixtures`, and the two MCP
 worker suites plus `net-outliner-converge` adopted main's shared quiescent-DO
-fixture. The resulting guard reports the existing 30 hand-rolled suites and
-confirms this branch added none.
+fixture.
+
+Before handoff, the live `origin/main` was checked again and had advanced to
+`a9f829ca`. That merge retained main's corrected NetAudit Analytics Engine
+index and broader fixture conversion. Five worker-test conflicts were the same
+old inline teardown versus shared-quiescence choice; the resolutions preserved
+this branch's semantic setup and used the shared fixture. The widened guard
+then found this branch's `net-account-state-repair` fixture and a stale
+`net-outliner-converge` exception. Converting account repair exposed a
+synthetic rollback subscriber with no destination: a later successful repair
+retried that outbox row and printed a delivery failure after an otherwise green
+test. The fixture now supplies a successful sink, drains it to quiescence, and
+asserts that delivery occurred. The resulting guard reports 29 remaining
+hand-rolled suites and confirms this branch added none.
 
 The round-three authority changes alter transcript construction and validation,
 not persisted world shape. They add no Durable Object binding, catalog major
@@ -197,6 +209,8 @@ ladder:
 |---|---|
 | Round-two adversarial remediation focus (11 files) | 248/248 |
 | Round-three create/lineage authority focus (4 files) | 115/115 |
+| Current-main affected Worker focus (11 files) | 109/109 |
+| Quiescent account-repair fixture focus | 4/4 |
 | `npm run typecheck` | passed |
 | `npm test` | 88 files, 1,071/1,071 |
 | `npm run test:worker` | 49 files, 394/394 |
@@ -272,7 +286,11 @@ Adversarial reversion proved the late integration tests are causal:
   and detached dependency cloning on ordinary no-recorder property/dispatch
   calls; the no-recorder causal probes observe those calls and fail;
 - reinstating the detached public-view metadata write makes the serialized
-  workerd-fixture test fail; and
+  workerd-fixture test fail;
+- reverting the account-repair quiescent sink leaves the synthetic rollback
+  subscriber undeliverable: the successful repair produces
+  `net_scope_outbox_delivery_failed`, and the positive delivery-count
+  assertion fails; and
 - reverting created-object proof pruning exposes reads and dispatch proof for
   an identity erased by rollback and fails the native rollback suite.
 
