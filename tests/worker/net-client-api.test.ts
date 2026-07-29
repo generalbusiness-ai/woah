@@ -463,13 +463,25 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
           "mcp-session-id": String(first.body.session)
         }
       }));
+      // The MCP endpoint names the same outage, but in its own envelope
+      // (mcp.md §M1.2): a JSON-RPC error carrying the woo code in `data`,
+      // with the 503 preserved. A GET carries no JSON-RPC request, so there
+      // is no id to correlate against and the member is absent.
       expect(mcp.status).toBe(503);
-      expect(await mcp.json()).toMatchObject({
+      const mcpBody = await mcp.json() as Record<string, any>;
+      expect(mcpBody).toMatchObject({
+        jsonrpc: "2.0",
         error: {
-          code: "E_RPC_TIMEOUT",
-          detail: { reason: "credential_authority_unavailable", retryable: true }
+          code: -32000,
+          message: "apikey authority is temporarily unavailable",
+          data: {
+            code: "E_RPC_TIMEOUT",
+            detail: { reason: "credential_authority_unavailable", retryable: true },
+            http_status: 503
+          }
         }
       });
+      expect(mcpBody).not.toHaveProperty("id");
     } finally {
       await h.close();
     }

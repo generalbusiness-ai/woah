@@ -253,4 +253,151 @@ describe("Net MCP stdio transport bridge", () => {
       error: { code: -32001, message: "session expired" }
     });
   });
+
+  // ---- defence in depth: bodies the bridge cannot parse as JSON-RPC --------
+  //
+  // The gateway now answers every /net-api/mcp request with a JSON-RPC message
+  // (mcp.md §M1.2), but the bridge and the worker version INDEPENDENTLY: a
+  // current bridge routinely talks to a worker that has not been redeployed.
+  // Whatever the body turns out to be, the server's own diagnosis must reach
+  // the client — the failure this replaced pasted a ~3.9 kB Zod union report
+  // into the user-facing message and dropped "apikey not found or revoked"
+  // entirely.
+
+  it("wraps an older gateway's bare woo refusal, preserving its code and message", async () => {
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      // Exactly what every pre-§M1.2 gateway answers with on this route.
+      fetchImpl: async () => Response.json(
+        {
+          error: {
+            code: "E_NOSESSION",
+            message: "apikey not found or revoked",
+            detail: { reason: "unknown_or_revoked" }
+          }
+        },
+        { status: 401 }
+      )
+    });
+
+    const reply = await proxy.forward({ jsonrpc: "2.0", id: 4, method: "initialize", params: {} });
+    expect(reply).toEqual({
+      jsonrpc: "2.0",
+      id: 4,
+      error: {
+        code: -32000,
+        message: "apikey not found or revoked",
+        data: { code: "E_NOSESSION", detail: { reason: "unknown_or_revoked" }, http_status: 401 }
+      }
+    });
+  });
+
+  it("re-correlates an id-less JSON-RPC error to the request that provoked it", async () => {
+    // A pre-parse refusal (foreign Origin, unparseable body) cannot know the
+    // id, so the gateway omits it. Only this side still knows which request it
+    // answered, and a reply the client cannot correlate is a hang.
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl: async () => Response.json(
+        { jsonrpc: "2.0", error: { code: -32000, message: "foreign MCP Origin is not allowed", data: { code: "E_PERM" } } },
+        { status: 403 }
+      )
+    });
+
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 12, method: "tools/list", params: {} })).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 12,
+      error: { code: -32000, message: "foreign MCP Origin is not allowed", data: { code: "E_PERM" } }
+    });
+  });
+
+  it("summarizes an unintelligible body instead of pasting the parser's report into the message", async () => {
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      // An intermediary's HTML error page: neither JSON-RPC nor a woo refusal.
+      fetchImpl: async () => new Response("<html><body>502 Bad Gateway</body></html>", {
+        status: 502,
+        headers: { "content-type": "text/html" }
+      })
+    });
+
+    const reply = await proxy.forward({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} }) as {
+      id: number;
+      error: { code: number; message: string; data: Record<string, unknown> };
+    };
+    expect(reply.id).toBe(5);
+    expect(reply.error.code).toBe(-32000);
+    expect(reply.error.message).toBe("Net MCP returned an unrecognized 502 response");
+    expect(reply.error.message.length).toBeLessThan(120);
+    // The unparseable material is kept — just not where a human reads it.
+    expect(reply.error.data.http_status).toBe(502);
+    expect(String(reply.error.data.body)).toContain("502 Bad Gateway");
+    expect(String(reply.error.data.parse_error).length).toBeGreaterThan(0);
+  });
+
+  it("reports an empty refusal body as a correlated error rather than a thrown transport failure", async () => {
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl: async () => new Response(null, { status: 401 })
+    });
+
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 6, method: "tools/list", params: {} })).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 6,
+      error: {
+        code: -32000,
+        message: "Net MCP returned 401 with an empty body",
+        data: { http_status: 401 }
+      }
+    });
+  });
+
+  it("reports a refused notification on stderr and does not throw", async () => {
+    // A notification has no reply slot, so the refusal cannot become a stdio
+    // message — but it must not become a bridge stack trace either. Both the
+    // current id-less JSON-RPC shape and an older gateway's bare body have to
+    // land as one legible line.
+    for (const body of [
+      { jsonrpc: "2.0", error: { code: -32000, message: "session expired", data: { code: "E_NOSESSION" } } },
+      { error: { code: "E_NOSESSION", message: "session expired" } }
+    ]) {
+      const errors: unknown[] = [];
+      const proxy = new NetMcpStdioProxy({
+        endpoint: "http://127.0.0.1:5173/net-api/mcp",
+        token: "apikey:local-dev:secret",
+        fetchImpl: async () => Response.json(body, { status: 401 }),
+        onError: (error) => { errors.push(error); }
+      });
+
+      await expect(proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" })).resolves.toBeNull();
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).toContain("notifications/initialized");
+      expect(String(errors[0])).toContain("session expired");
+    }
+  });
+
+  it("surfaces an initialize the gateway refused instead of complaining about a missing session header", async () => {
+    // A 200 initialize carrying a JSON-RPC error has no mcp-session-id, and the
+    // bridge used to throw on that absence — replacing the gateway's actual
+    // reason with "initialize response omitted mcp-session-id".
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl: async () => Response.json(
+        { jsonrpc: "2.0", id: 3, error: { code: -32000, message: "session mint failed: E_RETRY", data: { code: "E_RETRY" } } },
+        { status: 200 }
+      )
+    });
+
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 3, method: "initialize", params: {} })).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 3,
+      error: { code: -32000, message: "session mint failed: E_RETRY", data: { code: "E_RETRY" } }
+    });
+    expect(proxy.sessionReady).toBe(false);
+  });
 });

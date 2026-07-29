@@ -126,10 +126,18 @@ function expectInitialized(result: { status: number; session: string | null; bod
   expect(result.body?.result?.capabilities?.tools?.listChanged).toBe(true);
 }
 
+/** The refusal is a JSON-RPC message (mcp.md §M1.2) carrying the woo code in
+ * `error.data`, and the 403 the Origin contract is written in terms of is
+ * preserved on the response. It carries no `id`: the check runs before the
+ * body is read, so there is no id to correlate against. */
 function expectForeignOriginRefusal(result: { status: number; body: Record<string, any> | null }) {
   expect(result.status).toBe(403);
-  expect(result.body?.error?.code).toBe("E_PERM");
+  expect(result.body?.jsonrpc).toBe("2.0");
+  expect(result.body).not.toHaveProperty("id");
+  expect(result.body?.error?.code).toBe(-32000);
   expect(result.body?.error?.message).toBe("foreign MCP Origin is not allowed");
+  expect(result.body?.error?.data?.code).toBe("E_PERM");
+  expect(result.body?.error?.data?.http_status).toBe(403);
 }
 
 describe("MCP Origin admission through the Worker edge", () => {

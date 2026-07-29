@@ -1,6 +1,6 @@
 ---
 date: 2026-05-02
-updated: 2026-07-28
+updated: 2026-07-29
 status: implemented
 ---
 
@@ -48,12 +48,11 @@ trust a raw `Mcp-Session-Id` header whose expiry was never consulted), and
 includes methods this version does not know: an evolving protocol's
 notifications must not be an unauthenticated door into the gateway.
 
-A notification carries no `id` to correlate a JSON-RPC error against, so the
-HTTP status is the whole answer. An accepted notification is `202` with an
-empty body — including for an unrecognized method, which is then ignored. A
-rejected session is the standard client refusal envelope (`401`,
-`E_NOSESSION`); an exhausted rate bucket is `429`, `E_RATE`. `202` means
-*authenticated and accepted*, never merely *received*.
+An accepted notification is `202` with an empty body — including for an
+unrecognized method, which is then ignored. `202` means *authenticated and
+accepted*, never merely *received*. A rejected session is `401`/`E_NOSESSION`;
+an exhausted rate bucket is `429`/`E_RATE`, both in the §M1.2 envelope with no
+`id`.
 
 `initialize` keeps its own path: it is a request, it carries the `Mcp-Token`
 credential rather than a session id, and it mints the session this rule reads.
@@ -76,6 +75,79 @@ in-process world or dispatch verbs through a second host. After forwarding
 channel and forwards each server notification as one newline-delimited stdio
 message. Either successful empty acknowledgement (`202` or `204`) starts the
 channel. Closing stdio aborts that channel before deleting the Net session.
+
+### M1.2 The response envelope
+
+**Every response on `/net-api/mcp` — `POST`, `GET` and `DELETE`, success and
+refusal alike — is a well-formed JSON-RPC message.** MCP is JSON-RPC; a
+JSON-RPC request answered with anything else cannot be read by a JSON-RPC
+client. This applies to *transport- and auth-level* refusals, not only to tool
+results: a rejected API key, a missing/expired/forged session, an exhausted
+rate bucket, a foreign `Origin` (§M7.1), an unparseable body, and a refused
+notification are all in scope. The generic woo client body
+`{error:{code,message,detail}}` used elsewhere on `/net-api` MUST NOT appear on
+this route.
+
+This is not a cosmetic uniformity rule. A bridge or client that validates the
+body against the MCP message schema turns a non-conforming refusal into a
+schema-validation failure, and the server's diagnosis is replaced by the
+parser's — the observed case substituted ~3.9 kB of validator output for
+"apikey not found or revoked".
+
+**The HTTP status is preserved.** A refusal keeps the status it would otherwise
+have carried: `401` for a rejected credential or session bearer, `403` for a
+foreign `Origin`, `404` for an unusable session on the `GET` carrier (which is
+what tells a client to establish a NEW session), `406` for a `GET` without
+`Accept: text/event-stream`, `429` for rate. Streamable HTTP permits a JSON-RPC
+error body on a non-2xx response, and the status is what intermediaries and the
+`Origin`/rate defences act on. Answering `200` is a protocol regression.
+
+**The error object.**
+
+```json
+{"jsonrpc": "2.0", "id": 42,
+ "error": {"code": -32000,
+           "message": "apikey not found or revoked",
+           "data": {"code": "E_NOSESSION",
+                    "detail": {"reason": "unknown_or_revoked"},
+                    "http_status": 401}}}
+```
+
+- `error.code` is `-32000` for every woo refusal. It is JSON-RPC's
+  implementation-defined server-error slot, this endpoint has emitted it for
+  session refusals since the adapter landed, and it is the only number
+  available: the 2026-07-28 MCP revision reserves `-32020…-32099`, and
+  `-32001…-32019` are unallocated. woo's own distinctions are carried by the
+  STRING code in `error.data.code`; a parallel numeric taxonomy would be a
+  second source of truth for the same fact. Genuine JSON-RPC protocol errors
+  keep their own codes (`-32700` parse error, `-32601` unknown method,
+  `-32602` unknown tool).
+- `error.message` is the woo message, unmodified — one concise sentence.
+- `error.data` carries the woo `code`, its `detail` when it has one, the
+  `attempts` trace for `E_BUDGET`, and `http_status`. Nothing is flattened
+  into prose.
+
+**The `id`.** The originating request's `id` is echoed whenever one is known,
+which is every refusal raised after the body is parsed. When it is genuinely
+unknown the member is **omitted**: a foreign `Origin` is rejected before the
+body is read, a `GET`/`DELETE` carries no JSON-RPC request, an unparseable body
+has no id to recover, and a notification has none by construction. Omission is
+required rather than stylistic — Streamable HTTP sanctions "a JSON-RPC error
+response that has no id", and the official MCP SDK's error-response schema
+declares `id` optional over `string | number`, so `id: null` fails it and
+reintroduces exactly the parser-noise failure this section exists to prevent.
+
+**Refused notifications.** A notification has no reply slot, so a refusal is
+the id-less form above with its HTTP status. A client MUST NOT emit it as a
+correlated reply; the stdio bridge reports it as one diagnostic line on stderr
+and continues.
+
+**Bridge tolerance.** Because the bridge and the worker version independently,
+a current bridge must expect an older gateway's bare `{error:{code,message}}`
+body on this route and wrap it into a JSON-RPC error preserving that code and
+message. Only a body that is intelligible as neither may be summarized, and
+then the summary is short and the unparseable material goes in `error.data` —
+never into `error.message`.
 
 ## M2. Tool surface
 
@@ -426,7 +498,8 @@ THREW on an accepted commit, the envelope also carries that turn's
 an error the client cannot distinguish from a fresh one is a retry hazard.
 JSON-RPC protocol errors such as an unknown tool name use a JSON-RPC error
 object. A missing, expired, or malformed MCP session is rejected before
-discovery or invocation.
+discovery or invocation, in the §M1.2 envelope with its `401` intact — a
+session refusal is not a tool result and must not be dressed as one.
 
 ### M4.1 The submitter's own observations
 
@@ -1030,6 +1103,9 @@ re-list at any time even if it missed a live hint.
 ## M7. Security and scaling invariants
 
 - API-key authentication happens before session creation.
+- Every response on this endpoint is a JSON-RPC message and keeps its HTTP
+  status (§M1.2). A refusal never becomes a `200`, and never becomes a body
+  shape a JSON-RPC client cannot parse.
 - A present Streamable HTTP `Origin` must be admitted by §M7.1; headless
   clients may omit the header.
 - Every non-initialize method validates `Mcp-Session-Id` and its expiry, and
@@ -1080,7 +1156,10 @@ is compiled into the runtime; or the endpoint is loopback and the origin is
 loopback, which covers a development proxy serving the page and the endpoint on
 different loopback ports. Anything else — including an unparseable value and
 the opaque `null` origin — is refused with `E_PERM` and HTTP 403. A refusal
-carries no CORS headers; this endpoint is not a cross-origin API.
+carries no CORS headers; this endpoint is not a cross-origin API. The check
+runs before the request body is read, so the refusal is the id-less §M1.2
+envelope; the 403 is preserved, because this contract is written in terms of
+the status.
 
 **Absent `Origin`.** An absent `Origin` is admitted. Streamable HTTP's normal
 clients — stdio bridges, CLI agents, server runtimes — send none, and refusing

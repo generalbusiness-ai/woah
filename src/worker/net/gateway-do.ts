@@ -132,6 +132,14 @@ import {
   verifyApiKeyRecord,
   verifyPasswordCredential
 } from "./client-auth";
+import {
+  MCP_JSONRPC_METHOD_NOT_FOUND,
+  MCP_JSONRPC_PARSE_ERROR,
+  mcpJsonRpcError,
+  mcpWooErrorBody,
+  type McpRequestId,
+  type McpWooRefusal
+} from "./mcp-envelope";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -3396,19 +3404,15 @@ export class NetGatewayDO {
       // as the MCP bearer (mcp-session-id = the net session id, the same
       // trust shape v2's MCP surface uses; sessions expire) — so it
       // branches before the header-credential path below.
+      //
+      // The whole route family leaves through clientMcpRoute so that EVERY
+      // response on it — success and refusal alike — is a JSON-RPC message
+      // (§M1.2). Refusals must not reach the generic catch at the bottom of
+      // this method: its `{error:{code,message,detail}}` body is not JSON-RPC
+      // and a JSON-RPC client cannot read it.
       if (url.pathname === "/net-api/mcp"
         && (request.method === "POST" || request.method === "GET" || request.method === "DELETE")) {
-        const rejectedOrigin = rejectForeignMcpOrigin(request, this.env);
-        if (rejectedOrigin) return rejectedOrigin;
-      }
-      if (request.method === "POST" && url.pathname === "/net-api/mcp") {
-        return await this.clientMcp(request);
-      }
-      if (request.method === "GET" && url.pathname === "/net-api/mcp") {
-        return await this.clientMcpEvents(request);
-      }
-      if (request.method === "DELETE" && url.pathname === "/net-api/mcp") {
-        return await this.clientMcpClose(request);
+        return await this.clientMcpRoute(request, url);
       }
 
       // The identity door: these two routes authenticate by their OWN
@@ -3625,11 +3629,13 @@ export class NetGatewayDO {
         // The specific verdict (unknown_or_revoked, missing_credential,
         // expired…) is the audit-valuable outcome; the coarse code is
         // recoverable from it.
-        const reason =
-          err.detail && typeof err.detail === "object" && typeof (err.detail as { reason?: unknown }).reason === "string"
-            ? ((err.detail as { reason: string }).reason)
-            : err.code;
-        this.recordEdgeAudit(err.code === "E_RATE" ? "refusal" : "auth", reason, url.pathname, auditCredential, auditActor);
+        this.recordEdgeAudit(
+          err.code === "E_RATE" ? "refusal" : "auth",
+          clientAuthAuditReason(err),
+          url.pathname,
+          auditCredential,
+          auditActor
+        );
         return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
       }
       if (isNetError(err)) {
@@ -5231,25 +5237,109 @@ export class NetGatewayDO {
    * tools are neither missed nor re-pulled on every tools/list. */
   private readonly mcpContextWarmSuccesses = new Set<string>();
 
-  private async clientMcp(request: Request): Promise<Response> {
-    const rpc = (await request.json().catch(() => null)) as {
-      jsonrpc?: string;
-      id?: number | string | null;
-      method?: string;
-      params?: Record<string, unknown>;
-    } | null;
-    if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
-      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
+  /**
+   * The `/net-api/mcp` envelope boundary (mcp.md §M1.2).
+   *
+   * EVERY response leaving this route family is a well-formed JSON-RPC
+   * message. Refusals used to escape through `clientApi`'s generic catch,
+   * which renders `{error:{code,message,detail}}` — a body no JSON-RPC client
+   * can parse. The observed cost was not cosmetic: the stdio bridge validated
+   * that body against the MCP message schema, the validation failed, and the
+   * agent received kilobytes of parser noise where "apikey not found or
+   * revoked" should have been.
+   *
+   * **The HTTP status is preserved exactly.** A 401 stays 401, a 429 stays
+   * 429, a foreign `Origin` stays 403. Streamable HTTP explicitly permits a
+   * JSON-RPC error body on a non-2xx response, and both the status-driven
+   * defences (§M7.1, H4) and any intermediary read the status, not the body.
+   * Answering 200 with the error in the body would be a protocol regression
+   * dressed up as a fix.
+   *
+   * **The id.** `id` is filled in the moment the body is parsed, so a refusal
+   * raised after that point — every auth, rate, and world refusal on a POST —
+   * correlates. A refusal raised BEFORE it genuinely has no id: a foreign
+   * `Origin` is rejected without reading the body (deliberately: the check is
+   * a pre-parse defence), a `GET`/`DELETE` carries no JSON-RPC request at all,
+   * an unparseable body has no id to recover, and a notification has none by
+   * construction. Those omit the member — see `mcpJsonRpcError` for why
+   * omission rather than `null`.
+   */
+  private async clientMcpRoute(request: Request, url: URL): Promise<Response> {
+    let id: McpRequestId = null;
+    try {
+      const rejectedOrigin = rejectForeignMcpOrigin(request, this.env);
+      if (rejectedOrigin) return rejectedOrigin;
+      if (request.method === "GET") return await this.clientMcpEvents(request);
+      if (request.method === "DELETE") return await this.clientMcpClose(request);
+      const rpc = (await request.json().catch(() => null)) as {
+        jsonrpc?: string;
+        id?: number | string | null;
+        method?: string;
+        params?: Record<string, unknown>;
+      } | null;
+      if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
+        return json(
+          mcpJsonRpcError(null, MCP_JSONRPC_PARSE_ERROR, "parse error: expected a JSON-RPC 2.0 request"),
+          400
+        );
+      }
+      if (typeof rpc.id === "number" || typeof rpc.id === "string") id = rpc.id;
+      return await this.clientMcp(request, rpc.method, rpc.params ?? {}, id);
+    } catch (err) {
+      return this.mcpRefusal(err, id, url.pathname);
     }
-    if (rpc.id === undefined || rpc.id === null) {
-      return await this.mcpNotification(request, rpc.method, mcpRecord(rpc.params));
+  }
+
+  /**
+   * Render a refusal thrown anywhere inside the MCP route family.
+   *
+   * This is the MCP-shaped twin of `clientApi`'s catch, including its AU1.2
+   * edge-record capture: an attempt that never committed still audits. MCP
+   * requests reach that catch with no credential or actor learned (the route
+   * branches before the header-credential gate), so the principal is the same
+   * anonymous one it recorded before.
+   */
+  private mcpRefusal(err: unknown, id: McpRequestId, pathname: string): Response {
+    if (err instanceof ClientAuthError) {
+      this.recordEdgeAudit(
+        err.code === "E_RATE" ? "refusal" : "auth",
+        clientAuthAuditReason(err),
+        pathname,
+        null,
+        null
+      );
+      return mcpWooRefusal(id, { code: err.code, message: err.message, detail: err.detail }, err.status);
     }
-    if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
-    if (rpc.method === "tools/list") return await this.mcpToolsList(request, rpc.id, rpc.params ?? {});
-    if (rpc.method === "tools/call") {
-      return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
+    if (isNetError(err)) {
+      // Same taxonomy the client HTTP surface uses; E_BUDGET keeps its
+      // attempt trace (CO6) so the failure still explains itself.
+      return mcpWooRefusal(
+        id,
+        {
+          code: err.code,
+          message: err.message,
+          detail: err.detail,
+          ...(err.attempts ? { attempts: err.attempts } : {})
+        },
+        netErrorHttpStatus(err)
+      );
     }
-    return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
+    return mcpWooRefusal(id, { code: "E_INTERNAL", message: String(err) }, 500);
+  }
+
+  /** Dispatch one validated JSON-RPC message. `id === null` means the message
+   * carried no id and is therefore a notification (§M1.1). */
+  private async clientMcp(
+    request: Request,
+    method: string,
+    params: Record<string, unknown>,
+    id: McpRequestId
+  ): Promise<Response> {
+    if (id === null) return await this.mcpNotification(request, method, mcpRecord(params));
+    if (method === "initialize") return await this.mcpInitialize(request, id, params);
+    if (method === "tools/list") return await this.mcpToolsList(request, id, params);
+    if (method === "tools/call") return await this.mcpToolsCall(request, id, params);
+    return json(mcpJsonRpcError(id, MCP_JSONRPC_METHOD_NOT_FOUND, `method not found: ${method}`), 200);
   }
 
   /**
@@ -5274,11 +5364,13 @@ export class NetGatewayDO {
     params: Record<string, unknown>
   ): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    // Both throws are ClientAuthError, which clientApi's catch renders as the
-    // standard client refusal envelope (401 for a rejected session bearer,
-    // 429 for E_RATE) and records as an AU1.2 edge audit. A notification has
-    // no id to correlate a JSON-RPC error against, so the HTTP status is the
-    // whole answer — and it must not be 202.
+    // Both throws are ClientAuthError. `clientMcpRoute`'s catch renders them
+    // as a JSON-RPC error with the HTTP status preserved (401 for a rejected
+    // session bearer, 429 for E_RATE) and records the AU1.2 edge audit. A
+    // notification has no id, so the error carries none either — Streamable
+    // HTTP's stated shape for input the server cannot accept. What matters is
+    // that the status is not 202 and that the body still names the reason: a
+    // bare status left a bridge with nothing to put on stderr but a number.
     const actor = await this.mcpSessionActor(session);
     this.enforceClientRate(actor, "/net-api/mcp");
     if (method === "notifications/cancelled") {
@@ -5325,23 +5417,34 @@ export class NetGatewayDO {
   private async clientMcpEvents(request: Request): Promise<Response> {
     const accept = request.headers.get("accept") ?? "";
     if (!accept.toLowerCase().includes("text/event-stream")) {
-      return json({ error: { code: "E_INVARG", message: "MCP GET requires Accept: text/event-stream" } }, 406);
+      return json(
+        mcpWooErrorBody(null, { code: "E_INVARG", message: "MCP GET requires Accept: text/event-stream" }, 406),
+        406
+      );
     }
     const session = request.headers.get("mcp-session-id") ?? "";
     let actor: string;
     try {
       actor = await this.mcpSessionActor(session);
     } catch (error) {
+      // Handled here rather than by clientMcpRoute's catch to keep the
+      // Streamable HTTP status mapping this path owns: an unusable session id
+      // on the notification carrier is 404, which is what tells a client to
+      // establish a NEW session rather than retry the same one. A GET carries
+      // no JSON-RPC request, so the error carries no id.
       const auth = error instanceof ClientAuthError ? error : null;
+      const status = auth?.code === "E_NOSESSION" ? 404 : (auth?.status ?? 404);
       return json(
-        {
-          error: {
+        mcpWooErrorBody(
+          null,
+          {
             code: auth?.code ?? "E_NOSESSION",
             message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
             ...(auth ? { detail: auth.detail } : {})
-          }
-        },
-        auth?.code === "E_NOSESSION" ? 404 : (auth?.status ?? 404)
+          },
+          status
+        ),
+        status
       );
     }
     this.enforceClientRate(actor, "/net-api/mcp");
@@ -5419,16 +5522,23 @@ export class NetGatewayDO {
       this.mcpDisposeSessionState(session);
       return new Response(null, { status: 204 });
     }
+    // A DELETE carries no JSON-RPC request, so these refusals carry no id.
+    // They are still JSON-RPC messages: a client that reads one body shape on
+    // this endpoint must not have to read a second one (§M1.2).
     if (verdict !== "ok") {
-      return json({ error: { code: "E_PERM", message: `session ${verdict}` } }, 403);
+      return json(mcpWooErrorBody(null, { code: "E_PERM", message: `session ${verdict}` }, 403), 403);
     }
     const actor = (cell?.value as { actor?: string }).actor;
     if (typeof actor !== "string" || !actor) {
-      return json({ error: { code: "E_NOSESSION", message: "session actor is missing" } }, 401);
+      return json(mcpWooErrorBody(null, { code: "E_NOSESSION", message: "session actor is missing" }, 401), 401);
     }
     const identity = await this.catalogIdentity();
     const closed = await this.clientSessionClose(actor, session, identity.epoch);
-    if (!closed.ok) return closed;
+    // clientSessionClose is shared with `DELETE /net-api/session`, whose
+    // clients read the bare woo body, so it keeps that shape and this route
+    // re-envelopes it. Without this an E_RETRY on a non-committing close was
+    // the one remaining non-JSON-RPC body on the MCP endpoint.
+    if (!closed.ok) return await mcpRewrapWooRefusal(closed);
     this.mcpDisposeSessionState(session);
     return new Response(null, { status: 204 });
   }
@@ -5448,9 +5558,27 @@ export class NetGatewayDO {
     const { actor } = await this.verifyClientApiKey(identity.map, credential);
     this.enforceClientRate(actor, "/net-api/session"); // the mint bucket (H4 amplifier rule)
     const opened = await this.clientSession(actor, {}, identity.epoch, { apiKeyId: credential.id });
-    const body = (await opened.json()) as { session?: string };
+    const body = (await opened.json()) as { session?: string; error?: { code?: string; detail?: unknown } };
     if (!opened.ok || typeof body.session !== "string") {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
+      // Keep the mint's own woo code where a client can read it rather than
+      // stringifying the whole body into prose. The status follows the mint's:
+      // an initialize that failed because the world would not commit is not a
+      // success, and answering 200 made it indistinguishable from one. An
+      // accepted mint that yielded no session id is this gateway's own bug,
+      // hence 500 rather than the mint's 200.
+      const status = opened.ok ? 500 : opened.status;
+      return json(
+        mcpWooErrorBody(
+          id,
+          {
+            code: typeof body.error?.code === "string" ? body.error.code : "E_RETRY",
+            message: `session mint failed: ${JSON.stringify(body)}`,
+            detail: body.error?.detail
+          },
+          status
+        ),
+        status
+      );
     }
     this.mcpSessionState(body.session, actor);
     return json(
@@ -5504,21 +5632,11 @@ export class NetGatewayDO {
 
   private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    let actor: string;
-    try {
-      actor = await this.mcpSessionActor(session);
-    } catch (error) {
-      const auth = error instanceof ClientAuthError ? error : null;
-      return json({
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: -32000,
-          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
-          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
-        }
-      }, 200);
-    }
+    // No local catch: clientMcpRoute renders every refusal on this route
+    // family, with this request's id and the refusal's own HTTP status. The
+    // catch that used to sit here answered 200 for a rejected session bearer,
+    // which contradicted the status every other MCP refusal carried.
+    const actor = await this.mcpSessionActor(session);
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     const name = typeof params.name === "string" ? params.name : "";
@@ -5706,21 +5824,8 @@ export class NetGatewayDO {
    * invocation cannot disagree about reachability. */
   private async mcpToolsList(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    let actor: string;
-    try {
-      actor = await this.mcpSessionActor(session);
-    } catch (error) {
-      const auth = error instanceof ClientAuthError ? error : null;
-      return json({
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: -32000,
-          message: auth?.message ?? (error instanceof Error ? error.message : String(error)),
-          ...(auth ? { data: { code: auth.code, detail: auth.detail, http_status: auth.status } } : {})
-        }
-      }, 200);
-    }
+    // See mcpToolsCall: refusals are rendered once, by clientMcpRoute.
+    const actor = await this.mcpSessionActor(session);
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     await this.warmMcpContext(actor, session);
@@ -10351,7 +10456,54 @@ function rejectForeignMcpOrigin(request: Request, env: NetGatewayEnv): Response 
     configured: env.WOO_MCP_ALLOWED_ORIGINS
   });
   if (decision === "allow") return null;
-  return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
+  // M7.1 is a pre-parse defence: the body is never read, so the refusal
+  // carries no JSON-RPC id. It is still a JSON-RPC message (§M1.2), and it
+  // is still 403 — the status is what the contract is written in terms of.
+  return json(
+    mcpWooErrorBody(null, { code: "E_PERM", message: "foreign MCP Origin is not allowed" }, 403),
+    403
+  );
+}
+
+/**
+ * The AU1.2 audit outcome for a refused client attempt.
+ *
+ * The specific verdict (`unknown_or_revoked`, `missing_credential`,
+ * `expired`…) is the audit-valuable fact; the coarse code is recoverable from
+ * it. Shared by `clientApi`'s catch and the MCP route's, so one refusal does
+ * not audit differently depending on which surface it arrived through.
+ */
+function clientAuthAuditReason(err: ClientAuthError): string {
+  return err.detail
+    && typeof err.detail === "object"
+    && typeof (err.detail as { reason?: unknown }).reason === "string"
+    ? (err.detail as { reason: string }).reason
+    : err.code;
+}
+
+/** A woo refusal as a JSON-RPC response, with the HTTP status preserved. */
+function mcpWooRefusal(id: McpRequestId, refusal: McpWooRefusal, status: number): Response {
+  return json(mcpWooErrorBody(id, refusal, status), status);
+}
+
+/**
+ * Re-envelope a bare woo refusal Response produced by a helper shared with the
+ * non-MCP client surface. The status and the woo code/detail survive; only the
+ * container changes.
+ */
+async function mcpRewrapWooRefusal(response: Response): Promise<Response> {
+  const body = (await response.json().catch(() => null)) as {
+    error?: { code?: unknown; message?: unknown; detail?: unknown };
+  } | null;
+  return mcpWooRefusal(
+    null,
+    {
+      code: typeof body?.error?.code === "string" ? body.error.code : "E_INTERNAL",
+      message: typeof body?.error?.message === "string" ? body.error.message : `MCP request failed with ${response.status}`,
+      detail: body?.error?.detail
+    },
+    response.status
+  );
 }
 
 // "all" is intentionally NOT a scope. It had no branch in mcpToolPage and
