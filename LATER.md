@@ -7,12 +7,10 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
-- @dig-equivalent.
+- @dig-equivalent.  Value prop starts like this: "Easily spin up a workroom for any scale of incident, case, task.  Get the right people and agents on the same page; make it easy to see what's what.  Agents and humans have straightforward and flexible ways to work together (task decomposition, prioritization, research, action, verification, compliance...).  Proven effective for agentic development.  Programmers can dynamically customize the workspace, workflows, or even build entire new structures and share them.  Link workrooms together when appropriate".  What's the exact recommended path to achieving this?  From the outside; and (more critically!!) when you're within the world already.
 
 - tool-granularity redesign from the original walkthrough (collapsing per-room
-  compass/speech duplicates, decoupling presence from working set)
-
-- MCP v2
+  compass/speech duplicates, decoupling presence from working set)  
 
 - DSL syntax: json-wrapped is terrible for editors
 
@@ -237,3 +235,4 @@ Done:
 . woah
 . pre-Net stack retirement
 . audit/observability infrastructure
+. MCP v2
