@@ -7642,10 +7642,18 @@ export class NetGatewayDO {
       const input = mcpInputSchema(draft.argSpec);
       const receiverParam = receiverParameterName(input.args);
       const family = fold.families.get(`${draft.definer}\0${draft.verb}`);
+      // The session aliases are published as accepted enum VALUES, not merely
+      // resolved after the fact: the advertised set and the accepted set have
+      // to be one thing (M4.3), and an enum that refused `$here` while the
+      // dispatcher would have honoured it is exactly that disagreement.
+      const aliases = [
+        ...(activeSpace && group.receivers.has(activeSpace) ? ["$here"] : []),
+        ...(group.receivers.has(actor) ? ["$me"] : [])
+      ];
       const properties: Record<string, unknown> = {
         [receiverParam]: {
           type: "string",
-          enum: receivers,
+          enum: [...receivers, ...aliases],
           description: defaultReceiver
             ? `Which object to act on. Defaults to ${defaultReceiver}.`
             : "Which object to act on."
