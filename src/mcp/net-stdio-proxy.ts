@@ -19,6 +19,12 @@ export type NetMcpStdioProxyOptions = {
    * transport deliberately preserves the full JSON-RPC message shape. */
   onNotification?: (message: JSONRPCMessage) => Promise<void> | void;
   onError?: (error: unknown) => void;
+  /** MCP surface profile to request (mcp.md §M9.1). Sent as the
+   * `woo-mcp-profile` header on EVERY forwarded request, not just
+   * `initialize`: the gateway holds the latched value in memory, and a DO
+   * eviction mid-conversation would otherwise drop the bridge silently back
+   * to the classic surface. Absent means the server default (classic). */
+  profile?: string;
 };
 
 /** Default wall-clock bound for each step of {@link NetMcpStdioProxy.close}. */
@@ -27,6 +33,7 @@ export const NET_MCP_STDIO_CLOSE_MS = 500;
 export class NetMcpStdioProxy {
   private readonly endpoint: string;
   private readonly token: string;
+  private readonly profile: string | null;
   private readonly fetchImpl: typeof fetch;
   private readonly onNotification: (message: JSONRPCMessage) => Promise<void> | void;
   private readonly onError: (error: unknown) => void;
@@ -43,6 +50,7 @@ export class NetMcpStdioProxy {
   constructor(options: NetMcpStdioProxyOptions) {
     this.endpoint = options.endpoint;
     this.token = options.token;
+    this.profile = options.profile?.trim() || null;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.onNotification = options.onNotification ?? (() => {});
     this.onError = options.onError ?? (() => {});
@@ -61,6 +69,7 @@ export class NetMcpStdioProxy {
         accept: "application/json, text/event-stream",
         "content-type": "application/json"
       });
+      if (this.profile) headers.set("woo-mcp-profile", this.profile);
       if (isInitialize(message)) headers.set("mcp-token", this.token);
       else if (this.sessionId) headers.set("mcp-session-id", this.sessionId);
       if (!isInitialize(message) && this.protocolVersion) {
@@ -160,6 +169,7 @@ export class NetMcpStdioProxy {
     this.sessionId = null;
     if (!session) return;
     const headers = new Headers({ "mcp-session-id": session });
+    if (this.profile) headers.set("woo-mcp-profile", this.profile);
     if (this.protocolVersion) headers.set("mcp-protocol-version", this.protocolVersion);
     // Both bounds are needed: the signal frees the socket, and the race frees
     // this method even from a `fetch` implementation that ignores the signal.
@@ -190,6 +200,7 @@ export class NetMcpStdioProxy {
     while (!this.closed && this.sessionId === session) {
       try {
         const headers = new Headers({ accept: "text/event-stream", "mcp-session-id": session });
+        if (this.profile) headers.set("woo-mcp-profile", this.profile);
         if (this.protocolVersion) headers.set("mcp-protocol-version", this.protocolVersion);
         const response = await this.fetchImpl(this.endpoint, {
           method: "GET",

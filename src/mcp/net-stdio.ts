@@ -21,9 +21,14 @@ async function main(): Promise<void> {
   const reportError = (error: unknown): void => {
     process.stderr.write(`net MCP stdio bridge error: ${errorMessage(error)}\n`);
   };
+  // `WOO_MCP_PROFILE=collapsed` selects the collapsed tool/resource surface
+  // (mcp.md §M9.1). Unset keeps the classic default, so an existing bridge
+  // configuration behaves exactly as before.
+  const profile = process.env.WOO_MCP_PROFILE;
   const proxy = new NetMcpStdioProxy({
     endpoint,
     token,
+    ...(profile ? { profile } : {}),
     onNotification: (message) => transport.send(message),
     onError: reportError
   });
