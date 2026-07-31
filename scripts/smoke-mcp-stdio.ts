@@ -20,6 +20,83 @@ function assertOk(name: string, result: ToolResult): ToolResult {
 }
 
 /**
+ * The collapsed profile (mcp.md §M9) over the same bridge and backend.
+ *
+ * A SECOND stdio child, because the profile is chosen by the environment the
+ * client spawns the bridge with — running it in-process would prove the
+ * gateway logic the fake-DO lane already covers, and skip the only part this
+ * lane can add.
+ *
+ * Returns the contextual tool count so the caller can print both surfaces.
+ */
+async function runCollapsedSession(endpoint: string, token: string): Promise<number> {
+  const client = new Client({ name: "woo-net-stdio-smoke-collapsed", version: "0.0.0" });
+  const transport = new StdioClientTransport({
+    command: "npx",
+    args: ["tsx", "src/mcp/net-stdio.ts"],
+    cwd: process.cwd(),
+    env: { ...process.env, WOO_MCP_URL: endpoint, WOO_MCP_TOKEN: token, WOO_MCP_PROFILE: "collapsed" },
+    stderr: "pipe"
+  });
+  const stderrChunks: Buffer[] = [];
+  transport.stderr?.on("data", (chunk) => stderrChunks.push(Buffer.from(chunk)));
+  try {
+    await client.connect(transport);
+    const listed = await client.listTools();
+    const names = listed.tools.map((tool) => tool.name);
+    if (listed.nextCursor) throw new Error("collapsed profile should fit one tools/list page");
+    // The universal verb is one bare tool; the cockatoo's own `look` shadows
+    // it and stays object-qualified; the mounts contribute nothing.
+    for (const required of ["look", "say", "go", "woo_read"]) {
+      if (!names.includes(required)) throw new Error(`collapsed profile omitted ${required}: ${JSON.stringify(names)}`);
+    }
+    if (!names.includes("the_cockatoo__look")) {
+      throw new Error(`collapsed profile dropped a shadowing catalog verb: ${JSON.stringify(names)}`);
+    }
+    for (const folded of ["north", "southeast", "out"]) {
+      if (names.includes(folded)) throw new Error(`collapsed profile advertised the folded ${folded}`);
+    }
+    if (names.some((name) => name.startsWith("the_outline__") || name.startsWith("the_dubspace__"))) {
+      throw new Error(`collapsed profile projected a closed mount: ${JSON.stringify(names)}`);
+    }
+
+    // Resources: the listing is constant, and the exit record carries the
+    // traversability category the classic surface never had.
+    const resources = await client.listResources();
+    const uris = resources.resources.map((entry) => entry.uri).sort();
+    if (uris.join(",") !== "woo://here,woo://here/exits,woo://here/roster,woo://me,woo://me/inventory") {
+      throw new Error(`unexpected resource listing: ${JSON.stringify(uris)}`);
+    }
+    const templates = await client.listResourceTemplates();
+    if (!templates.resourceTemplates.some((entry) => entry.uriTemplate === "woo://object/{id}")) {
+      throw new Error("resource templates omitted woo://object/{id}");
+    }
+    const exits = await client.readResource({ uri: "woo://here/exits" });
+    const first = exits.contents[0] as { text?: string } | undefined;
+    const payload = JSON.parse(first?.text ?? "{}") as { exits?: Array<{ id: string; traversable: boolean }> };
+    const south = payload.exits?.find((exit) => exit.id === "exit_living_room_south");
+    if (!south) throw new Error(`exit record missing the seeded pseudo-exit: ${first?.text}`);
+    if (south.traversable !== false) throw new Error("the seeded pseudo-exit is reported traversable");
+
+    // The universal tool dispatches, and reaches the receiver it is given.
+    const looked = assertOk("collapsed look(the_mug)", await client.callTool({
+      name: "look",
+      arguments: { target: "the_mug" }
+    }) as ToolResult);
+    if (!JSON.stringify(looked).toLowerCase().includes("mug")) {
+      throw new Error(`collapsed look did not reach its receiver: ${JSON.stringify(looked).slice(0, 400)}`);
+    }
+    return names.filter((name) => !name.startsWith("woo_")).length;
+  } catch (error) {
+    const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+    if (stderr) console.error(stderr);
+    throw error;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+/**
  * Exercise the default stdio command through a real workerd Net backend.
  * Supplying WOO_MCP_URL and WOO_MCP_TOKEN reuses an already-running `npm run
  * dev`; otherwise the smoke owns an isolated temporary backend. Either way,
@@ -124,7 +201,16 @@ async function main(): Promise<void> {
       throw new Error(`Net MCP re-list did not reflect the destination context: ${JSON.stringify(movedNames)}`);
     }
 
-    console.log(`Net MCP stdio smoke passed (${stable.length} stable + ${listedTools.length - stable.length} contextual tools)`);
+    // ---- the collapsed profile, through the same bridge and backend -------
+    // The fake-DO lane proves the projection's rules; this proves the OPT-IN
+    // reaches them: a real MCP SDK client, a real stdio child process reading
+    // WOO_MCP_PROFILE from its environment, and real workerd DOs behind it.
+    const collapsedCount = await runCollapsedSession(endpoint, token);
+
+    console.log(
+      `Net MCP stdio smoke passed (${stable.length} stable + ${listedTools.length - stable.length} contextual tools; `
+      + `collapsed profile: ${collapsedCount} contextual tools)`
+    );
   } catch (error) {
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
     if (stderr) console.error(stderr);
