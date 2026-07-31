@@ -40,6 +40,11 @@ export const MCP_JSONRPC_PARSE_ERROR = -32700;
  * {@link MCP_JSONRPC_SERVER_ERROR}. */
 export const MCP_JSONRPC_METHOD_NOT_FOUND = -32601;
 
+/** JSON-RPC's own code for a request whose params are structurally wrong —
+ * a missing or non-string `uri` on `resources/read`, for example. This is a
+ * PROTOCOL error, not a woo refusal: no world state was consulted. */
+export const MCP_JSONRPC_INVALID_PARAMS = -32602;
+
 /**
  * The id to echo on a reply.
  *

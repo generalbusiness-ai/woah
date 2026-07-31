@@ -121,6 +121,12 @@ import { identityAnchorIds, provisionAnchorSubmit } from "../../net/identity-anc
 import { NET_ACCOUNT_CLASS, NET_AGENT_CLASS, NET_HUMAN_CLASS } from "../../net/identity-roles";
 import { verifyInternalRequest } from "../internal-auth";
 import { mcpOriginDecision, PUBLIC_ORIGIN_HEADER } from "../public-origin";
+import {
+  argumentSignature,
+  foldNameKeyedFamilies,
+  receiverParameterName,
+  universalDefiners
+} from "./mcp-collapse";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import {
   ClientAuthError,
@@ -133,6 +139,7 @@ import {
   verifyPasswordCredential
 } from "./client-auth";
 import {
+  MCP_JSONRPC_INVALID_PARAMS,
   MCP_JSONRPC_METHOD_NOT_FOUND,
   MCP_JSONRPC_PARSE_ERROR,
   mcpJsonRpcError,
@@ -5476,6 +5483,14 @@ export class NetGatewayDO {
     if (method === "initialize") return await this.mcpInitialize(request, id, params);
     if (method === "tools/list") return await this.mcpToolsList(request, id, params);
     if (method === "tools/call") return await this.mcpToolsCall(request, id, params);
+    // §M9.5. The resource methods exist only for the collapsed profile: the
+    // classic surface advertises no `resources` capability, and a method a
+    // server never advertised must answer "method not found" rather than
+    // quietly working — a client that discovers capabilities by probing would
+    // otherwise see two different servers on one endpoint.
+    if (method === "resources/list" || method === "resources/templates/list" || method === "resources/read") {
+      return await this.mcpResources(request, method, id, params);
+    }
     return json(mcpJsonRpcError(id, MCP_JSONRPC_METHOD_NOT_FOUND, `method not found: ${method}`), 200);
   }
 
@@ -5717,14 +5732,25 @@ export class NetGatewayDO {
         status
       );
     }
-    this.mcpSessionState(body.session, actor);
+    const profile = mcpProfileFromHeader(request) ?? "classic";
+    const state = this.mcpSessionState(body.session, actor);
+    // §M9.1: latch the profile so a client that sets the header once — the
+    // common MCP-host shape — keeps the surface it asked for.
+    state.profile = profile;
     return json(
       {
         jsonrpc: "2.0",
         id,
         result: {
           protocolVersion: "2025-06-18",
-          capabilities: { tools: { listChanged: true } },
+          capabilities: profile === "collapsed"
+            // Resources exist only in this profile, so only this profile
+            // advertises them. `listChanged` is honest: the LIST is constant,
+            // but the capability is what a client reads before subscribing to
+            // the notification, and we do emit it if the deployment's resource
+            // set ever changes.
+            ? { tools: { listChanged: true }, resources: { listChanged: true } }
+            : { tools: { listChanged: true } },
           serverInfo: { name: "woo-net", version: "1" },
           // This string is an agent's ENTIRE onboarding: many MCP clients
           // never call anything they were not pointed at. Two sentences of
@@ -5736,7 +5762,9 @@ export class NetGatewayDO {
           // first and never carry a collision suffix (M2.3). Any OTHER
           // object's tool must be read from the canonical listing instead —
           // see mcpAdvertisedName.
-          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives. Start with ${mcpSanitizeId(actor)}__help for orientation — with no topic it returns the index. Use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
+          instructions: profile === "collapsed"
+            ? `You are woo actor ${actor}. This session uses the COLLAPSED tool profile. Verbs that every object shares are single tools that take the object as an argument (look, say, take, describe…); verbs distinctive to one object keep an <object>__<verb> name. A workspace sitting in your space shows only its handle until you enter it. Read woo://here for where you are and what is reachable — resources are the state channel, tools are the action channel; woo_read does the same job for hosts that ignore resources. Start with help for orientation, use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
+            : `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives. Start with ${mcpSanitizeId(actor)}__help for orientation — with no topic it returns the index. Use woo_wait to hear what other actors do, and woo_list_reachable_tools to page or search the dynamic surface.`
         }
       },
       200,
@@ -5776,6 +5804,8 @@ export class NetGatewayDO {
     const actor = await this.mcpSessionActor(session);
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
+    const profile = this.mcpProfile(request, session);
+    const controlSchemas = profile === "collapsed" ? MCP_COLLAPSED_CONTROL_SCHEMAS : MCP_CONTROL_SCHEMAS;
     const name = typeof params.name === "string" ? params.name : "";
     // M4.3: validate the ROOT value before treating it as a property bag.
     // `(params.arguments ?? {})` cast a string, an array, a number, or an
@@ -5812,7 +5842,7 @@ export class NetGatewayDO {
       // M4.3: the advertised schema is enforced before anything else happens.
       // Silently defaulting a wrong-typed `timeout_ms` made a client that
       // passed "5000" park for one second and believe it had parked for five.
-      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      const refusal = mcpValidateNamedArguments(name, controlSchemas[name], args);
       if (refusal) return this.mcpToolError(id, refusal);
       const timeout = typeof args.timeout_ms === "number" ? Math.min(Math.max(args.timeout_ms, 0), 25_000) : 1000;
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
@@ -5831,10 +5861,10 @@ export class NetGatewayDO {
       // other tool uses, so the refusal names the field and the allowed set
       // instead of arriving as a bare thrown message. mcpToolScope still
       // guards the internal contract for non-transport callers.
-      const refusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      const refusal = mcpValidateNamedArguments(name, controlSchemas[name], args);
       if (refusal) return this.mcpToolError(id, refusal);
       try {
-        const page = this.mcpToolPage(actor, session, args);
+        const page = this.mcpToolPage(actor, session, args, profile);
         // Re-baseline from the canonical set the page was projected from —
         // the same descriptors tools/list would render, so a discovery call
         // never records a digest that disagrees with the standard listing.
@@ -5880,7 +5910,7 @@ export class NetGatewayDO {
       // own argument namespace never collides with the reserved name.
       const operation = mcpOperationId(params, args, []);
       if (!operation.ok) return this.mcpToolError(id, operation.error);
-      const controlRefusal = mcpValidateNamedArguments(name, MCP_CONTROL_SCHEMAS[name], args);
+      const controlRefusal = mcpValidateNamedArguments(name, controlSchemas[name], args);
       if (controlRefusal) return this.mcpToolError(id, controlRefusal);
       const requested = args.object as string;
       const verb = args.verb as string;
@@ -5943,7 +5973,14 @@ export class NetGatewayDO {
         verbSlot
       );
     }
-    const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
+    if (name === MCP_READ_TOOL_CORE.name && profile === "collapsed") {
+      const refusal = mcpValidateNamedArguments(name, controlSchemas[name], args);
+      if (refusal) return this.mcpToolError(id, refusal);
+      const read = this.mcpReadResource(actor, session, String(args.uri));
+      if ("error" in read) return this.mcpToolError(id, read.error);
+      return this.mcpResult(id, read.value);
+    }
+    const dynamic = this.mcpContextTools(actor, session, profile).find((tool) => tool.name === name);
     if (dynamic) {
       // The operation id goes first for the carrier-uniformity reason spelled
       // out in the woo_call branch above.
@@ -5954,14 +5991,20 @@ export class NetGatewayDO {
       // included — so the accepted set and the advertised set are one thing.
       const refusal = mcpValidateNamedArguments(name, mcpProtocolTool(dynamic).inputSchema, args);
       if (refusal) return this.mcpToolError(id, refusal);
+      // §M9.2: a collapsed tool resolves its receiver PER CALL from the
+      // argument and live session state. That is what makes a remembered name
+      // safe — `say` cannot retarget, because the target was never frozen into
+      // the identifier.
+      const receiver = this.mcpCollapsedReceiver(dynamic, actor, session, args);
+      if ("error" in receiver) return this.mcpToolError(id, receiver.error);
       return this.mcpInvokeTurn(
         id,
         actor,
         session,
-        dynamic.object,
+        receiver.object,
         dynamic.verb,
         mcpNamedArgs(dynamic, args),
-        dynamic.route,
+        receiver.route,
         this.mcpTraceOf(request),
         operation.value
       );
@@ -5979,10 +6022,12 @@ export class NetGatewayDO {
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     await this.warmMcpContext(actor, session);
+    const profile = this.mcpProfile(request, session);
     const cursor = mcpCursor(params.cursor);
     const context = this.mcpContextObjects(actor, session);
-    const dynamic = this.mcpToolsForObjects(actor, context, this.mcpActiveCommandContext(actor, session));
-    const all = [...MCP_TOOL_DEFS, ...dynamic.map(mcpProtocolTool)];
+    const dynamic = this.mcpProjectedTools(actor, session, profile, context);
+    const controls = profile === "collapsed" ? MCP_COLLAPSED_TOOL_DEFS : MCP_TOOL_DEFS;
+    const all = [...controls, ...dynamic.map(mcpProtocolTool)];
     this.mcpMarkToolListSeen(session, actor, this.mcpToolListDigest(actor, session, dynamic, context));
     const tools = all.slice(cursor, cursor + MCP_STANDARD_TOOL_PAGE);
     const next = cursor + tools.length;
@@ -5994,6 +6039,256 @@ export class NetGatewayDO {
         ...(next < all.length ? { nextCursor: String(next) } : {})
       }
     });
+  }
+
+  /**
+   * `resources/list`, `resources/templates/list`, `resources/read` (§M9.5).
+   *
+   * Authenticated and rate-limited on exactly the same terms as `tools/call`.
+   * The listing endpoints are CONSTANT — see `MCP_RESOURCE_DEFS` for why that
+   * is a protocol requirement rather than a simplification — so they do no
+   * world work at all; only `resources/read` touches the mirror.
+   */
+  private async mcpResources(
+    request: Request,
+    method: string,
+    id: number | string,
+    params: Record<string, unknown>
+  ): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    const actor = await this.mcpSessionActor(session);
+    this.mcpSessionState(session, actor, true);
+    this.enforceClientRate(actor, "/net-api/mcp");
+    if (this.mcpProfile(request, session) !== "collapsed") {
+      return json(
+        mcpJsonRpcError(
+          id,
+          MCP_JSONRPC_METHOD_NOT_FOUND,
+          `method not found: ${method} (this session uses the classic tool profile, which advertises no resources capability; `
+            + `re-initialize with the ${MCP_PROFILE_HEADER}: collapsed header)`
+        ),
+        200
+      );
+    }
+    if (method === "resources/list") {
+      return json({ jsonrpc: "2.0", id, result: { resources: MCP_RESOURCE_DEFS.map((entry) => ({ ...entry })) } });
+    }
+    if (method === "resources/templates/list") {
+      return json({
+        jsonrpc: "2.0",
+        id,
+        result: { resourceTemplates: MCP_RESOURCE_TEMPLATE_DEFS.map((entry) => ({ ...entry })) }
+      });
+    }
+    const uri = typeof params.uri === "string" ? params.uri : "";
+    if (!uri) {
+      return json(mcpJsonRpcError(id, MCP_JSONRPC_INVALID_PARAMS, "resources/read requires a string `uri`"), 200);
+    }
+    await this.warmMcpContext(actor, session);
+    const read = this.mcpReadResource(actor, session, uri);
+    if ("error" in read) {
+      return mcpWooRefusal(id, read.error, read.error.code === "E_PERM" ? 403 : 400);
+    }
+    return json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        contents: [
+          {
+            uri,
+            mimeType: "application/json",
+            text: JSON.stringify(read.value.data, null, 2)
+          }
+        ],
+        // The revision's cacheability hints. A room description is the same
+        // bytes for everyone standing in it; an inventory is one principal's.
+        ...(read.value.ttlMs !== undefined ? { ttlMs: read.value.ttlMs } : {}),
+        ...(read.value.cacheScope !== undefined ? { cacheScope: read.value.cacheScope } : {})
+      }
+    });
+  }
+
+  /**
+   * One resource read, authorized per principal and presence.
+   *
+   * Shared by `resources/read` and the `woo_read` tool, so a host that ignores
+   * resources cannot see a different world from one that does not. Reads only
+   * the gateway's mirror: no turn is planned and nothing is committed, which
+   * is what makes orientation free of the observation traffic a `look` emits.
+   */
+  private mcpReadResource(
+    actor: string,
+    session: string,
+    uri: string
+  ):
+    | { value: { data: Record<string, unknown>; ttlMs?: number; cacheScope?: "public" | "private" } }
+    | { error: { code: string; message: string; detail?: unknown } } {
+    const here = this.mcpActiveScope(actor, session);
+    const cache = MCP_RESOURCE_CACHE[uri];
+    const wrap = (data: Record<string, unknown>) => ({ value: { data, ...(cache ?? {}) } });
+    const noSpace = {
+      error: {
+        code: "E_PERM",
+        message: `${uri} does not resolve: this session has no active space`,
+        detail: { reason: "no_active_scope", actor, remediation: "enter a space first" }
+      }
+    };
+    if (uri === "woo://here") {
+      if (!here) return noSpace;
+      const contents = [...this.mcpContentsContext(here, actor)];
+      const mounts = contents.filter((object) => this.mcpIsSpace(object));
+      return wrap({
+        id: here,
+        ...this.mcpObjectFacts(here),
+        exits: this.mcpExitRecords(here),
+        contents: contents
+          .filter((object) => !mounts.includes(object))
+          .map((object) => ({ id: object, ...this.mcpObjectFacts(object) })),
+        // Mounted workspaces are named separately from furniture because the
+        // collapsed projection treats them differently (§M9.4): their own
+        // verbs appear only once the actor is inside.
+        mounts: mounts.map((object) => ({
+          id: object,
+          ...this.mcpObjectFacts(object),
+          open_with: { tool: "enter", argument: "target", value: object }
+        })),
+        roster: this.mcpRosterRecords(here)
+      });
+    }
+    if (uri === "woo://here/exits") {
+      if (!here) return noSpace;
+      return wrap({ space: here, exits: this.mcpExitRecords(here) });
+    }
+    if (uri === "woo://here/roster") {
+      if (!here) return noSpace;
+      return wrap({ space: here, roster: this.mcpRosterRecords(here) });
+    }
+    if (uri === "woo://me") {
+      return wrap({ id: actor, ...this.mcpObjectFacts(actor), location: here });
+    }
+    if (uri === "woo://me/inventory") {
+      return wrap({
+        actor,
+        inventory: this.relationMembers("contents", actor).map((row) => ({
+          id: row.member,
+          ...this.mcpObjectFacts(row.member)
+        }))
+      });
+    }
+    const objectMatch = /^woo:\/\/object\/(.+)$/.exec(uri);
+    if (objectMatch) {
+      const object = decodeURIComponent(objectMatch[1]);
+      // Reachability is the SAME predicate `woo_call` enforces (M3). A
+      // resource read must not become a side channel around it.
+      if (!this.mcpContextObjects(actor, session).has(object)) {
+        return {
+          error: {
+            code: "E_PERM",
+            message:
+              `${object} is not reachable from this session. Reachable objects are you (${actor}), `
+              + `your space${here ? ` (${here})` : " — you are not in one"}, that space's contents, and your inventory.`,
+            detail: { reason: "target_not_reachable", target: object, actor, active_scope: here }
+          }
+        };
+      }
+      return {
+        value: {
+          data: {
+            id: object,
+            ...this.mcpObjectFacts(object),
+            is_space: this.mcpIsSpace(object),
+            ...(this.mcpIsSpace(object) ? { exits: this.mcpExitRecords(object) } : {})
+          },
+          // An arbitrary object's state is world-visible, but it changes
+          // whenever anyone acts on it: public, and short.
+          ttlMs: 10_000,
+          cacheScope: "public"
+        }
+      };
+    }
+    return {
+      error: {
+        code: "E_INVARG",
+        message: `unknown resource uri: ${uri}`,
+        detail: {
+          reason: "unknown_resource",
+          value: uri,
+          known: [...MCP_RESOURCE_DEFS.map((entry) => entry.uri), ...MCP_RESOURCE_TEMPLATE_DEFS.map((entry) => entry.uriTemplate)]
+        }
+      }
+    };
+  }
+
+  /** Name/title/description as the mirror holds them. Missing properties are
+   * omitted rather than nulled: an absent title is not an empty title. */
+  private mcpObjectFacts(object: string): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const property of ["name", "title", "description"]) {
+      const value = this.ensureView().get(cellKey("property_cell", object, property))?.value as { value?: unknown } | undefined;
+      if (typeof value?.value === "string" && value.value) out[property] = value.value;
+    }
+    return out;
+  }
+
+  /**
+   * The space's exits as structured records (§M9.5).
+   *
+   * `traversable` is the field the design note asks for, and it is DERIVED
+   * from the same two properties the exit's own `move` verb consults: an exit
+   * that carries a refusal message, or that names no destination, will not
+   * move the actor. The seeded Living Room's `south` is the case — plate-glass
+   * windows with a `nogo_msg` — and reporting it as a real exit is what sent
+   * the walkthrough's agent through a wall.
+   *
+   * The refusal TEXT is not published. Category is public, content is earned:
+   * an agent learns that south is not a way out without being handed the joke
+   * (notes/2026-07-29, §Playfulness).
+   */
+  private mcpExitRecords(space: string): Array<Record<string, unknown>> {
+    const view = this.ensureView();
+    const map = view.get(cellKey("property_cell", space, "exits"))?.value as { value?: unknown } | undefined;
+    const exits = mcpRecord(map?.value);
+    // The property is alias → exit id, so several keys name one exit. Group by
+    // the exit's identity: a stable id is the whole point of the record.
+    const byExit = new Map<string, string[]>();
+    for (const [alias, target] of Object.entries(exits)) {
+      if (typeof target !== "string" || !target) continue;
+      const aliases = byExit.get(target) ?? [];
+      aliases.push(alias);
+      byExit.set(target, aliases);
+    }
+    const out: Array<Record<string, unknown>> = [];
+    for (const [exit, aliases] of [...byExit].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const property = (name: string): unknown =>
+        (view.get(cellKey("property_cell", exit, name))?.value as { value?: unknown } | undefined)?.value;
+      const destination = property("dest");
+      const refusal = property("nogo_msg");
+      out.push({
+        id: exit,
+        label: typeof property("name") === "string" ? property("name") : aliases[0],
+        aliases: aliases.sort(),
+        destination: typeof destination === "string" && destination ? destination : null,
+        // Exactly the condition `$exit:move` applies before it moves anyone.
+        traversable: Boolean(destination) && !refusal,
+        ...(typeof property("description") === "string" ? { description: property("description") } : {})
+      });
+    }
+    return out;
+  }
+
+  /** Who the space reports as present. Read from the same presence relation
+   * the gateway routes observations by, so the roster and delivery cannot
+   * disagree. */
+  private mcpRosterRecords(space: string): Array<Record<string, unknown>> {
+    const seen = new Set<string>();
+    const out: Array<Record<string, unknown>> = [];
+    for (const row of this.clientRelationMembers(SESSION_PRESENCE_RELATION, space)) {
+      const member = row.member;
+      if (typeof member !== "string" || seen.has(member)) continue;
+      seen.add(member);
+      out.push({ id: member, ...this.mcpObjectFacts(member) });
+    }
+    return out.sort((a, b) => String(a.id).localeCompare(String(b.id)));
   }
 
   private async mcpInvokeTurn(
@@ -6522,10 +6817,15 @@ export class NetGatewayDO {
     context?: Set<string>
   ): string {
     const contextualObjects = context ?? this.mcpContextObjects(actor, session);
-    const descriptors = tools ?? this.mcpToolsForObjects(
+    // The digest must describe the surface THIS session sees: a collapsed
+    // session digested against the classic projection would either miss a
+    // change or invent one, and `notifications/tools/list_changed` is the
+    // only signal an enumerating host has.
+    const descriptors = tools ?? this.mcpProjectedTools(
       actor,
-      contextualObjects,
-      this.mcpActiveCommandContext(actor, session)
+      session,
+      this.mcpSessionProfile(session),
+      contextualObjects
     );
     return cellVersion({
       active_space: this.mcpActiveScope(actor, session),
@@ -6638,7 +6938,12 @@ export class NetGatewayDO {
    * those objects were not in structural context, advertising descriptors
    * that neither dynamic-name invocation nor `woo_call` would accept.
    */
-  private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
+  private mcpToolPage(
+    actor: string,
+    session: string,
+    args: Record<string, unknown>,
+    profile: NetMcpProfile
+  ): NetMcpToolPage {
     const scope = mcpToolScope(args.scope);
     const activeScope = this.mcpActiveScope(actor, session);
     const object = typeof args.object === "string" && args.object ? args.object : null;
@@ -6646,12 +6951,18 @@ export class NetGatewayDO {
     const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
     const cursor = mcpCursor(args.cursor);
     const context = this.mcpContextObjects(actor, session);
-    const canonical = this.mcpToolsForObjects(actor, context, this.mcpActiveCommandContext(actor, session));
+    const canonical = this.mcpProjectedTools(actor, session, profile, context);
     const selected = this.mcpScopeSelection(scope, actor, activeScope, object, context);
 
     const normalized = query?.toLowerCase() ?? "";
     const all = canonical.filter((tool) =>
-      selected.has(tool.object) && (
+      // A collapsed tool reaches many objects, so scope selection must consult
+      // every receiver: filtering on `tool.object` alone would hide `look`
+      // from `scope:"object"` unless the named object happened to be its
+      // default receiver.
+      (tool.collapsed
+        ? [...tool.collapsed.receivers.keys()].some((receiver) => selected.has(receiver))
+        : selected.has(tool.object)) && (
         !normalized || tool.name.toLowerCase().includes(normalized) ||
         tool.object.toLowerCase().includes(normalized) ||
         tool.verb.toLowerCase().includes(normalized) ||
@@ -6851,12 +7162,93 @@ export class NetGatewayDO {
   /** The exact dynamic set advertised by standard tools/list and accepted by
    * dynamic-name calls. woo_call resolves through the same draft producer
    * without the advertising gate — see mcpResolveCall. */
-  private mcpContextTools(actor: string, session: string): NetMcpDynamicTool[] {
-    return this.mcpToolsForObjects(
+  private mcpContextTools(actor: string, session: string, profile?: NetMcpProfile): NetMcpDynamicTool[] {
+    return this.mcpProjectedTools(
       actor,
-      this.mcpContextObjects(actor, session),
-      this.mcpActiveCommandContext(actor, session)
+      session,
+      profile ?? this.mcpSessionProfile(session),
+      this.mcpContextObjects(actor, session)
     );
+  }
+
+  /**
+   * Resolve which object a dynamic tool acts on (§M9.2).
+   *
+   * A classic tool answers with the object frozen into its name. A collapsed
+   * tool reads its receiver argument, falling back to the session's default —
+   * the active space when it is a legal receiver, else the actor. `$me` and
+   * `$here` are accepted for the same reason `woo_call` accepts them: they are
+   * the forms every user doc uses, and no world object is named either.
+   */
+  private mcpCollapsedReceiver(
+    tool: NetMcpDynamicTool,
+    actor: string,
+    session: string,
+    args: Record<string, unknown>
+  ): { object: string; route: "direct" | "sequenced" } | { error: { code: string; message: string; detail?: unknown } } {
+    if (!tool.collapsed) return { object: tool.object, route: tool.route };
+    const raw = args[tool.collapsed.receiverParam];
+    const supplied = typeof raw === "string" && raw ? raw : null;
+    const resolved = supplied === "$me"
+      ? actor
+      : supplied === "$here"
+        ? this.mcpActiveScope(actor, session)
+        : supplied;
+    const object = resolved ?? tool.collapsed.defaultReceiver;
+    if (!object) {
+      return {
+        error: {
+          code: "E_INVARG",
+          message: `${tool.name} requires ${tool.collapsed.receiverParam}: this session has no default receiver for it`,
+          detail: {
+            reason: "receiver_required",
+            field: tool.collapsed.receiverParam,
+            candidates: [...tool.collapsed.receivers.keys()].sort()
+          }
+        }
+      };
+    }
+    const route = tool.collapsed.receivers.get(object);
+    if (!route) {
+      return {
+        error: {
+          code: "E_INVARG",
+          message: `${object} is not a receiver of ${tool.name}`,
+          detail: {
+            reason: "receiver_not_reachable",
+            field: tool.collapsed.receiverParam,
+            value: object,
+            candidates: [...tool.collapsed.receivers.keys()].sort(),
+            // The remediation, not a restatement: an object CAN be reachable
+            // and still not answer this verb, and `woo_call` is the door that
+            // says which of the two it is.
+            remediation: `call woo_call with object "${object}" to learn whether it is unreachable or simply defines no ${tool.verb}`
+          }
+        }
+      };
+    }
+    return { object, route };
+  }
+
+  /** The profile latched at `initialize` (§M9.1). Used where no request is in
+   * hand — the digest, and the list-changed comparison. */
+  private mcpSessionProfile(session: string): NetMcpProfile {
+    return this.mcpQueues.get(session)?.profile ?? "classic";
+  }
+
+  /**
+   * The profile for one request. A per-request header wins over the latched
+   * value, and updates it: the gateway's session state is in-memory, so an
+   * eviction between calls would otherwise silently drop a client back to the
+   * classic surface mid-conversation. Our own stdio bridge sends the header on
+   * every request for exactly that reason.
+   */
+  private mcpProfile(request: Request, session: string): NetMcpProfile {
+    const requested = mcpProfileFromHeader(request);
+    if (!requested) return this.mcpSessionProfile(session);
+    const state = this.mcpQueues.get(session);
+    if (state) state.profile = requested;
+    return requested;
   }
 
   /** The advertised name for one (object, verb) pair in THIS session's
@@ -6915,6 +7307,31 @@ export class NetGatewayDO {
     };
     if (active) addRows(this.relationMembers("contents", active), this.ownerScopeFor(active));
     addRows(this.relationMembers("contents", actor), this.ownerScopeFor(actor));
+    // Exits are anchored to the space but are NOT among its contents, so the
+    // contents walk above never pulls them and their cells stay absent. The
+    // consequence was silent and wrong rather than merely missing: every exit
+    // record read `destination: null` and therefore `traversable: false`,
+    // which is the exact confusion the exit record exists to remove (§M9.5).
+    // Bounded by the same cap, and de-duplicated because the property is an
+    // alias map in which several keys name one exit.
+    //
+    // Collapsed-profile only. The classic surface never reads an exit's cells,
+    // so pulling them there would be work no caller consumes — and the classic
+    // path is required to stay behaviourally unchanged (§M9.1).
+    if (active && this.mcpSessionProfile(session) === "collapsed") {
+      const scope = this.ownerScopeFor(active);
+      const exits = mcpRecord(
+        (this.ensureView().get(cellKey("property_cell", active, "exits"))?.value as { value?: unknown } | undefined)?.value
+      );
+      const seen = new Set<string>();
+      for (const target of Object.values(exits)) {
+        if (candidates.length >= MAX_ROOM_CONTENT_AUTHORITY_OBJECTS) break;
+        if (typeof target !== "string" || !target || seen.has(target)) continue;
+        seen.add(target);
+        if (this.mcpContextWarmSuccesses.has(`${scope}\0${target}`)) continue;
+        candidates.push({ object: target, scope });
+      }
+    }
     if (candidates.length === 0) return;
 
     const now = this.host.now();
@@ -7082,6 +7499,233 @@ export class NetGatewayDO {
         description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`
       };
     });
+  }
+
+  /**
+   * The dynamic descriptor set for a session, under its selected profile
+   * (§M9.1). Every producer that must agree about names — `tools/list`,
+   * dynamic-name invocation, the list digest, and `woo_list_reachable_tools` —
+   * goes through here, so a profile can never advertise one set and accept
+   * another (the M2.3 rule, now parameterised by profile).
+   */
+  private mcpProjectedTools(
+    actor: string,
+    session: string,
+    profile: NetMcpProfile,
+    context: Set<string>
+  ): NetMcpDynamicTool[] {
+    const commandObjects = this.mcpActiveCommandContext(actor, session);
+    if (profile === "classic") return this.mcpToolsForObjects(actor, context, commandObjects);
+    return this.mcpCollapsedTools(actor, this.mcpActiveScope(actor, session), context, commandObjects);
+  }
+
+  /**
+   * The COLLAPSED projection (§M9). See `mcp-collapse.ts` for the derivation
+   * rules and the measurements that motivated them; this method is the wiring.
+   *
+   * Same drafts, same listing gates, same permission prefilter as the classic
+   * producer — only the PRESENTATION differs. Nothing here can advertise a
+   * verb the classic surface would have withheld.
+   */
+  private mcpCollapsedTools(
+    actor: string,
+    activeSpace: string | null,
+    objects: Set<string>,
+    commandObjects: Set<string>
+  ): NetMcpDynamicTool[] {
+    // Same ordering rule as the classic producer: the actor's own object
+    // first, then alphabetical. It decides the default receiver's tiebreak and
+    // the collision-suffix order, so it has to be deterministic.
+    const byObject = (a: string, b: string) =>
+      (a === actor ? 0 : 1) - (b === actor ? 0 : 1) || a.localeCompare(b);
+    const ordered = [...objects].sort(byObject);
+
+    const draftsByObject = new Map<string, NetMcpToolDraft[]>();
+    for (const object of ordered) {
+      draftsByObject.set(
+        object,
+        this.mcpObjectToolDrafts(actor, object, commandObjects.has(object))
+          .filter((draft) => draft.bytecode && draft.exposed && draft.executable)
+      );
+    }
+    const allDrafts = ordered.flatMap((object) => draftsByObject.get(object) ?? []);
+
+    const fold = foldNameKeyedFamilies(allDrafts);
+    const universal = universalDefiners(draftsByObject, actor, activeSpace);
+    // A $space that is not the space the actor is standing in is a mounted
+    // workspace, and the note's dominant measured lever: the two mounts in the
+    // seeded Living Room supplied 80 of 146 tools while the actor was in
+    // neither. Withhold their DISTINCTIVE verbs until the actor is in them.
+    // They remain receivers of the universal verbs, so the handle that opens
+    // one is the universal `enter` with the mount as its target — which is
+    // exactly what `<mount>__enter` does today (§M9.4).
+    //
+    // `$space` is a SUBSTRATE contract (spec/semantics/space.md), not catalog
+    // knowledge: it is the sequenced-log base every world has, in the same way
+    // `$nowhere` is already consulted by `mcpPlacedScope`. No catalog class
+    // name appears here.
+    const closedMounts = new Set(
+      ordered.filter((object) => object !== actor && object !== activeSpace && this.mcpIsSpace(object))
+    );
+
+    // ---- partition ------------------------------------------------------
+    type UniversalGroup = {
+      verb: string;
+      signature: string;
+      representative: NetMcpToolDraft;
+      receivers: Map<string, NetMcpToolDraft>;
+    };
+    const groups = new Map<string, UniversalGroup>();
+    const distinctive: NetMcpToolDraft[] = [];
+    for (const draft of allDrafts) {
+      if (fold.members.has(`${draft.definer}\0${draft.verb}`)) continue; // absorbed by its general form
+      const isUniversal = draft.definer !== draft.object && universal.has(draft.definer);
+      if (!isUniversal) {
+        if (closedMounts.has(draft.object)) continue;
+        distinctive.push(draft);
+        continue;
+      }
+      // Same verb name with a different parameter list is a different call.
+      // Merging those would advertise one schema that half the receivers
+      // reject, so signature is part of the group key and the losing groups
+      // simply fall back to object-qualified names below.
+      const signature = argumentSignature(draft.argSpec);
+      const key = `${draft.verb}\0${signature}`;
+      const group = groups.get(key) ?? {
+        verb: draft.verb,
+        signature,
+        representative: draft,
+        receivers: new Map<string, NetMcpToolDraft>()
+      };
+      if (!group.receivers.has(draft.object)) group.receivers.set(draft.object, draft);
+      groups.set(key, group);
+    }
+
+    // A verb name claimed by two signature groups: the group holding the
+    // session's default receiver keeps the bare name; every other group is
+    // demoted to object-qualified names rather than guessing.
+    const winners = new Map<string, UniversalGroup>();
+    for (const group of [...groups.values()].sort((a, b) => a.verb.localeCompare(b.verb) || a.signature.localeCompare(b.signature))) {
+      const held = winners.get(group.verb);
+      if (!held) {
+        winners.set(group.verb, group);
+        continue;
+      }
+      const prefers = (candidate: UniversalGroup) =>
+        (activeSpace && candidate.receivers.has(activeSpace) ? 2 : 0)
+        + (candidate.receivers.has(actor) ? 1 : 0);
+      if (prefers(group) > prefers(held)) {
+        winners.set(group.verb, group);
+        distinctive.push(...held.receivers.values());
+      } else {
+        distinctive.push(...group.receivers.values());
+      }
+    }
+
+    // ---- render ---------------------------------------------------------
+    // Static control names are reserved first: a collapsed tool is named by
+    // its bare verb, so unlike an `object__verb` name it CAN collide with a
+    // `woo_*` control, and the control must keep its name.
+    const used = new Set<string>(MCP_COLLAPSED_TOOL_DEFS.map((definition) => definition.name));
+    const out: NetMcpDynamicTool[] = [];
+
+    for (const group of [...winners.values()].sort((a, b) => a.verb.localeCompare(b.verb))) {
+      const receivers = [...group.receivers.keys()].sort(byObject);
+      const defaultReceiver = activeSpace && group.receivers.has(activeSpace)
+        ? activeSpace
+        : group.receivers.has(actor)
+          ? actor
+          : receivers.length === 1
+            ? receivers[0]
+            : null;
+      const draft = defaultReceiver ? group.receivers.get(defaultReceiver)! : group.representative;
+      const input = mcpInputSchema(draft.argSpec);
+      const receiverParam = receiverParameterName(input.args);
+      const family = fold.families.get(`${draft.definer}\0${draft.verb}`);
+      const properties: Record<string, unknown> = {
+        [receiverParam]: {
+          type: "string",
+          enum: receivers,
+          description: defaultReceiver
+            ? `Which object to act on. Defaults to ${defaultReceiver}.`
+            : "Which object to act on."
+        },
+        ...mcpRecord(input.schema.properties)
+      };
+      if (family) {
+        // The absorbed names are ACCEPTED VALUES, not the whole domain — `go`
+        // still takes any exit name the room knows — so they are advertised in
+        // the description rather than as an enum that would refuse the rest.
+        const existing = mcpRecord(properties[family.parameter]);
+        properties[family.parameter] = {
+          ...existing,
+          description: mcpClampDescription(
+            `${typeof existing.description === "string" ? `${existing.description} ` : ""}`
+            + `Accepts (among others): ${family.values.join(", ")}.`
+          )
+        };
+      }
+      const required = [
+        ...(defaultReceiver ? [] : [receiverParam]),
+        ...(Array.isArray(input.schema.required)
+          ? input.schema.required.filter((value): value is string => typeof value === "string")
+          : [])
+      ];
+      const name = mcpUniqueToolName(mcpSanitizeId(draft.verb), used);
+      const paragraph = mcpFirstParagraph(draft.source);
+      const callForm = `<${receiverParam}>:${draft.verb}(${input.args.join(", ")})`;
+      // Receiver ids go in the DESCRIPTION as well as the enum: the discovery
+      // control searches descriptions, and a deferring host looking for
+      // "outline" must be able to find the tool that reaches it.
+      const receiverLine = `Reaches: ${receivers.join(", ")}.`;
+      out.push({
+        ...draft,
+        object: defaultReceiver ?? receivers[0],
+        name,
+        inputSchema: { type: "object", properties, ...(required.length > 0 ? { required } : {}) },
+        argNames: input.args,
+        description: mcpClampDescription(
+          `${paragraph ? `${paragraph} ` : ""}${receiverLine} Call: ${callForm}`
+        ),
+        collapsed: {
+          receiverParam,
+          receivers: new Map([...group.receivers].map(([object, member]) => [object, member.route])),
+          defaultReceiver
+        }
+      });
+    }
+
+    for (const draft of distinctive.sort((a, b) => byObject(a.object, b.object) || a.verb.localeCompare(b.verb))) {
+      const input = mcpInputSchema(draft.argSpec);
+      const name = mcpUniqueToolName(`${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`, used);
+      const paragraph = mcpFirstParagraph(draft.source);
+      const callForm = `${draft.object}:${draft.verb}(${input.args.join(", ")})`;
+      out.push({
+        ...draft,
+        name,
+        inputSchema: input.schema,
+        argNames: input.args,
+        description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`
+      });
+    }
+    return out;
+  }
+
+  /** Does this object inherit from the substrate's sequenced-log base? Used
+   * only to tell a mounted workspace from furniture (§M9.4). Walks the mirror
+   * lineage chain; an incomplete chain answers false, which degrades to the
+   * classic per-object projection rather than hiding anything. */
+  private mcpIsSpace(object: string): boolean {
+    const view = this.ensureView();
+    let current: string | null = object;
+    const walked = new Set<string>();
+    while (current && !walked.has(current)) {
+      walked.add(current);
+      if (current === "$space") return true;
+      const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
+      current = typeof lineage?.parent === "string" ? lineage.parent : null;
+    }
+    return false;
   }
 
   private mcpObjectToolDrafts(actor: string, object: string, allowCommandShaped: boolean): NetMcpToolDraft[] {
@@ -10783,8 +11427,38 @@ type NetMcpSseWaiter = {
   close(): void;
 };
 
+/**
+ * Which MCP projection a session sees (§M9.1).
+ *
+ * `classic` is the default and is byte-for-byte the surface that shipped
+ * before the collapsed profile existed. `collapsed` is opt-in.
+ */
+type NetMcpProfile = "classic" | "collapsed";
+
+/** The header that selects the profile, on any `/net-api/mcp` request.
+ *
+ * A HEADER rather than an `initialize` parameter, deliberately. MCP's
+ * `initialize` params are a closed schema plus a `_meta` bag that hosts are
+ * not obliged to forward, and several hosts (including our own stdio bridge)
+ * construct `initialize` themselves from configuration rather than passing a
+ * caller's object through. A transport header is settable by every HTTP
+ * client (`curl -H`), forwardable by a proxy that never parses the body, and —
+ * because it rides EVERY request rather than only the first — survives the
+ * gateway losing its in-memory session state to a DO eviction. The value
+ * recorded at `initialize` is still honoured for clients that set it once.
+ */
+const MCP_PROFILE_HEADER = "woo-mcp-profile";
+
+function mcpProfileFromHeader(request: Request): NetMcpProfile | null {
+  const raw = request.headers.get(MCP_PROFILE_HEADER)?.trim().toLowerCase();
+  if (raw === "collapsed" || raw === "classic") return raw;
+  return null;
+}
+
 type NetMcpSessionState = {
   actor: string;
+  /** §M9.1. Latched at initialize; a per-request header still wins. */
+  profile: NetMcpProfile;
   buffer: unknown[];
   /** Parked `woo_wait` calls. Keyed by the class-discriminated JSON-RPC
    * request id (`mcpRequestKey`) so an explicit `notifications/cancelled` can
@@ -10814,6 +11488,7 @@ type NetMcpWaiter = { requestKey: string; wake: (cancelled: boolean) => void };
 function mcpSessionState(actor: string): NetMcpSessionState {
   return {
     actor,
+    profile: "classic",
     buffer: [],
     waiters: [],
     ownEchoIds: new Set(),
@@ -10943,6 +11618,22 @@ type NetMcpDynamicTool = NetMcpToolDraft & {
   description: string;
   inputSchema: Record<string, unknown>;
   argNames: string[];
+  /**
+   * COLLAPSED PROFILE ONLY (§M9). Present on a tool whose name no longer
+   * carries the receiver, so the receiver arrives as an argument instead.
+   *
+   * `object` on such a tool is the DEFAULT receiver — it keeps the descriptor
+   * shape uniform for presentation and digesting — but dispatch must read
+   * `receivers` and never assume `object`.
+   */
+  collapsed?: {
+    /** The argument that names the receiver. */
+    receiverParam: string;
+    /** Legal receivers and the route each one's page declares. */
+    receivers: Map<string, "direct" | "sequenced">;
+    /** Used when the caller omits `receiverParam`; null makes it required. */
+    defaultReceiver: string | null;
+  };
 };
 
 type NetMcpToolPage = {
@@ -11111,6 +11802,19 @@ function isMcpArgumentObject(value: unknown): value is Record<string, unknown> {
 
 function mcpSanitizeId(value: string): string {
   return value.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+/** Claim `base`, or the first free `base_2`, `base_3`… Sanitization is lossy
+ * (`a-b` and `a_b` both render `a_b`), so the suffix is what keeps two
+ * descriptors apart — and it is only meaningful relative to the set it was
+ * assigned over, which is why `used` is threaded through one whole listing
+ * rather than recomputed per page (M2.3). */
+function mcpUniqueToolName(base: string, used: Set<string>): string {
+  let name = base;
+  let suffix = 2;
+  while (used.has(name)) name = `${base}_${suffix++}`;
+  used.add(name);
+  return name;
 }
 
 /**
@@ -11865,3 +12569,128 @@ const MCP_TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Rec
 const MCP_CONTROL_SCHEMAS: Record<string, Record<string, unknown>> = Object.fromEntries(
   MCP_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema])
 );
+
+/**
+ * `woo_read` — the resource channel's TOOL fallback (§M9.5).
+ *
+ * Resources are the efficient path for state, but not every host consumes
+ * them: a host that ignores `resources/*` must not be locked out of the world
+ * map, and in the collapsed profile the per-object `look`-shaped reads it
+ * would otherwise have used are exactly what collapsed away. This returns the
+ * same payload `resources/read` returns for the same URI.
+ */
+const MCP_READ_TOOL_CORE = {
+  name: "woo_read",
+  description:
+    "Read world state by stable URI — the tool form of this server's MCP resources, for hosts that do not consume resources. "
+    + "`woo://here` (the space you are in, its exits, contents and mounts), `woo://here/exits`, `woo://here/roster`, "
+    + "`woo://me`, `woo://me/inventory`, `woo://object/<id>`. Reads authorize per principal and presence: an object you cannot reach is refused.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      uri: { type: "string", minLength: 1, description: "A `woo://` resource URI." }
+    },
+    required: ["uri"]
+  }
+} as const;
+
+/** The stable controls advertised by the COLLAPSED profile: the three classic
+ * ones plus `woo_read`. Kept as a distinct list so the classic profile's
+ * `tools/list` is unchanged. */
+const MCP_COLLAPSED_TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
+  ...MCP_TOOL_DEFS,
+  {
+    name: MCP_READ_TOOL_CORE.name,
+    description: MCP_READ_TOOL_CORE.description,
+    inputSchema: mcpControlSchema(MCP_READ_TOOL_CORE.inputSchema as unknown as Record<string, unknown>)
+  }
+];
+
+const MCP_COLLAPSED_CONTROL_SCHEMAS: Record<string, Record<string, unknown>> = Object.fromEntries(
+  MCP_COLLAPSED_TOOL_DEFS.map((definition) => [definition.name, definition.inputSchema])
+);
+
+/**
+ * The resource surface (§M9.5), and the constraint that shapes it.
+ *
+ * SEP-2567 requires `resources/list` to be determined by deployment and
+ * authenticated principal — NEVER by a prior call or by connection state. A
+ * resource list that grew and shrank as the actor walked would reproduce
+ * exactly the defect measured in the tool list, one layer down. So:
+ *
+ *   - this list is CONSTANT. `woo://here` is a stable URI whose CONTENT
+ *     changes as the actor moves; the URI itself does not.
+ *   - "what is here" is therefore a READ, never a listing. Nearby objects and
+ *     mounts are enumerated inside `woo://here`, not as sibling resources.
+ *   - `resources/templates/list` advertises the one parameterised shape,
+ *     `woo://object/{id}`, which likewise does not vary.
+ *   - `resources/read` is where presence and authority are enforced, and it
+ *     may refuse.
+ */
+const MCP_RESOURCE_DEFS = [
+  {
+    uri: "woo://here",
+    name: "Here",
+    title: "The space you are in",
+    description:
+      "The actor's current space: id, title, description, real exits, visible contents, and mounted workspaces. "
+      + "Stable URI, moving content — read it again after moving.",
+    mimeType: "application/json"
+  },
+  {
+    uri: "woo://here/exits",
+    name: "Exits",
+    title: "Exits from the space you are in",
+    description:
+      "Structured exits with stable ids, labels, aliases, destination, and `traversable`. "
+      + "An exit with `traversable:false` is advertised by the world but will not move you.",
+    mimeType: "application/json"
+  },
+  {
+    uri: "woo://here/roster",
+    name: "Roster",
+    title: "Who is present here",
+    description: "Actors currently present in the space, as the space itself reports them.",
+    mimeType: "application/json"
+  },
+  {
+    uri: "woo://me",
+    name: "Me",
+    title: "The session's actor",
+    description: "The authenticated actor: id, name, description, location, and class chain.",
+    mimeType: "application/json"
+  },
+  {
+    uri: "woo://me/inventory",
+    name: "Inventory",
+    title: "What you are carrying",
+    description: "Objects in the actor's own contents, which follow it between spaces.",
+    mimeType: "application/json"
+  }
+] as const;
+
+const MCP_RESOURCE_TEMPLATE_DEFS = [
+  {
+    uriTemplate: "woo://object/{id}",
+    name: "Object",
+    title: "Any reachable object",
+    description:
+      "One object's public state: name, title, description, class chain, and the tools that reach it. "
+      + "Reachability is enforced on read — you, your space, its contents, and your inventory.",
+    mimeType: "application/json"
+  }
+] as const;
+
+/** How long a resource read may be reused, and by whom (§M9.5).
+ *
+ * A room's description and its exits are the same bytes for every actor
+ * standing in it and change only when someone edits the room, so they are
+ * `public` and comparatively long-lived. A roster changes whenever anyone
+ * moves. An actor's own record and inventory are that principal's alone. */
+const MCP_RESOURCE_CACHE: Record<string, { ttlMs: number; cacheScope: "public" | "private" }> = {
+  "woo://here": { ttlMs: 30_000, cacheScope: "public" },
+  "woo://here/exits": { ttlMs: 300_000, cacheScope: "public" },
+  "woo://here/roster": { ttlMs: 5_000, cacheScope: "private" },
+  "woo://me": { ttlMs: 30_000, cacheScope: "private" },
+  "woo://me/inventory": { ttlMs: 5_000, cacheScope: "private" }
+};
