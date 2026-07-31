@@ -35,6 +35,11 @@ WOO_MCP_TOKEN=apikey:local-dev:local-dev-secret
 WOO_MCP_URL=http://127.0.0.1:5173/net-api/mcp
 ```
 
+Optionally add `WOO_MCP_PROFILE=collapsed` to select the collapsed tool and
+resource surface described in
+[Tools and actions](tools-and-actions.md#the-collapsed-profile-opt-in). Leave
+it unset for the default surface; nothing else about the bridge changes.
+
 The stdio process is only a framing bridge. It forwards JSON-RPC to the HTTP
 endpoint, remembers the returned session id, and closes the remote session on
 EOF. It does not create an in-process world or dispatch verbs itself.
