@@ -135,9 +135,21 @@ committed frame audience and ignore both `_audience_exclude` and
 **How the audience is computed.** For each observation:
 
 1. **Self-addressed.** If the observation is `looked` or `who` and has a `to: obj` field, the audience is `[to]`. (The look's structured payload is for the looker; bystanders don't see another player's look output.)
-2. **Directed.** If the observation's `type` appears in the canonical *directed observation type set* (§12.7.1), the audience is `[to, from]` (whichever are present and are valid object refs). The `told`/`whisper`/`page` family is the v1 use.
-3. **Self-suppressing.** If the observation is `entered`, `left`, `taken`, or `dropped` and has an `actor: obj` field, the audience is everyone with presence in the source/audience space *except* that actor — the actor's own command output is delivered through the call result or a `text` observation; the room broadcasts to bystanders.
-4. **Default.** Otherwise the audience is everyone with presence in the audience space (the source space if `observation.source` is a `$space` descendant, else the call's space argument).
+2. **Subject-addressed.** If the observation has a `target: obj` field naming an `$actor` descendant (or an object this host does not hold), the audience is `[target]` — the observation is *about* one actor, so it goes to that actor. This is how a catalog addresses a single actor without joining the closed directed-type set of §12.7.1: `$player:look_self`'s `looked_at` uses it to tell one person they were looked at.
+3. **Directed.** If the observation's `type` appears in the canonical *directed observation type set* (§12.7.1), the audience is `[to, from]` (whichever are present and are valid object refs). The `told`/`whisper`/`page` family is the v1 use.
+4. **Self-suppressing.** If the observation is `entered`, `left`, `taken`, or `dropped` and has an `actor: obj` field, the audience is everyone with presence in the source/audience space *except* that actor — the actor's own command output is delivered through the call result or a `text` observation; the room broadcasts to bystanders.
+5. **Default.** Otherwise the audience is everyone with presence in the audience space (the source space if `observation.source` is a `$space` descendant, else the call's space argument).
+
+**`to` narrows delivery for every type (normative).** Rule 2 above decides the
+*positive* audience on the live path, but the committed path re-resolves
+audiences from each shard's own presence mirror and cannot see it. The one
+observation-intrinsic field that survives that round trip for an arbitrary type
+is `to`: a delivery point MUST NOT hand an observation carrying `to: obj` to any
+actor other than that `to` (or, for a §12.7.1 directed type, its `from`). A
+catalog emitting a subject-addressed observation therefore sets **both** `to` and
+`target` to the same actor, so the live rule and the committed rule select the
+same single recipient. Setting `target` alone would broadcast on the committed
+path; setting `to` alone would broadcast on the live path.
 
 #### 12.7.1 Directed observation types (v1)
 
@@ -153,7 +165,7 @@ Future additions (`whispered`, `paged`, `pm`) require a spec amendment so all tr
 **Directed routing holds on the sequenced path too (normative).** An `applied` frame from a sequenced call carries its observations as a unit and, on a sharded deployment, carries *no* per-observation audience vector: each receiving relay re-resolves the frame's audience from its own presence mirror. The two audience rules that are intrinsic to the observation survive that round trip, and every relay MUST apply both before delivering to a carrier:
 
 1. a directed observation (§12.7.1) reaches only its named recipients — `to`/`from` for `told`, `target` for `text`;
-2. a self-addressed `looked`/`who` payload reaches only its `to`.
+2. any observation carrying `to: obj` reaches only that actor. `looked`/`who` are the self-addressed cases with a live-path rule of their own; the predicate is general, so a catalog's subject-addressed type (`looked_at`) is narrowed the same way without amending §12.7.1.
 
 Everything else broadcasts to the sessions present in the frame's scope. Sequenced verbs *do* emit directed observations in practice — `$exit:move` sends the mover its second-person `leave_msg` with `tell()` before broadcasting the room's third-person `left` — so treating an applied frame as an undifferentiated broadcast leaks one actor's private line to every session in the room. Client-side re-filtering is not a substitute: a transport that hands raw observations to an agent (the MCP wait queue) does none, so the rule is server-side or it does not exist. The implementation is `observationReachesActor` in `src/core/types.ts`, applied by the core direct path (`observationAudienceActors`, `appliedFrameAudience`) and by the gateway's committed fanout (`pushScopedObservations`).
 

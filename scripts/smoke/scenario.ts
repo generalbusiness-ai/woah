@@ -232,6 +232,36 @@ export async function runSmokeWalkthrough(
     waitMs, ctx.signal, cfg);
   });
 
+  // Looking at a person is social, and the social half is emitted by the TARGET.
+  // `look_at` dispatches `look_self` on bob, and `$player:look_self` answers with
+  // a `looked_at` addressed to bob alone (bootstrap.md §B2.7.1). Three things are
+  // under test and only a real transport can show all three: the line reaches the
+  // looked-at actor's own session; alice's own-turn reply carries her private
+  // `looked` view but NOT the notification (the own-turn seat drops rows
+  // `to`-addressed elsewhere); and nothing about the looker's view changed.
+  // Read-only and idempotent — nobody moves and no state is written.
+  await step("look at a person: bob is told, alice gets only her own view", async (ctx) => {
+    const { alice, bob } = pair;
+    await drain(bob, cfg, ctx.signal);
+    const raw = await alice.callRaw("the_chatroom", "look_at", [bob.actor], ctx.signal);
+    const ownTurn: unknown[] = raw?.result?.structuredContent?.observations ?? [];
+    const kinds = ownTurn.filter(isRecord).map((obs) => String(obs.type));
+    if (!kinds.includes("looked")) {
+      throw new Error(`look_at: alice's own turn should carry her \`looked\` view; got ${JSON.stringify(kinds)}`);
+    }
+    if (kinds.includes("looked_at")) {
+      throw new Error(`look_at: alice must not receive the notification addressed to bob; got ${JSON.stringify(kinds)}`);
+    }
+    await waitFor(bob, (obs) =>
+      obs.type === "looked_at" &&
+      obs.actor === alice.actor &&
+      obs.to === bob.actor &&
+      typeof obs.text === "string" && obs.text.endsWith("looks you over."),
+    waitMs, ctx.signal, cfg);
+    await drain(alice, cfg, ctx.signal);
+    await drain(bob, cfg, ctx.signal);
+  });
+
   // take/drop with cross-actor fanout: alice takes the mug, then drops it; bob,
   // co-located in the_chatroom, must see both `taken` and `dropped` (the actor
   // is excluded from those room broadcasts, so a peer is the right observer).

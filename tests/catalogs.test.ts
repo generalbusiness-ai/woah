@@ -5488,6 +5488,82 @@ describe("local catalogs", () => {
       expect(presentNames).not.toContain("Looker McLook");
     });
 
+    // `look`/`look_at` dispatch `look_self` on the TARGET, so the target's own
+    // verb is the only place that can decide whether being looked at is
+    // noticeable (bootstrap.md §B2.7.1). These three cases pin the whole
+    // contract: a person notices, a thing does not, and neither case changes
+    // what the looker gets back.
+    describe("look_self owns the social half of a look", () => {
+      // Three actors in one room so the assertions can distinguish "the target
+      // heard it" from "the room heard it".
+      async function lookRoom() {
+        const world = createWorld();
+        const looker = world.auth("guest:look-social-looker").actor;
+        const target = world.auth("guest:look-social-target").actor;
+        const bystander = world.auth("guest:look-social-bystander").actor;
+        for (const [id, name] of [[looker, "Looker McLook"], [target, "Targie McSeen"], [bystander, "Bystander McIdle"]] as const) {
+          world.setProp(id, "name", name);
+          world.setObjectName(id, name);
+        }
+        for (const [index, id] of [looker, target, bystander].entries()) {
+          const entered = await world.directCall(`look-social-enter-${index}`, id, "the_chatroom", "enter", []);
+          expect(entered.op).toBe("result");
+        }
+        return { world, looker, target, bystander };
+      }
+
+      it("tells the person who was looked at, and only them", async () => {
+        const { world, looker, target, bystander } = await lookRoom();
+
+        const looked = await world.directCall("look-social-at-player", looker, "the_chatroom", "look_at", [target]);
+        expect(looked.op).toBe("result");
+        if (looked.op !== "result") return;
+
+        const noticedIndex = looked.observations.findIndex((obs) => obs.type === "looked_at");
+        expect(noticedIndex).toBeGreaterThanOrEqual(0);
+        const noticed = looked.observations[noticedIndex];
+        // `to` and `target` must BOTH name the person looked at: the live path
+        // resolves the audience from an actor-valued `target`, the committed
+        // path re-resolves it from `to`, and the two must not disagree.
+        expect(noticed).toMatchObject({ type: "looked_at", actor: looker, to: target, target, room: "the_chatroom" });
+        expect(String(noticed?.text ?? "")).toBe("Looker McLook looks you over.");
+        // Reaches the target's session; not the room's.
+        expect(looked.observationAudiences?.[noticedIndex]).toEqual([target]);
+
+        // The looker still gets its own view, exactly as before, and gets no
+        // echo of the notification.
+        const viewIndex = looked.observations.findIndex((obs) => obs.type === "looked");
+        expect(viewIndex).toBeGreaterThanOrEqual(0);
+        expect(looked.observations[viewIndex]).toMatchObject({ type: "looked", to: looker, target });
+        expect(looked.observationAudiences?.[viewIndex]).toEqual([looker]);
+        expect(looked.result).toMatchObject({ id: target });
+
+        // Nobody else is told anything at all.
+        for (const audience of looked.observationAudiences ?? []) {
+          expect(audience).not.toContain(bystander);
+        }
+      });
+
+      it("says nothing when the target is a thing, and nothing extra on a self-look", async () => {
+        const { world, looker } = await lookRoom();
+
+        const mug = await world.directCall("look-social-at-thing", looker, "the_chatroom", "look_at", ["the_mug"]);
+        expect(mug.op).toBe("result");
+        if (mug.op !== "result") return;
+        // $root/$actor look_self stay silent: the looker's private view is the
+        // only thing a look at a mug emits.
+        expect(mug.observations.map((obs) => obs.type)).toEqual(["looked"]);
+        expect(mug.observations[0]).toMatchObject({ type: "looked", to: looker, target: "the_mug" });
+
+        const self = await world.directCall("look-social-at-self", looker, "the_chatroom", "look_at", [looker]);
+        expect(self.op).toBe("result");
+        if (self.op !== "result") return;
+        // Describing yourself is not a social act — and this is also what keeps
+        // the internal look_self callers (idle probes, help *objectdoc*) quiet.
+        expect(self.observations.map((obs) => obs.type)).toEqual(["looked"]);
+      });
+    });
+
     it(":match_names() is zero-arg and uses the verb-frame `actor` global, contributing actor-sensitive keywords", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["chat"]);

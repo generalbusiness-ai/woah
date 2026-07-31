@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -1176,6 +1176,19 @@
         "look": "map"
       },
       "audience": "reply",
+      "channel": "chat"
+    },
+    {
+      "on": "$player",
+      "type": "looked_at",
+      "shape": {
+        "actor": "obj",
+        "to": "obj",
+        "target": "obj",
+        "room": "obj?",
+        "text": "str"
+      },
+      "audience": "target",
       "channel": "chat"
     },
     {

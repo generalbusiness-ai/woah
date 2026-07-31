@@ -1620,6 +1620,22 @@ whether to run again. The repair renumbers into the order every node already
 resolves in, so no verb name starts resolving to a different verb; it cannot
 restore the authoring order, which nothing recorded.
 
+For a Net world installed before `$player:look_self` began emitting `looked_at`
+([bootstrap.md §B2.7.1](../semantics/bootstrap.md#b271-looked_at--the-target-decides-whether-a-look-is-social)),
+the persisted verb page is authoritative and a deploy does not rewrite it — the
+world keeps looking at people silently. In-memory and SQLite worlds heal on
+their own, because `createWorld` re-runs `bootstrap()` over the stored world and
+`sourceVerb` upserts on a source-hash change; a Net world has no equivalent
+pass. Deploy the runtime, then:
+
+```bash
+npm run repair:net-definitions -- \
+  https://woah1.generalbusiness.ai '$player:look_self'
+```
+
+The command is idempotent — it replaces the page with the one a fresh install
+plan would have written, so re-running it is a no-op.
+
 These commands require the currently deployed `WOO_INTERNAL_SECRET`. A missing
 local copy is not recoverable from Cloudflare (Worker secret values are
 write-only); rotate that secret deliberately and store the replacement in the
