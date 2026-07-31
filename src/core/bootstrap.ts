@@ -192,6 +192,35 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   if (description) { description = description + " " + line; }
   else { description = line; }
   base["description"] = description;
+  // Being looked at is noticeable. look / look_at dispatch look_self on the
+  // TARGET (LambdaMOO #3:l*ook calls dobj:look_self()), so the target's own
+  // verb is the only place that can decide whether a look is a private read or
+  // a social act. Emitting here rather than in the looking verb keeps that
+  // decision per-object: the generic object and actor look_self bodies above
+  // stay silent, so a mug or an appliance is still looked at without comment,
+  // while a person hears about it. Neither the substrate nor the looking verb
+  // holds an opinion about sociality.
+  //
+  // A self-look emits nothing: describing yourself is not a social act, and
+  // suppressing it also keeps the many internal look_self calls that run as
+  // their own subject (idle probes, help *objectdoc*) from manufacturing noise.
+  //
+  // Routing: to and target both name the person looked at. That is not
+  // redundant - observationAudienceActors picks the recipient from an
+  // actor-valued target, observationReachesActor (re-applied at every
+  // committed-frame delivery point) filters on to, and the two predicates must
+  // agree or the line leaks to the room. room only tells clients which panel to
+  // render it in.
+  //
+  // The looker's own looked view is unchanged and still comes from the chat
+  // catalog's look_at; this is additive, not a rerouting.
+  if (actor != null && actor != this) {
+    let who = null;
+    try { who = actor:title(); } except errt { who = null; }
+    if (!who) { try { who = actor.name; } except errn { who = null; } }
+    if (!who) { who = to_string(actor); }
+    observe({ type: "looked_at", actor: actor, to: this, target: this, room: location(this), text: who + " looks you over.", ts: now() });
+  }
   return base;
 }`;
 

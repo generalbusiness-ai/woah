@@ -100,7 +100,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:pose(text)` / `:quote(text)` / `:self(text)` | str | Small LambdaCore-flavored speech forms for `]`, `|`, and `<`. |
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
-| `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
+| `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. Whether the *target* notices is not this verb's business: `$player:look_self` emits its own `looked_at` to the person looked at, and a mug's `look_self` emits nothing. See [bootstrap.md §B2.7.1](../../spec/semantics/bootstrap.md#b271-looked_at--the-target-decides-whether-a-look-is-social). |
 | `:who()` rxd | — | Returns canonical roster rows and emits a private `who` observation to the caller with `roster`. |
 | `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: live active-scope occupants plus awake/idle/sleeping status. |
 | `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |
@@ -187,6 +187,12 @@ declare_event $conversational "left"    { source: obj, actor: obj, room: obj, de
 declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, text: str, look: map };
 declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, roster: list<map>, text: str };
 declare_event $conversational "huh"     { source: obj, actor: obj, text: str, reason?: str };
+
+// Emitted by $player:look_self (seed graph), not by a chat verb. The schema
+// and the chat-channel formatter live here because chat owns the look path
+// and the chat panel; the emission lives on the target because only the
+// target can decide whether being looked at is noticeable.
+declare_event $player "looked_at" { actor: obj, to: obj, target: obj, room?: obj, text: str };
 ```
 
 | Type | Payload | Notes |
@@ -198,6 +204,7 @@ declare_event $conversational "huh"     { source: obj, actor: obj, text: str, re
 | `told` | `{source, from, to, text}` | Delivered only to `to`. |
 | `entered` / `left` | room-originated presence payloads | Presence transitions. These follow the LambdaCore room pattern: the room tells its own occupants, and the moving actor is excluded from the room announcement. |
 | `looked` / `who` | private payloads with `to: actor` | Room-generated output for commands whose display text should not be client-derived. |
+| `looked_at` | `{actor, to, target, room?, text}` | The other half of a look, and the only row here the chat catalog does not emit. `$player:look_self` sends it to the person who was looked at when the looker is somebody else; `to` and `target` both name that person so the live and committed audience rules agree on one recipient. Silent for `$root`/`$actor` targets and for self-looks. See [bootstrap.md §B2.7.1](../../spec/semantics/bootstrap.md#b271-looked_at--the-target-decides-whether-a-look-is-social). |
 | `huh` | `{source, actor, text, reason?}` | Unparseable input. Routed privately to `actor`; the text is retained for local history/debugging but is not room speech. |
 
 Live observations flow over the wire as `op: "event"` frames ([wire.md §17.2](../../spec/protocol/wire.md#172-server--client)) or as SSE `event: event` entries; clients render them in the same chronological feed as applied frames but they are not part of `:replay` history.

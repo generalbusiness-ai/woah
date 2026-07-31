@@ -294,6 +294,11 @@ const CHAT_PASSTHROUGH_TYPES = [
   "entered",
   "left",
   "looked",
+  // `looked_at` is the other half of a look: `looked` is the looker's own view,
+  // `looked_at` is the "Someone looks you over." line that $player:look_self
+  // sends to the person who was looked at. It carries its own `text` and falls
+  // through to the generic system-line branch of renderChatLineHtml.
+  "looked_at",
   "who",
   "huh"
 ];

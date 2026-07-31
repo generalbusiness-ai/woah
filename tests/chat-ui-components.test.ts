@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { renderChatLineHtml, WooChatSpaceElement, WooSpaceChatPanelElement, type ChatSpaceData, type SpaceChatPanelData } from "../catalogs/chat/ui/chat-space";
-import type { WooContext } from "../src/client/framework";
+import { registerWooChatFormatters, renderChatLineHtml, WooChatSpaceElement, WooSpaceChatPanelElement, type ChatSpaceData, type SpaceChatPanelData } from "../catalogs/chat/ui/chat-space";
+import { ChatFormatterRegistry, type WooContext } from "../src/client/framework";
 
 function context(): WooContext {
   return {
@@ -165,6 +165,24 @@ describe("chat catalog UI components", () => {
     expect(container.textContent).toContain("I don't understand that.");
     expect(container.textContent).not.toContain("the_dubspace");
     expect(container.textContent).not.toContain("zzzz");
+  });
+
+  // A new observation type has to be claimed by a chat formatter or it lands in
+  // the generic observations panel instead of the chat feed — "the observation
+  // shows up but not in chat".
+  it("routes looked_at into the chat feed and renders the line the target was sent", () => {
+    const registry = new ChatFormatterRegistry();
+    registerWooChatFormatters(registry);
+    expect(registry.isChatType("looked_at")).toBe(true);
+
+    const html = renderChatLineHtml(
+      { kind: "looked_at", source: "the_chatroom", actor: "guest_1", text: "Looker McLook looks you over.", ts: 1 },
+      (id) => id || "unknown"
+    );
+
+    const container = document.createElement("div");
+    container.innerHTML = html;
+    expect(container.textContent).toContain("Looker McLook looks you over.");
   });
 
   it("marks provisional error lines as retractable chat output", () => {

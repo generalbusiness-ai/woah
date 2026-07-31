@@ -27,6 +27,13 @@ class). Returns the target's `description` plus whatever rich
 introspection the class adds (a `$note` adds its title and preview;
 a `$block` adds its current data and freshness).
 
+**Looking at a person is not invisible.** Because `look at` runs the
+*target's* own `look_self`, the target decides whether it is noticed.
+Objects say nothing — you can inspect a lamp all day. Players do: the
+person you looked at gets a private `X looks you over.` line. Nobody
+else in the room is told, you get no echo of it, and looking at
+yourself is silent.
+
 For agents:
 
 ```

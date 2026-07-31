@@ -149,7 +149,7 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:look_self()` rxd | — | Player view. Calls `pass()` to inherit `$actor:look_self`'s carrying-aware shape, then appends one of three idle-status sentences modeled on LambdaCore: `<name> is sleeping.` when `is_connected(this)` is false; `<name> is awake and looks alert.` when connected and `idle_seconds(this) < 60`; otherwise `<name> is awake, but has been staring off into space for N minutes.` Connection and idle state come from `is_connected` / `idle_seconds` substrate builtins (see [builtins.md §19.7](builtins.md#197-sessions)). |
+| `:look_self()` rxd | — | Player view. Calls `pass()` to inherit `$actor:look_self`'s carrying-aware shape, then appends one of three idle-status sentences modeled on LambdaCore: `<name> is sleeping.` when `is_connected(this)` is false; `<name> is awake and looks alert.` when connected and `idle_seconds(this) < 60`; otherwise `<name> is awake, but has been staring off into space for N minutes.` Connection and idle state come from `is_connected` / `idle_seconds` substrate builtins (see [builtins.md §19.7](builtins.md#197-sessions)). **Also emits `looked_at` to `this`** when the looking `actor` is somebody else — see §B2.7.1. |
 | `:on_disfunc()` | — | Disfunc hook called at session reap. Default body is a no-op; `$guest` overrides. See [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention). |
 | `:moveto(target)` | obj | Move this player to `target.contents`. Used by disfunc bodies. |
 | `:tell(text...)` rxd | any... | Woocode wrapper over the generic `tell(actor, text...)` builtin. Delivers text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |
@@ -161,6 +161,57 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 | `:join_player(name)` rxd | str | LambdaCore-shaped `@join <player>`. Resolves a player name globally, tells the caller a join message, moves the caller to that player's current location through `moveto`, emits leave/enter observations, and returns a move result with `look_deferred`. Native until global player matching is DSL-exposed. Alias: `@join`. Tool-exposed. |
 | `:ways(room?)` rxd | str? | LambdaCore-shaped `@ways`. Lists obvious exits from the current room, or from a visible room named by the argument. Reads the room's explicit `exits` map, prefetches its referenced exit pages on net, filters unique exits whose `obvious` property is truthy, tells the caller a formatted "Obvious exits" line, and returns `{room, exits, text}`. Missing referenced pages fail the plan so the complete listing is repaired and retried; they are never silently treated as hidden. Woocode seeded on `$player`. Alias: `@ways`. Tool-exposed. |
 | `:examine_detailed(name)` rxd | str | Woocode over `$match:match_object`, `visible_contents`, `obvious_verbs`, and `remote_describe`. LambdaCore-shaped `@examine <object>`. Resolves a visible object from the caller's command scope, tells name/owner/aliases/description/contents plus obvious command verbs, and returns the same data in structured form. Obvious verbs are readable verbs with command metadata, skipping dull base classes, matching the LambdaCore model of command-shaped affordances rather than a dump of all callable verbs. Alias: `@exam*ine`. Tool-exposed. |
+
+#### B2.7.1 `looked_at` — the target decides whether a look is social
+
+`look`/`look_at` never notify the object being looked at. They dispatch
+`target:look_self()` (the LambdaMOO `#3:l*ook` → `dobj:look_self()` shape) and
+emit the looker's own private `looked` view. **Whether a look is noticed is
+therefore decided by the target's own `look_self`, not by the looking verb and
+not by the substrate.** `$root:look_self` and `$actor:look_self` are silent, so a
+mug, a lamp, or an appliance is inspected without comment.
+
+`$player:look_self` is the one seeded class that opts in. When the calling
+`actor` is not `this`, it emits:
+
+```woo
+observe({ type: "looked_at", actor: <looker>, to: this, target: this,
+          room: location(this), text: "<Looker> looks you over.", ts: now() });
+```
+
+- **Recipient.** `to` and `target` both name the person looked at, which is what
+  makes the live rule and the committed rule agree on a single recipient
+  ([events.md §12.7](events.md#127-audience-and-delivery) rules 1–2 and the `to`
+  narrowing). The room is not told. The looker does not get an echo — the
+  `looked` view is its whole answer, and the MCP own-turn seat drops rows
+  `to`-addressed elsewhere.
+- **Durability.** `look_at` is a direct route, so the line is live-only, like
+  `tell()`. Being looked at is not a fact worth replaying.
+- **Self-looks are silent.** `actor == this` emits nothing, so describing
+  yourself, the idle/connection probes, and help's `*objectdoc*` render do not
+  manufacture traffic.
+- **Volume.** Room `look` composes its roster from the `room_roster` builtin and
+  excludes `$player` descendants from the contents list, so orienting in a room
+  never dispatches anybody's `look_self`. Only an explicit `look <person>` does.
+
+**Aged Net worlds need an operator step.** This is a change to a seeded verb's
+source. In-memory and SQLite worlds pick it up on the next boot (`createWorld`
+re-runs `bootstrap()` over the stored world and `sourceVerb` upserts when the
+source hash moves); a deployed Net world's persisted verb page is authoritative
+and a deploy does not rewrite it. Run
+`npm run repair:net-definitions -- <worker> '$player:look_self'` after deploying
+— see [cloudflare.md §R14](../reference/cloudflare.md).
+
+Stock LambdaCore ships this *off*: `#6:look_self` only tells the looker, and
+"who can perceive me" is answered by a separate toolkit (`@sweep`, `@paranoid`,
+`whodunnit`). Being told you were looked at is a per-player `look_self` override
+there — available because a LambdaMOO player owns itself. woo ships it **on**,
+because a woo player is owned by the wizard who minted it and cannot install
+that override; defaulting to silence would make the affordance unreachable
+rather than optional. The customization seat still exists, in the other
+direction: a class that wants silence defines its own `look_self` that does not
+route through `$player`'s body. No property gates this — a per-player flag would
+need the same ownership the override needs, so it would be dead surface.
 
 ### B2.8 `$guest` verbs
 
@@ -522,7 +573,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:emote(text)` | str | Emits `emoted`. |
 | `:tell(recipient, text)` | obj, str | Emits `told` to `recipient`. |
 | `:look()` | — | Thin chat command wrapper over `this:look_at(this)`. |
-| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
+| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. It holds no opinion about whether the target notices: any social half of a look is emitted by the target's own `look_self` (§B2.7.1). |
 | `:who()` | — | Woocode. Builds the room roster, emits a private `who` observation, and returns the roster. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
@@ -574,6 +625,14 @@ declare_event $conversational "left"    { source: obj, actor: obj, room: obj, de
 declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, target?: obj, text: str, look: map };
 declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, present_actors: list<obj>, text: str };
 declare_event $conversational "huh"     { source: obj, actor: obj, text: str, reason?: str };
+```
+
+The same manifest also declares the one schema whose emitter is *not* a chat
+class, because the chat catalog owns the chat channel and the client formatter
+for it:
+
+```woo
+declare_event $player "looked_at" { actor: obj, to: obj, target: obj, room?: obj, text: str };
 ```
 
 Schemas describe shape only ([events.md §13](events.md#13-schemas)); durability is set by the route of the verb that emits each observation.
