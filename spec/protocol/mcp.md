@@ -1,6 +1,6 @@
 ---
 date: 2026-05-02
-updated: 2026-07-29
+updated: 2026-07-30
 status: implemented
 ---
 
@@ -15,6 +15,13 @@ available; the gateway does not encode catalog names or command words.
 
 This document specifies the initial Net MCP profile. The classic MCP host is a
 rollback implementation and is not the reference for new behavior.
+
+Two PROJECTIONS of that surface exist. §M2–§M7 specify the **classic**
+projection, which is the default and the reference. §M9 specifies an optional
+**collapsed** projection, selected per session, that renders the same drafts
+under different names and adds an MCP resource channel. Everything outside §M9
+— authentication, the envelope, structural context, invocation, the
+observation queue, the security invariants — is shared by both, unchanged.
 
 ## M1. Connection and authentication
 
@@ -1184,8 +1191,217 @@ directly cannot observe the contract.
 - durable observation delivery;
 - additional credential carriers;
 - explicit typed returned-object references;
-- MCP resources such as `woo://here` or `woo://object/{id}`;
 - multi-actor multiplexing and streaming progress.
 
 Each is additive. None requires reviving MCP focus wrappers or a second
 execution stack.
+
+## M9. The collapsed projection (optional)
+
+**Status: implemented, opt-in.** This section describes an ALTERNATIVE
+rendering of the tool surface specified in §M2, plus a resource channel. It
+does not replace the classic projection: a session that does not opt in sees
+exactly §M2–§M7 and nothing here applies to it.
+
+The motivation is measured, not aesthetic. In the seeded demo world, standing
+in the Living Room, the classic projection advertises 146 dynamic tools over 9
+objects for 78 distinct verbs. `set_description` appears nine times, `look`
+eight. Two mounted workspaces the actor is standing in neither of contribute 80
+of the 146, and 56 of those are a byte-identical repeat of the generic room
+block. The cause is that a tool is minted per `(object, verb)` pair and object
+identity is carried in the tool NAME, so every object in view multiplies the
+surface by its whole inherited verb set. An enumerating host pays that in
+context; a host that searches for a tool by keyword gets nine
+indistinguishable `say` hits and no basis to choose.
+
+### M9.1 Selection
+
+A session selects the projection with the request header:
+
+```text
+woo-mcp-profile: collapsed
+```
+
+`classic` is the only other accepted value and is the default when the header
+is absent or unrecognised.
+
+The header is the carrier rather than an `initialize` parameter because
+`initialize` params are a closed schema plus a `_meta` bag hosts are not
+obliged to forward, and hosts commonly construct `initialize` themselves from
+configuration. A transport header is settable by every HTTP client and
+forwardable by a proxy that never parses the body.
+
+The value supplied at `initialize` is LATCHED for the session, so a client that
+sets it once keeps the surface it asked for. A header on any later request
+overrides and re-latches. Sending it on every request is recommended and is
+what the bundled stdio bridge does (`WOO_MCP_PROFILE=collapsed`): the latched
+value lives in gateway memory, and an eviction would otherwise drop a client
+back to the classic surface mid-conversation.
+
+`initialize` under this profile advertises
+`capabilities: { tools: { listChanged: true }, resources: { listChanged: true } }`.
+The classic profile advertises no `resources` capability, and every
+`resources/*` method answers JSON-RPC `-32601` there — a method a server never
+advertised must not quietly work, or capability discovery by probing sees two
+different servers on one endpoint.
+
+The collapsed profile advertises a fourth stable control, `woo_read(uri)`
+(§M9.5). The three controls of §M2.1 are unchanged.
+
+### M9.2 Universal and distinctive verbs
+
+A draft's DEFINER is the class or attached feature that holds the verb page
+(§M2.2). The projection partitions drafts by definer:
+
+> A definer is **universal** for a session iff it is a strict ancestor —
+> through class inheritance or feature attachment — of at least two distinct
+> objects in structural context, OR of the session's actor, OR of the
+> session's active space. Every other definer is **distinctive**.
+
+Both clauses are required.
+
+- The first clause is the design note's measured discriminator expressed as
+  its cause. `$thing` is shared by the mug, the lamp and the couch, so `look`
+  collapses; `$cockatoo` is one object's own type, so its `look` does not.
+- The second clause supplies stability. Under the first alone, a room holding
+  no second room would make `$room` and `$conversational` ancestors of exactly
+  one context object, and the whole generic block would fragment back into
+  `<room>__say`, `<room>__look`. The actor and the active space are the two
+  objects a session always has, so anchoring on them makes the universal
+  vocabulary the same in every room of every world.
+
+`strict` matters in both: a definer that IS the object is that object's own
+declaration and can never be universal for it.
+
+**Core holds no vocabulary of verb names.** Nothing in the gateway knows that
+`say`, `open` or `move` is special. That is a layering requirement, not a
+stylistic one: a reserved list would be catalog knowledge in the substrate.
+
+**Rendering.** Universal drafts are grouped by verb NAME. Each group becomes
+ONE tool named by the sanitized verb, whose first parameter names the RECEIVER
+— `target`, or the first free alternative when the verb already declares a
+parameter of that name. The parameter publishes an `enum` of the legal
+receivers plus `$here` and `$me` where those resolve to one. It is optional
+when a default exists (the active space if it is a receiver, else the actor,
+else the sole receiver) and required otherwise. Distinctive drafts keep the
+classic `<object>__<verb>` name and schema.
+
+Two receivers of the same verb name whose parameter lists DIFFER are a
+different call. The group holding the session's default receiver keeps the bare
+name; the others fall back to object-qualified names rather than advertising
+one schema that half the receivers reject.
+
+**Late binding is the point.** A collapsed tool resolves its receiver per call
+from the argument and live session state. A remembered `say` therefore cannot
+retarget, because the target was never frozen into the identifier — the
+converse of the §M2.3 collision-suffix hazard.
+
+### M9.3 Shadowing is allowed and diagnostic
+
+A catalog verb whose name matches a universal one is NOT an error. It stays
+object-qualified, stays callable, and both names appear in the listing. The
+shadowing object is not a receiver of the universal tool, because its own
+declaration is what the world would dispatch.
+
+`the_weather:open` coexisting with a conventional `open` tells a catalog author
+either that the catalog should adopt the convention or that its verb is
+misnamed. That is a lint offered to authors, never a constraint enforced by the
+protocol. No reserved-word rule exists.
+
+### M9.4 Name-keyed families and closed mounts
+
+Two further reductions, both structural.
+
+**Name-keyed families.** A verb whose `arg_spec.authority.prefetch` contains a
+`{"path":[...]}` entry with the literal `"$verb"` is declaring that its own
+name is a key into that path — its name is data. When the same definer declares
+a sibling whose otherwise-identical path reads `{"arg": i}` in that position,
+the sibling is the family's general form, and the members fold into it: they
+are not advertised, and their names and literal aliases are documented as
+accepted values of parameter `i`. In the seeded world the eight compass verbs
+and `out` read `target.exits[$verb].dest` and fold into `go(exit)`, which reads
+`target.exits[exit].dest`. The fold is refused, leaving the member advertised,
+when a member matches two general forms, declares more than one `$verb` path,
+or when the general form does not declare the parameter its path reads.
+
+**Closed mounts.** A `$space` in structural context that is not the active
+space is a mounted workspace rather than furniture. Its DISTINCTIVE verbs are
+withheld; it remains a receiver of the universal ones, so its handle is the
+universal entry verb with the mount as `target` — semantically identical to the
+classic `<mount>__enter`, which is to say it moves the actor. `$space` is a
+substrate contract (spec/semantics/space.md), not a catalog class name.
+
+This is projection only. The world is unchanged: no mount relation, no
+foreground-work concept, no separation of presence from work.
+
+**The collapse never applies to the textual command parser.** `n`, `north`,
+`go north` and every flavour alias keep working at a prompt whatever this
+projection advertises. Prose for people, contract for clients.
+
+**Listing is never an authority grant** (§M2.2 unchanged). A collapsed tool may
+advertise nine receivers and the authoritative turn refuse eight of them.
+
+### M9.5 Resources
+
+The collapsed profile implements `resources/list`,
+`resources/templates/list` and `resources/read`.
+
+**The list/read asymmetry is the load-bearing constraint.** SEP-2567 requires
+`resources/list` to be determined by deployment and authenticated principal,
+never by a prior call or by connection state. A resource list that grew and
+shrank as the actor walked would reproduce the tool-list defect one layer down.
+Therefore:
+
+- `resources/list` is CONSTANT for the deployment. It returns exactly
+  `woo://here`, `woo://here/exits`, `woo://here/roster`, `woo://me`,
+  `woo://me/inventory`. These are stable URIs whose CONTENT moves with the
+  actor; the URIs do not.
+- `resources/templates/list` advertises stable URI SHAPES. There is one:
+  `woo://object/{id}`.
+- "What is here" is a READ, never a listing. Nearby objects and mounted
+  workspaces are enumerated inside `woo://here`, not as sibling resources.
+- `resources/read` is where presence and authority are enforced, and it may
+  refuse. `woo://object/{id}` applies the same reachability predicate as
+  `woo_call` (§M3): a resource read is not a side channel around it.
+
+Reads touch the gateway mirror only. No turn is planned and nothing is
+committed, which is what makes orientation free of the observation traffic a
+`look` emits.
+
+`ttlMs` and `cacheScope` accompany a read where meaningful. A room's
+description and exits are the same bytes for everyone standing in it
+(`public`, longer-lived); a roster, an actor's own record and its inventory are
+one principal's (`private`, short).
+
+**Exit records.** `woo://here/exits` returns, per exit, a stable `id`, a
+`label`, every `alias` that names it, its `destination`, and `traversable`.
+`traversable` is derived from the same two properties the exit's own move verb
+consults: an exit that carries a refusal message, or that names no destination,
+will not move the actor. The refusal TEXT is not published — the category is
+public, the content is earned. The seeded Living Room's `south` is the case
+this exists for: a stable id and a real destination, and it does not move you.
+
+**`woo_read(uri)`** returns the same payload as `resources/read` for the same
+URI. It exists because not every host consumes resources, and because the
+per-object read-shaped verbs a host would otherwise fall back on are exactly
+what collapsed away. Resources are the efficient path; this is the floor.
+
+Resource subscriptions are NOT implemented and must not absorb the observation
+feed: "the mug's text changed" is a state diff, "Guest 2 said hello" is a
+social event with an audience model, and collapsing them would discard the
+audience semantics.
+
+### M9.6 What this projection does not do
+
+- It does not merge distinct verbs that merely mean similar things. `say`,
+  `say_as`, `emote`, `pose` and `quote` remain five tools, because merging
+  them into one `say(text, mode)` requires knowing what those NAMES mean, and
+  that knowledge belongs to a catalog. Ancestry cannot derive it.
+- It does not rename anything. A collapsed tool carries the world's own verb
+  name — `set_description`, not `describe`; `enter`, not `open`.
+- It does not introduce `work_scope`, a mount relation, or any separation of
+  physical presence from foreground work.
+
+Measured result for the seeded Living Room: **146 dynamic tools become 47**,
+with the two mounts contributing 0 instead of 80, and every remaining name
+naming one concept exactly once.

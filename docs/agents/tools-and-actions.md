@@ -179,5 +179,73 @@ MCP does not use the in-world focus list. A task on the current board is
 available immediately; after `claim`, its tools follow you in inventory. There
 is no `focus -> re-list -> call -> unfocus` protocol sequence.
 
+## The collapsed profile (opt-in)
+
+Everything above describes the default surface. An alternative *collapsed*
+surface is available per session, and the two never mix: a session sees one or
+the other.
+
+Select it with a request header on every call to `/net-api/mcp`:
+
+```
+woo-mcp-profile: collapsed
+```
+
+or, through the stdio bridge, by setting `WOO_MCP_PROFILE=collapsed` in the
+environment your MCP client spawns it with.
+
+**What changes.** Verbs that every object in view shares — the ones inherited
+from a base class or an attached feature — become ONE tool each, named by the
+verb, taking the object as an argument:
+
+```
+look()                                    # the space you are in
+look(target: "the_mug")
+say(text: "hello")
+set_description(target: "the_mug", desc: "…")
+go(exit: "southeast")                     # absorbs north, out, and the rest
+```
+
+Verbs distinctive to one object keep the familiar `<object>__<verb>` name,
+because there the object *is* the meaning:
+
+```
+the_cockatoo__squawk()
+the_weather__ask(day: "tomorrow")
+```
+
+A verb a catalog declares for itself keeps its own name even when a universal
+tool shares it — `the_cockatoo__look` and `look` both exist, and they are
+different verbs.
+
+A workspace sitting in your space shows no tools of its own until you enter it.
+Enter it the way you always did, through the universal entry verb with the
+workspace as the target.
+
+Standing in the seeded Living Room this is 47 tools instead of 146.
+
+**Reading the world.** This profile also serves MCP resources, which are the
+efficient way to orient:
+
+| URI | What |
+|---|---|
+| `woo://here` | the space you are in: exits, contents, mounted workspaces, roster |
+| `woo://here/exits` | exits with stable ids, aliases, destination, and `traversable` |
+| `woo://here/roster` | who is present |
+| `woo://me` | your actor |
+| `woo://me/inventory` | what you are carrying |
+| `woo://object/{id}` | any object you can reach |
+
+`resources/list` never changes as you move — the URIs are stable and their
+contents move with you. Read `woo://here` again after a move rather than
+expecting a new resource to appear.
+
+`traversable: false` means the world advertises that exit and it will not move
+you. Whether that is a locked door or a joke is for you to find out.
+
+If your client ignores resources, `woo_read(uri)` returns the same payload as
+a tool call.
+
 The normative contract is
-[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md).
+[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md); the collapsed
+profile is §M9.
