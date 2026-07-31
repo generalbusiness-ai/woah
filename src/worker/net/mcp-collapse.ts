@@ -33,16 +33,18 @@
 //      one session-level tool each, named by the verb, taking the receiver as
 //      an argument. Everything else stays `<object>__<verb>`.
 //
-//   3. CLOSED MOUNTS (`isClosedMount` at the call site). A `$space` sitting in
-//      the room the actor is standing in is a workspace, not furniture: its
-//      DISTINCTIVE verbs are withheld until the actor is in it. It keeps its
-//      universal verbs as receiver candidates, so the handle that opens it is
-//      the universal `enter` with the mount as `target` — exactly what
-//      `<mount>__enter` does today.
+//   3. CLOSED MOUNTS (decided at the call site, from the substrate's routing
+//      classification). An object that roots its own shared sequencer, sitting
+//      in the room the actor is standing in, is a workspace rather than
+//      furniture: its DISTINCTIVE verbs are withheld until the actor is in it.
+//      It keeps its universal verbs as receiver candidates, so the handle that
+//      opens it is the universal entry verb with the mount as its target —
+//      exactly what the object-qualified form does today.
 //
 // Nothing here changes world semantics. Entering a mount still moves the
-// actor; the textual command parser still accepts `n`, `north` and `go north`
-// whatever this projection advertises (spec/protocol/mcp.md §M9.6).
+// actor; the textual command parser still accepts every direction word and
+// flavour alias whatever this projection advertises (spec/protocol/mcp.md
+// §M9.4).
 
 /** The subset of a gateway tool draft this module reasons over. Declared
  * structurally rather than importing `NetMcpToolDraft` so the collapse rules
@@ -74,19 +76,19 @@ export type CollapseClass =
  *
  *   (a) SHARED IN CONTEXT — the definer is a strict ancestor of at least two
  *       distinct context objects. This is the note's measured discriminator
- *       expressed as its cause: `$thing` is shared by the mug, the lamp and
- *       the couch, so `look` collapses; `$cockatoo` is the cockatoo's own
- *       type, so `the_cockatoo__look` stays object-bound even though it
- *       shadows the universal name. Shadowing is diagnostic, not an error
- *       (§M9.3).
+ *       expressed as its cause: a base that several visible objects derive
+ *       from is conventional, so the verb it declares collapses; a type only
+ *       one object has is that object's own, so its verb stays object-bound
+ *       even when it shadows a universal name. Shadowing is diagnostic, not
+ *       an error (§M9.3).
  *
  *   (b) ANCHORED — the definer is a strict ancestor of the session ACTOR or of
  *       its ACTIVE SPACE. Clause (a) alone is unstable at the bottom end: in a
- *       room holding no second room, `$room` and `$conversational` would be
+ *       room holding no second room-like object, the room's own bases would be
  *       ancestors of exactly one context object and the whole generic block
- *       would fragment back into `<room>__say`, `<room>__look`… — the surface
- *       shape would depend on the furniture, which is the defect this
- *       projection exists to remove. The actor and the active space are the
+ *       would fragment back into object-qualified names — the surface shape
+ *       would depend on the furniture, which is the defect this projection
+ *       exists to remove. The actor and the active space are the
  *       two objects a session always has, so anchoring on them makes the
  *       universal vocabulary the same in every room of every world.
  *
@@ -162,9 +164,9 @@ export function foldNameKeyedFamilies(drafts: readonly CollapseDraft[]): NameKey
   // position blanked. Value carries the parameter index the path reads.
   //
   // DEDUPED BY (definer, verb). One class page is drafted once per object that
-  // inherits it, so a room, an outliner and a dubspace all contribute the same
-  // `$room:go` — three copies of ONE general form. Counting the copies made
-  // every family look ambiguous and silently disabled the fold.
+  // inherits it, so three room-like objects in context contribute three copies
+  // of ONE general form. Counting the copies made every family look ambiguous
+  // and silently disabled the fold.
   const generalForms = new Map<string, Map<string, { parameterIndex: number; definer: string }>>();
   for (const draft of drafts) {
     for (const path of prefetchPaths(draft.argSpec)) {

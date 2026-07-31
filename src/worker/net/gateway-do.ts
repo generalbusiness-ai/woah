@@ -6136,7 +6136,8 @@ export class NetGatewayDO {
     if (uri === "woo://here") {
       if (!here) return noSpace;
       const contents = [...this.mcpContentsContext(here, actor)];
-      const mounts = contents.filter((object) => this.mcpIsSpace(object));
+      const classifier = this.mcpLineageClassifier();
+      const mounts = contents.filter((object) => this.mcpIsWorkspace(object, classifier));
       return wrap({
         id: here,
         ...this.mcpObjectFacts(here),
@@ -6191,13 +6192,14 @@ export class NetGatewayDO {
           }
         };
       }
+      const isWorkspace = this.mcpIsWorkspace(object, this.mcpLineageClassifier());
       return {
         value: {
           data: {
             id: object,
             ...this.mcpObjectFacts(object),
-            is_space: this.mcpIsSpace(object),
-            ...(this.mcpIsSpace(object) ? { exits: this.mcpExitRecords(object) } : {})
+            is_workspace: isWorkspace,
+            ...(isWorkspace ? { exits: this.mcpExitRecords(object) } : {})
           },
           // An arbitrary object's state is world-visible, but it changes
           // whenever anyone acts on it: public, and short.
@@ -6234,7 +6236,7 @@ export class NetGatewayDO {
    * The space's exits as structured records (§M9.5).
    *
    * `traversable` is the field the design note asks for, and it is DERIVED
-   * from the same two properties the exit's own `move` verb consults: an exit
+   * from the same two properties the exit's own move verb consults: an exit
    * that carries a refusal message, or that names no destination, will not
    * move the actor. The seeded Living Room's `south` is the case — plate-glass
    * windows with a `nogo_msg` — and reporting it as a real exit is what sent
@@ -6268,7 +6270,8 @@ export class NetGatewayDO {
         label: typeof property("name") === "string" ? property("name") : aliases[0],
         aliases: aliases.sort(),
         destination: typeof destination === "string" && destination ? destination : null,
-        // Exactly the condition `$exit:move` applies before it moves anyone.
+        // Exactly the condition the exit's own move verb applies before it
+        // moves anyone.
         traversable: Boolean(destination) && !refusal,
         ...(typeof property("description") === "string" ? { description: property("description") } : {})
       });
@@ -7552,20 +7555,20 @@ export class NetGatewayDO {
 
     const fold = foldNameKeyedFamilies(allDrafts);
     const universal = universalDefiners(draftsByObject, actor, activeSpace);
-    // A $space that is not the space the actor is standing in is a mounted
-    // workspace, and the note's dominant measured lever: the two mounts in the
+    // An object that roots its own shared sequencer and is not the space the
+    // actor is standing in is a mounted workspace, and the note's dominant measured lever: the two mounts in the
     // seeded Living Room supplied 80 of 146 tools while the actor was in
     // neither. Withhold their DISTINCTIVE verbs until the actor is in them.
     // They remain receivers of the universal verbs, so the handle that opens
     // one is the universal `enter` with the mount as its target — which is
     // exactly what `<mount>__enter` does today (§M9.4).
     //
-    // `$space` is a SUBSTRATE contract (spec/semantics/space.md), not catalog
-    // knowledge: it is the sequenced-log base every world has, in the same way
-    // `$nowhere` is already consulted by `mcpPlacedScope`. No catalog class
-    // name appears here.
+    // The discriminator is the substrate's own routing classification — see
+    // `mcpIsWorkspace`. No class name, catalog or bootstrap, appears here.
+    const workspaceClassifier = this.mcpLineageClassifier();
     const closedMounts = new Set(
-      ordered.filter((object) => object !== actor && object !== activeSpace && this.mcpIsSpace(object))
+      ordered.filter((object) =>
+        object !== actor && object !== activeSpace && this.mcpIsWorkspace(object, workspaceClassifier))
     );
 
     // ---- partition ------------------------------------------------------
@@ -7719,21 +7722,36 @@ export class NetGatewayDO {
     return out;
   }
 
-  /** Does this object inherit from the substrate's sequenced-log base? Used
-   * only to tell a mounted workspace from furniture (§M9.4). Walks the mirror
-   * lineage chain; an incomplete chain answers false, which degrades to the
-   * classic per-object projection rather than hiding anything. */
-  private mcpIsSpace(object: string): boolean {
-    const view = this.ensureView();
-    let current: string | null = object;
-    const walked = new Set<string>();
-    while (current && !walked.has(current)) {
-      walked.add(current);
-      if (current === "$space") return true;
-      const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
-      current = typeof lineage?.parent === "string" ? lineage.parent : null;
+  /**
+   * Is this object a mounted workspace rather than furniture (§M9.4)?
+   *
+   * Asked of the SUBSTRATE'S OWN ROUTING CLASSIFICATION, not of a class name.
+   * `scopeNameOf` already answers "does this object root its own shared
+   * sequencer" — that is what a `room:<self>` scope means, and it is the fact
+   * that makes a workspace's verbs sequence somewhere other than the room the
+   * actor is standing in. Re-deriving it by walking for a base class would
+   * have put a bootstrap identity in a runtime branch, and would also have
+   * mis-sorted an appliance that roots its own `cluster:` family.
+   *
+   * An incomplete lineage chain throws; that answers false, which degrades to
+   * the ordinary per-object projection rather than hiding anything.
+   */
+  private mcpIsWorkspace(object: string, classifier: ScopeClassifier): boolean {
+    try {
+      return classifier.scopeOf(object) === `room:${object}`;
+    } catch {
+      return false;
     }
-    return false;
+  }
+
+  /** A lineage classifier over this gateway's mirror. Built once per listing
+   * or read: it memoizes nothing, so constructing one per object would rewalk
+   * the same chains. */
+  private mcpLineageClassifier(): ScopeClassifier {
+    const view = this.ensureView();
+    return classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
   }
 
   private mcpObjectToolDrafts(actor: string, object: string, allowCommandShaped: boolean): NetMcpToolDraft[] {
