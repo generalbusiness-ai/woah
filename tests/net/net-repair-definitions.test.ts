@@ -27,4 +27,22 @@ describe("signed net definition repair inputs", () => {
       "not retired bundled bootstrap definition pages"
     );
   });
+
+  // A *bootstrap* retirement has no catalog migration to name it, so before
+  // RETIRED_BOOTSTRAP_DEFINITIONS this op could install a replacement seed page
+  // and never drop the one it superseded — leaving the nearer, retired ancestor
+  // winning on every deployed world. This is the exact command the deploy runs
+  // (cloudflare.md §R14): both halves in one signed request.
+  it("admits retired bootstrap pages on the drop side", async () => {
+    const result = await definitionRepairInputs(["$root:look"], ["$thing:look"]);
+    expect(result.cells).toEqual([
+      expect.objectContaining({ kind: "verb_bytecode", object: "$root", name: "look", value: expect.any(Object) })
+    ]);
+    expect(result.remove).toEqual([{ kind: "verb_bytecode", object: "$thing", name: "look" }]);
+
+    // The allow-list is still an allow-list: a page the current bundle ships
+    // cannot be dropped, and an unretired bootstrap page is not nameable.
+    await expect(definitionRepairInputs([], ["$root:look"])).rejects.toThrow("not retired bundled bootstrap definition pages");
+    await expect(definitionRepairInputs([], ["$player:tell"])).rejects.toThrow("not retired bundled bootstrap definition pages");
+  });
 });

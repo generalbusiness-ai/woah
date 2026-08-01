@@ -271,6 +271,36 @@ source/schema sync repeatable and declaration-free. Explicit one-shot boot
 migrations remain only for data conversions or compatibility repairs that cannot
 be inferred from a manifest diff.
 
+**Retired bootstrap definitions.** The drift pass above repairs *catalog*
+definitions. Seed pages delivered by the substrate's own bootstrap need the
+same treatment in the delete direction, and cannot get it from a manifest diff:
+seeding is declarative, so re-seeding adds and updates pages but never removes
+one. A page that stops being seeded therefore survives on every world an older
+build created — and while it survives it **shadows** its replacement for its own
+subtree, because a definition on a nearer ancestor always wins. Moving a verb
+*up* the seed graph is exactly the case: the old, lower page keeps answering.
+
+The bundle therefore carries an explicit retirement record
+(`RETIRED_BOOTSTRAP_DEFINITIONS`), and two consumers walk aged worlds forward
+from that one list so the local and deployed paths cannot drift apart:
+
+- **Local / SQLite** — a cold-init boot migration deletes each retired page it
+  finds. It runs *after* seeding and every catalog plan, so the replacement is
+  already present when its shadow is removed; there is never a window where
+  neither resolves. Idempotent twice over: the ledger short-circuits a repeat
+  run, and deleting an absent page is already a no-op.
+- **Deployed / Net** — the signed `repair:net-definitions` operator op accepts
+  the same entries in its `--drop` allow-list. That op exists to repair
+  bootstrap pages, but its drop side previously admitted only pages retired by
+  a bundled **catalog** migration, so it could install a replacement bootstrap
+  page while leaving the page it superseded in place. An operator still cannot
+  name an arbitrary live definition: a page present in the current bundle is
+  refused even if a record mentions it.
+
+Retiring a bootstrap page is thus a two-part change — seed the replacement, and
+record the retirement — and a deploy that installs the first without running the
+second leaves the old page winning.
+
 **Bundled catalog version upgrades.** Before the drift pass, boot compares each
 installed `@local` catalog's recorded version against its bundled manifest.
 When the bundle is ahead, boot applies the bundled §CT14 migration whose
