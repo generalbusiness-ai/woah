@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins inherit the v0.2 $note shape (name + description + text, where text is a single markdown string); board-level layout is independent of note content. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
@@ -168,22 +168,6 @@
             "args": []
           },
           "source": "verb :title() rxd { return this.name + \" on the wall\"; }"
-        },
-        {
-          "name": "look",
-          "aliases": [
-            "l@ook",
-            "ex@amine"
-          ],
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "reads_room_presence": true,
-          "tool_exposed": true,
-          "arg_spec": {
-            "args": []
-          },
-          "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
         },
         {
           "name": "look_self",

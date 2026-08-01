@@ -14,6 +14,7 @@ import {
   type CatalogSchemaPlanApplyResult,
   type CatalogSchemaPlanScope
 } from "./catalog-installer";
+import { RETIRED_BOOTSTRAP_DEFINITIONS } from "./retired-definitions";
 import { valuesEqual, type ObjRef, type WooValue } from "./types";
 import type { WooWorld } from "./world";
 
@@ -180,6 +181,13 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION = "2026-05-1
 // it a one-shot repair; future manifest additions require a new migration id.
 // Deployed fix reference: 2026-06-11 E_OBJNF exit_living_room_outline.
 const LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION = "2026-06-11-missing-seed-instances";
+// Deletes bootstrap definition pages this bundle retired (see
+// RETIRED_BOOTSTRAP_DEFINITIONS). Re-seeding can add and update pages but
+// never removes one, so a retired page survives on every world an older
+// bundle created — and a retired page on a *nearer* ancestor shadows its
+// replacement. Cold-init is the only moment a local world reliably re-reads
+// the bundle, so this is where the deletion belongs.
+const LOCAL_BOOT_RETIRED_BOOTSTRAP_DEFINITIONS_MIGRATION = "2026-07-31-retired-bootstrap-definitions";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -282,7 +290,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" },
-  { id: LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION }
+  { id: LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION },
+  { id: LOCAL_BOOT_RETIRED_BOOTSTRAP_DEFINITIONS_MIGRATION }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -582,7 +591,28 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   // The `reconcileSeedHooks: true` path in runLocalCatalogSchemaPlan gates each
   // create_instance step on world.objects.has(hook.as), so reruns are no-ops.
   runMissingSeedInstancesMigration(world, names, cleanInstalled);
+  // FIX 4: delete bootstrap definition pages the bundle retired. Must run
+  // after seeding and after every catalog plan, so the replacement page is
+  // already present when its shadow is removed — never a window where neither
+  // resolves.
+  runRetiredBootstrapDefinitionsMigration(world);
   return covered;
+}
+
+/** Remove retired bootstrap verb pages from a world an older bundle created.
+ *
+ * Idempotent twice over: the ledger short-circuits a repeat run, and
+ * `removeVerb` on an absent page is already a no-op, so a world that never had
+ * the page (or a partial previous run) ends in the same state. Only pages the
+ * class owns are touched — an inherited name is not this class's to retire. */
+function runRetiredBootstrapDefinitionsMigration(world: WooWorld): void {
+  if (migrationApplied(world, LOCAL_BOOT_RETIRED_BOOTSTRAP_DEFINITIONS_MIGRATION)) return;
+  for (const entry of RETIRED_BOOTSTRAP_DEFINITIONS) {
+    if (!world.objects.has(entry.object)) continue;
+    if (!world.ownVerbExact(entry.object, entry.name)) continue;
+    world.removeVerb(entry.object, entry.name);
+  }
+  markMigrationApplied(world, LOCAL_BOOT_RETIRED_BOOTSTRAP_DEFINITIONS_MIGRATION);
 }
 
 function localMigrationCatalogNames(world: WooWorld, requested: readonly string[]): string[] {

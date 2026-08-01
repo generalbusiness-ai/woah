@@ -165,10 +165,11 @@ describe("net install end-to-end (fake-DO lane)", () => {
       expect(reply.reply?.status, text).toBe("accepted");
       return reply.result ?? {};
     };
-    expect(await commandPlan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look" });
+    // One `look_at` serves the bare and object forms (chat v1.0.0).
+    expect(await commandPlan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at" });
     expect(await commandPlan("say hello there")).toMatchObject({ ok: true, verb: "say", args: ["hello there"] });
     // Object matching resolves against the room's contents in the slice.
-    expect(await commandPlan("look lamp")).toMatchObject({ ok: true, verb: "look_at", args: ["the_lamp"] });
+    expect(await commandPlan("look lamp")).toMatchObject({ ok: true, verb: "look_at", args: ["the_lamp", "lamp"] });
     expect(await commandPlan("take mug")).toMatchObject({ ok: true, verb: "take", persistence: "durable" });
 
     const turn = async (target: string, verb: string, args: unknown[] = []) => {

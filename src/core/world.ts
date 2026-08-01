@@ -15308,7 +15308,14 @@ export class WooWorld {
     // targets `me` but passes only the iobj text to set_description.
     const directObject = cmd.dobj_prefix ?? cmd.dobj;
     if (!directObject || directObject !== target) return false;
-    if (pattern.dobj !== "object") return false;
+    // `dobj` may be a single pattern or a list of alternatives — the sibling
+    // matcher `commandSlotMatches` already recurses over arrays. A dispatcher
+    // that accepts `["object", "none"]` (one verb serving both `look` and
+    // `look <thing>`) is still an object-consuming dispatcher when the slot is
+    // filled, so an exact `=== "object"` test would let it through and hand
+    // the command to the mounted space instead of the room.
+    const dobjPatterns = Array.isArray(pattern.dobj) ? pattern.dobj : [pattern.dobj];
+    if (!dobjPatterns.includes("object")) return false;
     const argsFrom = Array.isArray(pattern.args_from) ? pattern.args_from.map((item) => String(item)) : [];
     return argsFrom.includes("dobj") || argsFrom.includes("dobj_prefix");
   }

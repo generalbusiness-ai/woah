@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.15",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -203,7 +203,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { set_task_perms(caller_perms()); let roster = []; for compact in room_roster(this) { let row = { id: compact[\"player\"], name: compact[\"name\"], presence: compact[\"presence\"] }; if (compact[\"idle_seconds\"] != null) { row[\"idle_seconds\"] = compact[\"idle_seconds\"]; } roster = roster + [row]; } let visible = visible_contents(this); let remote_summaries = remote_describe(visible); let contents_rows = []; for item in visible { let _live = true; let _item_is_player = false; try { _item_is_player = isa(item, $player); } except errp { _live = false; } if (_live && !_item_is_player) { let title = item; let description = null; let is_remote = false; try { is_remote = is_remote_object(item); } except errr { _live = false; } if (_live) { if (is_remote) { let summary = null; if (typeof(remote_summaries) == \"map\" && has(remote_summaries, item)) { summary = remote_summaries[item]; } if (typeof(summary) == \"map\") { if (has(summary, \"name\") && summary[\"name\"]) { title = summary[\"name\"]; } if (has(summary, \"description\")) { description = summary[\"description\"]; } } } else { let name_str = null; try { name_str = item.name; } except errn { _live = false; } if (_live) { title = name_str; try { title = item:title(); } except err { if (err[\"code\"] != \"E_VERBNF\" && err[\"code\"] != \"E_TOOBIG\") { raise err; } } try { description = item.description; } except err2 { description = null; } } } } if (_live) { contents_rows = contents_rows + [{ id: item, title: title, description: description }]; } } } return { id: this, title: this:title(), description: this.description, roster: roster, contents: contents_rows }; }"
+          "source": "verb :look_self() rxd { set_task_perms(caller_perms()); let roster = []; for compact in room_roster(this) { let row = { id: compact[\"player\"], name: compact[\"name\"], presence: compact[\"presence\"] }; if (compact[\"idle_seconds\"] != null) { row[\"idle_seconds\"] = compact[\"idle_seconds\"]; } roster = roster + [row]; } let visible = visible_contents(this); let remote_summaries = remote_describe(visible); let contents_rows = []; for item in visible { let _live = true; let _item_is_player = false; try { _item_is_player = isa(item, $player); } except errp { _live = false; } if (_live && !_item_is_player) { let title = item; let description = null; let is_remote = false; try { is_remote = is_remote_object(item); } except errr { _live = false; } if (_live) { if (is_remote) { let summary = null; if (typeof(remote_summaries) == \"map\" && has(remote_summaries, item)) { summary = remote_summaries[item]; } if (typeof(summary) == \"map\") { if (has(summary, \"name\") && summary[\"name\"]) { title = summary[\"name\"]; } if (has(summary, \"description\")) { description = summary[\"description\"]; } } } else { let name_str = null; try { name_str = item.name; } except errn { _live = false; } if (_live) { title = name_str; try { title = item:title(); } except err { if (err[\"code\"] != \"E_VERBNF\" && err[\"code\"] != \"E_TOOBIG\") { raise err; } } try { description = item.description; } except err2 { description = null; } } } } if (_live) { contents_rows = contents_rows + [{ id: item, title: title, description: description }]; } } } let rendered = \"\"; if (this.description) { rendered = to_string(this.description); } if (length(roster) > 0) { let present_names = []; for who in roster { if (who[\"id\"] != actor) { let who_name = who[\"name\"]; if (who_name == null) { who_name = to_string(who[\"id\"]); } present_names = present_names + [who_name]; } } let names = str_join(present_names, \", \"); if (!names) { names = \"nobody\"; } if (rendered) { rendered = rendered + \" \"; } rendered = rendered + \"Present: \" + names + \".\"; } let things = \"\"; for item in contents_rows { if (things) { things = things + \", \"; } things = things + to_string(item[\"title\"]); } if (things) { if (rendered) { rendered = rendered + \" \"; } rendered = rendered + \"You see \" + things + \".\"; } return { id: this, title: this:title(), description: this.description, summary: rendered, roster: roster, contents: contents_rows }; }"
         },
         {
           "name": "announce",
@@ -749,23 +749,6 @@
           "source": "verb :tell(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"tell requires text\" }; } observe({ type: \"told\", from: actor, to: recipient, text: text, ts: now() }); return true; }"
         },
         {
-          "name": "look",
-          "aliases": [
-            "l@ook"
-          ],
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "tool_exposed": true,
-          "reads_room_presence": true,
-          "arg_spec": {
-            "args": []
-            ,
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
-          },
-          "source": "verb :look() rxd { set_task_perms(caller_perms()); return this:look_at(this); }"
-        },
-        {
           "name": "look_at",
           "aliases": [
             "look",
@@ -779,11 +762,12 @@
           "reads_room_presence": true,
           "arg_spec": {
             "args": [
-              "target"
+              "target?",
+              "target_str?"
             ],
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "live" }
+            "command": { "dobj": ["object", "none"], "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobjstr"], "persistence": "live" }
           },
-          "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } let roster = []; if (has(view, \"roster\")) { roster = view[\"roster\"]; } else { if (has(view, \"present_actors\")) { roster = view[\"present_actors\"]; } } if (length(roster) > 0) { let names = \"\"; try { let present_names = []; for who in roster { let who_id = who; let who_name = null; if (typeof(who) == \"map\") { if (has(who, \"id\")) { who_id = who[\"id\"]; } if (has(who, \"name\")) { who_name = who[\"name\"]; } } if (who_id != actor) { if (who_name == null) { try { who_name = who_id.name; } except errn { who_name = to_string(who_id); } } present_names = present_names + [who_name]; } } names = str_join(present_names, \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
+          "source": "verb :look_at(target, target_str) rxd { set_task_perms(caller_perms()); if (target == null) { target = this; } if (target == $failed_match && (target_str == null || str_trim(to_string(target_str)) == \"\")) { target = this; } let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } let roster = []; if (has(view, \"roster\")) { roster = view[\"roster\"]; } else { if (has(view, \"present_actors\")) { roster = view[\"present_actors\"]; } } if (length(roster) > 0) { let names = \"\"; try { let present_names = []; for who in roster { let who_id = who; let who_name = null; if (typeof(who) == \"map\") { if (has(who, \"id\")) { who_id = who[\"id\"]; } if (has(who, \"name\")) { who_name = who[\"name\"]; } } if (who_id != actor) { if (who_name == null) { try { who_name = who_id.name; } except errn { who_name = to_string(who_id); } } present_names = present_names + [who_name]; } } names = str_join(present_names, \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } if (typeof(view) == \"map\" && has(view, \"summary\") && view[\"summary\"]) { text = to_string(view[\"summary\"]); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
         },
         {
           "name": "who",

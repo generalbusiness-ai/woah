@@ -549,15 +549,45 @@ const PLAYER_HOME_SOURCE = `verb :home() rxd {
   return dest;
 }`;
 
-const THING_LOOK_SOURCE = `verb :look() rxd {
+/** The single `look` dispatcher. Seeded at the top of the seed graph so that
+ * every branch below it — objects, actors, spaces — resolves the same page.
+ *
+ * This mirrors LambdaMOO's split, verified against the live core: `#1:look_self`
+ * is the polymorphic *data* verb every class may override, and looking is
+ * resolved by exactly one dispatcher that calls it. In LambdaMOO that
+ * dispatcher is `#3:l*ook`, a parser command hosted on the room; woo dispatches
+ * `look` as a method on the target (that is also what mints its MCP tool), so
+ * the single dispatcher has to sit on the inheritance spine instead — and only
+ * the graph root is ancestral to all three branches.
+ *
+ * Seating it lower is what produced the drift this replaces: `look` had been
+ * declared on one seed class plus seven catalog classes, six with distinct
+ * bodies, two of which emitted no observation at all. **Objects customize
+ * `look_self`, never this verb.**
+ *
+ * `summary` is preferred over `description` for the observation text because
+ * workspace-shaped `look_self` views put their one-line rendering there;
+ * falling back to `description` keeps ordinary objects unchanged.
+ *
+ * The previous seat is retired in `./retired-definitions` — aged worlds still
+ * carry that page, and it shadows this one until dropped. */
+const ROOT_LOOK_SOURCE = `verb :look() rxd {
   let view = this:look_self();
   let text = "";
-  if (typeof(view) == "map" && has(view, "description") && view["description"]) {
+  if (typeof(view) == "map" && has(view, "summary") && view["summary"]) {
+    text = to_string(view["summary"]);
+  } else if (typeof(view) == "map" && has(view, "description") && view["description"]) {
     text = to_string(view["description"]);
   } else {
     text = to_string(view);
   }
-  observe({ type: "looked", actor: actor, to: actor, room: location(this), target: this, text: text, look: view, ts: now() });
+  // Which space the look happened in. For a contained object that is its
+  // location; for an object that contains rather than is contained — a room
+  // has no location of its own — it is the object itself. Reporting null there
+  // would strand the observation with no space to route or filter it by.
+  let room = location(this);
+  if (room == null) { room = this; }
+  observe({ type: "looked", actor: actor, to: actor, room: room, target: this, text: text, look: view, ts: now() });
   return view;
 }`;
 
@@ -1286,6 +1316,32 @@ function seedUniversal(world: WooWorld): void {
   sourceVerb(world, "$root", "describe", ROOT_DESCRIBE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "look_self", ROOT_LOOK_SELF_SOURCE, { directCallable: true });
+  // `parse: false` keeps this out of command matching on purpose: the textual
+  // surface reaches objects through the catalog-supplied `look_at` command
+  // entry, which owns the room-aware rendering. This page is the object-method
+  // form — what `woo_call` and the MCP tool surface dispatch.
+  //
+  // Both dispatch flags are inherited from the per-class `look` pages this
+  // replaces, and both are load-bearing:
+  //
+  // - `readsRoomPresence`: the gateway resolves that declaration from the
+  //   turn's *entry* verb only (`callReadsVerbFlag`), never from the
+  //   `look_self` this dispatches into. Space-shaped `look_self` bodies read
+  //   the room roster, so without the flag here a cold gateway would skip
+  //   `warmRoomPresentationContents` and serve an incomplete — or
+  //   non-convergent — workspace look. The textual path already pays this on
+  //   every look: its `look_at` entry declares the same flag.
+  // - `skipPresenceCheck`: matches that same `look_at` entry and the
+  //   per-class pages retired here. Rendering a description is
+  //   not a privileged read; `rxd` perms and the reachability gate still apply.
+  sourceVerb(world, "$root", "look", ROOT_LOOK_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    skipPresenceCheck: true,
+    readsRoomPresence: true,
+    aliases: ["l@ook", "ex@amine"],
+    argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
+  });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
     directCallable: true,
     toolExposed: true,
@@ -1409,12 +1465,6 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "provision_wizard_agent", "human_provision_wizard_agent", "verb :provision_wizard_agent(provision_id, options?) rxd { /* native: operator-signed provisioning of a wizard-flagged, programmer-surfaced agent under this human's account. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["provision_id", "options?"], authority: { prefetch: [{ path: ["target", "account"] }, { path: ["target", "account", "operator_provisioned_agents"] }] } } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");
-  sourceVerb(world, "$thing", "look", THING_LOOK_SOURCE, {
-    directCallable: true,
-    toolExposed: true,
-    aliases: ["l@ook", "ex@amine"],
-    argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
-  });
   for (const obj of ["$actor", "$space"]) {
     native(world, obj, "add_feature", "add_feature", "verb :add_feature(f) rx { ... }");
     native(world, obj, "remove_feature", "remove_feature", "verb :remove_feature(f) rx { ... }");

@@ -25,15 +25,16 @@
     "$match": 2,
     "$player": 27,
     "$room": 2,
-    "$root": 17,
+    "$root": 18,
     "$sequenced_log": 6,
     "$space": 16,
-    "$thing": 12
+    "$thing": 11
   },
   "src/core/dsl-compiler.ts": {
     "$root": 1
   },
   "src/core/local-catalogs.ts": {
+    "$account": 1,
     "$chatroom": 1,
     "$conversational": 14,
     "$dispensed_note": 4,
@@ -50,12 +51,14 @@
     "$task": 28,
     "$task_registry": 16,
     "$taskspace": 9,
-    "$transparent": 11,
-    "$account": 1
+    "$transparent": 11
   },
   "src/core/repository.ts": {
     "$sequenced_log": 2,
     "$space": 1
+  },
+  "src/core/retired-definitions.ts": {
+    "$thing": 1
   },
   "src/core/tiny-vm.ts": {
     "$actor": 1,
@@ -93,16 +96,16 @@
     "$transparent": 1,
     "$xxx": 1
   },
+  "src/net/identity-roles.ts": {
+    "$account": 1,
+    "$agent": 1,
+    "$human": 1
+  },
   "src/net/identity.ts": {
     "$account": 9,
     "$actor": 18,
     "$agent": 2,
     "$programmer": 2
-  },
-  "src/net/identity-roles.ts": {
-    "$account": 1,
-    "$agent": 1,
-    "$human": 1
   },
   "src/net/install.ts": {
     "$actor": 1,

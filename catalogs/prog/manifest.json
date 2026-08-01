@@ -1,6 +1,6 @@
 {
   "name": "prog",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Builder and programmer tooling. The same world is the IDE: tools inspect and mutate the live object graph, with no design-time/runtime split. The catalog deliberately preserves LambdaCore's builder/programmer authority split by installing them as player classes. Builder class membership exposes object/data tools. Programmer class membership exposes source/metadata tools, while progbit and wizbit remain the hard authority facts.",
   "license": "MIT",
@@ -24,15 +24,14 @@
       ],
       "verbs": [
         {
-          "name": "look",
+          "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "tool_exposed": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"search(query, opts?)\", \"create(parent, opts?)\", \"chparent(id, parent, opts?)\", \"recycle(id, opts?)\", \"set_property(id, name, value, opts?)\"] };\n}"
+          "source": "verb :look_self() rxd {\n  let view = pass();\n  view[\"api_version\"] = this.api_version;\n  view[\"tools\"] = [\"inspect(id, opts?)\", \"search(query, opts?)\", \"create(parent, opts?)\", \"chparent(id, parent, opts?)\", \"recycle(id, opts?)\", \"set_property(id, name, value, opts?)\"];\n  return view;\n}"
         },
         {
           "name": "inspect",
@@ -280,15 +279,14 @@
       ],
       "verbs": [
         {
-          "name": "look",
+          "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "tool_exposed": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"eval(source, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"] };\n}"
+          "source": "verb :look_self() rxd {\n  let view = pass();\n  view[\"tools\"] = [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"eval(source, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"];\n  return view;\n}"
         },
         {
           "name": "inspect",
@@ -743,14 +741,13 @@
       ],
       "verbs": [
         {
-          "name": "look",
+          "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
-          "tool_exposed": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, tools: [\"what()\", \"view(opts?)\", \"replace(text)\", \"insert(line, text)\", \"delete(start, end?)\", \"dry_run()\", \"save()\", \"pause()\", \"abort()\"] };\n}"
+          "source": "verb :look_self() rxd {\n  let view = pass();\n  view[\"tools\"] = [\"what()\", \"view(opts?)\", \"replace(text)\", \"insert(line, text)\", \"delete(start, end?)\", \"dry_run()\", \"save()\", \"pause()\", \"abort()\"];\n  return view;\n}"
         },
         {
           "name": "what",

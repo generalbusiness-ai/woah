@@ -1,6 +1,6 @@
 {
   "name": "outliner",
-  "version": "3.0.1",
+  "version": "4.0.0",
   "spec_version": "v1",
   "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node whose parent + sibling order live in ONE room-owned `__ordered_edge` { parent, rank } cell (fractional-rank ordered index \u2014 the sole structural authority; no per-item position/renumber). The outliner is an $outliner < $room that scopes items and tracks per-actor focus + single-level undo. Items are not portable; removal recycles and re-homes children to the removed item's former parent.",
   "license": "MIT",
@@ -193,22 +193,6 @@
             "args": []
           },
           "source": "verb :title() rxd { return this.name + \" (outliner)\"; }"
-        },
-        {
-          "name": "look",
-          "aliases": [
-            "l@ook",
-            "ex@amine"
-          ],
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "reads_room_presence": true,
-          "tool_exposed": true,
-          "arg_spec": {
-            "args": []
-          },
-          "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
         },
         {
           "name": "look_self",
