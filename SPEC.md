@@ -164,6 +164,7 @@ Normative class designs for bundled-catalog content that ships with this repo. T
 - [persistent-conversation.md](spec/catalogs/persistent-conversation.md) — `$conversational` and `$persistent_conversational` as composable current-space chat features; `$chatroom` / `$persistent_chatroom` convenience classes; replay-derived `:history()` and public-only persistent transcripts (PC1–PC15)
 - [channels.md](spec/catalogs/channels.md) — `$channel` hierarchy (`$dm_channel`, `$group_channel`, `$public_channel`); deterministic-corename DM uniqueness; per-member `joined_seq`; one-way promotion (dm → group → public) with sequenced log preserved (CH1–CH14, **draft**)
 - [library.md](spec/catalogs/library.md) — `$library`: in-world discoverability for fertile classes and shareable features; registration, live browse, dangling-entry handling; export roots (LB1–LB8, **draft**)
+- [blocks.md](spec/catalogs/blocks.md) — `$block` plug lifecycle facts, derived health states, atomic attempt/success/failure recording, transition-only room reporting, and subclass cadence/config hooks (BL1–BL6, **implemented**)
 
 ### Deferred
 

@@ -20,12 +20,19 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): { fetchImpl: typeof 
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const call: Call = { url, method, body };
     calls.push(call);
-    const handler = handlers[i++];
+    // Attempt recording is a new preflight turn shared by every scenario.
+    // Accept it without consuming the scenario's existing domain fixture;
+    // success/failure lifecycle turns still consume the final handler so tests
+    // can script their result and any following session-close failure.
+    const recordsAttempt = method === "POST"
+      && (body as { verb?: string } | undefined)?.verb === "record_plug_attempt";
+    const handler = recordsAttempt ? undefined : handlers[i++];
     // Every authenticated tick closes in finally. Keep the individual
     // scenario fixtures focused on their domain calls while still recording
     // and asserting the cleanup request.
-    const reply: Reply = handler
-      ? handler(call)
+    const reply: Reply = recordsAttempt
+      ? { status: 200, body: { reply: { status: "accepted" }, result: { state: "pending" }, observations: [] } }
+      : handler ? handler(call)
       : method === "DELETE" && url.endsWith("/net-api/session")
         ? { status: 200, body: { closed: true } }
         : { status: 404, body: { error: { code: "E_NOMATCH" } } };
@@ -100,10 +107,11 @@ const historyReply: Reply = {
 };
 
 describe("runWeatherTick", () => {
-  it("auths, reads place/units/timezone, reads priors for accumulation, fetches realtime+forecast+history in parallel, pushes a single set_properties bundle", async () => {
+  it("auths, records an attempt, reads config/priors, fetches weather, and records one successful bundle", async () => {
     const { fetchImpl, calls } = makeFetch([
       // 1: woo auth
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess_w", expires_at: null, token_class: "apikey" } }),
+      // Attempt recording is auto-accepted by makeFetch between auth and place.
       // 2: get place
       () => ({ status: 200, body: { cell: { value: { value: "Mountain View, CA" } } } }),
       // 3: get units
@@ -118,7 +126,7 @@ describe("runWeatherTick", () => {
       () => realtimeReply(),
       () => forecastReply,
       () => historyReply,
-      // 10: set_properties on the block
+      // 10: record_plug_success on the block
       () => ({ status: 200, body: { reply: { status: "accepted" }, result: { ok: true }, observations: [] } })
     ]);
 
@@ -129,28 +137,31 @@ describe("runWeatherTick", () => {
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
     expect(calls[0].body).toEqual({ roster_visible: false });
-    expect(calls[1].url).toContain("/net-api/cell?");
-    expect(calls[1].url).toContain("property_cell%3Athe_weather_block%3Aplace");
-    expect(calls[2].url).toContain("property_cell%3Athe_weather_block%3Aunits");
-    expect(calls[3].url).toContain("property_cell%3Athe_weather_block%3Atimezone");
-    expect(calls[4].url).toContain("property_cell%3Athe_weather_block%3Atimeseries");
-    expect(calls[5].url).toContain("property_cell%3Athe_weather_block%3Adaily");
-    expect(calls[6].url).toContain("api.tomorrow.io/v4/weather/realtime");
-    expect(calls[6].url).toContain("units=imperial");
-    expect(new URL(calls[6].url).searchParams.get("location")).toBe("Mountain View, CA");
-    expect(calls[7].url).toContain("api.tomorrow.io/v4/weather/forecast");
-    expect(new URL(calls[7].url).searchParams.get("timesteps")).toBe("1h,1d");
-    expect(calls[8].url).toContain("api.tomorrow.io/v4/weather/history/recent");
+    expect(calls[1].body).toMatchObject({ verb: "record_plug_attempt", args: [Date.parse("2026-05-05T18:00:00Z")] });
+    expect(calls[2].url).toContain("/net-api/cell?");
+    expect(calls[2].url).toContain("property_cell%3Athe_weather_block%3Aplace");
+    expect(calls[3].url).toContain("property_cell%3Athe_weather_block%3Aunits");
+    expect(calls[4].url).toContain("property_cell%3Athe_weather_block%3Atimezone");
+    expect(calls[5].url).toContain("property_cell%3Athe_weather_block%3Atimeseries");
+    expect(calls[6].url).toContain("property_cell%3Athe_weather_block%3Adaily");
+    expect(calls[7].url).toContain("api.tomorrow.io/v4/weather/realtime");
+    expect(calls[7].url).toContain("units=imperial");
+    expect(new URL(calls[7].url).searchParams.get("location")).toBe("Mountain View, CA");
+    expect(calls[8].url).toContain("api.tomorrow.io/v4/weather/forecast");
     expect(new URL(calls[8].url).searchParams.get("timesteps")).toBe("1h,1d");
+    expect(calls[9].url).toContain("api.tomorrow.io/v4/weather/history/recent");
+    expect(new URL(calls[9].url).searchParams.get("timesteps")).toBe("1h,1d");
 
-    const setProps = calls[9];
+    const setProps = calls[10];
     expect(setProps.url).toBe("https://woo.example/net-api/turn");
     expect(setProps.method).toBe("POST");
-    expect(setProps.body).toMatchObject({ target: "the_weather_block", verb: "set_properties", session: "sess_w" });
-    const props = (setProps.body as { args: [Record<string, unknown>] }).args[0];
+    expect(setProps.body).toMatchObject({ target: "the_weather_block", verb: "record_plug_success", session: "sess_w" });
+    const successArgs = (setProps.body as { args: [Record<string, unknown>, number] }).args;
+    const props = successArgs[0];
 
-    expect(props.last_error).toBeNull();
-    expect(props.last_pushed_at).toEqual(expect.any(Number));
+    expect(successArgs[1]).toEqual(expect.any(Number));
+    expect(props).not.toHaveProperty("last_error");
+    expect(props).not.toHaveProperty("last_pushed_at");
     expect(props.config_state).toMatchObject({
       status: "confirmed",
       place: "Mountain View, CA",
@@ -225,8 +236,8 @@ describe("runWeatherTick", () => {
       () => turnReply({})
     ]);
     await runWeatherTick(env, { fetchImpl });
-    expect(calls[6].url).toContain("units=metric");
-    const props = (calls[9].body as { args: [Record<string, any>] }).args[0];
+    expect(calls[7].url).toContain("units=metric");
+    const props = (calls[10].body as { args: [Record<string, any>] }).args[0];
     expect(props.current).toMatchObject({
       temperature: 22.4,
       temperature_unit: "°C",
@@ -244,10 +255,11 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toMatchObject({ code: "E_NO_PLACE" });
-    expect(calls[2].url).toBe("https://woo.example/net-api/turn");
-    expect(calls[2].body).toMatchObject({ target: "the_weather_block", verb: "set_properties" });
-    const props = (calls[2].body as { args: [Record<string, any>] }).args[0];
-    expect(props.last_error).toMatch(/owner has not configured `place`/);
+    expect(calls[3].url).toBe("https://woo.example/net-api/turn");
+    expect(calls[3].body).toMatchObject({ target: "the_weather_block", verb: "record_plug_failure" });
+    const failureArgs = (calls[3].body as { args: [string, Record<string, any>, number] }).args;
+    expect(failureArgs[0]).toMatch(/owner has not configured `place`/);
+    const props = failureArgs[1];
     expect(props.config_state).toMatchObject({ status: "error", code: "E_NO_PLACE" });
   });
 
@@ -261,11 +273,12 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toMatchObject({ code: "E_BAD_TIMEZONE" });
-    expect(calls).toHaveLength(6);
-    expect(calls[4].url).toBe("https://woo.example/net-api/turn");
-    expect(calls[4].body).toMatchObject({ target: "the_weather_block", verb: "set_properties" });
-    const props = (calls[4].body as { args: [Record<string, any>] }).args[0];
-    expect(props.last_error).toMatch(/valid timezone/);
+    expect(calls).toHaveLength(7);
+    expect(calls[5].url).toBe("https://woo.example/net-api/turn");
+    expect(calls[5].body).toMatchObject({ target: "the_weather_block", verb: "record_plug_failure" });
+    const failureArgs = (calls[5].body as { args: [string, Record<string, any>, number] }).args;
+    expect(failureArgs[0]).toMatch(/valid timezone/);
+    const props = failureArgs[1];
     expect(props.config_state).toMatchObject({
       status: "error",
       code: "E_BAD_TIMEZONE",
@@ -295,14 +308,13 @@ describe("runWeatherTick", () => {
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
     // After the three parallel API calls, the plug writes last_error. Find
-    // that call (the only set_property) rather than asserting an index, since
+    // that lifecycle call rather than asserting an index, since
     // Promise.all rejection can race with the outer flow.
-    const errCall = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_property");
+    const errCall = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_failure");
     expect(errCall).toBeDefined();
     const args = (errCall!.body as { args: unknown[] }).args;
-    expect(args[0]).toBe("last_error");
-    expect(args[1]).toMatch(/rejected the API key/i);
-    expect(args[1]).toMatch(/TOMORROW_IO_API_KEY/);
+    expect(args[0]).toMatch(/rejected the API key/i);
+    expect(args[0]).toMatch(/TOMORROW_IO_API_KEY/);
   });
 
   it("writes a clean rate-limit last_error when tomorrow.io returns 429", async () => {
@@ -320,13 +332,12 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
-    const errCall = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_property");
+    const errCall = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_failure");
     expect(errCall).toBeDefined();
     const args = (errCall!.body as { args: unknown[] }).args;
-    expect(args[0]).toBe("last_error");
-    expect(args[1]).toMatch(/rate-limited/i);
-    expect(args[1]).toMatch(/retry after 120s/);
-    expect(args[1]).toMatch(/25\/hour/);
+    expect(args[0]).toMatch(/rate-limited/i);
+    expect(args[0]).toMatch(/retry after 120s/);
+    expect(args[0]).toMatch(/25\/hour/);
   });
 
   it("writes a helpful last_error when tomorrow.io does not recognize the configured place", async () => {
@@ -346,10 +357,11 @@ describe("runWeatherTick", () => {
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
     const apiCall = calls.find((c) => c.url.includes("api.tomorrow.io"));
     expect(new URL(apiCall!.url).searchParams.get("location")).toBe("Atlantis");
-    const errCall = calls.find((c) => (c.body as any)?.verb === "set_properties" && (c.body as any)?.args?.[0]?.config_state?.status === "error");
+    const errCall = calls.find((c) => (c.body as any)?.verb === "record_plug_failure" && (c.body as any)?.args?.[1]?.config_state?.status === "error");
     expect(errCall).toBeDefined();
-    const props = (errCall!.body as { args: [Record<string, any>] }).args[0];
-    expect(props.last_error).toBe('tomorrow.io could not fetch weather for "Atlantis" - set place to a town name or zip code it recognizes');
+    const failureArgs = (errCall!.body as { args: [string, Record<string, any>, number] }).args;
+    expect(failureArgs[0]).toBe('tomorrow.io could not fetch weather for "Atlantis" - set place to a town name or zip code it recognizes');
+    const props = failureArgs[1];
     expect(props.config_state).toMatchObject({
       status: "error",
       code: "E_BAD_PLACE",

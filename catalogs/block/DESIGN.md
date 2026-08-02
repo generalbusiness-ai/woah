@@ -48,7 +48,7 @@ A `$block` instance has:
 | Tier | Who writes | Use |
 |---|---|---|
 | `writable_owner` | block's owner (or wizard) | configuration: where to fetch, what to display |
-| `writable_self` | block's actor (the plug) | data: pushed values, freshness, error state |
+| `writable_self` | block's actor (the plug) | data plus `last_attempt_at`, `last_pushed_at`, `last_failure_at`, `consecutive_failures`, and `last_error` |
 | (other) | wizard only | intrinsic / restricted |
 
 `:set_property(name, value)` is the single entry point; it consults
@@ -64,6 +64,27 @@ property, and instance reads inherit via the normal property-def
 `defaultValue` walk. Subclass declarations *should* extend the parent's
 lists explicitly — manifest authoring convention, not a substrate
 guarantee.
+
+## Plug lifecycle status
+
+The base catalog owns one durable lifecycle vocabulary for every plug-backed
+appliance. `:record_plug_attempt`, `:record_plug_success`, and
+`:record_plug_failure` update payload and lifecycle fields through the same
+atomic property gate. A plug records its attempt before external work, then
+finishes with one success or failure whenever its session remains usable.
+
+`:plug_status()` derives `never`, `pending`, `healthy`, `stale`, or `error`
+when read. It uses the class metadata `plug_expected_interval_ms` and
+`plug_stale_after_ms`; it never treats an ephemeral Net session as health.
+Subclasses may override `:plug_status_hint()` for configuration state and
+`:plug_last_success_at()` only for a well-defined legacy timestamp.
+
+Lifecycle writes emit `plug_status_changed` only when the derived state
+changes. The block-owned chat formatter presents that sparse observation as a
+room system line. Ordinary heartbeats and repeated failures stay quiet, while
+the exact `:plug_status()` read remains the recovery path after missed fanout.
+Time alone can make a block stale, so `healthy` to `stale` is reported on the
+next read rather than by an invented mutation.
 
 ## Observation route
 
@@ -147,11 +168,13 @@ malformed, secret-mismatched, or revoked.
 
 ## Look surface
 
-`:look_self()` returns `{id, title, description, last_pushed_at,
-last_error, summary, location}`. The `summary` is built by reading each
-name in `this.summary_props`. Subclasses set `summary_props` to the small
-set of values that should always ride in the look output (e.g. for
-weather: `["current"]`).
+`:look_self()` returns `{id, title, description, plug_status,
+last_attempt_at, last_pushed_at, last_failure_at, consecutive_failures,
+last_error, summary, location}`. The lifecycle message is appended to the
+description. The `summary` is built by reading each name in
+`this.summary_props`. Subclasses set `summary_props` to the small set of
+values that should always ride in the look output (e.g. for weather:
+`["current"]`).
 
 `:look()` wraps `:look_self()` and emits a caller-private `looked`
 observation, matching ordinary in-world look behavior. This matters even

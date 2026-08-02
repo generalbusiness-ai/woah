@@ -21,24 +21,26 @@ import manifest24 from "../../catalogs/prog/manifest.json";
 import manifest25 from "../../catalogs/scheduling/manifest.json";
 import manifest26 from "../../catalogs/tasks/manifest.json";
 import manifest28 from "../../catalogs/weather/manifest.json";
-import * as uiModule0 from "../../catalogs/chat/ui/chat-space";
-import * as uiModule1 from "../../catalogs/demoworld/ui/demoworld-chat";
-import * as uiModule2 from "../../catalogs/dispenser/ui/dispenser-chat";
-import * as uiModule3 from "../../catalogs/dubspace/ui/dubspace-workspace";
-import * as uiModule4 from "../../catalogs/note/ui/note-chat";
-import * as uiModule5 from "../../catalogs/outliner/ui/outliner-tree";
-import * as uiModule6 from "../../catalogs/pinboard/ui/pinboard-board";
-import * as uiModule7 from "../../catalogs/tasks/ui/kanban-board";
-import * as uiModule8 from "../../catalogs/weather/ui/weather-badge";
+import * as uiModule0 from "../../catalogs/block/ui/block-chat";
+import * as uiModule1 from "../../catalogs/chat/ui/chat-space";
+import * as uiModule2 from "../../catalogs/demoworld/ui/demoworld-chat";
+import * as uiModule3 from "../../catalogs/dispenser/ui/dispenser-chat";
+import * as uiModule4 from "../../catalogs/dubspace/ui/dubspace-workspace";
+import * as uiModule5 from "../../catalogs/note/ui/note-chat";
+import * as uiModule6 from "../../catalogs/outliner/ui/outliner-tree";
+import * as uiModule7 from "../../catalogs/pinboard/ui/pinboard-board";
+import * as uiModule8 from "../../catalogs/tasks/ui/kanban-board";
+import * as uiModule9 from "../../catalogs/weather/ui/weather-badge";
 
 export const BUNDLED_CATALOG_UI = [
-  { alias: "chat", manifest: manifest4, modules: { "chat-ui": uiModule0 } },
-  { alias: "demoworld", manifest: manifest6, modules: { "demoworld-chat": uiModule1 } },
-  { alias: "dispenser", manifest: manifest7, modules: { "dispenser-chat": uiModule2 } },
-  { alias: "dubspace", manifest: manifest9, modules: { "dubspace-ui": uiModule3 } },
-  { alias: "note", manifest: manifest14, modules: { "note-chat": uiModule4 } },
-  { alias: "outliner", manifest: manifest17, modules: { "outliner-ui": uiModule5 } },
-  { alias: "pinboard", manifest: manifest22, modules: { "pinboard-ui": uiModule6 } },
-  { alias: "tasks", manifest: manifest26, modules: { "tasks-ui": uiModule7 } },
-  { alias: "weather", manifest: manifest28, modules: { "weather-ui": uiModule8 } }
+  { alias: "block", manifest: manifest1, modules: { "block-chat": uiModule0 } },
+  { alias: "chat", manifest: manifest4, modules: { "chat-ui": uiModule1 } },
+  { alias: "demoworld", manifest: manifest6, modules: { "demoworld-chat": uiModule2 } },
+  { alias: "dispenser", manifest: manifest7, modules: { "dispenser-chat": uiModule3 } },
+  { alias: "dubspace", manifest: manifest9, modules: { "dubspace-ui": uiModule4 } },
+  { alias: "note", manifest: manifest14, modules: { "note-chat": uiModule5 } },
+  { alias: "outliner", manifest: manifest17, modules: { "outliner-ui": uiModule6 } },
+  { alias: "pinboard", manifest: manifest22, modules: { "pinboard-ui": uiModule7 } },
+  { alias: "tasks", manifest: manifest26, modules: { "tasks-ui": uiModule8 } },
+  { alias: "weather", manifest: manifest28, modules: { "weather-ui": uiModule9 } }
 ] as const;

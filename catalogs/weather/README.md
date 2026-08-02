@@ -1,9 +1,9 @@
 ---
 name: weather
-version: 1.2.0
+version: 1.3.0
 spec_version: v1
 license: MIT
-description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week. v1.2 adds durable plug health to `:look`.
+description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week. v1.3 uses the shared block lifecycle and wall-clock-centered detail UI.
 keywords:
   - block
   - weather
@@ -35,7 +35,6 @@ chart payload, and the plug's lifecycle.
 | `place` | `""` | Town name or zip code. The plug passes this to the upstream API, and the block displays this same value. |
 | `timezone` | `""` | IANA timezone, e.g. `America/Los_Angeles`; the plug uses it to render local observation time text and to bucket daily rollups. |
 | `units` | `"metric"` | `"metric"` or `"imperial"`. |
-| `config_state` | `{status: "unconfigured"}` | Plug confirmation state for the current location/timezone. |
 
 ## Owner Tools
 
@@ -54,16 +53,16 @@ invalid values are rejected when the plug runs.
 
 ### Plug-writable (data)
 
-Three internally-consistent props, written in one `:set_properties` bundle
-so a reader never sees a torn snapshot:
+Three internally-consistent props, written through
+`:record_plug_success(values, at)` so a reader never sees a torn snapshot or
+payload/lifecycle disagreement:
 
 | Name | Shape | Notes |
 |---|---|---|
 | `current` | small flat map | `temperature`, `temperature_unit`, `humidity`, `weather_code`, `observed_at` (ms epoch), `observed_at_text` (plug-rendered timezone-aware string), `local_date` (YYYY-MM-DD in the configured timezone, used by `:ask` to resolve "today"). Read by chat verbs and the badge. |
 | `daily` | list of small maps (~14) | One entry per covered day, ordered ascending by `date` (YYYY-MM-DD in the configured timezone). Each carries `weekday` (3-letter lowercase, e.g. `"thu"`), pre-computed min/max/mean per metric, and `precip_total`. Read by chat verbs that summarize the week. |
 | `timeseries` | column-major map | `anchor`, `t0`, `step`, `units`, `fields[name].{unit,agg,values}`. `anchor` records the update time; the chart's center/now line uses the live browser clock. ~336 hourly samples spanning ±7 days, one homogeneous array per metric. Read only by the chart UI. |
-| `last_pushed_at` | int | Inherited from `$block`; epoch ms of last plug push. |
-| `last_error` | str/null | Inherited from `$block`; most recent fetch failure. |
+| lifecycle fields | ints plus str/null | Inherited `last_attempt_at`, `last_pushed_at`, `last_failure_at`, `consecutive_failures`, and `last_error`; maintained by the block recording verbs. |
 | `config_state` | map | `pending`, `confirmed`, or config-specific `error` state for the owner-set location/timezone. |
 
 ## Look Surface
@@ -74,8 +73,8 @@ so a reader never sees a torn snapshot:
 at May 6, 2026, 9:01 AM PDT.` The plug formats this from the observation
 timestamp and the block's `timezone`; `:look_self()` does not show the raw
 `last_pushed_at` epoch. It includes a durable `plug_status` map derived from
-`last_pushed_at`, `last_error`, and `config_state`: `healthy`, `stale`
-(older than two hours), `pending`, `error`, or `never`; `current.observed_at`
+the inherited lifecycle fields and `config_state`: `healthy`, `stale`
+(outside its two-hour freshness window), `pending`, `error`, or `never`; `current.observed_at`
 is the fallback success timestamp for imported/seeded readings that lack
 `last_pushed_at`. A reading with no timestamp remains `never` in the structured
 status but does not print “no successful update yet” beside the reading. The

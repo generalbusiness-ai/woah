@@ -4459,7 +4459,7 @@ describe("local catalogs", () => {
             { name: "place", type: "str", default: "" },
             { name: "current", type: "map", default: {} },
             { name: "writable_owner", type: "list<str>", default: ["place"] },
-            { name: "writable_self", type: "list<str>", default: ["last_pushed_at", "last_error", "current"] }
+            { name: "writable_self", type: "list<str>", default: ["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error", "current"] }
           ]
         }]
       } as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "test-block-sub" });
@@ -4534,6 +4534,103 @@ describe("local catalogs", () => {
       const result = await world.directCall("get-data", "$wiz", blockId, "get_data", ["last_pushed_at"]);
       expect(result.op).toBe("result");
       if (result.op === "result") expect(result.result).toBe(12345);
+    });
+
+    it("$block records plug lifecycle atomically and announces only state transitions", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      const roomId = "obj_test_plug_status_room";
+      const blockId = "obj_test_plug_status_block";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      world.createObject({ id: blockId, name: "Status appliance", parent: "$block", owner: "$wiz", location: roomId });
+      world.setProp(blockId, "plug_label", "Test");
+      world.setProp(blockId, "plug_expected_interval_ms", 500);
+      world.setProp(blockId, "plug_stale_after_ms", 1_000);
+      expect(world.ownVerbExact("$block", "plug_status")).toMatchObject({ direct_callable: true, tool_exposed: true });
+
+      const never = await world.directCall("plug-status-never", "$wiz", blockId, "plug_status", []);
+      expect(never.op).toBe("result");
+      if (never.op === "result") expect(never.result).toMatchObject({
+        state: "never",
+        last_attempt_at: null,
+        last_success_at: null,
+        consecutive_failures: 0,
+        expected_interval_ms: 500,
+        stale_after_ms: 1_000
+      });
+
+      const attempted = await world.directCall("plug-status-attempt", blockId, blockId, "record_plug_attempt", [1_000]);
+      expect(attempted.op).toBe("result");
+      if (attempted.op === "result") {
+        expect(attempted.result).toMatchObject({ state: "pending", last_attempt_at: 1_000 });
+        expect(attempted.observations).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "plug_status_changed", block: blockId, from: "never", to: "pending" })
+        ]));
+      }
+
+      const repeatedAttempt = await world.directCall("plug-status-attempt-repeat", blockId, blockId, "record_plug_attempt", [1_500]);
+      expect(repeatedAttempt.op).toBe("result");
+      if (repeatedAttempt.op === "result") {
+        expect(repeatedAttempt.observations.some((obs) => obs.type === "plug_status_changed")).toBe(false);
+      }
+
+      const failed = await world.directCall("plug-status-failure", blockId, blockId, "record_plug_failure", ["upstream timed out", {}, 2_000]);
+      expect(failed.op).toBe("result");
+      if (failed.op === "result") {
+        expect(failed.result).toMatchObject({
+          state: "error",
+          last_attempt_at: 2_000,
+          last_failure_at: 2_000,
+          consecutive_failures: 1,
+          last_error: "upstream timed out"
+        });
+        expect(failed.observations).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "plug_status_changed", from: "pending", to: "error", text: expect.stringContaining("latest attempt failed") })
+        ]));
+      }
+
+      const failedAgain = await world.directCall("plug-status-failure-repeat", blockId, blockId, "record_plug_failure", ["still down", {}, 3_000]);
+      expect(failedAgain.op).toBe("result");
+      if (failedAgain.op === "result") {
+        expect(failedAgain.result).toMatchObject({ state: "error", consecutive_failures: 2, last_failure_at: 3_000 });
+        expect(failedAgain.observations.some((obs) => obs.type === "plug_status_changed")).toBe(false);
+      }
+
+      // `plug_status` derives freshness from the runtime clock. Feed the same
+      // logical instant as the recorded success so the recovery assertion is
+      // deterministic instead of comparing a fixture epoch with wall time.
+      // The turn reads `now` for block_data fanout, status derivation, and the
+      // transition observation respectively.
+      world.setLogicalInputsForReplay([
+        { name: "now", value: 4_000 },
+        { name: "now", value: 4_000 },
+        { name: "now", value: 4_000 }
+      ]);
+      const recovered = await world.directCall("plug-status-recovered", blockId, blockId, "record_plug_success", [{}, 4_000]);
+      expect(recovered.op).toBe("result");
+      if (recovered.op === "result") {
+        expect(recovered.result).toMatchObject({
+          state: "healthy",
+          last_attempt_at: 4_000,
+          last_pushed_at: 4_000,
+          last_failure_at: 3_000,
+          consecutive_failures: 0,
+          last_error: null
+        });
+        expect(recovered.observations).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "plug_status_changed", from: "error", to: "healthy" })
+        ]));
+      }
+
+      world.setLogicalInputsForReplay([{ name: "now", value: 5_001 }]);
+      const stale = await world.directCall("plug-status-stale", "$wiz", blockId, "plug_status", []);
+      expect(stale.op).toBe("result");
+      if (stale.op === "result") expect(stale.result).toMatchObject({ state: "stale", age_ms: 1_001 });
+
+      const stranger = world.auth("guest:plug-status-stranger").actor;
+      const denied = await world.directCall("plug-status-denied", stranger, blockId, "record_plug_failure", ["fake", {}, 6_000]);
+      expect(denied.op).toBe("error");
+      if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
     });
 
     it("$block:moveto raises E_PERM for non-wizards and :acceptable returns false", async () => {
@@ -5103,7 +5200,7 @@ describe("local catalogs", () => {
           last_updated: "May 6, 2026, 9:01 AM PDT",
           last_updated_text: "May 6, 2026, 9:01 AM PDT",
           plug_status: { state: "stale" },
-          description: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update is older than two hours."
+          description: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update missed its freshness window."
         });
       }
       world.setLogicalInputsForReplay([{ name: "now", value: staleWeatherNow }]);
@@ -5124,7 +5221,7 @@ describe("local catalogs", () => {
         expect(lookWeatherCommand.observations.find((obs) => obs.type === "looked")).toMatchObject({
           room: "the_chatroom",
           target: "the_weather",
-          text: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update is older than two hours."
+          text: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT. Weather plug status: stale; the last successful update missed its freshness window."
         });
       }
       // Horoscope machine: located on the deck, default rate limit + persona.
@@ -5785,7 +5882,7 @@ describe("local catalogs", () => {
       expect(world.object("$weather_block").flags.fertile).toBe(true);
       // v1 surface: forecast/history/forecast_hours dropped, daily/timeseries added.
       expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "timezone", "units"]);
-      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
+      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error", "current", "daily", "timeseries", "config_state"]);
       expect(world.ownVerbExact("$weather_block", "set_location")).toMatchObject({ direct_callable: true, tool_exposed: true });
       expect(world.ownVerbExact("$weather_block", "set_units")).toMatchObject({ direct_callable: true, tool_exposed: true });
       // set_forecast_hours was retired with the forecast_hours property.
@@ -5800,7 +5897,7 @@ describe("local catalogs", () => {
       world.createObject({ id: blockId, name: blockId, parent: "$weather_block", owner, location: roomId });
       expect(world.object(blockId).flags.fertile).not.toBe(true);
       expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "timezone", "units"]);
-      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
+      expect(world.getProp(blockId, "writable_self")).toEqual(["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error", "current", "daily", "timeseries", "config_state"]);
       // Default config matches the manifest.
       expect(world.getProp(blockId, "place")).toBe("");
       expect(world.getProp(blockId, "timezone")).toBe("");
@@ -5898,7 +5995,7 @@ describe("local catalogs", () => {
       if (staleStatus.op === "result") {
         expect(staleStatus.result).toMatchObject({
           state: "stale",
-          message: "Weather plug status: stale; the last successful update is older than two hours."
+          message: "Weather plug status: stale; the last successful update missed its freshness window."
         });
       }
 

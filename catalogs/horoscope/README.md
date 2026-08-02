@@ -1,6 +1,6 @@
 ---
 name: horoscope
-version: 0.3.0
+version: 0.4.0
 spec_version: v1
 license: MIT
 description: Workers-AI artifact dispenser built on the Acts-backed Dispenser contract.
@@ -44,12 +44,12 @@ receipt handles later retries.
 | `set_rate_limits(requester_seconds, block_seconds)` | Set cooldowns; zero disables either interval. |
 | `set_queue_limits(max_pending, max_chars)` | Lower the hard caps; zero selects 50 rows / 200 characters. |
 
-Only the owner or a wizard may configure the block. The plug’s ordinary
-`set_properties` use is limited to inherited heartbeat and error diagnostics;
-it cannot write queue state.
+Only the owner or a wizard may configure the block. The plug uses the
+inherited lifecycle recording verbs for attempts, heartbeats, and failures; it
+cannot write queue state.
 
-`look_self()` reports connection health and the projection-backed pending
-count. From a room:
+`look_self()` reports the shared durable `plug_status` and the
+projection-backed pending count. From a room:
 
 ```text
 order horoscope scorpio

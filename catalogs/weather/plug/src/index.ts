@@ -4,8 +4,8 @@
 //   1. Authenticate to woo with the actor-bound apikey for the weather block.
 //   2. Read the block's owner-set `place`, `units`, `timezone` properties.
 //   3. Fetch tomorrow.io (realtime + forecast 1h+1d + history 1h+1d).
-//   4. Push the {current, daily, timeseries, last_pushed_at, last_error,
-//      config_state} bundle via :set_properties in a single call.
+//   4. Push the {current, daily, timeseries, config_state} bundle through the
+//      generic :record_plug_success lifecycle boundary in a single call.
 //
 // Disconnects between ticks. The block keeps last-set values across plug
 // downtime; the SPA renders "stale, last seen ..." from `last_pushed_at` and
@@ -150,11 +150,15 @@ async function runAuthenticatedWeatherTick(
   fetchImpl: typeof fetch,
   now: (() => number) | undefined
 ): Promise<WeatherTickResult> {
+  const clock = now ?? Date.now;
+  // Record the attempt before any owner-config or upstream read. If the
+  // Worker dies mid-fetch, in-world status still shows that a run began.
+  await client.directCall(env.BLOCK_ID, "record_plug_attempt", [clock()]);
   const placeValue = await client.getProperty(env.BLOCK_ID, "place");
   const place = typeof placeValue === "string" && placeValue.trim() ? placeValue : null;
   if (!place) {
     const message = "owner has not configured `place`; set it to a town name or zip code";
-    await writeConfigError(client, env.BLOCK_ID, "E_NO_PLACE", message, { place: placeValue });
+    await writeConfigError(client, env.BLOCK_ID, "E_NO_PLACE", message, { place: placeValue }, clock());
     throw new WeatherConfigError("E_NO_PLACE", message, 400, { place: placeValue });
   }
 
@@ -167,7 +171,7 @@ async function runAuthenticatedWeatherTick(
   const timezone = normalizeTimezone(timezoneRaw);
   if (!timezone) {
     const message = "owner has not configured a valid timezone; use an IANA timezone such as America/Los_Angeles";
-    await writeConfigError(client, env.BLOCK_ID, "E_BAD_TIMEZONE", message, { place, timezone: timezoneRaw });
+    await writeConfigError(client, env.BLOCK_ID, "E_BAD_TIMEZONE", message, { place, timezone: timezoneRaw }, clock());
     throw new WeatherConfigError("E_BAD_TIMEZONE", message, 400, { place, timezone: timezoneRaw });
   }
   const tomorrowPlace = normalizeTomorrowLocation(place);
@@ -193,9 +197,9 @@ async function runAuthenticatedWeatherTick(
   } catch (err) {
     const message = formatLastError(err, place);
     if (isConfigSourceError(err)) {
-      await writeConfigError(client, env.BLOCK_ID, errorConfigCode(err), message, { place, timezone });
+      await writeConfigError(client, env.BLOCK_ID, errorConfigCode(err), message, { place, timezone }, clock());
     } else {
-      await client.directCall(env.BLOCK_ID, "set_property", ["last_error", message]);
+      await client.directCall(env.BLOCK_ID, "record_plug_failure", [message, {}, clock()]);
     }
     throw err;
   }
@@ -205,13 +209,11 @@ async function runAuthenticatedWeatherTick(
 
   // Single-bundle write so a reader never observes a torn snapshot
   // (e.g. a fresh `current` paired with a stale `daily`).
-  await client.directCall(env.BLOCK_ID, "set_properties", [
+  await client.directCall(env.BLOCK_ID, "record_plug_success", [
     {
       current: withLocalObservationTime(snapshot.current, timezone),
       daily: mergedDaily,
       timeseries: mergedTimeseries,
-      last_pushed_at: snapshot.fetched_at,
-      last_error: null,
       config_state: {
         status: "confirmed",
         message: "weather plug confirmed location and timezone",
@@ -219,7 +221,8 @@ async function runAuthenticatedWeatherTick(
         timezone,
         confirmed_at: snapshot.fetched_at
       }
-    }
+    },
+    snapshot.fetched_at
   ]);
 
   return { block: env.BLOCK_ID, place, fetched_at: snapshot.fetched_at };
@@ -353,18 +356,19 @@ function formatLastError(err: unknown, place?: string): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function writeConfigError(client: WooClient, blockId: string, code: string, message: string, value: Record<string, unknown>): Promise<void> {
-  await client.directCall(blockId, "set_properties", [
+async function writeConfigError(client: WooClient, blockId: string, code: string, message: string, value: Record<string, unknown>, at: number): Promise<void> {
+  await client.directCall(blockId, "record_plug_failure", [
+    message,
     {
-      last_error: message,
       config_state: {
         status: "error",
         code,
         message,
         ...value,
-        checked_at: Date.now()
+        checked_at: at
       }
-    }
+    },
+    at
   ]);
 }
 

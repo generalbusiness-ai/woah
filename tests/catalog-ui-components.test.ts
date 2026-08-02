@@ -10,10 +10,12 @@ import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
+import { registerWooChatFormatters as registerBlockChatFormatters } from "../catalogs/block/ui/block-chat";
 import { WooSpaceChatPanelElement } from "../catalogs/chat/ui/chat-space";
 import { DUBSPACE_DRUM_VOICES, dubspaceControlDefinitions } from "../catalogs/dubspace/ui/model";
 import {
   CatalogUiRegistry,
+  ChatFormatterRegistry,
   preserveAmbientCompanionPanel,
   renderAmbientCompanionShell,
   restoreAmbientCompanionPanel,
@@ -53,6 +55,30 @@ function appendAmbientCompanionPanel(root: ParentNode, space: string): HTMLEleme
 }
 
 describe("bundled catalog UI components", () => {
+  it("renders plug lifecycle transitions as sparse system lines", () => {
+    const registry = new ChatFormatterRegistry();
+    registerBlockChatFormatters(registry);
+
+    expect(registry.isChatType("plug_status_changed")).toBe(true);
+    expect(registry.format(
+      {
+        type: "plug_status_changed",
+        block: "the_weather",
+        from: "healthy",
+        to: "error",
+        text: "Weather plug status: error; the latest attempt failed."
+      },
+      { label: (id) => id ?? "unknown", viewer: "guest_1" }
+    )).toEqual({
+      kind: "system",
+      text: "Weather plug status: error; the latest attempt failed."
+    });
+    expect(registry.format(
+      { type: "plug_status_changed", to: "stale" },
+      { label: (id) => id ?? "unknown", viewer: "guest_1" }
+    )).toEqual({ kind: "system", text: "Plug status changed to stale." });
+  });
+
   it("renders and preserves the shared ambient companion shell", () => {
     const host = document.createElement("section");
     host.innerHTML = renderAmbientCompanionShell(

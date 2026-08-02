@@ -1,6 +1,6 @@
 ---
 name: block
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
 description: Anchored, plug-driven data display actor — base class for surfacing outside-world data inside woo.
@@ -42,8 +42,13 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 
 | Name | Tier | Notes |
 |---|---|---|
-| `last_pushed_at` | `writable_self` | epoch ms of last plug push |
-| `last_error` | `writable_self` | most recent failure (string or null) |
+| `last_attempt_at` | `writable_self` | epoch ms when the latest plug run began |
+| `last_pushed_at` | `writable_self` | epoch ms of the latest successful lifecycle write |
+| `last_failure_at` | `writable_self` | epoch ms of the latest recorded failure |
+| `consecutive_failures` | `writable_self` | failures since the latest success |
+| `last_error` | `writable_self` | latest failure text, or null after recovery |
+| `plug_expected_interval_ms` | class metadata | declared normal cadence; zero means unspecified |
+| `plug_stale_after_ms` | class metadata | freshness window; zero disables automatic stale classification |
 | `summary_props` | wizard-only | class metadata: which prop names ride in the look summary |
 
 `$block` verbs:
@@ -52,8 +57,12 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 |---|---|---|
 | `:set_property(name, value)` | tier-gated | Single property write; emits `block_data`. |
 | `:set_properties(values)` | tier-gated | Bulk; atomic permission gate, one observation per name. |
+| `:record_plug_attempt(at?)` | block actor/wizard | Starts a lifecycle attempt and reports a state transition when one occurs. |
+| `:record_plug_success(values, at?)` | block actor/wizard | Atomically writes payload and successful lifecycle state. |
+| `:record_plug_failure(error, values, at?)` | block actor/wizard | Atomically writes optional domain error state and increments the failure count. |
+| `:plug_status()` | rxd | Derives `never`, `pending`, `healthy`, `stale`, or `error` from durable lifecycle state. |
 | `:get_data(name)` | rxd | Read a property by name; respects normal `r` perms. |
-| `:look()` / `:look_self()` | rxd | Returns `{id, title, description, last_pushed_at, last_error, summary, location}`. `:look` also emits the caller-private `looked` observation, and is command-shaped so it appears in `@examine` / MCP obvious affordances. |
+| `:look()` / `:look_self()` | rxd | Returns structured `plug_status`, lifecycle fields, summary, and location; the description includes the status message. `:look` also emits the caller-private `looked` observation, and is command-shaped so it appears in `@examine` / MCP obvious affordances. |
 | `:moveto(target)` | wizard | Block is anchored; non-wizard raises `E_PERM`. |
 | `:acceptable(object)` | rxd | Always false (nothing enters a block). |
 | `:mint_apikey(label?)` | owner/wizard | Mints an apikey bound to this block's actor. |

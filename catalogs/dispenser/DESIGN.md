@@ -85,7 +85,7 @@ The v0 fields have one explicit disposition:
 | `last_request_at` | capped `requester_index` of Act sequences |
 | `last_order_at` | projection `last_order_seq` |
 | row `ts` | owning room-log envelope timestamp |
-| `last_pushed_at`, `last_error` | unchanged plug-health state |
+| inherited plug lifecycle fields | unchanged external-health state |
 
 ## Atomicity and retry
 
@@ -191,8 +191,8 @@ shared MCP walkthrough against real workerd before building.
 
 - Note content and physical location retain artifact authority; the queue
   records only the allocated/delivered reference.
-- Plug heartbeat and error diagnostics remain ordinary `$block` data; they are
-  health signals, not queue facts.
+- Plug attempt, heartbeat, and error diagnostics remain ordinary `$block`
+  lifecycle data; they are health signals, not queue facts.
 - The base catalog has no approval, failure, TTL, or dead-letter transition.
   Those facts should be added only when a real domain policy earns them.
 - Dropping a dispensed note is artifact lifecycle, not queue state.

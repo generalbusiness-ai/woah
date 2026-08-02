@@ -23,7 +23,7 @@ Cron-triggered every minute. Each tick:
 2. Reads the block's exact `system_prompt` cell through a short in-isolate TTL cache
    (`SYSTEM_PROMPT_TTL_MS`, default 5 minutes). Owner changes may take a
    few ticks to reach a warm plug isolate; cold starts still read it once.
-3. Loops up to `MAX_ORDERS_PER_TICK`:
+3. Calls `:record_plug_attempt`, then loops up to `MAX_ORDERS_PER_TICK`:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
@@ -47,14 +47,14 @@ Cron-triggered every minute. Each tick:
 Failure handling:
 
 - **AI generation failed** (rate limit, model timeout, empty response) — the
-  plug delivers a placeholder note instead so the queue drains, and writes
-  an `ai fallback: <reason>` line to `last_error` so `:look_self` reflects
-  the degraded mode.
+  plug delivers a placeholder note instead so the queue drains, and records
+  an `ai fallback: <reason>` failure so `:look_self` reflects the degraded
+  mode.
 - **Preparation or delivery raised a permanent code** (`E_INVARG`, `E_PERM`, `E_VERBNF`,
   `E_TYPE`, `E_RANGE`) — retrying with the same data won't change the
   outcome, so the plug calls the catalog's plug-actor `:cancel` path to
   peel the order off the queue head. The user gets nothing for that order;
-  the trail is in `last_error`.
+  the trail is in the inherited lifecycle status.
 - **Anything else** (`E_TIMEOUT`, `E_INTERNAL`, `E_GATEWAY`, 5xx, transport
   failure) — treated as transient. The order stays on the queue and the
   plug stops the tick. The next cron retries.
@@ -64,10 +64,12 @@ Failure handling:
 Both preparation and delivery are idempotent on `order_id`, so retries are
 safe; conflicting preparation content never overwrites a completed artifact.
 
-`last_pushed_at` is a health heartbeat, not a work record. Empty ticks only
-write it when `HEARTBEAT_INTERVAL_MS` has elapsed (default 5 minutes);
-ticks that delivered an order or need to surface `last_error` still write
-immediately.
+The plug lifecycle is health evidence, not a work record. Empty ticks call
+`:record_plug_success` only when `HEARTBEAT_INTERVAL_MS` has elapsed (default
+5 minutes); ticks that delivered an order or need to surface an error still
+record immediately. Every tick records its attempt even when a heartbeat is
+not yet due. The block class declares a 15-minute expected interval and a
+45-minute stale window, leaving room for cron jitter and transient retries.
 
 ## Why net turns, not MCP
 

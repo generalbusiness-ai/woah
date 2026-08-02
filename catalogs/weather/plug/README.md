@@ -14,23 +14,25 @@ Cron-triggered hourly. Each tick:
 1. POSTs to `/net-api/session` with the actor-bound apikey for the weather
    block and `roster_visible:false`, retaining Net authorization/fanout
    presence without appearing in the room roster.
-2. Reads the block's exact owner-set config cells (`place`, `timezone`, `units`).
+2. Calls `:record_plug_attempt`, then reads the block's exact owner-set config
+   cells (`place`, `timezone`, `units`).
 3. Fetches three tomorrow.io endpoints in parallel: `weather/realtime`,
    `weather/forecast` (1h+1d timesteps), and `weather/history/recent`
    (1h+1d timesteps).
-4. POSTs a sequenced `/net-api/turn` for `:set_properties` with `current` (flat scalar bundle, including
+4. POSTs a sequenced `/net-api/turn` for `:record_plug_success` with `current` (flat scalar bundle, including
    `local_date` — the calendar date in the configured timezone at
    observation time, used by the block's chat verbs to resolve "today"),
    `daily` (per-day rollup array, each entry stamped with a 3-letter
    `weekday` for matching "thursday" without TZ math in the VM),
-   `timeseries` (column-major ±7d hourly chart payload), `last_pushed_at`,
-   `last_error`, and `config_state` — all in a single bundle so a reader
-   never sees a torn snapshot.
+   `timeseries` (column-major ±7d hourly chart payload), and `config_state`.
+   The block injects success timestamp/error-reset metadata into the same
+   atomic write, so a reader never sees a torn snapshot or contradictory
+   lifecycle state.
 5. Closes the Net session in a `finally` path, including failed ticks.
 
 If the block has no `place` configured, has an invalid timezone, or
-tomorrow.io rejects the place, the plug writes `config_state.status = "error"`
-and a readable `last_error` on the block. On success it writes
+tomorrow.io rejects the place, the plug calls `:record_plug_failure` with
+`config_state.status = "error"` and a readable message. On success it writes
 `config_state.status = "confirmed"`. Timezone values must be valid IANA
 timezone names; the plug does not do alias matching. Non-config source
 failures, such as rate limits or auth errors, still update `last_error`.
@@ -42,8 +44,9 @@ Recognized failure modes:
 - generic per-call message on other transport / parse failures
 
 The Worker fails the whole tick when tomorrow.io errors; the cron retries
-hourly. `last_error` is the operator-facing signal; `config_state` tells the
-block owner whether the latest location/timezone has been confirmed.
+hourly. The inherited `plug_status` and lifecycle fields are the generic
+operator-facing signal; `config_state` tells the block owner whether the
+latest location/timezone has been confirmed.
 
 ## Tomorrow.io free-plan budget
 

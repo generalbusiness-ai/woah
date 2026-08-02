@@ -18,8 +18,15 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const call: Call = { url, method, body };
     calls.push(call);
-    const handler = handlers[i++];
-    const reply: Reply = handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
+    // Attempt recording is common preflight lifecycle traffic. Auto-accept it
+    // without consuming the scenario's domain fixture; the final success or
+    // failure call still consumes the existing heartbeat handler.
+    const recordsAttempt = method === "POST"
+      && (body as { verb?: string } | undefined)?.verb === "record_plug_attempt";
+    const handler = recordsAttempt ? undefined : handlers[i++];
+    const reply: Reply = recordsAttempt
+      ? { status: 200, body: { reply: { status: "accepted" }, result: { state: "pending" }, observations: [] } }
+      : handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
     const headers = new Headers(reply.headers ?? {});
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(reply.body), { status: reply.status, headers });
@@ -111,12 +118,13 @@ describe("runHoroscopeTick", () => {
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
     expect(calls[0].body).toEqual({ roster_visible: false });
-    expect(calls[1].url).toContain("/net-api/cell?");
-    expect(calls[1].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
-    expect(calls[2].url).toBe("https://woo.example/net-api/turn");
-    expect(calls[2].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
+    expect(calls[1].body).toMatchObject({ target: "the_horoscope_block", verb: "record_plug_attempt", session: "sess_h" });
+    expect(calls[2].url).toContain("/net-api/cell?");
+    expect(calls[2].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
+    expect(calls[3].url).toBe("https://woo.example/net-api/turn");
+    expect(calls[3].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
 
-    const prepare1 = calls[3];
+    const prepare1 = calls[4];
     expect(prepare1.url).toBe("https://woo.example/net-api/turn");
     expect(prepare1.body).toMatchObject({
       target: "the_horoscope_block",
@@ -130,7 +138,7 @@ describe("runHoroscopeTick", () => {
       expect.stringContaining("scorpio")
     ]);
 
-    const deliver1 = calls[4];
+    const deliver1 = calls[5];
     expect(deliver1.url).toBe("https://woo.example/net-api/turn");
     expect(deliver1.body).toMatchObject({
       target: "the_horoscope_block",
@@ -140,7 +148,7 @@ describe("runHoroscopeTick", () => {
     });
     expect((deliver1.body as { args: unknown[] }).args).toEqual(["ord_1", "note_1"]);
 
-    const prepare2 = calls[6];
+    const prepare2 = calls[7];
     expect(prepare2.body).toMatchObject({ verb: "prepare_artifact", route: "direct" });
     expect((prepare2.body as { args: unknown[] }).args).toEqual([
       "ord_2",
@@ -148,15 +156,15 @@ describe("runHoroscopeTick", () => {
       "destiny calls.",
       expect.stringContaining("leo")
     ]);
-    const deliver2 = calls[7];
+    const deliver2 = calls[8];
     expect(deliver2.body).toMatchObject({
       idempotency_key: "plug:deliver:the_horoscope_block:ord_2"
     });
     expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "note_2"]);
-    const heartbeat = calls[9];
+    const heartbeat = calls[10];
     expect(heartbeat.url).toBe("https://woo.example/net-api/turn");
-    expect(heartbeat.body).toMatchObject({ target: "the_horoscope_block", verb: "set_properties" });
-    expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
+    expect(heartbeat.body).toMatchObject({ target: "the_horoscope_block", verb: "record_plug_success" });
+    expect((heartbeat.body as { args: [Record<string, unknown>, number] }).args).toEqual([{}, expect.any(Number)]);
   });
 
   it("respects MAX_ORDERS_PER_TICK", async () => {
@@ -213,8 +221,8 @@ describe("runHoroscopeTick", () => {
     // Fallback delivery is degraded service — last_error must surface that
     // so :look_self / status reports don't show a healthy block while the
     // user is silently receiving placeholder text.
-    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties");
-    const recordedError = (heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error;
+    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_failure");
+    const recordedError = (heartbeat?.body as { args: [string, Record<string, unknown>, number] }).args[0];
     expect(typeof recordedError).toBe("string");
     expect(recordedError as string).toContain("ai fallback");
     expect(recordedError as string).toContain("model timeout");
@@ -259,7 +267,8 @@ describe("runHoroscopeTick", () => {
     expect(first.delivered).toBe(0);
     expect(second.delivered).toBe(0);
     expect(calls.filter((c) => c.url.includes("property_cell%3Athe_horoscope_block%3Asystem_prompt"))).toHaveLength(1);
-    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties")).toHaveLength(1);
+    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_success")).toHaveLength(1);
+    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_attempt")).toHaveLength(2);
     expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "next_pending")).toHaveLength(2);
   });
 
@@ -320,7 +329,8 @@ describe("runHoroscopeTick session cache", () => {
     expect(result.authMode).toBe("warm");
     expect(result.delivered).toBe(1);
     expect(calls.find((c) => c.url === "https://woo.example/net-api/session")).toBeUndefined();
-    expect(calls[0].url).toContain("/net-api/cell?");
+    expect(calls[0].body).toMatchObject({ verb: "record_plug_attempt", session: "sess_warm" });
+    expect(calls[1].url).toContain("/net-api/cell?");
   });
 
   it("re-authenticates when the cached session is within REAUTH_MARGIN_MS of expiry", async () => {
