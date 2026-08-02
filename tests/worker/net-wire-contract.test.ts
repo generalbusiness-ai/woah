@@ -193,7 +193,7 @@ describe("schema_version durable stamps (Phase 5)", () => {
     gw.close();
   });
 
-  it("gateway construction stamps net_gateway_meta schema_version v2, once", () => {
+  it("gateway construction stamps net_gateway_meta schema_version v3, once", () => {
     const gw = netState("wire-gateway");
     const env: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
     new NetGatewayDO(gw.state, env);
@@ -204,7 +204,7 @@ describe("schema_version durable stamps (Phase 5)", () => {
       }
     ).toArray();
     expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0].body)).toEqual({ v: 2 });
+    expect(JSON.parse(rows[0].body)).toEqual({ v: 3 });
     gw.close();
   });
 
@@ -262,10 +262,10 @@ describe("schema_version durable stamps (Phase 5)", () => {
     const version = (sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'") as {
       toArray(): Array<{ body: string }>;
     }).toArray();
-    expect(JSON.parse(version[0].body)).toEqual({ v: 2 });
+    expect(JSON.parse(version[0].body)).toEqual({ v: 3 });
 
     // The reset is the v1→v2 migration, not a construction side effect.
-    // Once stamped v2, a later hibernation/wake must preserve rebuilt rows.
+    // Once stamped v3, a later hibernation/wake must preserve rebuilt rows.
     sql.exec(
       "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?)",
       "object_lineage:rebuilt",
@@ -274,6 +274,38 @@ describe("schema_version durable stamps (Phase 5)", () => {
     );
     new NetGatewayDO(gw.state, env);
     expect(count("net_gateway_cell")).toBe(1);
+    gw.close();
+  });
+
+  it("gateway v2-to-v3 migration preserves derived cache rows and adds exact-read floors", () => {
+    const gw = netState("wire-gateway-v2");
+    const sql = gw.state.storage.sql;
+    sql.exec("CREATE TABLE net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    sql.exec(
+      "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+      JSON.stringify({ v: 2 })
+    );
+    sql.exec("CREATE TABLE net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL, owner_scope TEXT)");
+    sql.exec(
+      "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?)",
+      "object_lineage:rebuilt",
+      JSON.stringify({ rebuilt: true }),
+      "room:rebuilt"
+    );
+
+    new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    const version = (sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'") as {
+      toArray(): Array<{ body: string }>;
+    }).toArray();
+    expect(JSON.parse(version[0].body)).toEqual({ v: 3 });
+    const cached = (sql.exec("SELECT COUNT(*) AS n FROM net_gateway_cell") as {
+      toArray(): Array<{ n: number }>;
+    }).toArray()[0];
+    expect(Number(cached.n)).toBe(1);
+    const floorColumns = (sql.exec("PRAGMA table_info(net_gateway_cell_floor)") as {
+      toArray(): Array<{ name: string }>;
+    }).toArray().map((column) => column.name);
+    expect(floorColumns).toEqual(expect.arrayContaining(["key", "owner_scope", "authority_seq"]));
     gw.close();
   });
 });

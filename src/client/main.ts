@@ -2003,10 +2003,15 @@ async function fetchObjectSummaryForFill(subject: string, fields: readonly strin
 async function fetchNetObjectSummary(subject: string, fields: readonly string[] = []): Promise<any | undefined> {
   if (!netFeed || !netFeedOpen) return scopedObjectSummary(subject);
   const names = [...new Set(fields.filter((field) => typeof field === "string" && field.length > 0))].sort();
-  const [lineageCell, liveCell, ...propertyCells] = await Promise.all([
-    netFeed.cell(`object_lineage:${subject}`),
-    netFeed.cell(`object_live:${subject}`),
-    ...names.map((name) => netFeed!.cell(`property_cell:${subject}:${name}`))
+  // One authority barrier for the exact component-declared field set. A
+  // present gateway cell is only a derived projection and may predate an
+  // offline block update; treating it as complete reproduced July 26 weather
+  // on July 31. The server keeps this batch bounded and never enumerates
+  // arbitrary object properties.
+  const [lineageCell, liveCell, ...propertyCells] = await netFeed.authoritativeCells([
+    `object_lineage:${subject}`,
+    `object_live:${subject}`,
+    ...names.map((name) => `property_cell:${subject}:${name}`)
   ]);
   const lineage = netCellPayload(lineageCell);
   if (!lineage) return scopedObjectSummary(subject);

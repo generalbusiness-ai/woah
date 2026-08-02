@@ -1491,8 +1491,29 @@ One write path per fact (CO9), concretized:
     direct read is not cached and safely returns a newly validated result at
     the unchanged head.
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
-    client reads over the CO13 roster mirror and the view cell probe. Session
-    ids are bearer credentials: relation reads expose only actor-level
+    client reads over the CO13 roster mirror and the view cell probe. `POST
+    /net-api/cells {session, keys}` is the bounded authoritative counterpart:
+    it accepts at most 32 exact keys, groups them by the owning scope already
+    established by the caller's presence-scoped view, fetches those keys from
+    each authority, and returns them in request order. It never enumerates an
+    object's properties or a scope's cells. The gateway authorizes every key
+    both before the fetch and after installing the authority's lineage/live
+    support cells, so movement cannot turn an allowed stale-view read into a
+    disclosure from a room the caller has left. Requested absence is an exact
+    answer from the established owner, not a cache miss.
+
+    An authoritative exact read records a durable per-(scope,key) authority
+    floor at the returned scope head. Fanout at or below that floor still
+    advances delivery continuity, applies unrelated cells and relation deltas,
+    and delivers observations, but cannot overwrite that key (including an
+    authority-confirmed absence). The first later fanout for the key above the
+    floor applies normally and retires the floor. This is deliberately not a
+    scope high-water advance: using the scope high-water for a sparse read
+    would suppress unrelated observations and relation changes between the
+    gateway's prior view and the authority head. The floor table is derived
+    gateway cache state and reconstructs naturally through a later exact read.
+
+    Session ids are bearer credentials: relation reads expose only actor-level
     presence, session cells are owner-only, and any property whose inherited
     definition declares a `presenceProjection` with
     `{kind:"presence", key:"session"}` is not client-readable regardless of

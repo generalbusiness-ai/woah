@@ -721,6 +721,39 @@ describe("NetFeed reads + cache", () => {
     await feed.cell("object_live:#alice");
     expect(reads()).toBe(2);
   });
+
+  it("uses one uncached authoritative batch for exact projection fields and warms cell reads", async () => {
+    let generation = 0;
+    const { feed, calls } = feedWith(
+      {
+        ...SESSION_ROUTE,
+        "POST /net-api/cells": (call) => {
+          generation += 1;
+          const keys = (call.body as { keys: string[] }).keys;
+          return {
+            body: {
+              cells: keys.map((key) => ({ key, cell: { value: { value: `${key}:${generation}` } } }))
+            }
+          };
+        },
+        "GET /net-api/cell": () => ({ body: { cell: { value: { value: "unexpected-network-read" } } } })
+      },
+      { webSocket: false }
+    );
+    await feed.open();
+    const keys = ["object_lineage:weather", "property_cell:weather:current"];
+
+    const first = await feed.authoritativeCells(keys);
+    const second = await feed.authoritativeCells(keys);
+    expect((first[1] as any).value.value).toContain(":1");
+    expect((second[1] as any).value.value).toContain(":2");
+    expect(calls.filter((call) => call.path === "/net-api/cells")).toHaveLength(2);
+    expect(calls.find((call) => call.path === "/net-api/cells")?.body).toEqual({ session: "s_1", keys });
+
+    // A later ordinary probe consumes the fresh batch-populated cache.
+    expect(await feed.cell(keys[1])).toEqual(second[1]);
+    expect(calls.filter((call) => call.path.startsWith("/net-api/cell?"))).toHaveLength(0);
+  });
 });
 
 describe("NetFeed guards", () => {
