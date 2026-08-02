@@ -123,9 +123,10 @@ such as an invalid timezone or an upstream "unknown place" response.
 - **`agg`** records how each field was rolled up into `daily`. Future fields
   follow the same convention so a generic UI can label rollups without a
   hardcoded table.
-- **`anchor` is authoritative for "now"**, not `Date.now()` in the UI.
-  The d3 chart positions the now-line from `anchor` so chart and data agree
-  even if the client clock is skewed or the snapshot is stale.
+- **`anchor` is update provenance, not "now".** The detail chart centers its
+  now-line and daily highlight on the browser wall clock, interpreted in the
+  configured timezone. It renders `anchor` as a separate update marker and
+  warning source, so a stalled plug cannot make old data look current.
 
 ## Size budget
 
@@ -203,12 +204,16 @@ The badge reads only the projected `current`, `config_state`, `place`, and
 uses `current.weather_code` so the badge does not infer condition from
 temperature.
 
-### Detail chart (planned)
+### Detail chart
 
-A `block-detail` surface component (not yet shipped) will read
-`timeseries` and render a multi-line d3 chart spanning the past week
-through the next week, with the now-line positioned from `anchor`. Chart
-work is tracked separately; it is not part of the v1 schema landing.
+The title badge opens `<woo-weather-chart>`, a hand-rolled SVG detail view of
+`daily` and `timeseries`. The visible hourly domain is symmetric around the
+browser's current wall clock while expanding far enough to retain every
+populated sample. The configured timezone chooses the highlighted daily card.
+A cyan line marks current time; a distinct dashed line and headline label mark
+the `timeseries.anchor` update time. The open dialog refreshes those clock-
+derived details at minute boundaries and warns when the snapshot is older than
+two hourly intervals or its grid no longer covers current time.
 
 ## Connection mode
 

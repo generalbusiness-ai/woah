@@ -61,7 +61,7 @@ so a reader never sees a torn snapshot:
 |---|---|---|
 | `current` | small flat map | `temperature`, `temperature_unit`, `humidity`, `weather_code`, `observed_at` (ms epoch), `observed_at_text` (plug-rendered timezone-aware string), `local_date` (YYYY-MM-DD in the configured timezone, used by `:ask` to resolve "today"). Read by chat verbs and the badge. |
 | `daily` | list of small maps (~14) | One entry per covered day, ordered ascending by `date` (YYYY-MM-DD in the configured timezone). Each carries `weekday` (3-letter lowercase, e.g. `"thu"`), pre-computed min/max/mean per metric, and `precip_total`. Read by chat verbs that summarize the week. |
-| `timeseries` | column-major map | `anchor`, `t0`, `step`, `units`, `fields[name].{unit,agg,values}`. ~336 hourly samples spanning ±7 days, one homogeneous array per metric for d3. Read only by the chart UI. |
+| `timeseries` | column-major map | `anchor`, `t0`, `step`, `units`, `fields[name].{unit,agg,values}`. `anchor` records the update time; the chart's center/now line uses the live browser clock. ~336 hourly samples spanning ±7 days, one homogeneous array per metric. Read only by the chart UI. |
 | `last_pushed_at` | int | Inherited from `$block`; epoch ms of last plug push. |
 | `last_error` | str/null | Inherited from `$block`; most recent fetch failure. |
 | `config_state` | map | `pending`, `confirmed`, or config-specific `error` state for the owner-set location/timezone. |
