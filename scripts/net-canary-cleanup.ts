@@ -38,11 +38,14 @@ export function canaryCleanupConfig(input: {
   const migrationsAt = input.templateText.indexOf("[[migrations]]");
   if (migrationsAt < 0) throw new Error("canary template has no Durable Object migration history");
   const migrations = input.templateText.slice(migrationsAt).trim();
+  // Reclaim every namespace ever created by this disposable Worker. Current
+  // canaries use SQLite, but matching legacy `new_classes` prevents a future
+  // template addition from surviving cleanup unnoticed.
   const deletedClasses = [...new Set(
-    [...migrations.matchAll(/new_sqlite_classes\s*=\s*\[([^\]]*)\]/g)]
+    [...migrations.matchAll(/(?:new_sqlite_classes|new_classes)\s*=\s*\[([^\]]*)\]/g)]
       .flatMap((match) => [...match[1].matchAll(/"([A-Za-z0-9_]+)"/g)].map((entry) => entry[1]))
   )].sort();
-  if (deletedClasses.length === 0) throw new Error("canary template declares no SQLite Durable Object classes");
+  if (deletedClasses.length === 0) throw new Error("canary template declares no Durable Object classes");
   const text = [
     `name = ${JSON.stringify(input.worker)}`,
     `account_id = ${JSON.stringify(input.accountId)}`,

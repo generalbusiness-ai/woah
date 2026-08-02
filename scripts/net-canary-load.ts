@@ -144,6 +144,19 @@ export function resolveCanaryStorageGateOptions(
   };
 }
 
+/** Cloudflare timestamps periodic samples when they are emitted, which may be
+ * after the final write. Capture the exclusive query bound only after the
+ * settle delay so the gate cannot omit the tail of the run it is judging. */
+export async function storageWindowEndAfterMetricsSettle(
+  delayMs: number,
+  wait: (delayMs: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  now: () => Date = () => new Date()
+): Promise<string> {
+  if (delayMs > 0) await wait(delayMs);
+  return now().toISOString();
+}
+
 /** Enforcement requires both a conclusive run and a complete roster. */
 export function whoCheckFailsAcceptance(summary: WhoCheckSummary): boolean {
   return !summary.ran || summary.partial;
@@ -580,7 +593,6 @@ async function main(): Promise<void> {
     const failed = rows.filter((outcome) => !outcome.accepted);
     return [phase, { turns: rows.length, accepted: rows.length - failed.length, failures: failed.length }];
   }));
-  const storageTo = new Date().toISOString();
   let storageGate: Record<string, unknown>;
   let storageDecision: "pass" | "violation" | "incomplete" | "skipped" = "skipped";
   if (storageOptions.skip) {
@@ -588,8 +600,8 @@ async function main(): Promise<void> {
   } else {
     if (storageOptions.metricsDelayMs > 0) {
       console.error(`canary progress: waiting ${storageOptions.metricsDelayMs}ms for Durable Object billing metrics`);
-      await new Promise((resolve) => setTimeout(resolve, storageOptions.metricsDelayMs));
     }
+    const storageTo = await storageWindowEndAfterMetricsSettle(storageOptions.metricsDelayMs);
     try {
       const storage = await queryWorkerDurableObjectStorage({
         accountId: storageOptions.accountId!,

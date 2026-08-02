@@ -392,16 +392,19 @@ item; what remains is exactly what the workerd lanes cannot prove
   minimum duration and the full evidence envelope, and exits 2 if the
   maximum duration expires without sufficient healthy evidence. Sampled
   `wrangler tail` remains diagnostic only.
-  `load:net-canary` also records its exact wall-clock window and, after session
-  cleanup plus a bounded metrics-settle delay, queries Cloudflare's Durable
-  Object periodic and invocation datasets by the canary Worker's CURRENT
-  namespace ids and queries every namespace currently owned by that Worker.
+  `load:net-canary` records the billing window from immediately before load
+  through session cleanup and the bounded metrics-settle delay, then queries
+  Cloudflare's Durable Object periodic and invocation datasets by the canary
+  Worker's CURRENT namespace ids and queries every namespace currently owned
+  by that Worker. The dedicated canary Worker owns that interval, so including
+  traffic during the settle delay is safe over-attribution; ending before the
+  delay could omit periodic samples for the run's final writes.
   The Gateway, Scope, and Audit namespaces are required. The default
   acceptance budget is 250,000 total physical rows
   and 50,000 per object for one standard lane; these are initial ceilings
   grounded by the pre-fix clean hour and may be overridden only explicitly for
   a reviewed larger lane. Missing account/token, missing required namespace,
-  namespace, absent invocation evidence, query truncation, total excess, or
+  absent invocation evidence, query truncation, total excess, or
   one hot object is a failing gate. `--skip-storage-gate` is never implicit and
   requires a recorded `--skip-storage-gate-reason`; such a run is diagnostic,
   not acceptance evidence. `gate:net-storage` exposes the same namespace/object
@@ -413,9 +416,10 @@ item; what remains is exactly what the workerd lanes cannot prove
 
   Disposable canary cleanup MUST reclaim storage, not merely remove the Worker
   script. `cleanup:net-canary` first deploys a no-binding tombstone revision
-  whose migration history appends `deleted_classes` for every SQLite class in
-  `wrangler.net-canary.template.toml`, then deletes the Worker and its dedicated
-  KV namespace. It is a build-only dry run by default; irreversible execution
+  whose migration history appends `deleted_classes` for every class created by
+  `new_sqlite_classes` or `new_classes` in `wrangler.net-canary.template.toml`,
+  then deletes the Worker and its dedicated KV namespace. It is a build-only
+  dry run by default; irreversible execution
   requires `--execute` plus an exact `<worker>:<kv-namespace-id>` confirmation,
   and the name guard rejects anything outside the canary naming boundary.
   Stages are ordered and stop on failure so a failed class deletion cannot be

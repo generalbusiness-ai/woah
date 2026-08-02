@@ -21,13 +21,18 @@ describe("Net canary cleanup safety", () => {
         'new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]',
         "[[migrations]]",
         'tag = "v2"',
-        'new_sqlite_classes = ["NetAuditDO"]'
+        'new_sqlite_classes = ["NetAuditDO"]',
+        "[[migrations]]",
+        'tag = "v3"',
+        'new_classes = ["LegacyCanaryDO"]'
       ].join("\n")
     });
-    expect(generated.deletedClasses).toEqual(["NetAuditDO", "NetGatewayDO", "NetScopeDO"]);
+    expect(generated.deletedClasses).toEqual(["LegacyCanaryDO", "NetAuditDO", "NetGatewayDO", "NetScopeDO"]);
     expect(generated.text).toContain('tag = "v1"');
     expect(generated.text).toContain('tag = "canary-storage-cleanup-v1"');
-    expect(generated.text).toContain('deleted_classes = ["NetAuditDO","NetGatewayDO","NetScopeDO"]');
+    expect(generated.text).toContain(
+      'deleted_classes = ["LegacyCanaryDO","NetAuditDO","NetGatewayDO","NetScopeDO"]'
+    );
     expect(generated.text).not.toContain("[[durable_objects.bindings]]");
   });
 });

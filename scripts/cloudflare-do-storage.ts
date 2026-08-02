@@ -19,8 +19,9 @@ export type DurableObjectStorageObject = {
   name: string;
   rowsWritten: number;
   requests: number;
-  /** Number of periodic billing samples observed for this object. Requests
-   * without a corresponding sample are lag/incompleteness, not zero writes. */
+  /** Number of grouped periodic rows observed. The query groups by object
+   * without a datetime dimension, so this is effectively a 0/1 evidence
+   * marker: invocations without one are lag/incompleteness, not zero writes. */
   periodicSamples: number;
 };
 

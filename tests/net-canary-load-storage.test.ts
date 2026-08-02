@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CANARY_MAX_ROWS_WRITTEN,
   DEFAULT_CANARY_MAX_ROWS_WRITTEN_PER_OBJECT,
-  resolveCanaryStorageGateOptions
+  resolveCanaryStorageGateOptions,
+  storageWindowEndAfterMetricsSettle
 } from "../scripts/net-canary-load";
 
 const credentials = { CF_ACCOUNT_ID: "account", CF_ANALYTICS_TOKEN: "token" };
@@ -39,5 +40,19 @@ describe("deployed canary storage gate options", () => {
       "https://woah-net-canary.example.workers.dev",
       credentials
     )).toThrow("non-negative integers");
+  });
+
+  it("captures the billing window end after the metrics-settle delay", async () => {
+    const order: string[] = [];
+    const end = await storageWindowEndAfterMetricsSettle(
+      120_000,
+      async (delayMs) => { order.push(`wait:${delayMs}`); },
+      () => {
+        order.push("now");
+        return new Date("2026-08-02T20:02:00.000Z");
+      }
+    );
+    expect(order).toEqual(["wait:120000", "now"]);
+    expect(end).toBe("2026-08-02T20:02:00.000Z");
   });
 });
