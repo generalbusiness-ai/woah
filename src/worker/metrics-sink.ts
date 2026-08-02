@@ -62,6 +62,7 @@ export function analyticsSampleRate(event: AnalyticsMetric): number {
   if (e.status === "error" || (typeof e.error === "string" && e.error.length > 0)) return 1;
   if (event.kind === "storage_direct_write") return 10;
   if (event.kind === "storage_flush") return 10;
+  if (event.kind === "net_gateway_storage_write") return 10;
   return 1;
 }
 
@@ -83,6 +84,7 @@ function primaryCount(event: AnalyticsMetric): number {
     case "storage_direct_write":
     case "storage_flush":
     case "storage_full_save":
+    case "net_gateway_storage_write":
       return typeof e.rows === "number" ? e.rows : 0;
     case "broadcast":
       return typeof e.audience_size === "number" ? e.audience_size : 0;

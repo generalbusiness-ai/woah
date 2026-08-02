@@ -16,6 +16,7 @@ import { applyTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitReply, type CommitSubmit, type ScopeHead } from "../../src/net/scope";
 import type { RelationDelta } from "../../src/net/relations";
 import { turnEchoId } from "../../src/net/turn-echo";
+import { makeCell } from "../../src/net/cells";
 
 const SECRET = "net-relations-test-secret";
 const EPOCH = "cat-net-relations-1";
@@ -41,6 +42,7 @@ function netState(name: string) {
   };
   return {
     state,
+    sql: fake.storage.sql,
     settle: async () => {
       while (deferred.length > 0) await deferred.shift();
     },
@@ -310,6 +312,47 @@ describe("lane-batched /net/fanout receive (2026-07-22 gateway occupancy)", () =
     expect(typeof stamps[0]!.ms).toBe("number");
     expect(String(stamps[0]!.error).length).toBeGreaterThan(0);
     gatewayState.close();
+  });
+});
+
+describe("gateway fanout write amplification", () => {
+  it("does not rewrite byte-identical cells or relation rows at a newer sequence", async () => {
+    const state = netState("gateway-noop-write-suppression");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(state.state, gatewayEnv);
+    const cell = makeCell({
+      kind: "property_cell",
+      object: "guest_1",
+      name: "name",
+      value: { value: "unchanged" },
+      provenance: "authoritative",
+      stamp: { scope_head: "gateway-noop", catalog_epoch: EPOCH }
+    });
+    const relation = { op: "add" as const, row: { relation: "contents", owner: "the_chatroom", member: "guest_1" } };
+    const body = (seq: number) => ({
+      scope: ROOM_SCOPE,
+      seq,
+      delivery_seq: seq,
+      cells: [cell],
+      relations: [relation],
+      observations: []
+    });
+
+    await call(gateway, gatewayEnv, "/fanout", body(1));
+    const before = state.sql.execLog.length;
+    await call(gateway, gatewayEnv, "/fanout", body(2));
+    const repeated = state.sql.execLog.slice(before);
+
+    const cellWrites = repeated.filter((entry) => entry.query.startsWith("INSERT INTO net_gateway_cell"));
+    const relationWrites = repeated.filter((entry) => entry.query.startsWith("INSERT INTO net_gateway_relation"));
+    expect(cellWrites).toHaveLength(1);
+    expect(relationWrites).toHaveLength(1);
+    expect(cellWrites[0]!.changes).toBe(0);
+    expect(relationWrites[0]!.changes).toBe(0);
+    // The delivery high-water still advances: suppression affects derived
+    // payload duplicates, never ordering or continuity authority.
+    expect(repeated.find((entry) => entry.query.startsWith("INSERT INTO net_gateway_scope"))?.changes).toBe(1);
+    state.close();
   });
 });
 

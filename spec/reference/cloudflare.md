@@ -749,6 +749,23 @@ emit would bias the occupancy series toward survivors); `ms` spans mirror
 writes, relation deltas, presence scans, and WS pushes — the
 gateway-occupancy segment the 2026-07-22 bake attribution identified as
 the residual turn-tail driver; `rows` rides the count slot.
+`net_gateway_storage_write {what, phase, rows, status:"written"}` measures
+the physical SQLite cost beneath that logical receive metric. Every gateway
+SQL statement passes through one wrapper and mutations read Cloudflare's
+`SqlStorageCursor.rowsWritten`; `rows` therefore includes base-table and
+secondary-index rows rather than a logical-operation estimate. Synchronous
+writes are coalesced by durable family (`what`) and SQL operation (`phase`)
+before emission, zero-row attempts are omitted, and the metric is sampled
+1-in-10 under the ordinary storage-metric rule. Queries reconstruct totals
+with both the local multiplier and AE's adaptive weight. SQL text and bind
+values are never metrics because they may contain credentials or user data.
+
+Gateway fanout persistence must make repeated derived state a physical no-op.
+Lineage closure legitimately carries unchanged ancestor cells and relation
+producers may conservatively repeat membership adds; cell and relation UPSERTs
+therefore include a null-safe conflict predicate and update only when their
+stored payload or materialized scope differs. Receiver sequence/high-water
+rows still advance normally, so cost suppression cannot weaken continuity.
 `net_scope_fanout_batch_fallback` marks a sender falling back to bare-row
 delivery after a batch envelope was refused (the rollout-compatibility
 path — an old receiver during a code update).
@@ -779,7 +796,8 @@ Console-tail is unaffected (it sees every emission). AE-side sampling:
   `shadow_gateway_apply_step` records whose `phase != "total"`. The
   `total` phase carries the same dashboard-visible information; the
   per-phase records are ~10× amplification per envelope.
-- **1-in-10:** `storage_direct_write`, `storage_flush`. The multiplier
+- **1-in-10:** `storage_direct_write`, `storage_flush`, and
+  `net_gateway_storage_write`. The multiplier
   (10) is recorded in `doubles[1]` so dashboard queries can reconstruct
   totals — e.g. `SUM(double2 * double1)` for sampled-up sums.
 - **Always written:** any event with `status:"error"` or a non-empty
