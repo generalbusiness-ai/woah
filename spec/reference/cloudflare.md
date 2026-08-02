@@ -799,7 +799,9 @@ Console-tail is unaffected (it sees every emission). AE-side sampling:
 - **1-in-10:** `storage_direct_write`, `storage_flush`, and
   `net_gateway_storage_write`. The multiplier
   (10) is recorded in `doubles[1]` so dashboard queries can reconstruct
-  totals — e.g. `SUM(double2 * double1)` for sampled-up sums.
+  totals. In Analytics Engine's one-based column names, a primary-count sum is
+  `SUM(_sample_interval * double2 * double3)`: AE weight × local multiplier ×
+  primary count.
 - **Always written:** any event with `status:"error"` or a non-empty
   `error` field, regardless of kind. Dashboard error panes must reflect
   ground truth even during a burst.

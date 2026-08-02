@@ -74,10 +74,11 @@ const BLOB_SLOTS = 20;
 const DOUBLE_SLOTS = 20;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
-// dashboard queries can `SUM(double2)` to get totals without knowing which
-// kind they're aggregating over. Kinds that carry no natural primary count
-// (do_constructor, init, etc.) leave it at 0. Diagnostic anomaly kinds use
-// one event as the count so dashboards can sum incidents directly.
+// dashboard queries can multiply the primary count by both the manual sample
+// multiplier and AE's adaptive multiplier without knowing which kind they're
+// aggregating over. Kinds that carry no natural primary count (do_constructor,
+// init, etc.) leave it at 0. Diagnostic anomaly kinds use one event as the
+// count so dashboards can sum incidents directly.
 function primaryCount(event: AnalyticsMetric): number {
   const e = event as Record<string, unknown>;
   switch (event.kind) {
