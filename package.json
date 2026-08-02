@@ -58,6 +58,8 @@
     "load:net-dev": "vitest run --reporter=dot tests/worker/net-load-asymptote.test.ts",
     "load:net-skew": "vitest run --reporter=dot tests/worker/net-load-skew.test.ts",
     "metrics:net-ae": "tsx scripts/net-metrics-ae.ts",
+    "gate:net-storage": "tsx scripts/net-storage-gate.ts",
+    "cleanup:net-canary": "tsx scripts/net-canary-cleanup.ts",
     "bench:outliner-acts": "tsx scripts/bench-outliner-acts-workerd.ts",
     "cutover:freeze": "tsx scripts/net-freeze.ts",
     "load:net-canary": "tsx scripts/net-canary-load.ts",

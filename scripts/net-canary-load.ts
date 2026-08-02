@@ -26,6 +26,11 @@
 
 import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../src/net/client-session-policy";
 import { sessionShardHint } from "../src/net/session-id";
+import {
+  evaluateDurableObjectStorage,
+  queryWorkerDurableObjectStorage,
+  storageReportForOutput
+} from "./cloudflare-do-storage";
 
 export type CanaryGuest = { actor: string; session: string; elastic: boolean; activeScope: string | null };
 type Outcome = { phase: "enter" | "load"; status: number; ms: number; code: string; accepted: boolean; detail: string };
@@ -64,7 +69,80 @@ export type WhoCheckSummary = {
 // comfortably above the Worker's 5s internal RPC deadline while still bounding
 // the 512-responder roster phase.
 export const DEFAULT_CANARY_FETCH_TIMEOUT_MS = 30_000;
+/** Pre-fix clean acceptance traffic wrote 232,490 rows in its containing
+ * hour. These initial ceilings cover one standard 600-turn run but reject the
+ * multi-million-row diagnostic bursts that caused July's bill. Larger lanes
+ * must name a reviewed override instead of silently inheriting more budget. */
+export const DEFAULT_CANARY_MAX_ROWS_WRITTEN = 250_000;
+export const DEFAULT_CANARY_MAX_ROWS_WRITTEN_PER_OBJECT = 50_000;
+export const DEFAULT_CANARY_STORAGE_METRICS_DELAY_MS = 120_000;
 let canaryFetchTimeoutMs = DEFAULT_CANARY_FETCH_TIMEOUT_MS;
+
+export type CanaryStorageGateOptions = {
+  skip: boolean;
+  skipReason: string;
+  worker: string;
+  accountId: string | undefined;
+  token: string | undefined;
+  maxRowsWritten: number;
+  maxRowsWrittenPerObject: number;
+  metricsDelayMs: number;
+};
+
+function argumentValue(args: string[], name: string, fallback: string): string {
+  const at = args.indexOf(name);
+  return at === -1 ? fallback : (args[at + 1] ?? fallback);
+}
+
+/** Parse the billing gate independently of the load driver so acceptance
+ * cannot accidentally become permissive during later CLI maintenance. */
+export function resolveCanaryStorageGateOptions(
+  args: string[],
+  base: string,
+  env: { CF_ACCOUNT_ID?: string; CF_ANALYTICS_TOKEN?: string } = process.env
+): CanaryStorageGateOptions {
+  const skip = args.includes("--skip-storage-gate");
+  const skipReason = argumentValue(args, "--skip-storage-gate-reason", "").trim();
+  if (skip && !skipReason) throw new Error("--skip-storage-gate requires a non-empty --skip-storage-gate-reason");
+  if (!skip && skipReason) throw new Error("--skip-storage-gate-reason requires --skip-storage-gate");
+  const hostname = new URL(base).hostname;
+  const inferredWorker = hostname.endsWith(".workers.dev") ? hostname.split(".")[0] ?? "" : "";
+  const worker = argumentValue(args, "--storage-worker", inferredWorker);
+  if (!skip && !worker) {
+    throw new Error("--storage-worker is required when the base URL is not a <worker>.*.workers.dev hostname");
+  }
+  const maxRowsWritten = Number(argumentValue(args, "--max-rows-written", String(DEFAULT_CANARY_MAX_ROWS_WRITTEN)));
+  const maxRowsWrittenPerObject = Number(argumentValue(
+    args,
+    "--max-rows-written-per-object",
+    String(DEFAULT_CANARY_MAX_ROWS_WRITTEN_PER_OBJECT)
+  ));
+  const metricsDelayMs = Number(argumentValue(
+    args,
+    "--storage-metrics-delay-ms",
+    String(DEFAULT_CANARY_STORAGE_METRICS_DELAY_MS)
+  ));
+  if (![maxRowsWritten, maxRowsWrittenPerObject, metricsDelayMs].every((number) =>
+    Number.isSafeInteger(number) && number >= 0
+  )) {
+    throw new Error("storage row budgets and metrics delay must be non-negative integers");
+  }
+  if (!skip && (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN)) {
+    throw new Error(
+      "CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN are required; use an explicit --skip-storage-gate reason only for non-acceptance diagnostics"
+    );
+  }
+  return {
+    skip,
+    skipReason,
+    worker,
+    accountId: env.CF_ACCOUNT_ID,
+    token: env.CF_ANALYTICS_TOKEN,
+    maxRowsWritten,
+    maxRowsWrittenPerObject,
+    metricsDelayMs
+  };
+}
 
 /** Enforcement requires both a conclusive run and a complete roster. */
 export function whoCheckFailsAcceptance(summary: WhoCheckSummary): boolean {
@@ -302,12 +380,11 @@ async function runWhoCheck(base: string, guests: CanaryGuest[], run: string): Pr
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const value = (name: string, fallback: string): string => {
-    const at = args.indexOf(name);
-    return at === -1 ? fallback : (args[at + 1] ?? fallback);
-  };
+  const value = (name: string, fallback: string): string => argumentValue(args, name, fallback);
   const base = value("--base-url", "").replace(/\/$/, "");
   if (!/^https:\/\//.test(base)) throw new Error("--base-url https://... is required");
+  const storageOptions = resolveCanaryStorageGateOptions(args, base);
+  const storageFrom = new Date().toISOString();
   const actors = Math.max(1, Number(value("--actors", "10")));
   const rounds = Math.max(1, Number(value("--rounds", "50")));
   const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
@@ -328,6 +405,7 @@ async function main(): Promise<void> {
   const outcomes: Outcome[] = [];
   const closeFailures: Array<{ actor: string; status: number; detail: string }> = [];
   let whoCheck: WhoCheckSummary | null = null;
+  let loadError: unknown = null;
 
   try {
     await mapWithConcurrency(Array.from({ length: actors }, (_, index) => index), claimConcurrency, async (i) => {
@@ -462,6 +540,10 @@ async function main(): Promise<void> {
     // documenting the old connected_players partial view; --enforce-who fails
     // the run on any partial or inconclusive result.
     if (!skipWho) whoCheck = await runWhoCheck(base, guests, run);
+  } catch (error) {
+    // Cost evidence is still mandatory after a failed load. Keep the error,
+    // clean sessions, query billing rows, and only then fail the process.
+    loadError = error;
   } finally {
     await mapWithConcurrency(guests, turnConcurrency, async (guest) => {
       let last = { status: 0, detail: "close request did not run" };
@@ -498,6 +580,38 @@ async function main(): Promise<void> {
     const failed = rows.filter((outcome) => !outcome.accepted);
     return [phase, { turns: rows.length, accepted: rows.length - failed.length, failures: failed.length }];
   }));
+  const storageTo = new Date().toISOString();
+  let storageGate: Record<string, unknown>;
+  let storageDecision: "pass" | "violation" | "incomplete" | "skipped" = "skipped";
+  if (storageOptions.skip) {
+    storageGate = { state: "skipped", reason: storageOptions.skipReason };
+  } else {
+    if (storageOptions.metricsDelayMs > 0) {
+      console.error(`canary progress: waiting ${storageOptions.metricsDelayMs}ms for Durable Object billing metrics`);
+      await new Promise((resolve) => setTimeout(resolve, storageOptions.metricsDelayMs));
+    }
+    try {
+      const storage = await queryWorkerDurableObjectStorage({
+        accountId: storageOptions.accountId!,
+        token: storageOptions.token!,
+        worker: storageOptions.worker,
+        from: storageFrom,
+        to: storageTo
+      });
+      const budget = {
+        maxRowsWritten: storageOptions.maxRowsWritten,
+        maxRowsWrittenPerObject: storageOptions.maxRowsWrittenPerObject
+      };
+      const decision = evaluateDurableObjectStorage(storage, budget);
+      storageDecision = decision.state;
+      storageGate = { ...storageReportForOutput(storage), budget, decision };
+    } catch (error) {
+      // Preserve the load report while failing closed. A query/auth/dataset
+      // failure is cost-evidence failure, not a zero-write observation.
+      storageDecision = "incomplete";
+      storageGate = { state: "incomplete", error: String(error).slice(0, 1_000) };
+    }
+  }
   const report = {
     run,
     actors: guests.length,
@@ -528,7 +642,9 @@ async function main(): Promise<void> {
       p99: percentile(latencies, 99),
       max: Math.max(0, ...latencies)
     },
-    who_partial_view: whoCheck
+    who_partial_view: whoCheck,
+    load_error: loadError === null ? null : String(loadError),
+    storage_gate: storageGate
   };
   console.log(JSON.stringify(report, null, 2));
   if (whoCheck?.ran && whoCheck.partial) {
@@ -546,6 +662,8 @@ async function main(): Promise<void> {
     if (enforceWho && whoCheckFailsAcceptance(whoCheck)) process.exitCode = 3;
   }
   if (failures.length > 0 || closeFailures.length > 0) process.exitCode = 2;
+  if (loadError !== null) process.exitCode = 1;
+  if (storageDecision === "violation" || storageDecision === "incomplete") process.exitCode = 4;
 }
 
 if (process.argv[1]?.endsWith("net-canary-load.ts")) {

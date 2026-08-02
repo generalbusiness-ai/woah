@@ -173,6 +173,12 @@ Reference alerts:
 - Quota exceeded for any owner.
 - Migration stalled (no batch progress for 1 hour).
 - Audit events of severity warn or above.
+- Durable Object physical rows written above the configured per-Worker or
+  per-object hourly budget. The scheduled `woah-canary` workflow resolves
+  namespace ids and queries every namespace for each Worker named by
+  `WOO_DO_STORAGE_WORKERS`, fails closed on incomplete data, and may send the
+  bounded report to `WOO_STORAGE_ALERT_WEBHOOK_URL`. `CF_ANALYTICS_TOKEN` therefore needs both
+  Account Analytics Read and Workers Scripts Read, but no write permission.
 
 ---
 

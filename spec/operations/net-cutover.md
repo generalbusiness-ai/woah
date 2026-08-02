@@ -392,6 +392,34 @@ item; what remains is exactly what the workerd lanes cannot prove
   minimum duration and the full evidence envelope, and exits 2 if the
   maximum duration expires without sufficient healthy evidence. Sampled
   `wrangler tail` remains diagnostic only.
+  `load:net-canary` also records its exact wall-clock window and, after session
+  cleanup plus a bounded metrics-settle delay, queries Cloudflare's Durable
+  Object periodic and invocation datasets by the canary Worker's CURRENT
+  namespace ids and queries every namespace currently owned by that Worker.
+  The Gateway, Scope, and Audit namespaces are required. The default
+  acceptance budget is 250,000 total physical rows
+  and 50,000 per object for one standard lane; these are initial ceilings
+  grounded by the pre-fix clean hour and may be overridden only explicitly for
+  a reviewed larger lane. Missing account/token, missing required namespace,
+  namespace, absent invocation evidence, query truncation, total excess, or
+  one hot object is a failing gate. `--skip-storage-gate` is never implicit and
+  requires a recorded `--skip-storage-gate-reason`; such a run is diagnostic,
+  not acceptance evidence. `gate:net-storage` exposes the same namespace/object
+  check for an arbitrary window and is the scheduled alert primitive. Its API
+  token requires Account Analytics Read for GraphQL and Workers Scripts Read
+  to resolve current Durable Object namespaces. The small functional deploy
+  postflight records an explicit skip because the independent hourly gate owns
+  its cost evidence; it is not the acceptance load lane.
+
+  Disposable canary cleanup MUST reclaim storage, not merely remove the Worker
+  script. `cleanup:net-canary` first deploys a no-binding tombstone revision
+  whose migration history appends `deleted_classes` for every SQLite class in
+  `wrangler.net-canary.template.toml`, then deletes the Worker and its dedicated
+  KV namespace. It is a build-only dry run by default; irreversible execution
+  requires `--execute` plus an exact `<worker>:<kv-namespace-id>` confirmation,
+  and the name guard rejects anything outside the canary naming boundary.
+  Stages are ordered and stop on failure so a failed class deletion cannot be
+  disguised by deleting the script first.
 - **Presence is scoped, never globally enumerated — BUILT; deployed
   confirmation remains.** No public verb may enumerate all sessions or all
   objects: that returns a per-shard partial view under sharding and violates
