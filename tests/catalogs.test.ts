@@ -4279,6 +4279,95 @@ describe("local catalogs", () => {
     }
   });
 
+
+  it("keeps look command words out of the substrate so catalog pages still win", async () => {
+    const world = createWorld();
+
+    // The seed dispatcher answers only to its own name and that name's
+    // abbreviation. At the graph root an alias sits on every object's ancestor
+    // chain, and the chain resolves before features, so a DISTINCT command word
+    // here would shadow the catalog page that owns object matching.
+    expect(world.ownVerbExact("$root", "look")?.aliases ?? []).toEqual(["l@ook"]);
+
+    // `l` must keep naming the same page as `look`, or a client that retried a
+    // call using the shorter spelling would fingerprint as a different request
+    // and collide on its operation id.
+    expect(world.verbInfo("the_chatroom", "l").definer).toBe("$root");
+    expect(world.verbInfo("the_chatroom", "l").name).toBe("look");
+    expect(world.verbInfo("the_lamp", "l").name).toBe("look");
+
+    // Which is what makes this resolve to the catalog page, as it does on main.
+    expect(world.verbInfo("the_chatroom", "examine").definer).toBe("$conversational");
+    expect(world.verbInfo("the_chatroom", "examine").name).toBe("look_at");
+
+    // ...and therefore examine the ARGUMENT rather than swallowing it and
+    // rendering the room, which is what a root-seated alias did.
+    const examined = await world.directCall("alias-examine", "$wiz", "the_chatroom", "examine", ["the_lamp"]);
+    expect(examined.op).toBe("result");
+    if (examined.op === "result") {
+      expect(examined.result).toMatchObject({ id: "the_lamp" });
+      expect(examined.observations.find((obs) => obs.type === "looked")).toMatchObject({ target: "the_lamp" });
+    }
+
+    // The deliberate narrowing: a bare thing no longer answers to `examine`,
+    // because that word is a catalog command word and nothing on a thing's
+    // chain claims it. `examine lamp` still works from chat — it routes through
+    // the room's `look_at` — and the verb's own name and abbreviation are
+    // unaffected.
+    expect(() => world.verbInfo("the_lamp", "examine")).toThrow();
+    expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
+  });
+
+  it("plans a command token that execution re-resolves, like every other command verb", async () => {
+    // A command plan carries the target and the verb NAME; execution resolves
+    // that name again. So a page installed on the target between planning and
+    // execution is what runs — for `look_here` exactly as for `say`, `go` or
+    // any other command verb. This is a property of the plan/execute split,
+    // not of this consolidation: on main, bare `look` planned the token `look`
+    // and a page installed at `the_chatroom:look` hijacked it identically.
+    //
+    // Pinned here so that if plans ever start carrying an exact page identity,
+    // this test is the one that has to change — deliberately, for all tokens
+    // at once, rather than silently for one of them.
+    for (const token of ["look_here", "say"]) {
+      const world = createWorld();
+      const session = world.auth(`guest:token-${token}`);
+      const planned = await world.directCall(
+        `plan-${token}`,
+        session.actor,
+        "the_chatroom",
+        "command_plan",
+        [token === "say" ? "say hi" : "look"],
+        { sessionId: session.id }
+      );
+      expect(planned.op).toBe("result");
+      if (planned.op !== "result") continue;
+      const plan = planned.result as Record<string, unknown>;
+      expect(plan.verb, token).toBe(token);
+
+      const params = token === "say" ? "text" : "";
+      const planted = installVerb(
+        world,
+        "the_chatroom",
+        token,
+        `verb :${token}(${params}) rxd { return { rebound: true }; }`,
+        null
+      );
+      expect(planted.ok, `${token}: ${JSON.stringify(planted.diagnostics ?? null)}`).toBe(true);
+
+      const ran = await world.directCall(
+        `run-${token}`,
+        session.actor,
+        String(plan.target),
+        String(plan.verb),
+        plan.args as never,
+        { sessionId: session.id }
+      );
+      expect(ran.op, token).toBe("result");
+      if (ran.op === "result") expect(ran.result, token).toMatchObject({ rebound: true });
+    }
+  });
+
   it("drops the retired bootstrap look page from an aged world on cold init", () => {
     const world = createWorld();
     // Age the world: re-plant `$thing:look` the way an older bundle seeded it,

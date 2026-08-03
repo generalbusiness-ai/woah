@@ -1369,7 +1369,19 @@ function seedUniversal(world: WooWorld): void {
     toolExposed: true,
     skipPresenceCheck: true,
     readsRoomPresence: true,
-    aliases: ["l@ook", "ex@amine"],
+    // `l@ook` is this verb's OWN name with an abbreviation point — `l`, `lo`,
+    // `loo`, `look` all name this page. It has to stay, and stay here: an
+    // alias at the graph root sits on every object's ancestor chain, so if the
+    // root answered `look` but a catalog page answered `l`, the two spellings
+    // would resolve to different verbs and a retry that changed spelling would
+    // fingerprint as a different call (E_IDEMPOTENCY_CONFLICT).
+    //
+    // `ex@amine` is NOT here, and that is the difference: it is a distinct
+    // command word rather than an abbreviation of this name, and at the root
+    // it would sit ahead of the catalog page that owns object matching — so
+    // `<space>:examine <thing>` would swallow the argument and render the
+    // space. Distinct command words belong to the catalogs that own them.
+    aliases: ["l@ook"],
     argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
   });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
