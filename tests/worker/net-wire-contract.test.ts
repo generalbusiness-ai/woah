@@ -19,7 +19,7 @@
 // Plus the Phase-5 durable-format stamps (schema_version rows — the one
 // branch point for future durable evolution) and the no-expiry session
 // mint guard.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { cellVersion, makeCell, serializeTransfer } from "../../src/net/cells";
 import { mintSessionSubmit } from "../../src/net/sessions";
@@ -193,7 +193,7 @@ describe("schema_version durable stamps (Phase 5)", () => {
     gw.close();
   });
 
-  it("gateway construction stamps net_gateway_meta schema_version v2, once", () => {
+  it("gateway construction stamps net_gateway_meta schema_version v3, once", () => {
     const gw = netState("wire-gateway");
     const env: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
     new NetGatewayDO(gw.state, env);
@@ -204,7 +204,7 @@ describe("schema_version durable stamps (Phase 5)", () => {
       }
     ).toArray();
     expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0].body)).toEqual({ v: 2 });
+    expect(JSON.parse(rows[0].body)).toEqual({ v: 3 });
     gw.close();
   });
 
@@ -262,10 +262,10 @@ describe("schema_version durable stamps (Phase 5)", () => {
     const version = (sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'") as {
       toArray(): Array<{ body: string }>;
     }).toArray();
-    expect(JSON.parse(version[0].body)).toEqual({ v: 2 });
+    expect(JSON.parse(version[0].body)).toEqual({ v: 3 });
 
     // The reset is the v1→v2 migration, not a construction side effect.
-    // Once stamped v2, a later hibernation/wake must preserve rebuilt rows.
+    // Once stamped v3, a later hibernation/wake must preserve rebuilt rows.
     sql.exec(
       "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?)",
       "object_lineage:rebuilt",
@@ -274,6 +274,131 @@ describe("schema_version durable stamps (Phase 5)", () => {
     );
     new NetGatewayDO(gw.state, env);
     expect(count("net_gateway_cell")).toBe(1);
+    gw.close();
+  });
+
+  it("gateway v2-to-v3 migration preserves derived cache rows and adds exact-read floors", () => {
+    const gw = netState("wire-gateway-v2");
+    const sql = gw.state.storage.sql;
+    sql.exec("CREATE TABLE net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    sql.exec(
+      "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+      JSON.stringify({ v: 2 })
+    );
+    sql.exec("CREATE TABLE net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL, owner_scope TEXT)");
+    sql.exec(
+      "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?)",
+      "object_lineage:rebuilt",
+      JSON.stringify({ rebuilt: true }),
+      "room:rebuilt"
+    );
+
+    new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    const version = (sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'") as {
+      toArray(): Array<{ body: string }>;
+    }).toArray();
+    expect(JSON.parse(version[0].body)).toEqual({ v: 3 });
+    const cached = (sql.exec("SELECT COUNT(*) AS n FROM net_gateway_cell") as {
+      toArray(): Array<{ n: number }>;
+    }).toArray()[0];
+    expect(Number(cached.n)).toBe(1);
+    const floorColumns = (sql.exec("PRAGMA table_info(net_gateway_cell_floor)") as {
+      toArray(): Array<{ name: string }>;
+    }).toArray().map((column) => column.name);
+    expect(floorColumns).toEqual(expect.arrayContaining(["key", "owner_scope", "authority_seq"]));
+    gw.close();
+  });
+
+  it("resets a moved key's floor to the new scope sequence and survives a restart", () => {
+    const gw = netState("wire-gateway-floor-scope-change");
+    const sql = gw.state.storage.sql;
+    const first = new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    const firstInternals = first as unknown as {
+      ensureView(): { install(cell: unknown): void };
+      persistCell(view: unknown, key: string, ownerScope: string): void;
+      recordCellAuthorityFloor(key: string, scope: string, seq: number): void;
+    };
+    const key = "property_cell:moved:value";
+    const view = firstInternals.ensureView();
+    view.install(makeCell({
+      kind: "property_cell",
+      object: "moved",
+      name: "value",
+      value: { value: "fresh-in-b" },
+      provenance: "derived",
+      stamp: { scope_head: "b3", catalog_epoch: "cat1" }
+    }));
+    firstInternals.persistCell(view, key, "room:B");
+    firstInternals.recordCellAuthorityFloor(key, "room:A", 50_000);
+    firstInternals.recordCellAuthorityFloor(key, "room:B", 3);
+
+    const persisted = (sql.exec(
+      "SELECT owner_scope, authority_seq FROM net_gateway_cell_floor WHERE key = ?",
+      key
+    ) as { toArray(): Array<{ owner_scope: string; authority_seq: number }> }).toArray()[0];
+    expect(persisted).toEqual({ owner_scope: "room:B", authority_seq: 3 });
+
+    const rawSqlSpy = vi.spyOn(sql, "exec");
+    firstInternals.recordCellAuthorityFloor(key, "room:B", 3);
+    expect(rawSqlSpy.mock.calls.filter(([query]) => String(query).includes("net_gateway_cell_floor"))).toHaveLength(0);
+    rawSqlSpy.mockRestore();
+
+    // Reconstruct the DO from SQL, then prove B/4 removes the cell. The old
+    // corrupt row (B/50000) would filter this removal indefinitely.
+    const restarted = new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    const restartedInternals = restarted as unknown as {
+      ensureView(): { get(key: string): unknown };
+      seen: Map<string, number>;
+      receiveFanout(body: unknown): boolean;
+    };
+    const restartedView = restartedInternals.ensureView();
+    restartedInternals.seen.set("room:B", 0);
+    expect(restartedInternals.receiveFanout({
+      scope: "room:B",
+      seq: 4,
+      cells: [],
+      removed_cells: [key],
+      observations: [],
+      relations: []
+    })).toBe(true);
+    expect(restartedView.get(key)).toBeUndefined();
+    expect((sql.exec(
+      "SELECT COUNT(*) AS n FROM net_gateway_cell_floor WHERE key = ?",
+      key
+    ) as { toArray(): Array<{ n: number }> }).toArray()[0].n).toBe(0);
+    gw.close();
+  });
+
+  it("bounds durable authority floors and retains the newest exact reads", () => {
+    const gw = netState("wire-gateway-floor-retention");
+    const sql = gw.state.storage.sql;
+    new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    sql.exec(
+      "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 4097) " +
+        "INSERT INTO net_gateway_cell_floor (key, owner_scope, authority_seq) " +
+        "SELECT 'old:' || n, 'room:old', n FROM seq"
+    );
+
+    const gateway = new NetGatewayDO(gw.state, { WOO_INTERNAL_SECRET: SECRET });
+    const internals = gateway as unknown as {
+      ensureView(): unknown;
+      cellAuthorityFloorWrites: number;
+      recordCellAuthorityFloor(key: string, scope: string, seq: number): void;
+    };
+    internals.ensureView();
+    internals.cellAuthorityFloorWrites = 255;
+    internals.recordCellAuthorityFloor("newest", "room:new", 1);
+
+    const count = (sql.exec("SELECT COUNT(*) AS n FROM net_gateway_cell_floor") as {
+      toArray(): Array<{ n: number }>;
+    }).toArray()[0].n;
+    expect(count).toBe(4096);
+    expect((sql.exec("SELECT key FROM net_gateway_cell_floor WHERE key = 'old:1'") as {
+      toArray(): Array<{ key: string }>;
+    }).toArray()).toEqual([]);
+    expect((sql.exec("SELECT key FROM net_gateway_cell_floor WHERE key = 'newest'") as {
+      toArray(): Array<{ key: string }>;
+    }).toArray()).toEqual([{ key: "newest" }]);
     gw.close();
   });
 });

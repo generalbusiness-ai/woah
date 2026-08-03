@@ -18,15 +18,15 @@ The class object is a fertile template: behavior and owner tools live on
 
 The plug fetches tomorrow.io's `weather/realtime`, `weather/forecast`, and
 `weather/history/recent` endpoints for the configured `place`, then writes
-three internally-consistent props in a single `:set_properties({...})`
-bundle so a reader never sees a torn snapshot.
+three internally-consistent props through `:record_plug_success(...)` so a
+reader never sees a torn snapshot or payload/lifecycle disagreement.
 
 `place` is the owner-configured town name or zip code; the plug sends that
 value upstream and the block displays the same value. `timezone` is the
 IANA zone used by the plug to render the local-time strings on the
-client-facing surfaces. If the upstream API does not recognise `place`,
-the plug writes a helpful `last_error` instead of inventing a fallback
-display location.
+client-facing surfaces. If the upstream API does not recognise `place`, the
+plug records a helpful failure instead of inventing a fallback display
+location.
 
 ### `current` — scalar bundle (~80 bytes)
 
@@ -106,11 +106,14 @@ implicit so the array compresses well over the wire.
 
 ### Status props
 
-`last_pushed_at` (epoch ms) and `last_error` ride the standard `$block`
-writable_self surface so `:look` surfaces freshness. `config_state` rides
-weather-specific `writable_self`: `confirmed` after a successful fetch
-for the current location/timezone, or `error` for configuration failures
-such as an invalid timezone or an upstream "unknown place" response.
+The standard `$block` lifecycle fields (`last_attempt_at`, `last_pushed_at`,
+`last_failure_at`, `consecutive_failures`, and `last_error`) ride the inherited
+`writable_self` surface. The class declares a one-hour expected interval and a
+two-hour stale window. `config_state` rides weather-specific `writable_self`:
+`confirmed` after a successful fetch for the current location/timezone, or
+`error` for configuration failures such as an invalid timezone or an upstream
+"unknown place" response. The inherited recording verbs update each weather
+snapshot and its lifecycle evidence atomically.
 
 ## Field semantics & consumer rules
 
@@ -123,9 +126,10 @@ such as an invalid timezone or an upstream "unknown place" response.
 - **`agg`** records how each field was rolled up into `daily`. Future fields
   follow the same convention so a generic UI can label rollups without a
   hardcoded table.
-- **`anchor` is authoritative for "now"**, not `Date.now()` in the UI.
-  The d3 chart positions the now-line from `anchor` so chart and data agree
-  even if the client clock is skewed or the snapshot is stale.
+- **`anchor` is update provenance, not "now".** The detail chart centers its
+  now-line and daily highlight on the browser wall clock, interpreted in the
+  configured timezone. It renders `anchor` as a separate update marker and
+  warning source, so a stalled plug cannot make old data look current.
 
 ## Size budget
 
@@ -203,12 +207,16 @@ The badge reads only the projected `current`, `config_state`, `place`, and
 uses `current.weather_code` so the badge does not infer condition from
 temperature.
 
-### Detail chart (planned)
+### Detail chart
 
-A `block-detail` surface component (not yet shipped) will read
-`timeseries` and render a multi-line d3 chart spanning the past week
-through the next week, with the now-line positioned from `anchor`. Chart
-work is tracked separately; it is not part of the v1 schema landing.
+The title badge opens `<woo-weather-chart>`, a hand-rolled SVG detail view of
+`daily` and `timeseries`. The visible hourly domain is symmetric around the
+browser's current wall clock while expanding far enough to retain every
+populated sample. The configured timezone chooses the highlighted daily card.
+A cyan line marks current time; a distinct dashed line and headline label mark
+the `timeseries.anchor` update time. The open dialog refreshes those clock-
+derived details at minute boundaries and warns when the snapshot is older than
+two hourly intervals or its grid no longer covers current time.
 
 ## Connection mode
 
@@ -221,16 +229,18 @@ On each fire it:
    timesteps), and `weather/history/recent` endpoints.
 4. Computes the `daily` rollups from the hourly samples (mean / min / max /
    sum / mode per `fields[name].agg`).
-5. Calls `:set_properties({current, daily, timeseries, last_pushed_at, config_state})`
-   in a single bundle.
+5. Calls `:record_plug_success({current, daily, timeseries, config_state}, at)`
+   so the snapshot and successful lifecycle evidence commit in one bundle.
 6. Closes its hidden-roster Net session in a `finally` path.
 
-Failure paths set `last_error` and skip the data write; `:look` surfaces
-the durable plug state for operators. The plug's session retains ordinary
+The plug calls `:record_plug_attempt` before configuration and upstream I/O.
+Failure paths call `:record_plug_failure`, atomically pairing `last_error` and
+any configuration error state while preserving the previous good snapshot;
+`:look` surfaces the durable plug state for operators. The plug's session retains ordinary
 authorization presence while a tick runs, but `roster_visible:false` keeps
 the appliance out of `who` and presence UI. `:look` does not infer health
 from that ephemeral session: it derives `healthy`, `stale`, `pending`,
-`error`, or `never` from `last_pushed_at`, `last_error`, and `config_state`.
+`error`, or `never` from the inherited lifecycle fields and `config_state`.
 When an imported/seeded current reading predates `last_pushed_at`, its
 `observed_at` is fallback evidence of a successful update; a displayed reading
 without either timestamp does not also print the contradictory “no successful

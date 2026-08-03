@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import demoworldManifest from "../catalogs/demoworld/manifest.json";
@@ -10,15 +10,22 @@ import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
+import { registerWooChatFormatters as registerBlockChatFormatters } from "../catalogs/block/ui/block-chat";
 import { WooSpaceChatPanelElement } from "../catalogs/chat/ui/chat-space";
 import { DUBSPACE_DRUM_VOICES, dubspaceControlDefinitions } from "../catalogs/dubspace/ui/model";
 import {
   CatalogUiRegistry,
+  ChatFormatterRegistry,
   preserveAmbientCompanionPanel,
   renderAmbientCompanionShell,
   restoreAmbientCompanionPanel,
   type WooContext
 } from "../src/client/framework";
+
+// Clock-oriented weather tests use fake timers. Always restore the shared
+// jsdom clock even when an assertion aborts early, or later component tests
+// would inherit a frozen date and report misleading failures.
+afterEach(() => vi.useRealTimers());
 
 function defineOnce(tag: string, ctor: CustomElementConstructor): void {
   if (!customElements.get(tag)) customElements.define(tag, ctor);
@@ -48,6 +55,30 @@ function appendAmbientCompanionPanel(root: ParentNode, space: string): HTMLEleme
 }
 
 describe("bundled catalog UI components", () => {
+  it("renders plug lifecycle transitions as sparse system lines", () => {
+    const registry = new ChatFormatterRegistry();
+    registerBlockChatFormatters(registry);
+
+    expect(registry.isChatType("plug_status_changed")).toBe(true);
+    expect(registry.format(
+      {
+        type: "plug_status_changed",
+        block: "the_weather",
+        from: "healthy",
+        to: "error",
+        text: "Weather plug status: error; the latest attempt failed."
+      },
+      { label: (id) => id ?? "unknown", viewer: "guest_1" }
+    )).toEqual({
+      kind: "system",
+      text: "Weather plug status: error; the latest attempt failed."
+    });
+    expect(registry.format(
+      { type: "plug_status_changed", to: "stale" },
+      { label: (id) => id ?? "unknown", viewer: "guest_1" }
+    )).toEqual({ kind: "system", text: "Plug status changed to stale." });
+  });
+
   it("renders and preserves the shared ambient companion shell", () => {
     const host = document.createElement("section");
     host.innerHTML = renderAmbientCompanionShell(
@@ -263,6 +294,8 @@ describe("bundled catalog UI components", () => {
   });
 
   it("opens the chart dialog on badge click and closes on backdrop click", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-09T16:00:00Z"));
     const { WooWeatherBadgeElement } = await import("../catalogs/weather/ui/weather-badge");
     const { WooWeatherChartElement } = await import("../catalogs/weather/ui/weather-chart");
     defineOnce("woo-weather-badge", WooWeatherBadgeElement);
@@ -328,6 +361,8 @@ describe("bundled catalog UI components", () => {
     // Close button closes.
     dialog!.querySelector<HTMLButtonElement>("[data-weather-close]")?.click();
     expect(dialog!.open).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
   });
 
   it("badge activates the chart on Enter and Space (not just click)", async () => {
@@ -355,12 +390,12 @@ describe("bundled catalog UI components", () => {
     // Enter on the focused badge opens the chart.
     badge.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
     expect(ownDialog()?.open).toBe(true);
-    ownDialog()!.removeAttribute("open");
+    (badge as any).chart.close();
 
     // Space also activates.
     badge.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
     expect(ownDialog()?.open).toBe(true);
-    ownDialog()!.removeAttribute("open");
+    (badge as any).chart.close();
 
     // Other keys do nothing.
     badge.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true, cancelable: true }));
@@ -391,7 +426,7 @@ describe("bundled catalog UI components", () => {
     expect(symmetricDailySlice(wide, "1999-01-01")).toEqual(wide);
   });
 
-  it("symmetric timeseries domain extends to max(past, forward) populated half-width", async () => {
+  it("symmetric timeseries domain centers wall-clock now and retains the populated range", async () => {
     const { symmetricTimeseriesDomain } = await import("../catalogs/weather/ui/weather-chart");
     const HOUR = 3_600_000;
     const anchor = 1000 * HOUR;
@@ -406,9 +441,92 @@ describe("bundled catalog UI components", () => {
       }
     };
     const ts = { anchor, t0, step: HOUR, units: "imperial", fields } as any;
-    const [d0, d1] = symmetricTimeseriesDomain(ts);
-    expect(d0).toBe(anchor - 24 * HOUR);
-    expect(d1).toBe(anchor + 24 * HOUR);
+    const displayNow = anchor + 6 * HOUR;
+    const [d0, d1] = symmetricTimeseriesDomain(ts, displayNow);
+    // Relative to actual now the populated edges are 30h back and 10h
+    // forward, so the wider side wins while now remains dead-center.
+    expect(d0).toBe(displayNow - 30 * HOUR);
+    expect(d1).toBe(displayNow + 30 * HOUR);
+    expect((d0 + d1) / 2).toBe(displayNow);
+  });
+
+  it("separates current time from a stale update and highlights today in the configured timezone", async () => {
+    const {
+      WooWeatherChartElement,
+      localDateAt,
+      timeseriesFreshness
+    } = await import("../catalogs/weather/ui/weather-chart");
+    defineOnce("woo-weather-chart", WooWeatherChartElement);
+    const HOUR = 3_600_000;
+    const anchor = Date.parse("2026-07-26T12:00:00Z");
+    const displayNow = Date.parse("2026-07-31T16:00:00Z");
+    const t0 = anchor - 24 * HOUR;
+    const values = Array.from({ length: 9 * 24 }, () => 70);
+    const timeseries = {
+      anchor,
+      t0,
+      step: HOUR,
+      units: "imperial",
+      fields: { temperature: { unit: "°F", agg: "mean", values } }
+    } as any;
+    const chart = document.createElement("woo-weather-chart") as InstanceType<typeof WooWeatherChartElement>;
+    chart.clock = () => displayNow;
+    document.body.appendChild(chart);
+    chart.open({
+      place: "Brooklyn, NY",
+      timezone: "America/New_York",
+      current: { temperature: 70, temperature_unit: "°F" },
+      timeseries,
+      daily: [
+        { date: "2026-07-26", temperature: { min: 60, max: 72, unit: "°F" } },
+        { date: "2026-07-31", temperature: { min: 65, max: 75, unit: "°F" } }
+      ]
+    });
+
+    const dialog = chart.querySelector<HTMLDialogElement>(".weather-chart-dialog")!;
+    const nowX = Number(dialog.querySelector(".weather-chart-now")?.getAttribute("x1"));
+    const updatedX = Number(dialog.querySelector(".weather-chart-updated")?.getAttribute("x1"));
+    expect(nowX).toBe(440); // midpoint of the 36..844 chart data range
+    expect(updatedX).toBeLessThan(nowX);
+    expect(dialog.querySelector(".weather-chart-stale")?.textContent).toContain("may be stale");
+    expect(dialog.querySelector(".weather-chart-headline-updated")?.textContent).toContain("Jul 26");
+    expect(dialog.querySelector(".weather-chart-day.is-today")?.textContent).toContain("Fri 7/31");
+    expect(localDateAt(Date.parse("2026-08-01T01:00:00Z"), "America/New_York")).toBe("2026-07-31");
+    expect(timeseriesFreshness(timeseries, displayNow)).toBe("stale");
+    expect(timeseriesFreshness(timeseries, t0 - HOUR)).toBe("gap");
+    chart.close();
+    chart.remove();
+  });
+
+  it("refreshes clock-derived today at the next minute and stops its timer when closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const { WooWeatherChartElement } = await import("../catalogs/weather/ui/weather-chart");
+      defineOnce("woo-weather-chart", WooWeatherChartElement);
+      vi.setSystemTime(new Date("2026-07-31T03:59:30Z")); // 11:59:30 PM Jul 30 in New York
+      const chart = document.createElement("woo-weather-chart") as InstanceType<typeof WooWeatherChartElement>;
+      document.body.appendChild(chart);
+      const anchor = Date.now();
+      chart.open({
+        timezone: "America/New_York",
+        timeseries: {
+          anchor,
+          t0: anchor - 24 * 3_600_000,
+          step: 3_600_000,
+          fields: { temperature: { unit: "°F", agg: "mean", values: Array.from({ length: 72 }, () => 70) } }
+        },
+        daily: [{ date: "2026-07-30" }, { date: "2026-07-31" }]
+      });
+      expect(chart.querySelector(".weather-chart-day.is-today")?.textContent).toContain("Thu 7/30");
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(chart.querySelector(".weather-chart-day.is-today")?.textContent).toContain("Fri 7/31");
+      chart.close();
+      expect(vi.getTimerCount()).toBe(0);
+      chart.remove();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("opens via the weather_open observation routed by the catalog UI module", async () => {

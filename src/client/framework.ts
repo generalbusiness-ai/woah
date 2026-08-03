@@ -1598,8 +1598,10 @@ export class WooViewController<T> {
 // Room-contents snapshots are thin by design (no props), so a viewer who just
 // entered a room sees only id/name/parent for the subject until live
 // observations or a full summary fill in the rest. One round-trip per subject
-// per session: if the server's summary did not carry the requested field,
-// refetching cannot conjure it; live observations remain authoritative.
+// per session: the Net implementation makes that one fill an authoritative,
+// bounded exact-key read, while the legacy summary path reads its ordinary
+// server projection. Change observations invalidate the surrounding session
+// projection and a reset permits the next exact fill.
 export class ProjectionFieldFiller {
   private inFlight = new Set<string>();
   private completed = new Set<string>();

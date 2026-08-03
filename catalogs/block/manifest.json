@@ -5,17 +5,32 @@
   "description": "Anchored data-display actor. A $block bridges woo to an outside-world data source: an external plug authenticates as the block's actor (apikey-bound) and pushes property values through tier-gated write verbs; the block's owner sets configuration through the same verbs. Permissions follow the LambdaMOO :is_*_by convention — overrideable per-class verbs that gate every state mutation.",
   "license": "MIT",
   "depends": ["@local:perm"],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      { "id": "block-chat", "entry": "ui/block-chat.ts" }
+    ],
+    "chat_formatters": [
+      { "module": "block-chat", "types": ["plug_status_changed"] }
+    ]
+  },
   "classes": [
     {
       "local_name": "$block",
       "parent": "$actor",
       "description": "Base class for plug-driven data display. Anchored: a block stays at its placement and rejects becoming a container. Property writes go through :set_property[ies], which gate on this:is_writable_by_property(actor, name) — the LambdaMOO-shaped per-class hook. Default property policy grants wizard bypass, grants self-write of names in writable_self (so an apikey-bound plug session writes its own data props), and grants owner-write of names in writable_owner (so the block's owner sets config without touching the plug surface). Subclasses override the verb for richer policy; the writable_owner / writable_self lists are the conventional default-impl data.",
       "properties": [
+        { "name": "plug_label", "type": "str", "default": "Block", "perms": "r" },
+        { "name": "plug_expected_interval_ms", "type": "int", "default": 0, "perms": "r" },
+        { "name": "plug_stale_after_ms", "type": "int", "default": 0, "perms": "r" },
+        { "name": "last_attempt_at", "type": "int", "default": 0, "perms": "r" },
         { "name": "last_pushed_at", "type": "int", "default": 0, "perms": "r" },
+        { "name": "last_failure_at", "type": "int", "default": 0, "perms": "r" },
+        { "name": "consecutive_failures", "type": "int", "default": 0, "perms": "r" },
         { "name": "last_error", "type": "any", "default": null, "perms": "r" },
         { "name": "summary_props", "type": "list<str>", "default": [], "perms": "r" },
         { "name": "writable_owner", "type": "list<str>", "default": [], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" },
+        { "name": "writable_self", "type": "list<str>", "default": ["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error"], "perms": "r" },
         { "name": "instances_self_host", "type": "bool", "default": true, "perms": "r" }
       ],
       "verbs": [
@@ -60,6 +75,62 @@
           "source": "verb :set_properties(values) rx { if (typeof(values) != \"map\") { raise { code: \"E_INVARG\", message: \"set_properties requires a map\", value: values }; } let names = keys(values); for n in names { if (!this:is_writable_by_property(actor, n)) { raise { code: \"E_PERM\", message: \"property is not writable by this actor\", value: { property: n, actor: actor } }; } } let audience = location(this); let routable = audience != null && isa(audience, $space); let ts = now(); for n in names { let v = values[n]; this.(n) = v; if (routable) { observe_to_space(audience, { type: \"block_data\", block: this, name: n, value: v, ts: ts }); } } return values; }"
         },
         {
+          "name": "plug_last_success_at",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :plug_last_success_at() rxd { if (typeof(this.last_pushed_at) == \"number\" && this.last_pushed_at > 0) { return this.last_pushed_at; } return null; }"
+        },
+        {
+          "name": "plug_status_hint",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :plug_status_hint() rxd { return null; }"
+        },
+        {
+          "name": "plug_status",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :plug_status() rxd { let label = this.plug_label; if (typeof(label) != \"string\" || !label) { label = \"Block\"; } let attempted = this.last_attempt_at; if (typeof(attempted) != \"number\" || attempted <= 0) { attempted = null; } let succeeded = this:plug_last_success_at(); let failed = this.last_failure_at; if (typeof(failed) != \"number\" || failed <= 0) { failed = null; } let failures = this.consecutive_failures; if (typeof(failures) != \"number\" || failures < 0) { failures = 0; } let age = null; if (typeof(succeeded) == \"number\" && succeeded > 0) { age = now() - succeeded; if (age < 0) { age = 0; } } let state = \"healthy\"; let status_text = label + \" plug status: healthy.\"; let hint = this:plug_status_hint(); if (typeof(hint) == \"map\" && has(hint, \"state\") && typeof(hint[\"state\"]) == \"string\" && hint[\"state\"]) { state = hint[\"state\"]; if (has(hint, \"message\") && typeof(hint[\"message\"]) == \"string\" && hint[\"message\"]) { status_text = hint[\"message\"]; } else { status_text = label + \" plug status: \" + state + \".\"; } } else { if (failures > 0 || this.last_error) { state = \"error\"; status_text = label + \" plug status: error; the latest attempt failed.\"; } else { if (succeeded == null) { if (attempted != null) { state = \"pending\"; status_text = label + \" plug status: an update is in progress.\"; } else { state = \"never\"; status_text = label + \" plug status: no successful update yet.\"; } } else { let stale_after = this.plug_stale_after_ms; if (typeof(stale_after) == \"number\" && stale_after > 0 && age > stale_after) { state = \"stale\"; status_text = label + \" plug status: stale; the last successful update missed its freshness window.\"; } } } } return { state: state, message: status_text, last_attempt_at: attempted, last_pushed_at: this.last_pushed_at, last_success_at: succeeded, last_failure_at: failed, age_ms: age, expected_interval_ms: this.plug_expected_interval_ms, stale_after_ms: this.plug_stale_after_ms, consecutive_failures: failures, last_error: this.last_error }; }"
+        },
+        {
+          "name": "announce_plug_status_change",
+          "perms": "rxd",
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["before", "after"] },
+          "source": "verb :announce_plug_status_change(before, after) rxd { if (caller != this) { raise { code: \"E_PERM\", message: \"plug status announcements are block-internal\" }; } if (typeof(before) != \"map\" || typeof(after) != \"map\" || before[\"state\"] == after[\"state\"]) { return false; } let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"plug_status_changed\", block: this, from: before[\"state\"], to: after[\"state\"], text: after[\"message\"], ts: now() }); } return true; }"
+        },
+        {
+          "name": "record_plug_attempt",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["at?"] },
+          "source": "verb :record_plug_attempt(at) rx { if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can record an attempt\", value: actor }; } let before = this:plug_status(); let ts = at; if (typeof(ts) != \"number\" || ts <= 0) { ts = now(); } this:set_property(\"last_attempt_at\", ts); let after = this:plug_status(); this:announce_plug_status_change(before, after); return after; }"
+        },
+        {
+          "name": "record_plug_success",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["values", "at?"] },
+          "source": "verb :record_plug_success(values, at) rx { if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can record success\", value: actor }; } if (typeof(values) != \"map\") { raise { code: \"E_INVARG\", message: \"record_plug_success requires a property map\", value: values }; } let before = this:plug_status(); let ts = at; if (typeof(ts) != \"number\" || ts <= 0) { ts = now(); } values[\"last_attempt_at\"] = ts; values[\"last_pushed_at\"] = ts; values[\"consecutive_failures\"] = 0; values[\"last_error\"] = null; this:set_properties(values); let after = this:plug_status(); this:announce_plug_status_change(before, after); return after; }"
+        },
+        {
+          "name": "record_plug_failure",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["error_text", "values", "at?"] },
+          "source": "verb :record_plug_failure(error_text, values, at) rx { if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can record failure\", value: actor }; } if (typeof(error_text) != \"string\" || !error_text) { raise { code: \"E_INVARG\", message: \"record_plug_failure requires a non-empty message\", value: error_text }; } if (typeof(values) != \"map\") { raise { code: \"E_INVARG\", message: \"record_plug_failure requires a property map\", value: values }; } let before = this:plug_status(); let ts = at; if (typeof(ts) != \"number\" || ts <= 0) { ts = now(); } let failures = this.consecutive_failures; if (typeof(failures) != \"number\" || failures < 0) { failures = 0; } values[\"last_attempt_at\"] = ts; values[\"last_failure_at\"] = ts; values[\"consecutive_failures\"] = failures + 1; values[\"last_error\"] = error_text; this:set_properties(values); let after = this:plug_status(); this:announce_plug_status_change(before, after); return after; }"
+        },
+        {
           "name": "get_data",
           "perms": "rxd",
           "direct_callable": true,
@@ -74,7 +145,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let summary = {}; for n in this.summary_props { summary[n] = this.(n); } return { id: this, title: this.name, description: this.description, last_pushed_at: this.last_pushed_at, last_error: this.last_error, summary: summary, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let summary = {}; for n in this.summary_props { summary[n] = this.(n); } let plug = this:plug_status(); let text = this.description; if (typeof(text) != \"string\") { text = to_string(text); } if (text) { text = text + \" \" + plug[\"message\"]; } else { text = plug[\"message\"]; } return { id: this, title: this.name, description: text, plug_status: plug, last_attempt_at: this.last_attempt_at, last_pushed_at: this.last_pushed_at, last_failure_at: this.last_failure_at, consecutive_failures: this.consecutive_failures, last_error: this.last_error, summary: summary, location: location(this) }; }"
         },
         {
           "name": "moveto",
@@ -125,6 +196,17 @@
         "block": "obj",
         "name": "str",
         "value": "any",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$block",
+      "type": "plug_status_changed",
+      "shape": {
+        "block": "obj",
+        "from": "str",
+        "to": "str",
+        "text": "str",
         "ts": "int"
       }
     }

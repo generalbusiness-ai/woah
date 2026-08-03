@@ -1,6 +1,6 @@
 {
   "name": "dispenser",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "spec_version": "v1",
   "description": "Acts-backed dispenser blocks. Public typed verbs queue work, deliver an artifact, or cancel; the anchored block composes concise Acts on its containing room's sequenced log and one bounded $dispenser_queue projection owns pending membership, admission indexes, id allocation, and terminal receipts.",
   "license": "MIT",
@@ -56,7 +56,7 @@
         { "name": "legacy_last_request_at", "type": "map", "default": {}, "perms": "" },
         { "name": "legacy_last_order_at", "type": "int", "default": 0, "perms": "" },
         { "name": "writable_owner", "type": "list<str>", "default": ["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" }
+        { "name": "writable_self", "type": "list<str>", "default": ["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error"], "perms": "r" }
       ],
       "verbs": [
         {

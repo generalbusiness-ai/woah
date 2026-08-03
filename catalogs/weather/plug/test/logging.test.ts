@@ -16,9 +16,12 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const call: Call = { url, method, body };
     calls.push(call);
-    const handler = handlers[i++];
-    const reply: Reply = handler
-      ? handler(call)
+    const recordsAttempt = method === "POST"
+      && (body as { verb?: string } | undefined)?.verb === "record_plug_attempt";
+    const handler = recordsAttempt ? undefined : handlers[i++];
+    const reply: Reply = recordsAttempt
+      ? { status: 200, body: { reply: { status: "accepted" }, result: { state: "pending" }, observations: [] } }
+      : handler ? handler(call)
       : method === "DELETE" && url.endsWith("/net-api/session")
         ? { status: 200, body: { closed: true } }
         : { status: 404, body: { error: { code: "E_NOMATCH" } } };

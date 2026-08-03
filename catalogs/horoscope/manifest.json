@@ -1,6 +1,6 @@
 {
   "name": "horoscope",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "spec_version": "v1",
   "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory with name `Horoscope: Scorpio` and the generated text as its markdown body.",
   "license": "MIT",
@@ -11,7 +11,11 @@
       "parent": "$dispenser_block",
       "flags": { "fertile": true },
       "description": "A vending-machine block that produces short generated text artifacts. The owner configures system_prompt. Its authenticated plug reads bounded work through :next_pending, fills the preallocated note through direct :prepare_artifact, and sequences :deliver(order_id, note). Dispenser Acts own queue coordination; the delivered note owns its listing name, look description, and readable markdown body.",
-      "properties": [],
+      "properties": [
+        { "name": "plug_label", "type": "str", "default": "Horoscope", "perms": "r" },
+        { "name": "plug_expected_interval_ms", "type": "int", "default": 900000, "perms": "r" },
+        { "name": "plug_stale_after_ms", "type": "int", "default": 2700000, "perms": "r" }
+      ],
       "verbs": [
         {
           "name": "assert_configurable",
@@ -54,7 +58,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :title() rxd { if (this.last_pushed_at == 0) { return this.name + \" (disconnected)\"; } return this.name; }"
+          "source": "verb :title() rxd { let plug = this:plug_status(); if (plug[\"state\"] == \"healthy\") { return this.name; } return this.name + \" (\" + plug[\"state\"] + \")\"; }"
         },
         {
           "name": "look_self",
@@ -62,7 +66,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = this:pending_count(); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let plug = this:plug_status(); let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = this:pending_count(); let text = this.description + \" \" + plug[\"message\"] + \" \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, plug_status: plug, last_attempt_at: this.last_attempt_at, last_pushed_at: this.last_pushed_at, last_failure_at: this.last_failure_at, consecutive_failures: this.consecutive_failures, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
         }
       ]
     }

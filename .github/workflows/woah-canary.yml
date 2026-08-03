@@ -23,6 +23,65 @@ permissions:
   contents: read
 
 jobs:
+  storage-budget:
+    # Opt-in because the account-scoped read token must be installed first.
+    # Once enabled, a missing token or incomplete Cloudflare dataset is a
+    # failure: silence must not be interpreted as a zero-write hour.
+    if: ${{ vars.WOO_DO_STORAGE_MONITOR_ENABLED == 'true' }}
+    name: DO rows-written budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check the prior hour by namespace and object
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          WOO_STORAGE_ALERT_WEBHOOK_URL: ${{ secrets.WOO_STORAGE_ALERT_WEBHOOK_URL }}
+          STORAGE_WORKERS: ${{ vars.WOO_DO_STORAGE_WORKERS }}
+          STORAGE_MAX_ROWS: ${{ vars.WOO_DO_STORAGE_MAX_ROWS_HOURLY }}
+          STORAGE_MAX_ROWS_PER_OBJECT: ${{ vars.WOO_DO_STORAGE_MAX_ROWS_PER_OBJECT_HOURLY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          from="$(date -u -d '70 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          to="$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          workers="${STORAGE_WORKERS:-woah}"
+          max_rows="${STORAGE_MAX_ROWS:-250000}"
+          max_object="${STORAGE_MAX_ROWS_PER_OBJECT:-75000}"
+          status=0
+          IFS=',' read -ra worker_names <<< "$workers"
+          for raw_worker in "${worker_names[@]}"; do
+            worker="${raw_worker//[[:space:]]/}"
+            if [[ ! "$worker" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+              echo "invalid Worker name in WOO_DO_STORAGE_WORKERS: $raw_worker" >&2
+              status=1
+              continue
+            fi
+            report="do-storage-${worker}.txt"
+            if ! npm run gate:net-storage -- \
+              --worker "$worker" \
+              --from "$from" \
+              --to "$to" \
+              --max-rows-written "$max_rows" \
+              --max-rows-written-per-object "$max_object" 2>&1 | tee "$report"; then
+              status=1
+            fi
+            {
+              echo "## Durable Object rows written: $worker"
+              echo
+              echo '```text'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"
+
   mcp-smoke:
     name: v2 MCP smoke
     runs-on: ubuntu-latest

@@ -17,8 +17,12 @@ function makeFetch(handlers: Array<(call: Call) => Reply>): {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const call: Call = { url, method, body };
     calls.push(call);
-    const handler = handlers[i++];
-    const reply: Reply = handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
+    const recordsAttempt = method === "POST"
+      && (body as { verb?: string } | undefined)?.verb === "record_plug_attempt";
+    const handler = recordsAttempt ? undefined : handlers[i++];
+    const reply: Reply = recordsAttempt
+      ? { status: 200, body: { reply: { status: "accepted" }, result: { state: "pending" }, observations: [] } }
+      : handler ? handler(call) : { status: 404, body: { error: { code: "E_NOMATCH" } } };
     const headers = new Headers(reply.headers ?? {});
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(reply.body), { status: reply.status, headers });
@@ -204,9 +208,9 @@ describe("runLoggedHoroscopeTick", () => {
     // No :cancel was attempted — transient errors leave the order alone so a
     // momentary upstream blip doesn't silently drop a user's request.
     expect(calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "cancel")).toBeUndefined();
-    // The tick still wraps up with set_properties so last_error is recorded.
-    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties");
-    expect((heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error).toBe("upstream timed out");
+    // The tick still records the failed lifecycle with its diagnostic.
+    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_failure");
+    expect((heartbeat?.body as { args: [string, Record<string, unknown>, number] }).args[0]).toBe("upstream timed out");
     const events = lines.map((l) => l.event);
     expect(events).toContain("order_error");
     expect(events).not.toContain("order_canceled_by_plug");

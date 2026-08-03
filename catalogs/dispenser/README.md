@@ -1,6 +1,6 @@
 ---
 name: dispenser
-version: 1.0.0
+version: 1.1.0
 spec_version: v1
 license: MIT
 description: Acts-backed artifact dispenser with a bounded, rebuildable queue projection.

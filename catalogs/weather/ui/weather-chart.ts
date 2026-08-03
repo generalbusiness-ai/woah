@@ -8,11 +8,12 @@
 //   3. Precip / percent panel — shaded area for `precip_intensity`,
 //      lines for `precip_prob`, `humidity`, `cloud_cover`. Same x-axis.
 //
-// Time domain is the full ±7d frame anchored at `timeseries.anchor`. A
-// vertical "now" guide line lands at the anchor; the past half is tinted
-// faintly so a viewer can see "this is observation, that is forecast"
-// without reading a legend. Null slots break path segments cleanly so
-// gaps render as gaps, not as zero values.
+// The visible time domain is symmetric around the viewer's wall-clock now.
+// `timeseries.anchor` remains fetch/update provenance and gets its own dashed
+// marker; it must never masquerade as current time when a plug stops updating.
+// The actual past half is tinted so a viewer can distinguish observation from
+// forecast without reading a legend. Null slots break path segments cleanly
+// so gaps render as gaps, not as zero values.
 //
 // All exported functions are pure: they take data + sizing options and
 // return SVG/HTML strings. The custom element below assembles them into
@@ -21,6 +22,7 @@
 import { escapeHtml, type WooComponentRegistry } from "../../../src/client/framework";
 
 const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
 
 export type Timeseries = {
   anchor: number;
@@ -89,14 +91,16 @@ export function symmetricDailySlice(daily: DailyEntry[], todayDate: string | nul
   return out;
 }
 
-// Symmetric domain in milliseconds, anchored on `ts.anchor`. The half-
-// width is max(past-populated, forward-populated) hours so the chart
-// shows the full available range; the short side simply renders as
-// gaps (path null breaks render correctly). Falls back to the full
-// grid if no values are populated yet (cold start).
-export function symmetricTimeseriesDomain(ts: Timeseries): [number, number] {
-  const length = firstField(ts)?.values.length ?? 0;
-  if (length === 0) return [ts.t0, ts.t0 + 1];
+// Symmetric domain in milliseconds, centered on wall-clock `displayNow`.
+// The half-width is the larger distance from now to either populated edge,
+// so every available sample remains visible while the true now-line stays in
+// the middle. A stale snapshot therefore moves left of now instead of moving
+// "now" back to the snapshot's fetch time.
+export function symmetricTimeseriesDomain(ts: Timeseries, displayNow = Date.now()): [number, number] {
+  const now = Number.isFinite(displayNow) ? displayNow : Date.now();
+  const length = maxFieldLength(ts);
+  const step = Number.isFinite(ts.step) && ts.step > 0 ? ts.step : HOUR_MS;
+  if (length === 0) return [now - 12 * step, now + 12 * step];
   let firstIdx = -1, lastIdx = -1;
   for (let i = 0; i < length; i++) {
     let any = false;
@@ -109,14 +113,15 @@ export function symmetricTimeseriesDomain(ts: Timeseries): [number, number] {
       lastIdx = i;
     }
   }
-  if (firstIdx < 0) return [ts.t0, ts.t0 + length * ts.step];
-  const anchorIdx = Math.round((ts.anchor - ts.t0) / ts.step);
-  const pastHours = Math.max(0, anchorIdx - firstIdx);
-  const fwdHours = Math.max(0, lastIdx - anchorIdx);
-  // 12 h minimum half-width so a freshly-populated chart still has
+  if (firstIdx < 0) return [now - 12 * step, now + 12 * step];
+  const firstTime = ts.t0 + firstIdx * step;
+  const lastTime = ts.t0 + lastIdx * step;
+  const pastSlots = Math.max(0, Math.ceil((now - firstTime) / step));
+  const forwardSlots = Math.max(0, Math.ceil((lastTime - now) / step));
+  // 12-slot minimum half-width so a freshly-populated chart still has
   // room for a couple of day labels even when both sides are thin.
-  const halfHours = Math.max(12, Math.max(pastHours, fwdHours));
-  return [ts.anchor - halfHours * ts.step, ts.anchor + halfHours * ts.step];
+  const halfSlots = Math.max(12, pastSlots, forwardSlots);
+  return [now - halfSlots * step, now + halfSlots * step];
 }
 
 function addDays(date: string, delta: number): string {
@@ -179,12 +184,12 @@ const TEMP_FIELDS: Array<{ key: string; label: string; cls: string }> = [
   { key: "dew_point",            label: "Dew Point",   cls: "weather-line-dew" }
 ];
 
-export function temperaturePanelSvg(ts: Timeseries | undefined): string {
+export function temperaturePanelSvg(ts: Timeseries | undefined, displayNow = Date.now()): string {
   if (!ts || !ts.fields) return emptyPanelSvg(TEMP_PANEL_HEIGHT, "Temperature data unavailable");
   const present = TEMP_FIELDS.filter((f) => ts.fields[f.key]?.values?.some((v) => v !== null));
   if (present.length === 0) return emptyPanelSvg(TEMP_PANEL_HEIGHT, "No temperature samples yet");
 
-  const domain = symmetricTimeseriesDomain(ts);
+  const domain = symmetricTimeseriesDomain(ts, displayNow);
   // Y-domain: union of populated values within the visible x-window so
   // off-screen extremes don't squash the in-frame lines.
   const valuesUnion: number[] = [];
@@ -208,7 +213,7 @@ export function temperaturePanelSvg(ts: Timeseries | undefined): string {
   }).join("");
 
   const yAxis = yAxisLabels(yDomain, yScale, "°", PANEL_PAD_X);
-  const grid = gridAndAnchor(ts, xScale, TEMP_PANEL_HEIGHT, domain);
+  const grid = gridAndClock(ts, xScale, TEMP_PANEL_HEIGHT, displayNow, domain);
   const legend = legendHtml(present.map((f) => ({ label: f.label, cls: f.cls })));
 
   return `<div class="card card--pre weather-chart-panel">`
@@ -227,9 +232,9 @@ const PERCENT_FIELDS: Array<{ key: string; label: string; cls: string }> = [
   { key: "precip_prob",          label: "Precip Prob", cls: "weather-line-precipp"  }
 ];
 
-export function precipPanelSvg(ts: Timeseries | undefined): string {
+export function precipPanelSvg(ts: Timeseries | undefined, displayNow = Date.now()): string {
   if (!ts || !ts.fields) return emptyPanelSvg(PRECIP_PANEL_HEIGHT, "Precip data unavailable");
-  const domain = symmetricTimeseriesDomain(ts);
+  const domain = symmetricTimeseriesDomain(ts, displayNow);
   const xScale = xScaleForTimeseries(ts, domain);
   const yPercent = linear([0, 100], [PRECIP_PANEL_HEIGHT - PANEL_PAD_Y, PANEL_PAD_Y]);
 
@@ -254,7 +259,7 @@ export function precipPanelSvg(ts: Timeseries | undefined): string {
   }
 
   const yAxis = yAxisLabels([0, 100], yPercent, "%", PANEL_PAD_X);
-  const grid = gridAndAnchor(ts, xScale, PRECIP_PANEL_HEIGHT, domain);
+  const grid = gridAndClock(ts, xScale, PRECIP_PANEL_HEIGHT, displayNow, domain);
   const legend = legendHtml([...intensityLegend, ...present.map((f) => ({ label: f.label, cls: f.cls }))]);
 
   return `<div class="card card--pre weather-chart-panel">`
@@ -351,6 +356,14 @@ function firstField(ts: Timeseries) {
   return undefined;
 }
 
+function maxFieldLength(ts: Timeseries): number {
+  let length = 0;
+  for (const field of Object.values(ts.fields)) {
+    length = Math.max(length, field.values?.length ?? 0);
+  }
+  return length;
+}
+
 function domainOf(values: number[]): [number, number] {
   if (values.length === 0) return [0, 1];
   let lo = values[0], hi = values[0];
@@ -367,15 +380,15 @@ function padDomain(domain: [number, number], frac: number): [number, number] {
   return [a - span * frac, b + span * frac];
 }
 
-// ----- Grid + now-line + day boundaries -------------------------------------
+// ----- Grid + clock/update lines + day boundaries ---------------------------
 
-function gridAndAnchor(ts: Timeseries, xScale: (t: number) => number, height: number, domain?: [number, number]): string {
-  const length = firstField(ts)?.values.length ?? 0;
+function gridAndClock(ts: Timeseries, xScale: (t: number) => number, height: number, displayNow: number, domain?: [number, number]): string {
+  const length = maxFieldLength(ts);
   if (length === 0) return "";
   const [d0, d1] = domain ?? [ts.t0, ts.t0 + length * ts.step];
-  // Past tint covers from the visible domain start up to the anchor.
-  const pastEnd = Math.min(ts.anchor, d1);
-  const pastStart = Math.max(d0, d0);  // domain start
+  // Past tint follows the actual clock, not the snapshot timestamp.
+  const pastEnd = Math.min(Math.max(displayNow, d0), d1);
+  const pastStart = d0;
   const pastWidth = Math.max(0, xScale(pastEnd) - xScale(pastStart));
   const pastTint = pastWidth > 0
     ? `<rect class="weather-chart-past" x="${xScale(pastStart).toFixed(1)}" y="0" width="${pastWidth.toFixed(1)}" height="${height}" />`
@@ -388,9 +401,14 @@ function gridAndAnchor(ts: Timeseries, xScale: (t: number) => number, height: nu
     lines.push(`<line class="weather-chart-day-grid" x1="${x}" y1="0" x2="${x}" y2="${height}" />`);
     t += DAY_MS;
   }
-  // Now-line (only if the anchor is in the visible window).
+  // Update provenance is visually distinct from current time. Draw it first
+  // so the true now-line remains dominant when a fresh update nearly overlaps.
   if (ts.anchor >= d0 && ts.anchor <= d1) {
-    const nowX = xScale(ts.anchor).toFixed(1);
+    const updateX = xScale(ts.anchor).toFixed(1);
+    lines.push(`<line class="weather-chart-updated" x1="${updateX}" y1="0" x2="${updateX}" y2="${height}" />`);
+  }
+  if (displayNow >= d0 && displayNow <= d1) {
+    const nowX = xScale(displayNow).toFixed(1);
     lines.push(`<line class="weather-chart-now" x1="${nowX}" y1="0" x2="${nowX}" y2="${height}" />`);
   }
   return pastTint + lines.join("");
@@ -491,6 +509,9 @@ function conditionForWeatherCode(code: number | null): string {
 export class WooWeatherChartElement extends HTMLElement {
   private model: ChartProps = {};
   private dialog: HTMLDialogElement | null = null;
+  private clockTimer: number | null = null;
+  /** Injectable only so clock-dependent behavior is deterministic in tests. */
+  clock: () => number = () => Date.now();
 
   set data(value: ChartProps) {
     this.model = value ?? {};
@@ -509,12 +530,19 @@ export class WooWeatherChartElement extends HTMLElement {
       if (typeof this.dialog!.showModal === "function") this.dialog!.showModal();
       else this.dialog!.setAttribute("open", "");
     }
+    this.scheduleClockRefresh();
   }
 
   close(): void {
-    if (!this.dialog?.open) return;
-    if (typeof this.dialog.close === "function") this.dialog.close();
-    else this.dialog.removeAttribute("open");
+    if (this.dialog?.open) {
+      if (typeof this.dialog.close === "function") this.dialog.close();
+      else this.dialog.removeAttribute("open");
+    }
+    this.clearClockRefresh();
+  }
+
+  disconnectedCallback(): void {
+    this.clearClockRefresh();
   }
 
   private ensureDialog(): void {
@@ -526,21 +554,26 @@ export class WooWeatherChartElement extends HTMLElement {
       // element's close() so the jsdom test path stays valid.
       if (event.target === dialog) this.close();
     });
+    // Native Escape closes the dialog without calling this.close().
+    dialog.addEventListener("close", () => this.clearClockRefresh());
     this.appendChild(dialog);
     this.dialog = dialog;
   }
 
   private render(): void {
     if (!this.dialog) return;
-    const { current, daily, timeseries, place } = this.model;
-    const todayDate = todayLocalDate(timeseries);
-    const headline = headlineHtml(place, current);
+    const { current, daily, timeseries, place, timezone } = this.model;
+    const displayNow = this.clock();
+    const todayDate = localDateAt(displayNow, timezone);
+    const headline = headlineHtml(place, current, timeseries, displayNow, timezone);
+    const freshness = freshnessHtml(timeseries, displayNow, timezone);
     const strip = dailyStripHtml(daily ?? [], todayDate);
-    const tempPanel = temperaturePanelSvg(timeseries);
-    const precipPanel = precipPanelSvg(timeseries);
+    const tempPanel = temperaturePanelSvg(timeseries, displayNow);
+    const precipPanel = precipPanelSvg(timeseries, displayNow);
     this.dialog.innerHTML = `<div class="card card--raised weather-chart-card">`
       + `<button type="button" class="icon-button weather-chart-close" aria-label="Close" data-weather-close>×</button>`
       + headline
+      + freshness
       + strip
       + tempPanel
       + precipPanel
@@ -550,26 +583,111 @@ export class WooWeatherChartElement extends HTMLElement {
     // native dialog.close) still works in unit tests.
     close?.addEventListener("click", () => this.close());
   }
+
+  /** Re-render at the next wall-clock minute while open. The timeout is
+   * aligned rather than a permanent interval, so background throttling cannot
+   * accumulate drift and a closed/disconnected chart owns no live timer. */
+  private scheduleClockRefresh(): void {
+    this.clearClockRefresh();
+    if (!this.dialog?.open) return;
+    const now = this.clock();
+    const remainder = ((now % 60_000) + 60_000) % 60_000;
+    const delay = Math.max(250, 60_000 - remainder);
+    this.clockTimer = window.setTimeout(() => {
+      this.clockTimer = null;
+      if (!this.dialog?.open) return;
+      this.render();
+      this.scheduleClockRefresh();
+    }, delay);
+  }
+
+  private clearClockRefresh(): void {
+    if (this.clockTimer === null) return;
+    window.clearTimeout(this.clockTimer);
+    this.clockTimer = null;
+  }
 }
 
-function headlineHtml(place: string | undefined, current: CurrentBundle | undefined): string {
+function headlineHtml(
+  place: string | undefined,
+  current: CurrentBundle | undefined,
+  timeseries: Timeseries | undefined,
+  displayNow: number,
+  timezone: string | undefined
+): string {
   const placeLabel = place && place.trim() ? place.trim() : "this location";
   const temp = current && typeof current.temperature === "number" ? `${formatRound(current.temperature)}${current.temperature_unit ?? ""}` : "—";
   const observed = current?.observed_at_text ? `as of ${current.observed_at_text}` : "";
+  const updated = timeseries && Number.isFinite(timeseries.anchor)
+    ? `Updated ${formatZonedTime(timeseries.anchor, timezone)}`
+    : "Update time unavailable";
   return `<div class="weather-chart-headline">`
     + `<div class="weather-chart-headline-place">${escapeHtml(placeLabel)}</div>`
     + `<div class="weather-chart-headline-temp">${escapeHtml(temp)}</div>`
     + `<div class="weather-chart-headline-observed">${escapeHtml(observed)}</div>`
+    + `<div class="weather-chart-headline-updated" data-age-ms="${timeseries ? Math.max(0, displayNow - timeseries.anchor) : ""}">${escapeHtml(updated)}</div>`
     + `</div>`;
 }
 
-function todayLocalDate(ts: Timeseries | undefined): string | null {
-  if (!ts || typeof ts.anchor !== "number") return null;
-  const d = new Date(ts.anchor);
-  // We don't have the tz here cheaply; ISO local-day is acceptable since
-  // `daily` keys were built in the configured tz and we only use this to
-  // highlight the matching card. A 1-tz-off mismatch is harmless cosmetic.
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+export function localDateAt(timestamp: number, timezone?: string): string | null {
+  if (!Number.isFinite(timestamp)) return null;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      ...(timezone ? { timeZone: timezone } : {}),
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date(timestamp));
+    const part = (type: Intl.DateTimeFormatPartTypes): string | undefined => parts.find((entry) => entry.type === type)?.value;
+    const year = part("year"), month = part("month"), day = part("day");
+    return year && month && day ? `${year}-${month}-${day}` : null;
+  } catch {
+    // Invalid zones should already be rejected by the plug, but a malformed
+    // historical snapshot must not break the whole room UI.
+    const d = new Date(timestamp);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  }
+}
+
+function formatZonedTime(timestamp: number, timezone?: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      ...(timezone ? { timeZone: timezone } : {}),
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "short"
+    }).format(new Date(timestamp));
+  } catch {
+    return new Date(timestamp).toLocaleString();
+  }
+}
+
+export function timeseriesFreshness(ts: Timeseries | undefined, displayNow = Date.now()): "fresh" | "stale" | "gap" | "unavailable" {
+  if (!ts || !Number.isFinite(ts.anchor)) return "unavailable";
+  const step = Number.isFinite(ts.step) && ts.step > 0 ? ts.step : HOUR_MS;
+  const staleAfter = Math.max(2 * HOUR_MS, 2 * step);
+  const length = maxFieldLength(ts);
+  if (length > 0) {
+    const coverageEnd = ts.t0 + (length - 1) * step;
+    if (displayNow < ts.t0 || displayNow > coverageEnd) return "gap";
+  }
+  return displayNow - ts.anchor > staleAfter ? "stale" : "fresh";
+}
+
+function freshnessHtml(ts: Timeseries | undefined, displayNow: number, timezone?: string): string {
+  const freshness = timeseriesFreshness(ts, displayNow);
+  if (freshness === "fresh") return "";
+  if (freshness === "unavailable") {
+    return `<div class="weather-chart-stale" role="status">Weather update time is unavailable.</div>`;
+  }
+  const updated = ts ? formatZonedTime(ts.anchor, timezone) : "an unknown time";
+  const text = freshness === "gap"
+    ? `Weather data does not cover the current time. Last update: ${updated}.`
+    : `Weather data may be stale. Last update: ${updated}.`;
+  return `<div class="weather-chart-stale" role="status">${escapeHtml(text)}</div>`;
 }
 function pad2(n: number): string { return n < 10 ? `0${n}` : `${n}`; }
 

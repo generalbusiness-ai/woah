@@ -142,6 +142,7 @@ import {
 } from "./mcp-envelope";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
+import { instrumentGatewaySql, type GatewaySqlExecutor } from "./gateway-storage";
 
 export type NetGatewayDurableState = {
   id: unknown;
@@ -902,6 +903,23 @@ const CLIENT_RATE_BURST = 100;
  * tabs at once; sustained abuse throttles to 5/s). */
 const CLIENT_MINT_RATE_PER_SEC = 5;
 const CLIENT_MINT_RATE_BURST = 20;
+/** Projection hydration is explicit and exact, but still client supplied.
+ * Bound both the fan-out width and individual key size before any authority
+ * RPC so one HTTP request cannot become an unbounded closure workload. */
+const CLIENT_AUTHORITATIVE_CELL_MAX_KEYS = 32;
+const CLIENT_AUTHORITATIVE_CELL_MAX_KEY_BYTES = 512;
+/** A fanout may land while an authority closure is in flight. One retry is
+ * enough to get a head at/above the gateway's newly observed scope head;
+ * refusing after the second race is safer than installing older state. */
+const CLIENT_AUTHORITATIVE_CELL_ATTEMPTS = 2;
+/** Exact-read floors are derived repair state, not authority. Evicting an old
+ * row merely restores the prior stale-tolerant mirror semantics for that key,
+ * so count-bounding is safe and prevents one-off component reads from growing
+ * a gateway side table forever. */
+const GATEWAY_CELL_AUTHORITY_FLOOR_LIMIT = 4096;
+/** Amortize the bounded-floor sweep across actual row changes. Repeat reads at
+ * an unchanged authority head are SQL no-ops and do not advance this counter. */
+const CELL_AUTHORITY_FLOOR_SWEEP_INTERVAL = 256;
 /** A broken/partitioned catalog authority must not turn anonymous admission
  * traffic into a multi-Hz repair loop. The next request may retry after this
  * bounded brake; success is cached naturally by the repaired view page. */
@@ -930,8 +948,17 @@ function retryCapacityError(trace: AttemptTraceEntry[]): NetError {
 
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
+  /** Complete SQL chokepoint: Cloudflare's physical rowsWritten counter is
+   * captured for every mutation before the cursor escapes to a caller. */
+  private readonly sql: GatewaySqlExecutor;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /** Exact client reads do not advance a whole scope's fanout high-water:
+   * doing so would suppress unrelated observations. These durable per-key
+   * floors instead fence only the cells authoritatively read. */
+  private readonly cellAuthorityFloors = new Map<string, { scope: string; seq: number }>();
+  /** Changed floor rows since the last bounded-retention sweep. */
+  private cellAuthorityFloorWrites = 0;
   /** Whole-scope derived copies, exact at one authority head. Ephemeral on
    * purpose: hibernation merely makes the next large direct read re-pull a
    * full closure; correctness never depends on retaining this optimization. */
@@ -1017,28 +1044,36 @@ export class NetGatewayDO {
     // the scope DO so shard restarts are correlatable with latency
     // episodes in AE (net DOs previously emitted no wake signal at all).
     const constructedAt = Date.now();
+    this.sql = instrumentGatewaySql(state.storage.sql, (metric) => this.metric(metric));
     // CREATE IF NOT EXISTS on every construction — same idiom as
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
     // Phase 5 durable-format stamp (mirrors net_scope_meta's row): the
     // gateway's one branch point for durable evolution + migration ledger.
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
     const gatewayVersionRow = sqlRows<{ body: string }>(
-      state.storage.sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'")
+      this.sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'")
     )[0];
     const gatewayVersion = gatewayVersionRow === undefined
       ? null
       : (JSON.parse(gatewayVersionRow.body) as { v?: unknown }).v;
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL, owner_scope TEXT)"
     );
-    const cellColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_cell)"));
+    const cellColumns = sqlRows<{ name: string }>(this.sql.exec("PRAGMA table_info(net_gateway_cell)"));
     if (!cellColumns.some((column) => column.name === "owner_scope")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_cell ADD COLUMN owner_scope TEXT");
+      this.sql.exec("ALTER TABLE net_gateway_cell ADD COLUMN owner_scope TEXT");
     }
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0, live_seq INTEGER NOT NULL DEFAULT 0)");
-    const scopeColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_scope)"));
+    // Schema v3: an exact authority read can be newer than fanout already
+    // queued for this gateway. Keep an absence-capable floor separate from
+    // net_gateway_cell: a current authoritative answer may legitimately be
+    // "no such cell", and an old queued fanout must not resurrect it.
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_cell_floor (key TEXT PRIMARY KEY, owner_scope TEXT NOT NULL, authority_seq INTEGER NOT NULL)"
+    );
+    this.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0, live_seq INTEGER NOT NULL DEFAULT 0)");
+    const scopeColumns = sqlRows<{ name: string }>(this.sql.exec("PRAGMA table_info(net_gateway_scope)"));
     if (!scopeColumns.some((column) => column.name === "delivery_seen_seq")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN delivery_seen_seq INTEGER NOT NULL DEFAULT 0");
+      this.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN delivery_seen_seq INTEGER NOT NULL DEFAULT 0");
     }
     // M5.1 continuity: `live_seq` counts LIVE (direct-route) fanout bodies this
     // gateway has applied for a scope. Committed fanout already has
@@ -1047,7 +1082,7 @@ export class NetGatewayDO {
     // unreported. Additive and derived — legacy rows start at 0, which reads
     // as "no proof", and the first drain re-baselines.
     if (!scopeColumns.some((column) => column.name === "live_seq")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN live_seq INTEGER NOT NULL DEFAULT 0");
+      this.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN live_seq INTEGER NOT NULL DEFAULT 0");
     }
     // M5.1 continuity watermarks. `mcpQueues` is in-memory, so a Durable
     // Object eviction destroys a polling agent's observation queue — and on
@@ -1063,10 +1098,10 @@ export class NetGatewayDO {
     // nothing could have been dropped for it and the reply is gap-free.
     // Purely derived state: a missing row simply means "cannot prove", which
     // is the old conservative answer.
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_mcp_watermark (session TEXT PRIMARY KEY, scope TEXT NOT NULL, delivery_seq INTEGER NOT NULL, live_seq INTEGER NOT NULL, ts INTEGER NOT NULL)"
     );
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_mcp_watermark_ts ON net_gateway_mcp_watermark (ts)"
     );
     // CO13 relation mirror: roster rows (contents, session_presence)
@@ -1076,7 +1111,7 @@ export class NetGatewayDO {
     // per-scope seen high-water as cells, so there is no hydrated state
     // to keep coherent. Columns denormalize the row for the
     // (relation, owner) query; `body` is the row's JSON body or NULL.
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_relation (key TEXT PRIMARY KEY, relation TEXT NOT NULL, owner TEXT NOT NULL, member TEXT NOT NULL, body TEXT, owner_scope TEXT)"
     );
     // Phase 2: `owner_scope` is the scope the owner belongs to, MATERIALIZED
@@ -1086,33 +1121,33 @@ export class NetGatewayDO {
     // session_presence row and classifying each in JS. The column addition is
     // idempotent; schema v2 below then discards legacy unowned rows together
     // with the high-waters that could suppress their reconstruction.
-    const relationColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_relation)"));
+    const relationColumns = sqlRows<{ name: string }>(this.sql.exec("PRAGMA table_info(net_gateway_relation)"));
     if (!relationColumns.some((column) => column.name === "owner_scope")) {
-      state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
+      this.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
     }
     if (!relationColumns.some((column) => column.name === "member_scope")) {
       // Additive mirror metadata: new relation producers attach the member's
       // immutable authority scope so cold contextual reads stay targeted.
       // Legacy NULL rows remain valid and use the bounded owner fallback.
-      state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN member_scope TEXT");
+      this.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN member_scope TEXT");
     }
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
     // Observation delivery intersects one scope with the bounded sessions
     // that have a live carrier on this gateway. Keep member as the final key
     // so that intersection never scans every occupant of a large room.
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope_member ON net_gateway_relation (relation, owner_scope, member)"
     );
     // The authenticated read/auth query shapes (all O(matching rows), never
     // a table scan): presence-of-a-member (relation, member); the contents
     // membership check and the roster read (relation, owner, member — the
     // second also serves the owner-only ORDER BY member read as a prefix).
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_member ON net_gateway_relation (relation, member)"
     );
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_owner_member ON net_gateway_relation (relation, owner, member)"
     );
     // Gateway cache schema v2 materializes cell ownership for exact full-pull
@@ -1122,25 +1157,39 @@ export class NetGatewayDO {
     // migration is to clear cells, relation mirrors, and both high-waters in
     // one transaction; the next pull/fanout reconstructs them from authority.
     // Fresh databases create the v2 table directly and skip the reset.
-    if (gatewayVersion === 1) {
+    let effectiveGatewayVersion = gatewayVersion;
+    if (effectiveGatewayVersion === 1) {
       state.storage.transactionSync(() => {
-        state.storage.sql.exec("DELETE FROM net_gateway_cell");
-        state.storage.sql.exec("DELETE FROM net_gateway_relation");
-        state.storage.sql.exec("DELETE FROM net_gateway_scope");
-        state.storage.sql.exec(
+        this.sql.exec("DELETE FROM net_gateway_cell");
+        this.sql.exec("DELETE FROM net_gateway_cell_floor");
+        this.sql.exec("DELETE FROM net_gateway_relation");
+        this.sql.exec("DELETE FROM net_gateway_scope");
+        this.sql.exec(
           "UPDATE net_gateway_meta SET body = ? WHERE id = 'schema_version'",
           JSON.stringify({ v: 2 })
         );
       });
-    } else if (gatewayVersion === null) {
-      state.storage.sql.exec(
-        "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
-        JSON.stringify({ v: 2 })
-      );
-    } else if (gatewayVersion !== 2) {
-      throw new Error(`unsupported net gateway cache schema version ${JSON.stringify(gatewayVersion)}`);
+      effectiveGatewayVersion = 2;
     }
-    state.storage.sql.exec(
+    // v3 adds only derived exact-read floors. Existing v2 cache rows remain
+    // valid; the empty floor table means they retain their prior stale-
+    // tolerant semantics until the first authoritative exact read.
+    if (effectiveGatewayVersion === 2) {
+      this.sql.exec(
+        "UPDATE net_gateway_meta SET body = ? WHERE id = 'schema_version'",
+        JSON.stringify({ v: 3 })
+      );
+      effectiveGatewayVersion = 3;
+    } else if (effectiveGatewayVersion === null) {
+      this.sql.exec(
+        "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+        JSON.stringify({ v: 3 })
+      );
+      effectiveGatewayVersion = 3;
+    } else if (effectiveGatewayVersion !== 3) {
+      throw new Error(`unsupported net gateway cache schema version ${JSON.stringify(effectiveGatewayVersion)}`);
+    }
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_cell_scope ON net_gateway_cell (owner_scope)"
     );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
@@ -1149,7 +1198,7 @@ export class NetGatewayDO {
     // scope may already hold the recorded reply, and a second scope would
     // double-commit the turn. Retention is lease-based and shared with the
     // authority's reply cache (H2c: see pinScope).
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
     );
     // Lease columns, added in place so an already-deployed shard keeps its
@@ -1169,19 +1218,19 @@ export class NetGatewayDO {
     // route that is no longer needed, never discard one that is.
     state.storage.transactionSync(() => {
       const pinColumns = new Set(
-        sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
+        sqlRows<{ name: string }>(this.sql.exec("PRAGMA table_info(net_gateway_pin)")).map((row) => row.name)
       );
       if (!pinColumns.has("expires_at")) {
-        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
+        this.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN expires_at INTEGER");
       }
       if (!pinColumns.has("guaranteed")) {
-        state.storage.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
+        this.sql.exec("ALTER TABLE net_gateway_pin ADD COLUMN guaranteed INTEGER");
       }
       // Repairs BOTH columns, not just the one a fresh ALTER leaves null, so a
       // shard that halted midway lands in the same state as one that never
       // did. Unconditional rather than gated on the ALTERs: any row reaching
       // this table undated must not become an ageless one.
-      state.storage.sql.exec(
+      this.sql.exec(
         "UPDATE net_gateway_pin SET expires_at = COALESCE(expires_at, ?), guaranteed = COALESCE(guaranteed, 1) " +
           "WHERE expires_at IS NULL OR guaranteed IS NULL",
         Date.now() + GATEWAY_PIN_LEASE_MS
@@ -1191,25 +1240,25 @@ export class NetGatewayDO {
     // scan. Every SQLite index carries the rowid as its payload already, so
     // "oldest first within a class" is served by the class index — and naming
     // rowid in the index columns is a syntax error.
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_pin_expiry ON net_gateway_pin (expires_at)"
     );
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_pin_class ON net_gateway_pin (guaranteed)"
     );
     // AU1.2 durable edge-event lane: refusal records buffered here and
     // drained to the audit shards (see recordEdgeAudit).
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_audit_outbox (id TEXT PRIMARY KEY, destination TEXT NOT NULL, body TEXT NOT NULL)"
     );
     // B3: short-lived single-use WebSocket tickets. A ticket authenticates
     // one upgrade so the permanent apikey never rides the WS URL. Durable
     // (survives hibernation between mint and connect) but self-limiting:
     // TTL-reaped on every mint, and each ticket is deleted on use.
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_ws_ticket (ticket TEXT PRIMARY KEY, session TEXT NOT NULL, actor TEXT NOT NULL, expires_at INTEGER NOT NULL)"
     );
-    state.storage.sql.exec(
+    this.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_session_close_receipt (session TEXT PRIMARY KEY, actor TEXT NOT NULL)"
     );
     this.host = new WorkerdHost({
@@ -3207,6 +3256,7 @@ export class NetGatewayDO {
   //       including item-1 result/observations.
   //   GET /net-api/relation?relation=&owner=   authenticated roster read
   //   GET /net-api/cell?key=                   authenticated cell probe
+  //   POST /net-api/cells {session,keys}       bounded authoritative exact read
   //   GET /net-api/ws?session=                  WebSocket upgrade (Phase 4
   //     item 3): same apikey authentication, session REQUIRED and
   //     validated like /net-api/turn, then the socket is accepted with
@@ -3270,7 +3320,7 @@ export class NetGatewayDO {
         now: this.host.now()
       });
       for (const entry of routed) {
-        this.state.storage.sql.exec(
+        this.sql.exec(
           "INSERT OR IGNORE INTO net_gateway_audit_outbox (id, destination, body) VALUES (?, ?, ?)",
           `${entry.partition}/${entry.record.idempotency}`,
           `audit:${auditShardFor(entry.partition, shardCount)}`,
@@ -3309,7 +3359,7 @@ export class NetGatewayDO {
    * shard must not strand rows until its next request). */
   private async drainEdgeAudit(): Promise<void> {
     const rows = sqlRows<{ id: string; destination: string; body: string }>(
-      this.state.storage.sql.exec("SELECT id, destination, body FROM net_gateway_audit_outbox LIMIT 64")
+      this.sql.exec("SELECT id, destination, body FROM net_gateway_audit_outbox LIMIT 64")
     );
     const byDestination = new Map<string, Array<{ id: string; body: string }>>();
     for (const row of rows) {
@@ -3325,7 +3375,7 @@ export class NetGatewayDO {
           records: bucket.map((row) => JSON.parse(row.body) as unknown)
         });
         for (const row of bucket) {
-          this.state.storage.sql.exec("DELETE FROM net_gateway_audit_outbox WHERE id = ?", row.id);
+          this.sql.exec("DELETE FROM net_gateway_audit_outbox WHERE id = ?", row.id);
         }
       } catch (err) {
         this.metric({ kind: "net_gateway_audit_error", status: "error", error: String(err), destination });
@@ -3334,7 +3384,7 @@ export class NetGatewayDO {
     // Residue (a failed shard, or rows enqueued since the SELECT): re-arm
     // rather than strand until the next audited request on this shard.
     const remaining = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_gateway_audit_outbox) AS n")
+      this.sql.exec("SELECT EXISTS(SELECT 1 FROM net_gateway_audit_outbox) AS n")
     )[0];
     if (remaining && Number(remaining.n) > 0) {
       this.host.setAlarm(GATEWAY_AUDIT_ALARM_KEY, this.host.now() + GATEWAY_AUDIT_RETRY_MS, async () => {});
@@ -3610,6 +3660,11 @@ export class NetGatewayDO {
         }
         const reply = await this.host.rpc(`scope:${routed}`, "/schedules");
         return json({ ...(reply as Record<string, unknown>), room });
+      }
+      if (request.method === "POST" && url.pathname === "/net-api/cells") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        if (bearerSession && body.session === undefined) body.session = bearerSession;
+        return await this.clientAuthoritativeCells(actor, body);
       }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";
@@ -6425,7 +6480,7 @@ export class NetGatewayDO {
       for (const session of this.mcpQueues.keys()) candidates.add(session);
     } else {
       const present = sqlRows<{ member: string }>(
-        this.state.storage.sql.exec(
+        this.sql.exec(
           "SELECT member FROM net_gateway_relation WHERE relation = ? AND owner_scope = ?",
           SESSION_PRESENCE_RELATION,
           body.scope
@@ -7034,10 +7089,10 @@ export class NetGatewayDO {
     }
     const now = this.host.now();
     // Reap expired tickets on mint — bounded cleanup, no separate reaper.
-    this.state.storage.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE expires_at <= ?", now);
+    this.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE expires_at <= ?", now);
     const ticket = ticketIdWithShardHint(this.shardName(), randomHex(24));
     const expiresAt = now + 60_000;
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_ws_ticket (ticket, session, actor, expires_at) VALUES (?, ?, ?, ?)",
       ticket,
       session,
@@ -7067,9 +7122,9 @@ export class NetGatewayDO {
     // so a replayed ticket URL cannot open a second socket.
     const row = this.state.storage.transactionSync(() => {
       const found = sqlRows<{ session: string; actor: string; expires_at: number }>(
-        this.state.storage.sql.exec("SELECT session, actor, expires_at FROM net_gateway_ws_ticket WHERE ticket = ?", ticket)
+        this.sql.exec("SELECT session, actor, expires_at FROM net_gateway_ws_ticket WHERE ticket = ?", ticket)
       )[0];
-      if (found) this.state.storage.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE ticket = ?", ticket);
+      if (found) this.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE ticket = ?", ticket);
       return found;
     });
     if (!row || row.expires_at <= this.host.now()) {
@@ -7307,7 +7362,7 @@ export class NetGatewayDO {
       const chunk = carrierSessions.slice(offset, offset + GATEWAY_CARRIER_QUERY_CHUNK);
       const placeholders = chunk.map(() => "?").join(",");
       rows.push(...sqlRows<{ member: string; body: string | null }>(
-        this.state.storage.sql.exec(
+        this.sql.exec(
           `SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ? AND member IN (${placeholders})`,
           SESSION_PRESENCE_RELATION,
           body.scope,
@@ -7750,7 +7805,7 @@ export class NetGatewayDO {
     const active = (cell?.value as { activeScope?: unknown } | undefined)?.activeScope;
     if (typeof active === "string" && active) scopes.add(active);
     const rows = sqlRows<{ owner: string }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT owner FROM net_gateway_relation WHERE relation = ? AND member = ?",
         SESSION_PRESENCE_RELATION,
         session
@@ -7844,7 +7899,7 @@ export class NetGatewayDO {
     if (typeof location === "string" && scopes.has(location)) return;
     for (const scope of scopes) {
       const present = sqlRows<{ n: number }>(
-        this.state.storage.sql.exec(
+        this.sql.exec(
           "SELECT 1 AS n FROM net_gateway_relation WHERE relation = 'contents' AND owner = ? AND member = ? LIMIT 1",
           scope,
           object
@@ -7853,6 +7908,139 @@ export class NetGatewayDO {
       if (present.length > 0) return;
     }
     throw new ClientAuthError("cell not readable in the caller's presence", { key }, "E_PERM", 403);
+  }
+
+  /** Bounded authoritative projection hydration. GET /net-api/cell remains a
+   * cheap stale-tolerant probe for callers that explicitly want the mirror;
+   * this endpoint is the correctness boundary for component-declared fields.
+   * It fetches exact keys plus only the lineage/live cells needed to re-check
+   * authorization after movement — never an object's arbitrary property set. */
+  private async clientAuthoritativeCells(actor: string, body: Record<string, unknown>): Promise<Response> {
+    const session = typeof body.session === "string" && body.session.length > 0 ? body.session : "";
+    if (!session) {
+      throw new ClientAuthError("authoritative cell reads require a live session", { reason: "session_required" });
+    }
+    const sessionVerdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (sessionVerdict !== "ok") {
+      throw new ClientAuthError(`session ${sessionVerdict}`, { session_verdict: sessionVerdict });
+    }
+
+    const rawKeys = body.keys;
+    if (!Array.isArray(rawKeys) || rawKeys.length === 0 || rawKeys.length > CLIENT_AUTHORITATIVE_CELL_MAX_KEYS) {
+      throw new ClientAuthError(
+        `keys must be a non-empty array of at most ${CLIENT_AUTHORITATIVE_CELL_MAX_KEYS} exact cell keys`,
+        { max_keys: CLIENT_AUTHORITATIVE_CELL_MAX_KEYS },
+        "E_INVARG",
+        400
+      );
+    }
+    const keys: string[] = [];
+    const unique = new Set<string>();
+    for (const raw of rawKeys) {
+      if (
+        typeof raw !== "string"
+        || raw.length === 0
+        || new TextEncoder().encode(raw).byteLength > CLIENT_AUTHORITATIVE_CELL_MAX_KEY_BYTES
+        || !objectOfCellKey(raw)
+      ) {
+        throw new ClientAuthError(
+          "each key must be a bounded concrete cell key",
+          { max_key_bytes: CLIENT_AUTHORITATIVE_CELL_MAX_KEY_BYTES },
+          "E_INVARG",
+          400
+        );
+      }
+      if (!unique.has(raw)) {
+        unique.add(raw);
+        keys.push(raw);
+      }
+    }
+
+    // First gate: no protected or currently foreign key is allowed to cause
+    // an authority RPC. The second gate below re-runs after fresh live cells
+    // install, closing the stale-location disclosure window.
+    for (const key of keys) this.authorizeCellRead(actor, session, key);
+
+    const view = this.ensureView();
+    const classifier = this.viewClassifier(view);
+    const byScope = new Map<string, Set<string>>();
+    for (const key of keys) {
+      const object = objectOfCellKey(key);
+      let scope: string;
+      try {
+        scope = key.startsWith("session:") ? classifier.scopeOf(actor) : classifier.scopeOf(object);
+      } catch {
+        throw new ClientAuthError(
+          "cell owner is not routable from the caller's bounded view",
+          { key, object },
+          "E_MISSING_STATE",
+          404
+        );
+      }
+      const want = byScope.get(scope) ?? new Set<string>();
+      want.add(key);
+      // These two exact support cells are what makes the post-fetch
+      // authorization meaningful. Session keys already bind through actor.
+      if (!key.startsWith("session:")) {
+        want.add(cellKey("object_lineage", object));
+        want.add(cellKey("object_live", object));
+      }
+      byScope.set(scope, want);
+    }
+
+    type ExactTransfer = CellTransfer & { scope: string; head: ScopeHead };
+    const readScope = async ([scope, wanted]: [string, Set<string>]): Promise<[string, Set<string>, ExactTransfer]> => {
+      const transfer = (await this.host.rpc(`scope:${scope}`, "/closure", {
+        keys: [...wanted],
+        known: []
+      })) as ExactTransfer;
+      if (transfer.scope !== scope || !validScopeHead(transfer.head) || !Array.isArray(transfer.cells)) {
+        throw new ClientAuthError(
+          "authority returned a malformed exact-cell closure",
+          { expected_scope: scope },
+          "E_RPC_TIMEOUT",
+          503
+        );
+      }
+      return [scope, wanted, transfer];
+    };
+    let transfers: Array<[string, Set<string>, ExactTransfer]> = [];
+    for (let attempt = 1; attempt <= CLIENT_AUTHORITATIVE_CELL_ATTEMPTS; attempt += 1) {
+      transfers = await Promise.all([...byScope.entries()].map(readScope));
+      // Another request on this DO can apply fanout while ANY of the parallel
+      // RPCs awaits. Check every result together after the last settles; if
+      // the second round also races, refuse rather than install older state.
+      const raced = transfers.filter(([scope, , transfer]) => (this.seen.get(scope) ?? 0) > transfer.head.seq);
+      if (raced.length === 0) break;
+      if (attempt === CLIENT_AUTHORITATIVE_CELL_ATTEMPTS) {
+        throw new ClientAuthError(
+          "authoritative cell read raced newer fanout; retry unchanged",
+          { scopes: raced.map(([scope]) => scope), retryable: true },
+          "E_RETRY",
+          503
+        );
+      }
+    }
+
+    this.discardViewOnThrow(() => this.state.storage.transactionSync(() => {
+      for (const [scope, wanted, transfer] of transfers) {
+        // No await occurs between the aggregate head check above and this
+        // transaction, so this DO cannot interleave a newer fanout here.
+        const installed = this.installTransferredCells(view, transfer.cells, scope);
+        for (const key of wanted) {
+          if (!installed.has(key)) {
+            view.delete(key);
+            this.persistCell(view, key);
+          }
+          this.recordCellAuthorityFloor(key, scope, transfer.head.seq);
+        }
+      }
+    }));
+
+    for (const key of keys) this.authorizeCellRead(actor, session, key);
+    return json({
+      cells: keys.map((key) => ({ key, cell: view.get(key) ?? null }))
+    });
   }
 
   /** Authorize a relation read; throws ClientAuthError(403) on denial. */
@@ -7864,7 +8052,7 @@ export class NetGatewayDO {
 
   private relationMembers(relation: string, owner: string): Array<{ member: string; member_scope?: string; body?: unknown }> {
     return sqlRows<{ member: string; member_scope: string | null; body: string | null }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT member, member_scope, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
         relation,
         owner
@@ -7887,7 +8075,7 @@ export class NetGatewayDO {
     member: string
   ): { member: string; member_scope?: string; body?: unknown } | undefined {
     const row = sqlRows<{ member: string; member_scope: string | null; body: string | null }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT member, member_scope, body FROM net_gateway_relation WHERE relation = ? AND owner = ? AND member = ? LIMIT 1",
         relation,
         owner,
@@ -7933,7 +8121,7 @@ export class NetGatewayDO {
       }));
     }
     const rows: RelationRow[] = sqlRows<{ member: string; body: string | null }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ?",
         SESSION_PRESENCE_RELATION,
         owner
@@ -8639,7 +8827,7 @@ export class NetGatewayDO {
    * recorded reply on, so past it there is nothing left to route back to. */
   private pinRecord(idempotencyKey: string): { scope: string; guaranteed: boolean } | null {
     const rows = sqlRows<{ scope: string; guaranteed: number | null }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         // A NULL lease is a legacy row, and legacy reads as LIVE: honouring a
         // route we can no longer date is the harmless direction (a pin
         // outliving its reply costs nothing), while treating it as expired
@@ -8664,7 +8852,7 @@ export class NetGatewayDO {
   /** Unexpired guaranteed pins held by this shard. */
   private guaranteedPinCount(now: number): number {
     const held = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 1 AND (expires_at IS NULL OR expires_at > ?)",
         now
       )
@@ -8750,12 +8938,12 @@ export class NetGatewayDO {
    */
   private pinScope(idempotencyKey: string, scope: string, guaranteed: boolean): "pinned" | "capacity" {
     const now = Date.now();
-    this.state.storage.sql.exec("DELETE FROM net_gateway_pin WHERE expires_at <= ?", now);
+    this.sql.exec("DELETE FROM net_gateway_pin WHERE expires_at <= ?", now);
     const transient = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 0")
+      this.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin WHERE guaranteed = 0")
     )[0];
     if (transient && Number(transient.n) > GATEWAY_TRANSIENT_PIN_CAPACITY) {
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "DELETE FROM net_gateway_pin WHERE guaranteed = 0 AND rowid NOT IN " +
           "(SELECT rowid FROM net_gateway_pin WHERE guaranteed = 0 ORDER BY rowid DESC LIMIT ?)",
         GATEWAY_TRANSIENT_PIN_CAPACITY
@@ -8768,7 +8956,7 @@ export class NetGatewayDO {
         return "capacity";
       }
     }
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_pin (idempotency_key, scope, expires_at, guaranteed) VALUES (?, ?, ?, ?) " +
         "ON CONFLICT(idempotency_key) DO NOTHING",
       idempotencyKey,
@@ -8785,7 +8973,7 @@ export class NetGatewayDO {
   private mcpWatermarkScopeSet(): Set<string> {
     if (this.mcpWatermarkScopesLoaded) return this.mcpWatermarkScopes;
     for (const row of sqlRows<{ scope: string }>(
-      this.state.storage.sql.exec("SELECT DISTINCT scope FROM net_gateway_mcp_watermark")
+      this.sql.exec("SELECT DISTINCT scope FROM net_gateway_mcp_watermark")
     )) {
       this.mcpWatermarkScopes.add(row.scope);
     }
@@ -8826,7 +9014,7 @@ export class NetGatewayDO {
     if (!this.mcpWatermarkScopeSet().has(scope)) return;
     const next = (this.liveSeen.get(scope) ?? 0) + 1;
     this.liveSeen.set(scope, next);
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq, live_seq) VALUES (?, 0, 0, ?) "
       + "ON CONFLICT(scope) DO UPDATE SET live_seq = MAX(live_seq, excluded.live_seq)",
       scope,
@@ -8846,7 +9034,7 @@ export class NetGatewayDO {
     const scope = this.mcpDeliveryScope(actor, session);
     if (scope === null) return; // placeless / unclassifiable: nothing to vouch for
     this.mcpWatermarkScopeSet().add(scope);
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_mcp_watermark (session, scope, delivery_seq, live_seq, ts) VALUES (?, ?, ?, ?, ?) "
       + "ON CONFLICT(session) DO UPDATE SET scope = excluded.scope, delivery_seq = excluded.delivery_seq, "
       + "live_seq = excluded.live_seq, ts = excluded.ts",
@@ -8863,10 +9051,10 @@ export class NetGatewayDO {
     this.mcpWatermarkWrites += 1;
     if (this.mcpWatermarkWrites % MCP_WATERMARK_SWEEP_INTERVAL !== 0) return;
     const count = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_mcp_watermark")
+      this.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_mcp_watermark")
     )[0];
     if (count && Number(count.n) > GATEWAY_WATERMARK_LIMIT) {
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "DELETE FROM net_gateway_mcp_watermark WHERE rowid NOT IN "
         + "(SELECT rowid FROM net_gateway_mcp_watermark ORDER BY ts DESC LIMIT ?)",
         GATEWAY_WATERMARK_LIMIT
@@ -8884,7 +9072,7 @@ export class NetGatewayDO {
    * bound on what this gateway can know after losing its queue. */
   private mcpContinuityProven(session: string, actor: string): boolean {
     const row = sqlRows<{ scope: string; delivery_seq: number; live_seq: number }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT scope, delivery_seq, live_seq FROM net_gateway_mcp_watermark WHERE session = ?",
         session
       )
@@ -8900,7 +9088,7 @@ export class NetGatewayDO {
    * receipt remains resident on this session-routed gateway. */
   private closedSessionActor(session: string): string | null {
     const rows = sqlRows<{ actor: string }>(
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "SELECT actor FROM net_gateway_session_close_receipt WHERE session = ?",
         session
       )
@@ -8915,16 +9103,16 @@ export class NetGatewayDO {
    * just like a reply cache. Once pruned, an ancient replay returns the normal
    * missing-bearer refusal; no authority fact is reconstructed from it. */
   private recordSessionCloseReceipt(session: string, actor: string): void {
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_session_close_receipt (session, actor) VALUES (?, ?) ON CONFLICT(session) DO UPDATE SET actor = excluded.actor",
       session,
       actor
     );
     const count = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_session_close_receipt")
+      this.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_session_close_receipt")
     )[0];
     if (count && Number(count.n) > GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT) {
-      this.state.storage.sql.exec(
+      this.sql.exec(
         "DELETE FROM net_gateway_session_close_receipt WHERE rowid NOT IN (SELECT rowid FROM net_gateway_session_close_receipt ORDER BY rowid DESC LIMIT ?)",
         GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT
       );
@@ -10047,7 +10235,7 @@ export class NetGatewayDO {
   ): void {
     const present = this.installTransferredCells(view, cells, scope, installedProvenance);
     const owned = sqlRows<{ key: string }>(
-      this.state.storage.sql.exec("SELECT key FROM net_gateway_cell WHERE owner_scope = ?", scope)
+      this.sql.exec("SELECT key FROM net_gateway_cell WHERE owner_scope = ?", scope)
     );
     for (const { key } of owned) {
       if (present.has(key)) continue;
@@ -10064,7 +10252,7 @@ export class NetGatewayDO {
     if (seq <= last) return;
     // SQL first, memory second: if the durable write throws, memory has
     // not moved (memory-follows-durable, fix 3 discipline).
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
       scope,
       seq
@@ -10082,7 +10270,7 @@ export class NetGatewayDO {
     this.ensureView(); // Hydrates the durable high-water maps before max().
     const last = this.deliverySeen.get(scope) ?? 0;
     if (seq <= last) return;
-    this.state.storage.sql.exec(
+    this.sql.exec(
       "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq) VALUES (?, 0, ?) ON CONFLICT(scope) DO UPDATE SET delivery_seen_seq = MAX(delivery_seen_seq, excluded.delivery_seen_seq)",
       scope,
       seq
@@ -10124,6 +10312,20 @@ export class NetGatewayDO {
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
     const completeBefore = this.completeHeads.get(body.scope);
+    // An exact client read may have crossed older rows already queued on this
+    // subscriber lane. Filter only the fenced keys; the body itself must
+    // still advance delivery/authority continuity and deliver observations.
+    const floorAllows = (key: string): boolean => {
+      const floor = this.cellAuthorityFloors.get(key);
+      return floor === undefined || floor.scope !== body.scope || body.seq > floor.seq;
+    };
+    const fanoutCells = body.cells.filter((cell) => floorAllows(cell.key));
+    const fanoutRemovedCells = (body.removed_cells ?? []).filter(floorAllows);
+    const stateBody: FanoutBody = {
+      ...body,
+      cells: fanoutCells,
+      ...(body.removed_cells !== undefined ? { removed_cells: fanoutRemovedCells } : {})
+    };
     // Delivery continuity is per subscriber lane, not per authority head:
     // an authority event can validly produce no row for this destination.
     // Unstamped bodies are accepted for rolling-upgrade compatibility.
@@ -10144,13 +10346,13 @@ export class NetGatewayDO {
     }
     const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        const advanced = applyFanout(view, this.seen, body);
+        const advanced = applyFanout(view, this.seen, stateBody);
         if (body.delivery_seq !== undefined && body.delivery_seq > lastDelivery) {
           this.deliverySeen.set(body.scope, body.delivery_seq);
         }
         if (advanced) {
           const classifier = this.viewClassifier(view);
-          for (const cell of body.cells) {
+          for (const cell of fanoutCells) {
             this.invalidateRoomPresentationActor(cell);
             const ownerScope = this.transferredCellOwnerScope(cell, body.scope, classifier);
             if (ownerScope === null) {
@@ -10160,9 +10362,14 @@ export class NetGatewayDO {
               this.persistCell(view, cell.key, ownerScope);
             }
           }
-          for (const key of body.removed_cells ?? []) {
+          for (const key of fanoutRemovedCells) {
             this.invalidateRoomPresentationActorKey(key);
             this.persistCell(view, key);
+          }
+          // A strictly newer event becomes the ordinary source of truth for
+          // each touched key; its one-off exact-read fence is no longer needed.
+          for (const key of [...body.cells.map((cell) => cell.key), ...(body.removed_cells ?? [])]) {
+            this.retireCellAuthorityFloor(key, body.scope, body.seq);
           }
           // CO13: relation deltas ride the same body and the same seq
           // gate — a redelivered body no-ops above (applyFanout), so the
@@ -10174,7 +10381,7 @@ export class NetGatewayDO {
         // A pull may already have superseded this row's authority state,
         // but receiving it still advances outbox continuity. Persist both
         // high-waters together so a crash cannot manufacture a later gap.
-        this.state.storage.sql.exec(
+        this.sql.exec(
           "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq) VALUES (?, ?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = MAX(seen_seq, excluded.seen_seq), delivery_seen_seq = MAX(delivery_seen_seq, excluded.delivery_seen_seq)",
           body.scope,
           this.seen.get(body.scope) ?? 0,
@@ -10227,10 +10434,10 @@ export class NetGatewayDO {
   private replaceScopeRelations(scope: string, rows: readonly RelationRow[]): void {
     const present = new Set(rows.map((row) => relationKey(row.relation, row.owner, row.member)));
     const owned = sqlRows<{ key: string }>(
-      this.state.storage.sql.exec("SELECT key FROM net_gateway_relation WHERE owner_scope = ?", scope)
+      this.sql.exec("SELECT key FROM net_gateway_relation WHERE owner_scope = ?", scope)
     );
     for (const { key } of owned) {
-      if (!present.has(key)) this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+      if (!present.has(key)) this.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
     }
     for (const row of rows) this.applyRelationDelta({ op: "add", row }, scope);
   }
@@ -10242,8 +10449,14 @@ export class NetGatewayDO {
   private applyRelationDelta(delta: RelationDelta, sourceScope: string): void {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
-      this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope, member_scope) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope, member_scope = excluded.member_scope",
+      // Relation producers may conservatively repeat an existing membership.
+      // With four secondary indexes, rewriting an identical row is especially
+      // expensive under Cloudflare's physical-row billing. The conflict WHERE
+      // preserves idempotency while making an identical add a zero-row write.
+      this.sql.exec(
+        "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope, member_scope) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope, member_scope = excluded.member_scope " +
+          "WHERE body IS NOT excluded.body OR owner_scope IS NOT excluded.owner_scope OR member_scope IS NOT excluded.member_scope",
         key,
         delta.row.relation,
         delta.row.owner,
@@ -10253,7 +10466,7 @@ export class NetGatewayDO {
         delta.row.member_scope ?? null
       );
     } else {
-      this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+      this.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
     }
   }
 
@@ -10291,6 +10504,7 @@ export class NetGatewayDO {
     const discard = (): void => {
       this.view = null;
       this.seen.clear();
+      this.cellAuthorityFloors.clear();
       this.deliverySeen.clear();
       this.liveSeen.clear();
     };
@@ -10313,18 +10527,77 @@ export class NetGatewayDO {
   private ensureView(): CellStore {
     if (this.view) return this.view;
     const view = new CellStore("derived");
-    for (const row of sqlRows<{ body: string }>(this.state.storage.sql.exec("SELECT body FROM net_gateway_cell"))) {
+    for (const row of sqlRows<{ body: string }>(this.sql.exec("SELECT body FROM net_gateway_cell"))) {
       view.install(JSON.parse(row.body) as Cell);
     }
     for (const row of sqlRows<{ scope: string; seen_seq: number; delivery_seen_seq: number; live_seq: number } & ScopeRow>(
-      this.state.storage.sql.exec("SELECT scope, seen_seq, delivery_seen_seq, live_seq FROM net_gateway_scope")
+      this.sql.exec("SELECT scope, seen_seq, delivery_seen_seq, live_seq FROM net_gateway_scope")
     )) {
       this.seen.set(row.scope, row.seen_seq);
       this.deliverySeen.set(row.scope, row.delivery_seen_seq);
       this.liveSeen.set(row.scope, Number(row.live_seq ?? 0));
     }
+    for (const row of sqlRows<{ key: string; owner_scope: string; authority_seq: number }>(
+      this.sql.exec("SELECT key, owner_scope, authority_seq FROM net_gateway_cell_floor")
+    )) {
+      this.cellAuthorityFloors.set(row.key, { scope: row.owner_scope, seq: row.authority_seq });
+    }
     this.view = view;
     return view;
+  }
+
+  /** Record an exact-read fence for a present or absent key. The map mutates
+   * only inside the caller's SQLite transaction; discardViewOnThrow clears it
+   * with the view if persistence aborts. Authority sequences are local to one
+   * scope: a move therefore replaces, rather than maximizes, the old floor. */
+  private recordCellAuthorityFloor(key: string, scope: string, seq: number): void {
+    const prior = this.cellAuthorityFloors.get(key);
+    if (prior?.scope === scope && seq <= prior.seq) return;
+    this.sql.exec(
+      "INSERT INTO net_gateway_cell_floor (key, owner_scope, authority_seq) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET owner_scope = excluded.owner_scope, " +
+        "authority_seq = CASE WHEN net_gateway_cell_floor.owner_scope = excluded.owner_scope " +
+        "THEN MAX(net_gateway_cell_floor.authority_seq, excluded.authority_seq) ELSE excluded.authority_seq END " +
+        "WHERE net_gateway_cell_floor.owner_scope IS NOT excluded.owner_scope " +
+        "OR net_gateway_cell_floor.authority_seq < excluded.authority_seq",
+      key,
+      scope,
+      seq
+    );
+    this.cellAuthorityFloors.set(key, { scope, seq });
+    this.cellAuthorityFloorWrites += 1;
+    if (this.cellAuthorityFloorWrites >= CELL_AUTHORITY_FLOOR_SWEEP_INTERVAL) {
+      this.pruneCellAuthorityFloors();
+    }
+  }
+
+  /** Keep the durable and isolate-local floor sets aligned while evicting the
+   * oldest derived rows. A missing floor cannot hide authority state; it only
+   * permits the next delayed fanout to behave as it did before exact reads. */
+  private pruneCellAuthorityFloors(): void {
+    const evicted = sqlRows<{ key: string }>(this.sql.exec(
+      "SELECT key FROM net_gateway_cell_floor WHERE rowid NOT IN " +
+        "(SELECT rowid FROM net_gateway_cell_floor ORDER BY rowid DESC LIMIT ?)",
+      GATEWAY_CELL_AUTHORITY_FLOOR_LIMIT
+    ));
+    if (evicted.length > 0) {
+      this.sql.exec(
+        "DELETE FROM net_gateway_cell_floor WHERE rowid NOT IN " +
+          "(SELECT rowid FROM net_gateway_cell_floor ORDER BY rowid DESC LIMIT ?)",
+        GATEWAY_CELL_AUTHORITY_FLOOR_LIMIT
+      );
+      for (const row of evicted) this.cellAuthorityFloors.delete(row.key);
+    }
+    this.cellAuthorityFloorWrites = 0;
+  }
+
+  /** Once ordered fanout for this exact key exceeds its authority floor, the
+   * ordinary per-scope high-water is sufficient and the extra row can retire. */
+  private retireCellAuthorityFloor(key: string, scope: string, seq: number): void {
+    const floor = this.cellAuthorityFloors.get(key);
+    if (!floor || floor.scope !== scope || seq <= floor.seq) return;
+    this.sql.exec("DELETE FROM net_gateway_cell_floor WHERE key = ?", key);
+    this.cellAuthorityFloors.delete(key);
   }
 
   /** Write-through for one view cell (installed or deleted). Inserts require
@@ -10336,14 +10609,20 @@ export class NetGatewayDO {
       if (ownerScope === undefined) {
         throw netError("E_LINEAGE", "gateway cell insert omitted owner scope", { key });
       }
-      this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope",
+      this.sql.exec(
+        // Fanout is lineage-closed, so unchanged ancestor cells legitimately
+        // ride many bodies. A plain UPSERT rewrote the base row and its
+        // owner_scope index on every delivery. Keep the compare inside SQL:
+        // it is atomic with the write and Cloudflare reports rowsWritten=0.
+        "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope " +
+          "WHERE body IS NOT excluded.body OR owner_scope IS NOT excluded.owner_scope",
         key,
         JSON.stringify(cell),
         ownerScope
       );
     } else {
-      this.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key = ?", key);
+      this.sql.exec("DELETE FROM net_gateway_cell WHERE key = ?", key);
     }
   }
 }

@@ -275,7 +275,7 @@ export async function runHoroscopeTick(
   // session cache before bubbling up — otherwise the next tick adopts the
   // same dead session and fails identically. The deliver inner-catch does
   // its own invalidation; this outer catch covers getProperty,
-  // next_pending, and the closing set_properties heartbeat (all of which
+  // next_pending, and the closing lifecycle heartbeat (all of which
   // currently propagate). Any non-E_NOSESSION error is rethrown unchanged
   // and surfaces as `tick_error` upstream.
   try {
@@ -294,11 +294,22 @@ export async function runHoroscopeTick(
   const errors: HoroscopeTickResult["errors"] = [];
   const aiFallbacks: Array<{ order_id: string; message: string }> = [];
   let delivered = 0;
+  let attemptRecorded = false;
 
   let lastSeenOrderId: string | null = null;
   for (let i = 0; i < maxOrdersPerTick; i++) {
     const next = (await client.directCall(env.BLOCK_ID, "next_pending")) as PendingOrder | null;
     if (!next || typeof next !== "object" || !next.order_id) break;
+
+    // A one-minute scheduler poll is not itself durable health evidence. Only
+    // work records a separate in-progress attempt; empty heartbeat ticks fold
+    // their attempt timestamp into record_plug_success below. This preserves
+    // crash/stall visibility for real orders without committing 1,440 pure
+    // timestamp turns per day per idle block.
+    if (!attemptRecorded) {
+      await client.directCall(env.BLOCK_ID, "record_plug_attempt", [tickNow]);
+      attemptRecorded = true;
+    }
 
     // :next_pending peeks (it does not pop). If we see the same head twice
     // in a row, the previous iteration left it on the queue (transient
@@ -394,7 +405,7 @@ export async function runHoroscopeTick(
       // Permanent verb-side rejections (bad args, perm, missing verb)
       // mean retrying with the same data will keep failing. Cancel so the
       // queue drains; the user gets nothing for this order, but at least
-      // every order behind it isn't blocked. last_error keeps the trail.
+      // every order behind it isn't blocked. Lifecycle failure state keeps the trail.
       // Anything else (E_TIMEOUT / E_INTERNAL / E_GATEWAY / 5xx /
       // transport failure / unmapped runtime errors) is treated as
       // potentially transient — leave the order on the queue and stop
@@ -434,7 +445,7 @@ export async function runHoroscopeTick(
     }
   }
 
-  // Surface AI-degraded delivery in last_error even when no :deliver call
+  // Surface AI-degraded delivery in lifecycle state even when no :deliver call
   // failed, so look_self / status reports reflect that the block is only
   // shipping fallback notes (per catalogs/horoscope/DESIGN.md). Genuine
   // :deliver errors take precedence — they're more actionable.
@@ -445,13 +456,11 @@ export async function runHoroscopeTick(
   const heartbeatAt = now();
   const previousHeartbeatAt = heartbeatCache.get(env.BLOCK_ID);
   const heartbeatDue = previousHeartbeatAt === null || heartbeatAt - previousHeartbeatAt >= heartbeatIntervalMs;
-  if (delivered > 0 || lastErrorValue !== null || heartbeatDue) {
-    await client.directCall(env.BLOCK_ID, "set_properties", [
-      {
-        last_pushed_at: heartbeatAt,
-        last_error: lastErrorValue
-      }
-    ]);
+  if (lastErrorValue !== null) {
+    await client.directCall(env.BLOCK_ID, "record_plug_failure", [lastErrorValue, {}, heartbeatAt]);
+    heartbeatCache.set(env.BLOCK_ID, heartbeatAt);
+  } else if (delivered > 0 || heartbeatDue) {
+    await client.directCall(env.BLOCK_ID, "record_plug_success", [{}, heartbeatAt]);
     heartbeatCache.set(env.BLOCK_ID, heartbeatAt);
   }
 

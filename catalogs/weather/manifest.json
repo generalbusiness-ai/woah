@@ -1,6 +1,6 @@
 {
   "name": "weather",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "spec_version": "v1",
   "description": "Weather block class — a $block subclass that displays current conditions, a 14-day daily rollup, and a column-major hourly time-series payload for chart UIs. Owner sets `place`, `timezone`, and `units`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes the bundle via apikey-bound session. Includes an `:ask` chat verb (\"ask weather today/tomorrow/yesterday/<weekday>/<M-D>\") and a durable plug-health status in `:look`.",
   "license": "MIT",
@@ -41,8 +41,11 @@
       "local_name": "$weather_block",
       "parent": "$block",
       "flags": { "fertile": true },
-      "description": "A weather display block. The owner configures `place` (a town name or zip code), `timezone` (IANA timezone for local display), and `units` (\"metric\" or \"imperial\"). The plug sends `place` to the upstream API as configured and pushes three internally-consistent props in one bundle: `current` (small flat map with the headline temperature, humidity, weather code, and observed-time strings — read by chat verbs and the badge), `daily` (14 entries spanning the past week through the next week, each carrying min/max/mean rollups per metric — read by chat verbs that summarize the week), and `timeseries` (a column-major ±7-day hourly payload sized for chart UIs, with one homogeneous array per field — read by the detail chart, never by chat verbs). `last_pushed_at` and `last_error` ride the standard $block writable_self surface so :look surfaces freshness.",
+      "description": "A weather display block. The owner configures `place` (a town name or zip code), `timezone` (IANA timezone for local display), and `units` (\"metric\" or \"imperial\"). The plug sends `place` to the upstream API as configured and pushes three internally-consistent props in one lifecycle-recorded bundle: `current` (small flat map with the headline temperature, humidity, weather code, and observed-time strings — read by chat verbs and the badge), `daily` (14 entries spanning the past week through the next week, each carrying min/max/mean rollups per metric — read by chat verbs that summarize the week), and `timeseries` (a column-major ±7-day hourly payload sized for chart UIs, with one homogeneous array per field — read by the detail chart, never by chat verbs). The standard $block lifecycle fields make freshness, attempts, failures, and recovery visible through :plug_status and :look.",
       "properties": [
+        { "name": "plug_label", "type": "str", "default": "Weather", "perms": "r" },
+        { "name": "plug_expected_interval_ms", "type": "int", "default": 3600000, "perms": "r" },
+        { "name": "plug_stale_after_ms", "type": "int", "default": 7200000, "perms": "r" },
         { "name": "place", "type": "str", "default": "", "perms": "r" },
         { "name": "timezone", "type": "str", "default": "", "perms": "r" },
         { "name": "units", "type": "str", "default": "metric", "perms": "r" },
@@ -51,7 +54,7 @@
         { "name": "timeseries", "type": "map", "default": {}, "perms": "r" },
         { "name": "config_state", "type": "map", "default": { "status": "unconfigured", "message": "owner has not configured location and timezone" }, "perms": "r" },
         { "name": "writable_owner", "type": "list<str>", "default": ["place", "timezone", "units"], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"], "perms": "r" }
+        { "name": "writable_self", "type": "list<str>", "default": ["last_attempt_at", "last_pushed_at", "last_failure_at", "consecutive_failures", "last_error", "current", "daily", "timeseries", "config_state"], "perms": "r" }
       ],
       "verbs": [
         {
@@ -177,12 +180,20 @@
           "source": "verb :format_day_line(entry, label) rxd { let place = this:display_location(); let lab = \"that day\"; if (typeof(label) == \"string\" && label != \"\") { lab = label; } let temp = null; if (typeof(entry) == \"map\" && has(entry, \"temperature\")) { temp = entry[\"temperature\"]; } let unit = \"\"; if (typeof(temp) == \"map\" && has(temp, \"unit\") && typeof(temp[\"unit\"]) == \"string\") { unit = temp[\"unit\"]; } let mn = \"\"; let mx = \"\"; if (typeof(temp) == \"map\" && has(temp, \"min\") && temp[\"min\"] != null) { mn = to_string(temp[\"min\"]) + unit; } if (typeof(temp) == \"map\" && has(temp, \"max\") && temp[\"max\"] != null) { mx = to_string(temp[\"max\"]) + unit; } let body = \"no temperature data\"; if (mn != \"\" && mx != \"\") { body = mn + \" to \" + mx; } else if (mx != \"\") { body = \"high \" + mx; } else if (mn != \"\") { body = \"low \" + mn; } let precip = \"\"; if (typeof(entry) == \"map\" && has(entry, \"precip_total\") && entry[\"precip_total\"] != null && entry[\"precip_total\"] > 0) { let pu = \"\"; if (has(entry, \"precip_unit\") && typeof(entry[\"precip_unit\"]) == \"string\") { pu = entry[\"precip_unit\"]; } precip = \", precip \" + to_string(entry[\"precip_total\"]) + pu; } let date_part = \"\"; if (typeof(entry) == \"map\" && has(entry, \"date\") && typeof(entry[\"date\"]) == \"string\") { date_part = \" (\" + entry[\"date\"] + \")\"; } return \"Weather \" + lab + date_part + \" in \" + place + \": \" + body + precip; }"
         },
         {
-          "name": "plug_status",
+          "name": "plug_last_success_at",
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :plug_status() rxd { let pushed = this.last_pushed_at; let updated = pushed; let current = this.current; if ((typeof(updated) != \"number\" || updated <= 0) && typeof(current) == \"map\" && has(current, \"observed_at\") && typeof(current[\"observed_at\"]) == \"number\" && current[\"observed_at\"] > 0) { updated = current[\"observed_at\"]; } let age = null; if (typeof(updated) == \"number\" && updated > 0) { age = now() - updated; if (age < 0) { age = 0; } } let config = this.config_state; let config_status = \"\"; if (typeof(config) == \"map\" && has(config, \"status\") && typeof(config[\"status\"]) == \"string\") { config_status = config[\"status\"]; } if (config_status == \"error\" || this.last_error) { return { state: \"error\", message: \"Weather plug status: error.\", last_pushed_at: pushed, last_success_at: updated, age_ms: age }; } if (config_status == \"pending\") { return { state: \"pending\", message: \"Weather plug status: waiting for the next update to confirm configuration.\", last_pushed_at: pushed, last_success_at: updated, age_ms: age }; } if (age == null) { return { state: \"never\", message: \"Weather plug status: no successful update yet.\", last_pushed_at: pushed, last_success_at: null, age_ms: null }; } /* STALE_AFTER_MS=7200000 is two hourly cron intervals; keep aligned with plug/wrangler.toml and DESIGN.md. */ if (age > 7200000) { return { state: \"stale\", message: \"Weather plug status: stale; the last successful update is older than two hours.\", last_pushed_at: pushed, last_success_at: updated, age_ms: age }; } return { state: \"healthy\", message: \"Weather plug status: healthy.\", last_pushed_at: pushed, last_success_at: updated, age_ms: age }; }"
+          "source": "verb :plug_last_success_at() rxd { if (typeof(this.last_pushed_at) == \"number\" && this.last_pushed_at > 0) { return this.last_pushed_at; } let current = this.current; if (typeof(current) == \"map\" && has(current, \"observed_at\") && typeof(current[\"observed_at\"]) == \"number\" && current[\"observed_at\"] > 0) { return current[\"observed_at\"]; } return null; }"
+        },
+        {
+          "name": "plug_status_hint",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :plug_status_hint() rxd { let config = this.config_state; if (typeof(config) != \"map\" || !has(config, \"status\")) { return null; } if (config[\"status\"] == \"error\") { return { state: \"error\", message: \"Weather plug status: configuration error.\" }; } if (config[\"status\"] == \"pending\") { return { state: \"pending\", message: \"Weather plug status: waiting for the next update to confirm configuration.\" }; } return null; }"
         },
         {
           "name": "look_self",

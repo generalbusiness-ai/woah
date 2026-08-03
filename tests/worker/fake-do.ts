@@ -6,7 +6,12 @@ export type FakeSqlExecLogEntry = {
 };
 
 export class FakeSqlCursor {
-  constructor(private readonly rows: Record<string, unknown>[]) {}
+  constructor(
+    private readonly rows: Record<string, unknown>[],
+    /** Node SQLite does not expose index-row writes. `changes` still models
+     * the critical zero-vs-write contract used by gateway cost tests. */
+    readonly rowsWritten = 0
+  ) {}
 
   toArray(): Record<string, unknown>[] {
     return this.rows;
@@ -30,8 +35,12 @@ export class FakeSqlStorage {
       return new FakeSqlCursor(stmt.all(...(params as any[])) as Record<string, unknown>[]);
     }
     const result = stmt.run(...(params as any[])) as { changes?: number };
-    this.execLog.push({ query, changes: Number(result.changes ?? 0) });
-    return new FakeSqlCursor([]);
+    // sqlite3_changes() is not reset by DDL. Treat only row-DML as a
+    // measured write so a CREATE following an INSERT cannot inherit the
+    // prior INSERT's count in the fake.
+    const changes = /^(?:INSERT|UPDATE|DELETE|REPLACE)\b/.test(head ?? "") ? Number(result.changes ?? 0) : 0;
+    this.execLog.push({ query, changes });
+    return new FakeSqlCursor([], changes);
   }
 }
 
@@ -166,4 +175,3 @@ export class FakeDurableObjectNamespace {
     };
   }
 }
-

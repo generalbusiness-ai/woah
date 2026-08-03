@@ -250,6 +250,7 @@ async function buildHarness(options: { credentialTtlMs?: string } = {}) {
   };
   return {
     gateway,
+    gatewayState,
     actor,
     other,
     roomScope,
@@ -687,6 +688,20 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const bytecode = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=${encodeURIComponent("verb_bytecode:capi_box:bump")}`, { token });
     expect(bytecode.status).toBe(403);
 
+    // The authoritative batch applies the same deny-by-default gate before
+    // any authority RPC, and bounds request amplification.
+    const protectedBatch = await clientFetch(h.gateway, "POST", "/net-api/cells", {
+      token,
+      body: { session: sid, keys: ["object_live:capi_box", "property_cell:$system:api_keys"] }
+    });
+    expect(protectedBatch.status).toBe(403);
+    const oversizedBatch = await clientFetch(h.gateway, "POST", "/net-api/cells", {
+      token,
+      body: { session: sid, keys: Array.from({ length: 33 }, (_, index) => `property_cell:capi_box:p${index}`) }
+    });
+    expect(oversizedBatch.status).toBe(400);
+    expect(oversizedBatch.body).toMatchObject({ error: { code: "E_INVARG" } });
+
     // ALLOW: the caller's own actor cell.
     const own = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=${encodeURIComponent("object_live:" + h.actor)}`, { token });
     expect(own.status, JSON.stringify(own.body)).toBe(200);
@@ -710,6 +725,102 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(noSession.body.error).toMatchObject({ detail: { reason: "session_required" } });
 
     await h.close();
+  });
+
+  it("authoritatively refreshes present-but-stale exact cells without suppressing older fanout observations", async () => {
+    const h = await buildHarness();
+    try {
+      const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+      const opened = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+      expect(opened.status, JSON.stringify(opened.body)).toBe(200);
+      const sid = String(opened.body.session);
+      const counterKey = "property_cell:capi_box:counter";
+
+      const first = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "capi_box", verb: "bump", session: sid }
+      });
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      const staleRead = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/cell?session=${encodeURIComponent(sid)}&key=${encodeURIComponent(counterKey)}`,
+        { token }
+      );
+      const staleCell = staleRead.body.cell as any;
+      expect(staleCell.value.value).toBe(1);
+
+      const second = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "capi_box", verb: "bump", session: sid }
+      });
+      expect(second.status, JSON.stringify(second.body)).toBe(200);
+      expect(second.body.result).toBe(2);
+
+      // Recreate the production failure shape: lineage says the object is
+      // warm, but one persisted property cell predates the authority. Lower
+      // the synthetic fanout high-water so the delayed-row assertion below
+      // proves the per-key floor, not the ordinary scope redelivery gate.
+      const internals = h.gateway as unknown as {
+        ensureView(): { install(cell: unknown): void; get(key: string): unknown };
+        persistCell(view: unknown, key: string, ownerScope: string): void;
+        seen: Map<string, number>;
+        receiveFanout(body: unknown): boolean;
+      };
+      const view = internals.ensureView();
+      view.install(staleCell);
+      internals.persistCell(view, counterKey, h.roomScope);
+      internals.seen.set(h.roomScope, 0);
+      h.gatewayState.state.storage.sql.exec(
+        "UPDATE net_gateway_scope SET seen_seq = 0 WHERE scope = ?",
+        h.roomScope
+      );
+
+      const authoritative = await clientFetch(h.gateway, "POST", "/net-api/cells", {
+        token,
+        body: {
+          session: sid,
+          keys: ["object_lineage:capi_box", "object_live:capi_box", counterKey]
+        }
+      });
+      expect(authoritative.status, JSON.stringify(authoritative.body)).toBe(200);
+      const rows = authoritative.body.cells as Array<{ key: string; cell: any }>;
+      expect(rows.find((row) => row.key === counterKey)?.cell.value.value).toBe(2);
+
+      const floor = (h.gatewayState.state.storage.sql.exec(
+        "SELECT authority_seq FROM net_gateway_cell_floor WHERE key = ?",
+        counterKey
+      ) as { toArray(): Array<{ authority_seq: number }> }).toArray()[0];
+      expect(Number(floor.authority_seq)).toBeGreaterThan(0);
+      const delayedSeq = Math.max(1, Number(floor.authority_seq) - 1);
+      // Deferred delivery from the second turn is allowed to settle while the
+      // exact closure awaits. Rewind only this synthetic receiver watermark so
+      // the delayed carrier below reaches the per-key floor branch.
+      internals.seen.set(h.roomScope, 0);
+      h.gatewayState.state.storage.sql.exec(
+        "UPDATE net_gateway_scope SET seen_seq = 0 WHERE scope = ?",
+        h.roomScope
+      );
+      const advanced = internals.receiveFanout({
+        scope: h.roomScope,
+        seq: delayedSeq,
+        cells: [staleCell],
+        observations: [{ type: "delayed_probe" }],
+        relations: []
+      });
+      // The carrier is accepted (so its observation path is not suppressed),
+      // while the stale cell itself remains fenced by the exact-read floor.
+      expect(advanced).toBe(true);
+      const afterDelayed = await clientFetch(
+        h.gateway,
+        "GET",
+        `/net-api/cell?session=${encodeURIComponent(sid)}&key=${encodeURIComponent(counterKey)}`,
+        { token }
+      );
+      expect((afterDelayed.body.cell as any).value.value).toBe(2);
+    } finally {
+      await h.close();
+    }
   });
 
   it("accepts bounded browser diagnostics on the net namespace without trusting payload identity", async () => {

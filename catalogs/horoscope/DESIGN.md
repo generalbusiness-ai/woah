@@ -32,9 +32,15 @@ The Worker authenticates as the block actor, then:
 This split is an authority boundary, not transport ceremony: generated prose
 belongs to the artifact and never appears in the durable room transcript.
 
-Queue state is never exposed as a writable block property. `last_pushed_at` and
-`last_error` remain direct plug-writable diagnostics because they describe
-external service health, not work coordination.
+Queue state is never exposed as a writable block property. The inherited block
+lifecycle fields remain plug-writable diagnostics because they describe
+external service health, not work coordination. The plug records an attempt
+when it discovers pending work, before AI or delivery, then records success or
+failure atomically. Empty scheduler polls write nothing until the heartbeat is
+due; `record_plug_success` then records both attempt and success timestamps in
+one turn. Horoscope declares a 15-minute expected heartbeat and a 45-minute
+stale window; its `look_self` includes the inherited structured `plug_status`
+beside the projection-backed pending count.
 
 AI failures produce a bounded fallback note so one poisoned generation cannot
 stall the queue. Permanent delivery errors cancel the order; transient errors
