@@ -2025,7 +2025,7 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("pinboard-look-plan", session.actor, "the_pinboard", "command_plan", ["look"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") {
-      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look", args: [] });
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look_here", args: [] });
     }
     const looked = await world.directCall("pinboard-look", session.actor, "the_pinboard", "look", []);
     expect(looked.op).toBe("result");
@@ -4059,7 +4059,11 @@ describe("local catalogs", () => {
   it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 30000 }, async () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", []);
-    const look = world.ownVerb("$conversational", "look")!;
+    // Name the verb EXACTLY. `ownVerb` resolves by alias too, so asking for
+    // "look" here used to return whichever chat page happened to answer to
+    // that word — a moving target once `$conversational:look` was retired and
+    // `look_here`/`look_at` both claimed the alias.
+    const look = world.ownVerbExact("$conversational", "look_at")!;
     world.addVerb("$conversational", {
       kind: "native",
       name: look.name,
@@ -4099,9 +4103,12 @@ describe("local catalogs", () => {
     expect(migratedEnter?.kind).toBe("bytecode");
       expect(migratedEnter?.source).toContain("moveto(actor, this)");
       expect(migratedEnter?.source).not.toContain("set_presence");
-    const migratedLook = world.ownVerb("$conversational", "look");
+    const migratedLook = world.ownVerbExact("$conversational", "look_at");
     expect(migratedLook?.kind).toBe("bytecode");
-    expect(migratedLook?.source).toContain("look_at");
+    expect(migratedLook?.source).toContain("look_self");
+    // The retired per-class dispatcher must not come back: repair sources the
+    // current manifest, which no longer declares it.
+    expect(world.ownVerbExact("$conversational", "look")).toBeNull();
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-source-catalog-verbs");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-catalog-placement-metadata");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-room-look-self");
@@ -4222,12 +4229,13 @@ describe("local catalogs", () => {
       return result.op === "result" ? (result.result as Record<string, unknown>) : null;
     };
 
-    // Bare `look` is answered by the seed dispatcher's own command pattern —
-    // `dobj`/`prep`/`iobj` all `none` — resolved on the actor's space, which
-    // renders itself. `look <target>` is the catalog's `look_at`, which owns
-    // object matching. Two closed patterns, no overlap.
-    expect(await plan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look", args: [] });
-    expect(await plan("l")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look", args: [] });
+    // Both command words belong to the catalog: `look_here` for the bare form
+    // (`dobj`/`prep`/`iobj` all `none`, delegating to the space's own `:look`)
+    // and `look_at` for `look <target>`. The substrate's `$root:look` is
+    // `parse: false` — an object method only, never a command entry. Two
+    // closed patterns, no overlap.
+    expect(await plan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_here", args: [] });
+    expect(await plan("l")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_here", args: [] });
     expect(await plan("look mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
     expect(await plan("examine mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
 
@@ -4267,7 +4275,7 @@ describe("local catalogs", () => {
     const inside = await world.directCall("plan-inside", "guest_1", "the_outline", "command_plan", ["look"]);
     expect(inside.op).toBe("result");
     if (inside.op === "result") {
-      expect(inside.result).toMatchObject({ ok: true, target: "the_outline", verb: "look", args: [] });
+      expect(inside.result).toMatchObject({ ok: true, target: "the_outline", verb: "look_here", args: [] });
     }
   });
 

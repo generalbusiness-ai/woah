@@ -26,10 +26,10 @@ Returns the target's `description` plus whatever rich introspection its
 class adds (a `$note` adds its title and preview; a `$block` adds its
 current data and freshness; the cockatoo adds its mood).
 
-Bare `look` and `look <target>` are the same command — with no target it
-describes the room you are standing in. Every object answers the same
-`look`, wherever it sits in the class tree; what differs between a mug, a
-room and a person is how each one renders itself.
+Bare `look` describes the room you are standing in; `look <target>`
+describes that target. Every object answers the same `look`, wherever it
+sits in the class tree; what differs between a mug, a room and a person is
+how each one renders itself.
 
 For agents:
 

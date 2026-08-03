@@ -1178,14 +1178,37 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     try {
       const aged = harness.world;
 
-      // Age the world in both dimensions the runtime looks at: replant the
-      // retired seed page, replant one catalog's `look` override, and wind
-      // that catalog's recorded version back behind the bundle so the major
-      // edge is a real edge rather than an already-applied no-op.
+      // Every look retirement this branch ships, on one aged world. Each entry
+      // is (class, catalog, version-to-rewind-to) — the version must land one
+      // MAJOR behind the bundle so the §CT14 edge is a real edge rather than an
+      // already-applied no-op. Derived from the migration files themselves:
+      // block/chat/demoworld/prog v0->v1, pinboard v1->v2, outliner v3->v4.
+      const retired = [
+        { klass: "$block", catalog: "block", from: "0.1.0" },
+        { klass: "$conversational", catalog: "chat", from: "0.2.15" },
+        { klass: "$cockatoo", catalog: "demoworld", from: "0.2.0" },
+        { klass: "$outliner", catalog: "outliner", from: "3.0.1" },
+        { klass: "$pinboard", catalog: "pinboard", from: "1.0.1" },
+        { klass: "$builder", catalog: "prog", from: "0.4.0" },
+        { klass: "$programmer", catalog: "prog", from: "0.4.0" },
+        { klass: "$generic_editor", catalog: "prog", from: "0.4.0" }
+      ] as const;
+      const rewound = new Map<string, string>(retired.map((entry) => [entry.catalog, entry.from]));
+
+      // Age the world in both dimensions the runtime looks at: replant every
+      // retired page, and wind each owning catalog back behind the bundle.
+      for (const entry of retired) {
+        expect(
+          installVerb(aged, entry.klass, "look", "verb :look() rxd { return { legacy: true }; }", null).ok,
+          entry.klass
+        ).toBe(true);
+      }
       expect(installVerb(aged, "$thing", "look", "verb :look() rxd { return this:look_self(); }", null).ok).toBe(true);
-      expect(installVerb(aged, "$cockatoo", "look", "verb :look() rxd { return { legacy: true }; }", null).ok).toBe(true);
       const installed = (aged.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
-        .map((record) => (record.alias === "demoworld" ? { ...record, version: "0.2.0" } : record));
+        .map((record) => {
+          const back = rewound.get(String(record.alias));
+          return back ? { ...record, version: back } : record;
+        });
       aged.setProp("$catalog_registry", "installed_catalogs", installed as never);
       aged.setProp("$system", "catalog_migration_records", [] as never);
       aged.setProp(
@@ -1196,39 +1219,65 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       );
 
       // The fixture really is aged, or the assertions below prove nothing:
-      // both replanted pages currently WIN, each shadowing $root:look for its
-      // own subtree. That shadowing is the whole reason they must be dropped.
+      // every replanted page currently WINS over $root:look for its own
+      // subtree. That shadowing is the whole reason they must be dropped.
+      for (const entry of retired) {
+        expect(aged.ownVerbExact(entry.klass, "look"), entry.klass).toBeTruthy();
+      }
       expect(aged.verbInfo("the_lamp", "look").definer).toBe("$thing");
       expect(aged.verbInfo("the_cockatoo", "look").definer).toBe("$cockatoo");
+      expect(aged.verbInfo("the_outline", "look").definer).toBe("$outliner");
 
-      // Reopen the same file. Cold init runs the boot migration and the
+      // Reopen the same file. Cold init runs the boot migration and each
       // bundled major-version upgrade against state that came off disk.
       const reopened = harness.restart();
 
+      for (const entry of retired) {
+        expect(reopened.ownVerbExact(entry.klass, "look"), `${entry.catalog}:${entry.klass}`).toBeNull();
+      }
       expect(reopened.ownVerbExact("$thing", "look")).toBeNull();
-      expect(reopened.ownVerbExact("$cockatoo", "look")).toBeNull();
-      expect(reopened.verbInfo("the_lamp", "look").definer).toBe("$root");
-      expect(reopened.verbInfo("the_cockatoo", "look").definer).toBe("$root");
       expect(reopened.getProp("$system", "applied_migrations")).toContain("2026-07-31-retired-bootstrap-definitions");
-      const upgraded = (reopened.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
-        .find((record) => record.alias === "demoworld");
-      expect(upgraded?.version).toBe("1.0.0");
 
-      // The catalog's own view survived the drop: the cockatoo's extra fields
-      // moved into look_self, so the migration removed a dispatcher without
-      // removing behavior.
+      // Each catalog actually advanced across its major edge — a version left
+      // behind would mean the migration never ran and the drops above came
+      // from somewhere else.
+      const versions = new Map(
+        (reopened.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+          .map((record) => [String(record.alias), String(record.version)])
+      );
+      expect(versions.get("block")).toBe("1.0.0");
+      expect(versions.get("chat")).toBe("1.0.0");
+      expect(versions.get("demoworld")).toBe("1.0.0");
+      expect(versions.get("outliner")).toBe("4.0.0");
+      expect(versions.get("pinboard")).toBe("2.0.0");
+      expect(versions.get("prog")).toBe("1.0.0");
+
+      // One dispatcher now serves every shape that had its own page.
+      for (const target of ["the_lamp", "the_cockatoo", "the_outline", "the_pinboard", "the_weather"]) {
+        expect(reopened.verbInfo(target, "look").definer, target).toBe("$root");
+      }
+
+      // The catalogs' own views survived the drops: the migrations removed
+      // dispatchers without removing behavior.
       const seen = await reopened.directCall("sqlite-cockatoo-look", "$wiz", "the_cockatoo", "look", []);
       expect(seen.op).toBe("result");
       if (seen.op === "result") {
         expect(seen.result).toMatchObject({ id: "the_cockatoo", mood: "alert" });
         expect(seen.observations.some((obs) => obs.type === "cockatoo_seen")).toBe(true);
       }
+      const outline = await reopened.directCall("sqlite-outline-look", "$wiz", "the_outline", "look", []);
+      expect(outline.op).toBe("result");
+      if (outline.op === "result") {
+        expect(outline.result).toMatchObject({ id: "the_outline", summary: "Outline has 0 items." });
+      }
 
       // Reruns are safe, and — the point of doing this on SQLite — the drops
       // stay dropped across another full close/reopen cycle.
       const again = harness.restart();
+      for (const entry of retired) {
+        expect(again.ownVerbExact(entry.klass, "look"), entry.klass).toBeNull();
+      }
       expect(again.ownVerbExact("$thing", "look")).toBeNull();
-      expect(again.ownVerbExact("$cockatoo", "look")).toBeNull();
       expect(again.verbInfo("the_lamp", "look").definer).toBe("$root");
     } finally {
       harness.cleanup();

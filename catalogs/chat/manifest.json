@@ -749,6 +749,21 @@
           "source": "verb :tell(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"tell requires text\" }; } observe({ type: \"told\", from: actor, to: recipient, text: text, ts: now() }); return true; }"
         },
         {
+          "name": "look_here",
+          "aliases": [
+            "l@ook"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "reads_room_presence": true,
+          "arg_spec": {
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
+          },
+          "source": "verb :look_here() rxd { set_task_perms(caller_perms()); return this:look(); }"
+        },
+        {
           "name": "look_at",
           "aliases": [
             "look",

@@ -88,13 +88,21 @@ transfers.
 
 | Verb | Purpose |
 |---|---|
-| `look()` | Surface map for agents — what's available here. |
 | `inspect(id, opts?)` | Structure/data view: parent, children, contents, location, flags, properties. No source. |
 | `search(query, opts?)` | Bounded search across object names and property channels. No source. |
 | `create(parent, opts?)` | New ordinary object owned by the invoking actor. `opts: {name?, description?, location?, fertile?}`. `location` defaults to **you** — a new object lands in your inventory. |
 | `chparent(id, parent, opts?)` | Reparent within owner/fertile/cycle rules. `opts.dry_run=true` checks only (LambdaCore's `@check-chparent`). |
 | `recycle(id, opts?)` | Destroy owned objects (wizard or owner). `opts.dry_run=true` reports affected objects without mutation. |
 | `set_property(id, name, value, opts?)` | Set ordinary data values. No executable source or perm metadata. |
+
+There is no `look()` here. These verbs are **worn as a feature**, not
+inherited, and a feature is consulted only after an object's parent chain —
+so a builder's own `look` could never override the one every object shares.
+LambdaCore draws the same line: `#1:examine_verbs` walks the parent chain only
+and carries a `dull_classes` list that names the builder and programmer
+classes explicitly, keeping their verbs out of that view. The listing that
+answers "what can I do?" is the MCP tool list itself, which is derived from
+what you can actually reach rather than transcribed by hand.
 
 **Chat commands:**
 

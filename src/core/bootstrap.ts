@@ -1340,20 +1340,16 @@ function seedUniversal(world: WooWorld): void {
   sourceVerb(world, "$root", "describe", ROOT_DESCRIBE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "look_self", ROOT_LOOK_SELF_SOURCE, { directCallable: true });
-  // This page serves BOTH the object-method form (what `woo_call` and the MCP
-  // tool surface dispatch) and the bare `look` command. Its command pattern is
-  // fully closed — `dobj`, `prep` and `iobj` all `none` — so it matches only a
-  // truly empty command; the target search reaches the actor's space, which
-  // renders itself through its own `look_self`. `look <target>` belongs to the
-  // catalog's `look_at` entry, which owns object matching.
-  //
-  // The two patterns must stay disjoint rather than being merged into one verb
-  // accepting `dobj: ["object", "none"]`. Slots match independently, so a
-  // single widened pattern would let `look at`, `look under mug` and
-  // `look in front of me` satisfy the `none` alternative on an empty `dobj`
-  // while `prep`/`iobj` absorbed the rest — silently rendering the room
-  // instead of failing to parse. Two closed patterns reject them, and the
-  // planner falls through to `huh` as it should.
+  // `parse: false` — this is the object-method form only, what `woo_call` and
+  // the MCP tool surface dispatch. Command words and parser grammar are
+  // catalog policy, not substrate policy (AGENTS.md "Layering discipline",
+  // core.md §C0), so the textual surface is owned entirely by the chat
+  // catalog: `look_here` for the bare form, `look_at` for `look <target>`.
+  // Both of those are CLOSED patterns and must stay disjoint — a single
+  // widened `dobj: ["object", "none"]` would match slots independently, so
+  // `look at`, `look under mug` and `look in front of me` would satisfy the
+  // `none` alternative on an empty `dobj` while `prep`/`iobj` absorbed the
+  // rest, silently rendering the room instead of failing to parse.
   //
   // Both dispatch flags are inherited from the per-class `look` pages this
   // replaces, and both are load-bearing:
@@ -1374,7 +1370,7 @@ function seedUniversal(world: WooWorld): void {
     skipPresenceCheck: true,
     readsRoomPresence: true,
     aliases: ["l@ook", "ex@amine"],
-    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [], persistence: "live" } }
+    argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
   });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
     directCallable: true,
