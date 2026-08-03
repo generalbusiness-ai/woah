@@ -62,6 +62,7 @@ export function analyticsSampleRate(event: AnalyticsMetric): number {
   if (e.status === "error" || (typeof e.error === "string" && e.error.length > 0)) return 1;
   if (event.kind === "storage_direct_write") return 10;
   if (event.kind === "storage_flush") return 10;
+  if (event.kind === "net_gateway_storage_write") return 10;
   return 1;
 }
 
@@ -73,16 +74,18 @@ const BLOB_SLOTS = 20;
 const DOUBLE_SLOTS = 20;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
-// dashboard queries can `SUM(double2)` to get totals without knowing which
-// kind they're aggregating over. Kinds that carry no natural primary count
-// (do_constructor, init, etc.) leave it at 0. Diagnostic anomaly kinds use
-// one event as the count so dashboards can sum incidents directly.
+// dashboard queries can multiply the primary count by both the manual sample
+// multiplier and AE's adaptive multiplier without knowing which kind they're
+// aggregating over. Kinds that carry no natural primary count (do_constructor,
+// init, etc.) leave it at 0. Diagnostic anomaly kinds use one event as the
+// count so dashboards can sum incidents directly.
 function primaryCount(event: AnalyticsMetric): number {
   const e = event as Record<string, unknown>;
   switch (event.kind) {
     case "storage_direct_write":
     case "storage_flush":
     case "storage_full_save":
+    case "net_gateway_storage_write":
       return typeof e.rows === "number" ? e.rows : 0;
     case "broadcast":
       return typeof e.audience_size === "number" ? e.audience_size : 0;

@@ -281,9 +281,6 @@ export async function runHoroscopeTick(
   try {
 
   const tickNow = now();
-  // Persist attempt start before queue/config work. A crash or upstream stall
-  // can then be distinguished from a scheduler that never invoked the plug.
-  await client.directCall(env.BLOCK_ID, "record_plug_attempt", [tickNow]);
   let systemPrompt = systemPromptCache.get(env.BLOCK_ID, tickNow, systemPromptTtlMs);
   if (systemPrompt === null) {
     // Owners change system_prompt rarely, while cron reads it every minute.
@@ -297,11 +294,22 @@ export async function runHoroscopeTick(
   const errors: HoroscopeTickResult["errors"] = [];
   const aiFallbacks: Array<{ order_id: string; message: string }> = [];
   let delivered = 0;
+  let attemptRecorded = false;
 
   let lastSeenOrderId: string | null = null;
   for (let i = 0; i < maxOrdersPerTick; i++) {
     const next = (await client.directCall(env.BLOCK_ID, "next_pending")) as PendingOrder | null;
     if (!next || typeof next !== "object" || !next.order_id) break;
+
+    // A one-minute scheduler poll is not itself durable health evidence. Only
+    // work records a separate in-progress attempt; empty heartbeat ticks fold
+    // their attempt timestamp into record_plug_success below. This preserves
+    // crash/stall visibility for real orders without committing 1,440 pure
+    // timestamp turns per day per idle block.
+    if (!attemptRecorded) {
+      await client.directCall(env.BLOCK_ID, "record_plug_attempt", [tickNow]);
+      attemptRecorded = true;
+    }
 
     // :next_pending peeks (it does not pop). If we see the same head twice
     // in a row, the previous iteration left it on the queue (transient

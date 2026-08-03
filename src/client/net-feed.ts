@@ -217,6 +217,9 @@ type SessionReply = { session: string; actor: string; expires_at: number | null;
 
 /** Bound of the self-settled (scope, seq) guard set (see the header). */
 const SELF_SETTLED_CAP = 256;
+/** Keep the client contract coupled to the server's explicit authority-RPC
+ * width without making a large component declaration fail atomically. */
+const AUTHORITATIVE_CELL_BATCH_SIZE = 32;
 
 /** Marker for a WS turn whose socket died before the turn_result frame:
  * the caller falls back to REST with the SAME idempotency key (CO2.5
@@ -780,19 +783,24 @@ export class NetFeed {
    * later burst reads in the same settled view remain cheap. */
   async authoritativeCells(keys: readonly string[]): Promise<unknown[]> {
     if (keys.length === 0) return [];
-    const reply = (await this.fetchJson("POST", "/net-api/cells", {
-      session: this.requireSession(),
-      keys
-    })) as { cells?: unknown };
-    const rows = Array.isArray(reply.cells) ? reply.cells : [];
+    const session = this.requireSession();
+    const unique = [...new Set(keys)];
     const byKey = new Map<string, unknown>();
-    for (const row of rows) {
-      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
-      const key = (row as { key?: unknown }).key;
-      if (typeof key !== "string") continue;
-      const cell = (row as { cell?: unknown }).cell ?? null;
-      byKey.set(key, cell);
-      this.readCache.set(`cell\0${key}`, cell);
+    for (let offset = 0; offset < unique.length; offset += AUTHORITATIVE_CELL_BATCH_SIZE) {
+      const batch = unique.slice(offset, offset + AUTHORITATIVE_CELL_BATCH_SIZE);
+      const reply = (await this.fetchJson("POST", "/net-api/cells", {
+        session,
+        keys: batch
+      })) as { cells?: unknown };
+      const rows = Array.isArray(reply.cells) ? reply.cells : [];
+      for (const row of rows) {
+        if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+        const key = (row as { key?: unknown }).key;
+        if (typeof key !== "string") continue;
+        const cell = (row as { cell?: unknown }).cell ?? null;
+        byKey.set(key, cell);
+        this.readCache.set(`cell\0${key}`, cell);
+      }
     }
     return keys.map((key) => byKey.get(key) ?? null);
   }

@@ -754,6 +754,30 @@ describe("NetFeed reads + cache", () => {
     expect(await feed.cell(keys[1])).toEqual(second[1]);
     expect(calls.filter((call) => call.path.startsWith("/net-api/cell?"))).toHaveLength(0);
   });
+
+  it("chunks large authoritative projections at the server bound and preserves duplicate order", async () => {
+    const { feed, calls } = feedWith(
+      {
+        ...SESSION_ROUTE,
+        "POST /net-api/cells": (call) => {
+          const keys = (call.body as { keys: string[] }).keys;
+          return { body: { cells: keys.map((key) => ({ key, cell: { value: key } })) } };
+        }
+      },
+      { webSocket: false }
+    );
+    await feed.open();
+    const unique = Array.from({ length: 65 }, (_, index) => `property_cell:panel:p${index}`);
+    const requested = [...unique, unique[0]];
+
+    const cells = await feed.authoritativeCells(requested);
+
+    const batches = calls.filter((call) => call.path === "/net-api/cells");
+    expect(batches.map((call) => (call.body as { keys: string[] }).keys.length)).toEqual([32, 32, 1]);
+    expect(cells).toHaveLength(requested.length);
+    expect((cells[0] as { value: string }).value).toBe(unique[0]);
+    expect(cells.at(-1)).toEqual(cells[0]);
+  });
 });
 
 describe("NetFeed guards", () => {

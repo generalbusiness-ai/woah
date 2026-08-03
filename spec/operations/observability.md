@@ -66,6 +66,10 @@ Each persistent host emits standard metrics:
 - `memory_peak_bytes` (histogram)
 - `storage_bytes_used` (gauge)
 - `storage_flush_slices` (histogram/counter by slice kind: objects, properties, sessions, tasks, counters)
+- Net gateway physical SQLite rows by durable family and SQL operation
+  (`net_gateway_storage_write`). This uses the Cloudflare cursor's billed
+  `rowsWritten` value, including index rows; logical fanout-body counts are
+  not an acceptable storage-cost proxy.
 - `startup_storage` events for cold-init repository migration/load/save work, host-seed fetches, and Directory route registration (both object-route and session-route registration; the per-call `writes` count separates diff-deduped no-ops from actual row writes). These are emitted before `WooWorld` finishes initialization, so startup write amplification is visible even when the ordinary world metrics hook is not installed yet.
 - Durable Object lifecycle events: `do_constructor` records constructor-body wallclock by DO class, and `do_handler` records method/route handler wallclock by DO class. These split a cold request tail into isolate/constructor time versus actual handler work. Since the 2026-07 net-only cutover the only DO classes are `NetScopeDO` and `NetGatewayDO`: `host_key` is the scope key for `NetScopeDO` and the gateway shard key for `NetGatewayDO`. (The retired classic classes `PersistentObjectDO`/`DirectoryDO`/`CommitScopeDO` keyed `host_key` by object host / directory / scope key respectively before they were removed.)
 - v2 turn-network events: `v2_open` records commit-scope open latency/status, transfer mode, executable-seed cache hit/miss, executable transfer size/page counts, preseeded object count, and full-save use; `shadow_open_executable_seed_bytes` records the executable seed transfer size, total page count, inline page count, and `ok`/`warn` status for each browser scope open; `v2_envelope` records envelope latency/status, idempotency freshness, reply class, fanout, full-save use, projection bytes, append-only tail rows written, and retained tail bytes; `commit_reply_replay` records reply-idempotency mode (`fresh`, `cached_sql`, `cached_kv`, or `miss_after_hibernate`), status, reply class, bytes, and latency so durable reply-row hit rates can be measured before any KV/offload decision; `authority_tail` records accepted-frame/transcript tail rows written/pruned and retained byte counts; `shadow_commit_accepted` and `shadow_commit_rejected` split commit outcomes into tail-queryable counters so operators can answer "is v2 healthy?" without inferring from generic request or cross-host RPC traffic. `v2_host_apply_fanout` records the post-accept write-through from an accepted transcript or row-body-complete projection writes to routed object hosts, including touched row/object count, host count, latency, and retryable failures.
@@ -169,6 +173,12 @@ Reference alerts:
 - Quota exceeded for any owner.
 - Migration stalled (no batch progress for 1 hour).
 - Audit events of severity warn or above.
+- Durable Object physical rows written above the configured per-Worker or
+  per-object hourly budget. The scheduled `woah-canary` workflow resolves
+  namespace ids and queries every namespace for each Worker named by
+  `WOO_DO_STORAGE_WORKERS`, fails closed on incomplete data, and may send the
+  bounded report to `WOO_STORAGE_ALERT_WEBHOOK_URL`. `CF_ANALYTICS_TOKEN` therefore needs both
+  Account Analytics Read and Workers Scripts Read, but no write permission.
 
 ---
 

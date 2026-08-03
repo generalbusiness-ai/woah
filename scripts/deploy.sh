@@ -405,7 +405,10 @@ if [[ "$selected_stack" == "net" ]]; then
     warn "net deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or --skip-smoke)"
   else
     if npx --no-install tsx scripts/net-canary-load.ts --base-url "$WORKER_URL" \
-        --actors 2 --rounds 1 --requests-per-actor 1 >/tmp/woo-deploy-net-smoke.log 2>&1; then
+        --actors 2 --rounds 1 --requests-per-actor 1 \
+        --skip-storage-gate \
+        --skip-storage-gate-reason "functional deploy postflight; hourly billing gate is separate" \
+        >/tmp/woo-deploy-net-smoke.log 2>&1; then
       ok "net smoke: two guests committed turns and released sessions"
     else
       tail -30 /tmp/woo-deploy-net-smoke.log

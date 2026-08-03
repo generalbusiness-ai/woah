@@ -118,11 +118,11 @@ describe("runHoroscopeTick", () => {
 
     expect(calls[0].url).toBe("https://woo.example/net-api/session");
     expect(calls[0].body).toEqual({ roster_visible: false });
-    expect(calls[1].body).toMatchObject({ target: "the_horoscope_block", verb: "record_plug_attempt", session: "sess_h" });
-    expect(calls[2].url).toContain("/net-api/cell?");
-    expect(calls[2].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
-    expect(calls[3].url).toBe("https://woo.example/net-api/turn");
-    expect(calls[3].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
+    expect(calls[1].url).toContain("/net-api/cell?");
+    expect(calls[1].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
+    expect(calls[2].url).toBe("https://woo.example/net-api/turn");
+    expect(calls[2].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
+    expect(calls[3].body).toMatchObject({ target: "the_horoscope_block", verb: "record_plug_attempt", session: "sess_h" });
 
     const prepare1 = calls[4];
     expect(prepare1.url).toBe("https://woo.example/net-api/turn");
@@ -268,7 +268,7 @@ describe("runHoroscopeTick", () => {
     expect(second.delivered).toBe(0);
     expect(calls.filter((c) => c.url.includes("property_cell%3Athe_horoscope_block%3Asystem_prompt"))).toHaveLength(1);
     expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_success")).toHaveLength(1);
-    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_attempt")).toHaveLength(2);
+    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "record_plug_attempt")).toHaveLength(0);
     expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "next_pending")).toHaveLength(2);
   });
 
@@ -329,8 +329,8 @@ describe("runHoroscopeTick session cache", () => {
     expect(result.authMode).toBe("warm");
     expect(result.delivered).toBe(1);
     expect(calls.find((c) => c.url === "https://woo.example/net-api/session")).toBeUndefined();
-    expect(calls[0].body).toMatchObject({ verb: "record_plug_attempt", session: "sess_warm" });
-    expect(calls[1].url).toContain("/net-api/cell?");
+    expect(calls[0].url).toContain("/net-api/cell?");
+    expect(calls[2].body).toMatchObject({ verb: "record_plug_attempt", session: "sess_warm" });
   });
 
   it("re-authenticates when the cached session is within REAUTH_MARGIN_MS of expiry", async () => {

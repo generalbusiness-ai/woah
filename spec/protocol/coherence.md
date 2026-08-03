@@ -1500,10 +1500,17 @@ One write path per fact (CO9), concretized:
     both before the fetch and after installing the authority's lineage/live
     support cells, so movement cannot turn an allowed stale-view read into a
     disclosure from a room the caller has left. Requested absence is an exact
-    answer from the established owner, not a cache miss.
+    answer from the established owner, not a cache miss. A client projection
+    wider than 32 keys issues successive bounded batches and reconstructs the
+    caller's original order; it does not turn the server's authority-work cap
+    into an all-or-nothing component failure.
 
-    An authoritative exact read records a durable per-(scope,key) authority
-    floor at the returned scope head. Fanout at or below that floor still
+    An authoritative exact read records a durable per-key authority floor,
+    carrying the key's current owner scope and that scope's returned head.
+    Sequence numbers are comparable only within one scope: when a key moves,
+    recording the new owner replaces the old sequence instead of maximizing
+    across scopes. Repeat hydration at an unchanged or older same-scope head
+    is a zero-row SQL no-op. Fanout at or below the current-scope floor still
     advances delivery continuity, applies unrelated cells and relation deltas,
     and delivers observations, but cannot overwrite that key (including an
     authority-confirmed absence). The first later fanout for the key above the
@@ -1512,6 +1519,10 @@ One write path per fact (CO9), concretized:
     would suppress unrelated observations and relation changes between the
     gateway's prior view and the authority head. The floor table is derived
     gateway cache state and reconstructs naturally through a later exact read.
+    Every 256 changed floor rows, a sweep retains the highest-rowid 4096 rows
+    per gateway shard (so at most 4351 exist between sweeps); evicting an older
+    floor safely restores the former stale-tolerant mirror semantics for only
+    that key.
 
     Session ids are bearer credentials: relation reads expose only actor-level
     presence, session cells are owner-only, and any property whose inherited

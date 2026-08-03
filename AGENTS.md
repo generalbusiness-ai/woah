@@ -273,5 +273,7 @@ must include a vitest case before it lands.
 - `npm run smoke:walkthrough` — shared cross-actor MCP walkthrough against the deployed worker.
 - `npm run load:net-dev` / `npm run load:net-skew` — concurrency + skewed-load drivers.
 - `npm run load:net-canary` — the deployed acceptance-canary load driver.
+- `npm run gate:net-storage -- --worker <name> --from <ISO> --max-rows-written <n> --max-rows-written-per-object <n>` — fail-closed Cloudflare physical row-write gate with namespace/object attribution.
+- `npm run cleanup:net-canary -- --worker <name> --kv-namespace-id <id>` — dry-run the storage-reclaiming canary cleanup; irreversible execution additionally requires the exact confirmation printed by the dry run.
 - `npm run metrics:net-ae` — read the Analytics Engine acceptance gate (global-weighted p99 + per-shard diagnostics; defaults to dataset `woo_v1_net_canary`).
 - `npm run e2e:net` — real-browser cross-user net path (Playwright).

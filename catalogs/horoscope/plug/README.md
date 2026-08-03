@@ -23,7 +23,8 @@ Cron-triggered every minute. Each tick:
 2. Reads the block's exact `system_prompt` cell through a short in-isolate TTL cache
    (`SYSTEM_PROMPT_TTL_MS`, default 5 minutes). Owner changes may take a
    few ticks to reach a warm plug isolate; cold starts still read it once.
-3. Calls `:record_plug_attempt`, then loops up to `MAX_ORDERS_PER_TICK`:
+3. Loops up to `MAX_ORDERS_PER_TICK`; when the first pending order appears,
+   calls `:record_plug_attempt` once for that productive tick:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
@@ -67,9 +68,11 @@ safe; conflicting preparation content never overwrites a completed artifact.
 The plug lifecycle is health evidence, not a work record. Empty ticks call
 `:record_plug_success` only when `HEARTBEAT_INTERVAL_MS` has elapsed (default
 5 minutes); ticks that delivered an order or need to surface an error still
-record immediately. Every tick records its attempt even when a heartbeat is
-not yet due. The block class declares a 15-minute expected interval and a
-45-minute stale window, leaving room for cron jitter and transient retries.
+record immediately. A productive tick records a separate attempt before AI or
+delivery work. An empty heartbeat folds its attempt timestamp into the atomic
+success record, and an empty tick inside the heartbeat window writes nothing.
+The block class declares a 15-minute expected interval and a 45-minute stale
+window, leaving room for cron jitter and transient retries.
 
 ## Why net turns, not MCP
 
