@@ -4183,38 +4183,30 @@ describe("local catalogs", () => {
     }
 
     // The programmer surfaces returned a hardcoded tool list from `look` and
-    // emitted nothing. As `look_self` they compose with the inherited view.
-    //
-    // This MUST be asserted on a real actor, not on `$programmer` itself. The
-    // surface is worn as a FEATURE, and verb lookup consults features only
-    // after the parent chain — so `$wiz:look_self` resolves `$player`'s page
-    // and the feature never gets a turn. Looking at the class object hides
-    // that completely, because there the feature's page is also its own.
-    expect(world.getProp("$wiz", "features")).toContain("$programmer");
-    expect(world.verbInfo("$wiz", "look_self").definer).toBe("$player");
-
-    const prog = await world.directCall("programmer-look", "$wiz", "$wiz", "look", []);
-    expect(prog.op).toBe("result");
-    if (prog.op === "result") {
-      const view = prog.result as Record<string, unknown>;
-      // Contributed by the worn feature...
-      expect(Array.isArray(view.tools)).toBe(true);
-      expect(view.tools as string[]).toContain("eval(source, opts?)");
-      expect(view).toHaveProperty("api_version");
-      // ...while identity and inventory still belong to the wearer. A feature
-      // may only ADD keys, or dispatching look_self on the feature object
-      // would stamp the feature's own id/title over the actor's.
-      expect(view.id).toBe("$wiz");
-      expect(view).toHaveProperty("carrying");
-      expect(prog.observations.some((obs) => obs.type === "looked")).toBe(true);
+    // emitted nothing. Where that class is genuinely INHERITED the list stays,
+    // and now rides the shared dispatcher, so looking also emits `looked`.
+    const editor = await world.directCall("editor-look", "$wiz", "the_verb_editor", "look", []);
+    expect(editor.op).toBe("result");
+    if (editor.op === "result") {
+      const view = editor.result as Record<string, unknown>;
+      expect(world.verbInfo("the_verb_editor", "look_self").definer).toBe("$generic_editor");
+      expect(view.tools as string[]).toContain("save()");
+      expect(editor.observations.some((obs) => obs.type === "looked")).toBe(true);
     }
 
-    // An actor with no features is unchanged — the merge adds nothing and
-    // cannot introduce keys of its own.
-    const plain = await world.directCall("plain-look", "guest_1", "guest_1", "look", []);
-    expect(plain.op).toBe("result");
-    if (plain.op === "result") {
-      expect(Object.keys(plain.result as Record<string, unknown>).sort()).toEqual([
+    // $builder/$programmer are only ever WORN as features, never inherited, and
+    // a feature is consulted after the parent chain — so their look_self could
+    // only ever have been reached by folding features into the actor view.
+    // LambdaCore does not do that anywhere: #6:look_self ignores .features,
+    // #1:examine_verbs walks parents only and excludes $prog/$builder via
+    // dull_classes, and features reach behavior solely through #6:my_huh after
+    // parsing fails. So a wizard looks like a player, and the tool list is the
+    // MCP surface's job.
+    expect(world.getProp("$wiz", "features")).toContain("$programmer");
+    const wiz = await world.directCall("wiz-look", "$wiz", "$wiz", "look", []);
+    expect(wiz.op).toBe("result");
+    if (wiz.op === "result") {
+      expect(Object.keys(wiz.result as Record<string, unknown>).sort()).toEqual([
         "carrying",
         "description",
         "id",

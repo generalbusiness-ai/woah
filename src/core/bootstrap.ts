@@ -103,6 +103,30 @@ export function isCurrentGuestResetVerbPageFor(value: unknown, contract: GuestRe
 
 const bootSnapshotCache = new Map<string, SerializedWorld>();
 
+/** The actor view. Worn features contribute nothing to it, deliberately.
+ *
+ * Verb lookup consults an object's features only after its parent chain, so a
+ * feature can never override this page — and, checked against the live
+ * LambdaMOO core (1.8.3+47), it should not want to. LambdaCore draws the same
+ * line in three independent places:
+ *
+ *   - #6:look_self (generic player) never reads its features at all.
+ *   - #1:examine_verbs (root class) walks the parent chain only
+ *     (`what = parent(what)`) and carries a `dull_classes` exclusion list
+ *     naming the programmer and builder classes explicitly — their verbs are
+ *     deliberately kept OUT of that view.
+ *   - features reach behavior solely through #6:my_huh ("This version of
+ *     my_huh just handles features"), which the command-utils huh path calls
+ *     only *after* normal command parsing has already failed. Commands, not
+ *     views.
+ *
+ * LambdaCore answers "what can I do?" with an explicit `@features` listing
+ * rather than a fatter look, and its feature base class (#13131) defines its
+ * own look_self so a feature is looked at directly, standalone. woo's analogue
+ * of that listing is the MCP tool list. An earlier revision of this branch
+ * merged feature contributions here to keep a worn programmer surface visible
+ * in `look`; there is no precedent for it, so it was removed along with the
+ * two overrides that depended on it. */
 const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   let title = this:title();
   let description = this.description;
@@ -131,30 +155,7 @@ const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
     if (description) { description = description + " " + inventory; }
     else { description = inventory; }
   }
-  let view = { id: this, title: title, description: description, carrying: carried };
-  // Features are worn, not inherited, and verb lookup consults them only after
-  // the parent chain (resolveVerbLive). A feature therefore cannot OVERRIDE an
-  // inherited verb — it can only fill a gap. So a feature that wants to add to
-  // how its wearer looks cannot do it by defining look_self: this page always
-  // wins. Ask each feature to describe itself instead and merge what it
-  // contributes.
-  //
-  // Merge rule: a feature may only ADD keys. Identity and inventory belong to
-  // the wearer, so an existing key is never overwritten, and the feature's own
-  // id/title/description/carrying — an artifact of dispatching look_self on
-  // the feature object — cannot leak into the wearer's view.
-  for feature in this.features {
-    if (feature != this) {
-      let extra = null;
-      try { extra = dispatch(feature, "look_self", []); } except err { extra = null; }
-      if (typeof(extra) == "map") {
-        for key in keys(extra) {
-          if (!has(view, key)) { view[key] = extra[key]; }
-        }
-      }
-    }
-  }
-  return view;
+  return { id: this, title: title, description: description, carrying: carried };
 }`;
 
 const ACTOR_HUH_SOURCE = `verb :huh(text, reason, source) rxd {

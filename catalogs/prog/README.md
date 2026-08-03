@@ -191,9 +191,13 @@ The catalog ships once these are in place:
 
 ### Builder tools
 
+These are worn as a feature, not inherited, so they do not appear in `look` —
+LambdaCore keeps builder and programmer verbs out of views the same way
+(`#1:examine_verbs` excludes them via `dull_classes`). The MCP tool list is the
+listing that answers "what can I do?".
+
 | verb | role |
 | --- | --- |
-| `look()` | Surface map for agents. |
 | `inspect(id, opts?)` | Structure/data view: parent, children, contents, location, flags, properties. No source. |
 | `search(query, opts?)` | Bounded search across object names and property channels. No source. |
 | `create(parent, opts?)` | New ordinary object owned by the invoking actor. `opts: {name?, description?, location?, fertile?}`. No `owner` option. **`location` defaults to the invoking actor** — the new object lands in your inventory, as LambdaMOO's `@create` does. Pass an explicit `location` to place it elsewhere, or `location: null` to leave it in no container. |
@@ -205,7 +209,6 @@ The catalog ships once these are in place:
 
 | verb | role |
 | --- | --- |
-| `look()` | Surface map for agents. |
 | `inspect(id, opts?)` | Source-aware live call-tree shape with read filters. |
 | `resolve_verb(id, descriptor)` | Where the verb actually resolves and the walk that got there. |
 | `list_verb(id, descriptor, opts?)` | Readable source and metadata for one slot. |

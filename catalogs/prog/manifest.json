@@ -24,16 +24,6 @@
       ],
       "verbs": [
         {
-          "name": "look_self",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "arg_spec": {
-            "args": []
-          },
-          "source": "verb :look_self() rxd {\n  let view = pass();\n  view[\"api_version\"] = this.api_version;\n  view[\"tools\"] = [\"inspect(id, opts?)\", \"search(query, opts?)\", \"create(parent, opts?)\", \"chparent(id, parent, opts?)\", \"recycle(id, opts?)\", \"set_property(id, name, value, opts?)\"];\n  return view;\n}"
-        },
-        {
           "name": "inspect",
           "perms": "rxd",
           "direct_callable": true,
@@ -278,16 +268,6 @@
         }
       ],
       "verbs": [
-        {
-          "name": "look_self",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "arg_spec": {
-            "args": []
-          },
-          "source": "verb :look_self() rxd {\n  let view = pass();\n  view[\"tools\"] = [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"eval(source, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"];\n  return view;\n}"
-        },
         {
           "name": "inspect",
           "perms": "rxd",
