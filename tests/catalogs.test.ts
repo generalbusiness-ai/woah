@@ -2025,7 +2025,7 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("pinboard-look-plan", session.actor, "the_pinboard", "command_plan", ["look"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") {
-      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look", args: [] });
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look_here", args: [] });
     }
     const looked = await world.directCall("pinboard-look", session.actor, "the_pinboard", "look", []);
     expect(looked.op).toBe("result");
@@ -2339,13 +2339,14 @@ describe("local catalogs", () => {
       .filter((id) => ![
         "2026-05-02-pinboard-v02-repair",
         "2026-05-02-pinboard-v02-data-repair",
-        "2026-05-02-chat-look-skip-presence",
         "2026-05-13-chat-command-plan-skip-presence"
       ].includes(id));
     world.setProp("$system", "applied_migrations", migrations);
 
-    const chatLook = world.ownVerbExact("$conversational", "look")!;
-    world.addVerb("$conversational", { ...chatLook, skip_presence_check: false, version: chatLook.version + 1 });
+    // `$conversational:look` was retired into `look_at` — the bare and object
+    // forms are one verb now — so a fresh world has no `look` page to degrade
+    // here. The chat v0->v1 migration drops it on aged worlds; that edge is
+    // covered by "retires the per-class look dispatchers".
     const commandPlan = world.ownVerbExact("$conversational", "command_plan")!;
     world.addVerb("$conversational", { ...commandPlan, skip_presence_check: false, version: commandPlan.version + 1 });
     const listNotes = world.ownVerbExact("$pinboard", "list_notes")!;
@@ -2359,7 +2360,7 @@ describe("local catalogs", () => {
 
     installLocalCatalogs(world, []);
 
-    expect(world.ownVerbExact("$conversational", "look")?.skip_presence_check).toBe(true);
+    expect(world.ownVerbExact("$conversational", "look")).toBeNull();
     expect(world.ownVerbExact("$conversational", "command_plan")?.skip_presence_check).toBe(true);
     expect(world.ownVerbExact("$pinboard", "list_notes")?.source).toContain("contents(this)");
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
@@ -4058,7 +4059,11 @@ describe("local catalogs", () => {
   it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 30000 }, async () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", []);
-    const look = world.ownVerb("$conversational", "look")!;
+    // Name the verb EXACTLY. `ownVerb` resolves by alias too, so asking for
+    // "look" here used to return whichever chat page happened to answer to
+    // that word — a moving target once `$conversational:look` was retired and
+    // `look_here`/`look_at` both claimed the alias.
+    const look = world.ownVerbExact("$conversational", "look_at")!;
     world.addVerb("$conversational", {
       kind: "native",
       name: look.name,
@@ -4098,12 +4103,336 @@ describe("local catalogs", () => {
     expect(migratedEnter?.kind).toBe("bytecode");
       expect(migratedEnter?.source).toContain("moveto(actor, this)");
       expect(migratedEnter?.source).not.toContain("set_presence");
-    const migratedLook = world.ownVerb("$conversational", "look");
+    const migratedLook = world.ownVerbExact("$conversational", "look_at");
     expect(migratedLook?.kind).toBe("bytecode");
-    expect(migratedLook?.source).toContain("look_at");
+    expect(migratedLook?.source).toContain("look_self");
+    // The retired per-class dispatcher must not come back: repair sources the
+    // current manifest, which no longer declares it.
+    expect(world.ownVerbExact("$conversational", "look")).toBeNull();
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-source-catalog-verbs");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-catalog-placement-metadata");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-room-look-self");
+  });
+
+
+  // ---------------------------------------------------------------------
+  // One `look` dispatcher (2026-07-31).
+  //
+  // `look` had been declared on `$thing` plus seven catalog classes — six
+  // distinct bodies, two of which emitted no observation at all — because the
+  // seed graph put the dispatcher on `$thing`, which is not an ancestor of
+  // `$actor` or `$space`. LambdaMOO's live core resolves looking with exactly
+  // one dispatcher (`#3:l*ook`) over a polymorphic `#1:look_self`; woo now
+  // does the same with `$root:look` plus the catalog's `look_at` command entry.
+  //
+  // These tests fail if any catalog reintroduces its own `look`, if the
+  // dispatcher stops emitting `looked` for a shape, or if a per-class view
+  // (cockatoo mood, workspace summary, editor tool list) is lost.
+  // ---------------------------------------------------------------------
+
+  it("resolves look through a single dispatcher for every object shape", async () => {
+    const world = createWorld();
+
+    const definers = new Set<string>();
+    for (const id of world.objects.keys()) {
+      if (world.ownVerbExact(id, "look")) definers.add(id);
+    }
+    expect(Array.from(definers)).toEqual(["$root"]);
+
+    // The polymorphic half is unaffected: classes still override `look_self`.
+    expect(world.ownVerbExact("$cockatoo", "look_self")).toBeTruthy();
+    expect(world.ownVerbExact("$room", "look_self")).toBeTruthy();
+    expect(world.ownVerbExact("$outliner", "look_self")).toBeTruthy();
+
+    // Every shape reaches that one page: a plain thing, a room ($space), an
+    // actor ($player), a block ($actor descendant that is not a player), and a
+    // workspace. Before the consolidation these resolved four different bodies.
+    for (const target of ["the_lamp", "the_chatroom", "guest_1", "the_weather", "the_outline"]) {
+      expect(world.verbInfo(target, "look").definer).toBe("$root");
+      const result = await world.directCall(`one-look-${target}`, "guest_1", target, "look", []);
+      expect(result.op).toBe("result");
+      if (result.op !== "result") continue;
+      const looked = result.observations.find((obs) => obs.type === "looked");
+      // $builder and $generic_editor previously emitted nothing at all, so a
+      // missing observation here is the regression this line exists to catch.
+      expect(looked, `${target} emitted no looked observation`).toBeTruthy();
+      expect(String((looked as Record<string, unknown>).text ?? "")).not.toBe("");
+    }
+  });
+
+  it("keeps per-class look views after folding the dispatchers away", async () => {
+    const world = createWorld();
+
+    // The cockatoo moved its body from `look` into `look_self`, so the extra
+    // fields AND the catalog's own `cockatoo_seen` observation must survive —
+    // and now also fire from the textual command path, which never reached the
+    // old `$cockatoo:look` (that page carried no command pattern).
+    const bird = await world.directCall("cockatoo-look", "guest_1", "the_cockatoo", "look", []);
+    expect(bird.op).toBe("result");
+    if (bird.op === "result") {
+      expect(bird.result).toMatchObject({ id: "the_cockatoo", mood: "alert" });
+      expect(bird.result).toHaveProperty("phrase_count");
+      expect(bird.observations.some((obs) => obs.type === "cockatoo_seen")).toBe(true);
+      expect(bird.observations.some((obs) => obs.type === "looked")).toBe(true);
+    }
+
+    // Workspace `look_self` views put their one-line rendering in `summary`;
+    // the shared dispatcher prefers it over `description` so the outliner and
+    // pinboard keep the observation text their own `look` used to build.
+    const outline = await world.directCall("outline-look", "guest_1", "the_outline", "look", []);
+    expect(outline.op).toBe("result");
+    if (outline.op === "result") {
+      expect(outline.result).toMatchObject({ id: "the_outline", summary: "Outline has 0 items." });
+      expect(outline.observations.find((obs) => obs.type === "looked")).toMatchObject({
+        target: "the_outline",
+        text: "Outline has 0 items."
+      });
+    }
+
+    // The programmer surfaces returned a hardcoded tool list from `look` and
+    // emitted nothing. Where that class is genuinely INHERITED the list stays,
+    // and now rides the shared dispatcher, so looking also emits `looked`.
+    const editor = await world.directCall("editor-look", "$wiz", "the_verb_editor", "look", []);
+    expect(editor.op).toBe("result");
+    if (editor.op === "result") {
+      const view = editor.result as Record<string, unknown>;
+      expect(world.verbInfo("the_verb_editor", "look_self").definer).toBe("$generic_editor");
+      expect(view.tools as string[]).toContain("save()");
+      expect(editor.observations.some((obs) => obs.type === "looked")).toBe(true);
+    }
+
+    // $builder/$programmer are only ever WORN as features, never inherited, and
+    // a feature is consulted after the parent chain — so their look_self could
+    // only ever have been reached by folding features into the actor view.
+    // LambdaCore does not do that anywhere: #6:look_self ignores .features,
+    // #1:examine_verbs walks parents only and excludes $prog/$builder via
+    // dull_classes, and features reach behavior solely through #6:my_huh after
+    // parsing fails. So a wizard looks like a player, and the tool list is the
+    // MCP surface's job.
+    expect(world.getProp("$wiz", "features")).toContain("$programmer");
+    const wiz = await world.directCall("wiz-look", "$wiz", "$wiz", "look", []);
+    expect(wiz.op).toBe("result");
+    if (wiz.op === "result") {
+      expect(Object.keys(wiz.result as Record<string, unknown>).sort()).toEqual([
+        "carrying",
+        "description",
+        "id",
+        "title"
+      ]);
+    }
+  });
+
+  it("keeps the bare and object look commands on disjoint closed patterns", async () => {
+    const world = createWorld();
+    const plan = async (text: string) => {
+      const result = await world.directCall(`plan-${text}`, "guest_1", "the_chatroom", "command_plan", [text]);
+      return result.op === "result" ? (result.result as Record<string, unknown>) : null;
+    };
+
+    // Both command words belong to the catalog: `look_here` for the bare form
+    // (`dobj`/`prep`/`iobj` all `none`, delegating to the space's own `:look`)
+    // and `look_at` for `look <target>`. The substrate's `$root:look` is
+    // `parse: false` — an object method only, never a command entry. Two
+    // closed patterns, no overlap.
+    expect(await plan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_here", args: [] });
+    expect(await plan("l")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_here", args: [] });
+    expect(await plan("look mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+    expect(await plan("examine mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+
+    // Merging both into one verb with `dobj: ["object", "none"]` looks tidy and
+    // is wrong: slots match independently, so anything that leaves `dobj` empty
+    // while `prep`/`iobj` absorb the rest satisfies the `none` alternative and
+    // silently renders the room. Each of these must fail to parse.
+    for (const malformed of ["look at", "examine at", "look under mug", "look in front of me"]) {
+      expect(await plan(malformed), malformed).toMatchObject({ ok: false, verb: "huh" });
+    }
+
+    // A mounted workspace carries the same conversational feature, so it also
+    // answers `look_at`. The command must still be handled by the room the
+    // actor is standing in — otherwise the `looked` observation lands in the
+    // workspace's own sequenced log instead of the room's.
+    expect(await plan("look outline")).toMatchObject({
+      ok: true,
+      target: "the_chatroom",
+      verb: "look_at",
+      args: ["the_outline"]
+    });
+
+    // The mounted-space guard must read a `dobj` pattern the same way the slot
+    // matcher does. `commandSlotMatches` recurses over alternatives, so a
+    // catalog may legitimately write a list; an exact `=== "object"` test in
+    // the guard would skip it and let the workspace claim the command.
+    const lookAt = world.ownVerbExact("$conversational", "look_at")!;
+    world.addVerb("$conversational", {
+      ...lookAt,
+      arg_spec: { ...lookAt.arg_spec, command: { ...(lookAt.arg_spec.command as Record<string, unknown>), dobj: ["object", "string"] } },
+      version: lookAt.version + 1
+    });
+    expect(await plan("look outline")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at" });
+    world.addVerb("$conversational", { ...lookAt, version: lookAt.version + 2 });
+
+    // Standing inside the workspace, bare look renders the workspace itself.
+    const inside = await world.directCall("plan-inside", "guest_1", "the_outline", "command_plan", ["look"]);
+    expect(inside.op).toBe("result");
+    if (inside.op === "result") {
+      expect(inside.result).toMatchObject({ ok: true, target: "the_outline", verb: "look_here", args: [] });
+    }
+  });
+
+
+  it("looks with the looker's authority, not the seed page's", async () => {
+    const world = createWorld();
+    const other = world.auth("guest:look-perm-other");
+    expect((await world.directCall("lp-o", other.actor, "the_chatroom", "enter", [], { sessionId: other.id })).op).toBe("result");
+
+    // A thing whose owner has made the description unreadable. Authoring needs
+    // programmer authority, so the seed wizard owns it; the looker is an
+    // ordinary guest, which is the asymmetry under test.
+    const lamp = world.createAuthoredObject("$wiz", {
+      parent: "$thing",
+      name: "Private Lamp",
+      description: "A hidden builder lamp.",
+      location: "the_chatroom"
+    });
+    const def = world.object(lamp).propertyDefs.get("description")!;
+    world.defineProperty(lamp, { ...def, perms: "w" });
+    expect(world.propOrNullForActor(other.actor, lamp, "description")).toBeNull();
+
+    // The shared dispatcher is owned by the seed wizard, and the room's
+    // `look_self` opens with `set_task_perms(caller_perms())`. Without an
+    // explicit drop to the looker's authority first, that view would inherit
+    // WIZARD perms from the dispatcher's frame and read straight past the
+    // property's permissions. Each per-class dispatcher used to carry its own
+    // `set_task_perms`, so the chain never ran privileged; one shared page has
+    // to do it or the escalation is silent.
+    const looked = await world.directCall("lp-look", other.actor, "the_chatroom", "look", [], { sessionId: other.id });
+    expect(looked.op).toBe("result");
+    if (looked.op === "result") {
+      const room = looked.result as { contents: Array<{ id: string; description: unknown }> };
+      expect(room.contents.find((row) => row.id === lamp)).toMatchObject({ id: lamp, description: null });
+    }
+  });
+
+  it("keeps look command words out of the substrate so catalog pages still win", async () => {
+    const world = createWorld();
+
+    // The seed dispatcher answers only to its own name and that name's
+    // abbreviation. At the graph root an alias sits on every object's ancestor
+    // chain, and the chain resolves before features, so a DISTINCT command word
+    // here would shadow the catalog page that owns object matching.
+    expect(world.ownVerbExact("$root", "look")?.aliases ?? []).toEqual(["l@ook"]);
+
+    // `l` must keep naming the same page as `look`, or a client that retried a
+    // call using the shorter spelling would fingerprint as a different request
+    // and collide on its operation id.
+    expect(world.verbInfo("the_chatroom", "l").definer).toBe("$root");
+    expect(world.verbInfo("the_chatroom", "l").name).toBe("look");
+    expect(world.verbInfo("the_lamp", "l").name).toBe("look");
+
+    // Which is what makes this resolve to the catalog page, as it does on main.
+    expect(world.verbInfo("the_chatroom", "examine").definer).toBe("$conversational");
+    expect(world.verbInfo("the_chatroom", "examine").name).toBe("look_at");
+
+    // ...and therefore examine the ARGUMENT rather than swallowing it and
+    // rendering the room, which is what a root-seated alias did.
+    const examined = await world.directCall("alias-examine", "$wiz", "the_chatroom", "examine", ["the_lamp"]);
+    expect(examined.op).toBe("result");
+    if (examined.op === "result") {
+      expect(examined.result).toMatchObject({ id: "the_lamp" });
+      expect(examined.observations.find((obs) => obs.type === "looked")).toMatchObject({ target: "the_lamp" });
+    }
+
+    // The deliberate narrowing: a bare thing no longer answers to `examine`,
+    // because that word is a catalog command word and nothing on a thing's
+    // chain claims it. `examine lamp` still works from chat — it routes through
+    // the room's `look_at` — and the verb's own name and abbreviation are
+    // unaffected.
+    expect(() => world.verbInfo("the_lamp", "examine")).toThrow();
+    expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
+  });
+
+  it("plans a command token that execution re-resolves, like every other command verb", async () => {
+    // A command plan carries the target and the verb NAME; execution resolves
+    // that name again. So a page installed on the target between planning and
+    // execution is what runs — for `look_here` exactly as for `say`, `go` or
+    // any other command verb. This is a property of the plan/execute split,
+    // not of this consolidation: on main, bare `look` planned the token `look`
+    // and a page installed at `the_chatroom:look` hijacked it identically.
+    //
+    // Pinned here so that if plans ever start carrying an exact page identity,
+    // this test is the one that has to change — deliberately, for all tokens
+    // at once, rather than silently for one of them.
+    for (const token of ["look_here", "say"]) {
+      const world = createWorld();
+      const session = world.auth(`guest:token-${token}`);
+      const planned = await world.directCall(
+        `plan-${token}`,
+        session.actor,
+        "the_chatroom",
+        "command_plan",
+        [token === "say" ? "say hi" : "look"],
+        { sessionId: session.id }
+      );
+      expect(planned.op).toBe("result");
+      if (planned.op !== "result") continue;
+      const plan = planned.result as Record<string, unknown>;
+      expect(plan.verb, token).toBe(token);
+
+      const params = token === "say" ? "text" : "";
+      const planted = installVerb(
+        world,
+        "the_chatroom",
+        token,
+        `verb :${token}(${params}) rxd { return { rebound: true }; }`,
+        null
+      );
+      expect(planted.ok, `${token}: ${JSON.stringify(planted.diagnostics ?? null)}`).toBe(true);
+
+      const ran = await world.directCall(
+        `run-${token}`,
+        session.actor,
+        String(plan.target),
+        String(plan.verb),
+        plan.args as never,
+        { sessionId: session.id }
+      );
+      expect(ran.op, token).toBe("result");
+      if (ran.op === "result") expect(ran.result, token).toMatchObject({ rebound: true });
+    }
+  });
+
+  it("drops the retired bootstrap look page from an aged world on cold init", () => {
+    const world = createWorld();
+    // Age the world: re-plant `$thing:look` the way an older bundle seeded it,
+    // and clear the ledger entry so cold init runs the repair. While that page
+    // exists it SHADOWS `$root:look` for every thing — which is the whole
+    // reason a retired seed page cannot simply be left in place.
+    const planted = installVerb(
+      world,
+      "$thing",
+      "look",
+      "verb :look() rxd { return this:look_self(); }",
+      null
+    );
+    expect(planted.ok).toBe(true);
+    world.setProp(
+      "$system",
+      "applied_migrations",
+      (world.getProp("$system", "applied_migrations") as string[])
+        .filter((id) => id !== "2026-07-31-retired-bootstrap-definitions") as never
+    );
+    expect(world.verbInfo("the_lamp", "look").definer).toBe("$thing");
+
+    installLocalCatalogs(world, []);
+
+    expect(world.ownVerbExact("$thing", "look")).toBeNull();
+    expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-07-31-retired-bootstrap-definitions");
+
+    // Reruns are safe: nothing left to drop, nothing disturbed.
+    installLocalCatalogs(world, []);
+    expect(world.ownVerbExact("$thing", "look")).toBeNull();
+    expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
   });
 
   it("repairs stale native chat command planning on existing installs", async () => {

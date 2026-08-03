@@ -1,6 +1,6 @@
 {
   "name": "demoworld",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "spec_version": "v1",
   "license": "MIT",
   "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and the bundled demo instances of every demo-capable catalog (dubspace, pinboard, outliner, weather, horoscope). Other catalogs define classes/verbs but never depend on demoworld; demoworld owns every demo placement so the layering stays one-way.",
@@ -99,18 +99,13 @@
           "source": "verb :title() rxd { let suffix = \"perched on the mantelpiece\"; if (this.gagged) { suffix = \"perched on the mantelpiece, gagged\"; } return this.name + \", a sulphur-crested cockatoo \" + suffix; }"
         },
         {
-          "name": "look",
-          "aliases": [
-            "l@ook",
-            "ex@amine"
-          ],
+          "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
-          "tool_exposed": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd { let state = this.mood; if (this.gagged) { state = \"gagged\"; } observe({ type: \"cockatoo_seen\", source: this, room: location(this), actor: actor, mood: state, ts: now() }); return { description: this.description, mood: state, phrase_count: length(this.phrases) }; }"
+          "source": "verb :look_self() rxd { let view = pass(); let state = this.mood; if (this.gagged) { state = \"gagged\"; } view[\"mood\"] = state; view[\"phrase_count\"] = length(this.phrases); observe({ type: \"cockatoo_seen\", source: this, room: location(this), actor: actor, mood: state, ts: now() }); return view; }"
         },
         {
           "name": "squawk",

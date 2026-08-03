@@ -1,6 +1,6 @@
 {
   "name": "block",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Anchored data-display actor. A $block bridges woo to an outside-world data source: an external plug authenticates as the block's actor (apikey-bound) and pushes property values through tier-gated write verbs; the block's owner sets configuration through the same verbs. Permissions follow the LambdaMOO :is_*_by convention — overrideable per-class verbs that gate every state mutation.",
   "license": "MIT",
@@ -138,16 +138,6 @@
           "tool_exposed": true,
           "arg_spec": { "args": ["name"] },
           "source": "verb :get_data(name) rxd { if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"get_data requires a non-empty name\", value: name }; } if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read this block\", value: this }; } return this.(name); }"
-        },
-        {
-          "name": "look",
-          "aliases": ["l@ook", "ex@amine"],
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "tool_exposed": true,
-          "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": [], "persistence": "live" } },
-          "source": "verb :look() rxd { let view = this:look_self(); let text = \"\"; if (typeof(view) == \"map\" && has(view, \"description\")) { text = to_string(view[\"description\"]); } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: text, look: view, ts: now() }); return view; }"
         },
         {
           "name": "look_self",

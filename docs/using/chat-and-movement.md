@@ -14,24 +14,28 @@ calling verbs through MCP. Where they diverge, both forms are shown.
 look
 ```
 
-Calls `<here>:look()`. Returns the room's description, its visible
-contents, and its obvious exits.
+Returns the room's description, its visible contents, and its obvious
+exits.
 
 ```
 look at the cockatoo
 look at #01HX...
 ```
 
-Calls `<target>:look_self()` (or `:look()` depending on the target's
-class). Returns the target's `description` plus whatever rich
-introspection the class adds (a `$note` adds its title and preview;
-a `$block` adds its current data and freshness).
+Returns the target's `description` plus whatever rich introspection its
+class adds (a `$note` adds its title and preview; a `$block` adds its
+current data and freshness; the cockatoo adds its mood).
+
+Bare `look` describes the room you are standing in; `look <target>`
+describes that target. Every object answers the same `look`, wherever it
+sits in the class tree; what differs between a mug, a room and a person is
+how each one renders itself.
 
 For agents:
 
 ```
 woo_call("$here", "look", [])
-woo_call("the_cockatoo", "look_self", [])
+woo_call("the_cockatoo", "look", [])
 ```
 
 `$here` is a corename for your current location resolved per request.

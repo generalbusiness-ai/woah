@@ -417,12 +417,12 @@ describe("outliner v1 -> v2 migration", () => {
     assertRetiredVerbsRemoved(world);
     // The registry landed on the bundled version — the composed chain updated
     // it atomically with the data rewrites.
-    expect(installedOutlinerVersion(world)).toBe("3.0.1");
+    expect(installedOutlinerVersion(world)).toBe("4.0.0");
     // v3 delivered the acts-era surface.
     expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   }
 
-  it("boot-upgrades an aged v1 outliner to the bundled v3 (composed v1→v2→v3 chain, the prod deploy path)", async () => {
+  it("boot-upgrades an aged v1 outliner to the bundled v4 (composed v1→v2→v3→v4 chain, the prod deploy path)", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note"]);
     // A synthetic v1 outliner (real class names/ancestors) with aged items.
@@ -458,7 +458,7 @@ describe("outliner v1 -> v2 migration", () => {
     expect(world.getProp("boot_mo", "projections")).toEqual([]);
   });
 
-  it("boot-upgrades an aged v0 outliner to the bundled v3 (composed v0→v1→v2→v3 chain)", () => {
+  it("boot-upgrades an aged v0 outliner to the bundled v4 (composed v0→v1→v2→v3→v4 chain)", () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note"]);
     // v0 shape: $outliner still parented on $space with its own public
@@ -485,13 +485,13 @@ describe("outliner v1 -> v2 migration", () => {
 
     assertBootUpgraded(world);
     // The v0→v1 hop's own steps also ran: the class was reparented off $space
-    // and the class-owned lifecycle verbs are gone (the bundled v3 manifest
+    // and the class-owned lifecycle verbs are gone (the bundled v4 manifest
     // does not redefine any of the three).
     expect(world.object("$outliner").parent).toBe("$room");
     expect(world.ownVerbExact("$outliner", "out")).toBeNull();
   });
 
-  it("boot-upgrades an installed v2 outliner to the bundled v3 (single no-rewrite edge, edges untouched)", () => {
+  it("boot-upgrades an installed v2 outliner to the bundled v4 (composed v2→v3→v4, no rewrite, edges untouched)", () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note"]);
     // v2 shape: edge index already the structural authority.
@@ -514,7 +514,7 @@ describe("outliner v1 -> v2 migration", () => {
 
     // v2→v3 performs no data rewrites: the authored edge survives byte-for-byte.
     expect(world.propOrNull("bi_a", "__ordered_edge")).toEqual({ parent: null, rank: "V1" });
-    expect(installedOutlinerVersion(world)).toBe("3.0.1");
+    expect(installedOutlinerVersion(world)).toBe("4.0.0");
     expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   });
 });

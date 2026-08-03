@@ -1603,6 +1603,26 @@ npm run repair:net-definitions -- \
   'prop:$actor:api_keys'
 ```
 
+For a Net world deployed before `look` was consolidated onto one dispatcher
+([bootstrap.md §B2.3](../semantics/bootstrap.md)), install the replacement page
+**and drop the page it supersedes** in the same run. Both halves are required:
+the retired `$thing:look` is a nearer ancestor for every thing, so while it
+survives it keeps winning and the world still resolves two different `look`
+bodies.
+
+```bash
+npm run repair:net-definitions -- \
+  https://woah1.generalbusiness.ai \
+  '$root:look' \
+  --drop '$thing:look'
+```
+
+The `--drop` side is allow-listed from the bundle's own retirement record
+([catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations)),
+so an operator cannot name an arbitrary live definition, and a page still
+present in the current bundle is refused. The per-catalog `look` overrides are
+retired by ordinary §CT14 major-version migrations and need no operator step.
+
 For a Net world whose seeded map data a bundled catalog has since corrected —
 declared as `merge_map` set_property hooks with `supersedes` fingerprints
 ([catalogs.md §CT5.4](../discovery/catalogs.md#ct54-local-catalogs-and-auto-install));

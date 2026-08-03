@@ -176,8 +176,14 @@ description. The `summary` is built by reading each name in
 values that should always ride in the look output (e.g. for weather:
 `["current"]`).
 
-`:look()` wraps `:look_self()` and emits a caller-private `looked`
-observation, matching ordinary in-world look behavior. This matters even
+`$block` no longer declares its own `:look()`. It was a verbatim fork of
+the seed dispatcher that had already drifted, and it existed only because
+`look` used to be seeded on `$thing` — not an ancestor of `$block`, which
+descends from `$actor`. The dispatcher now lives at the graph root, so a
+block inherits it like everything else and customizes `:look_self()` only.
+One visible consequence: `look weather` is planned by the room's `look_at`
+like any other object, instead of being intercepted by a block-owned
+command pattern. This matters even
 when command planning routes through the block directly: chat clients render
 the observation, not just the returned structured value.
 
@@ -186,7 +192,7 @@ directly to the block object, room look treats block instances as visible
 contents rather than as present players. A room-mounted block should read
 like an appliance in the room, not like another user standing there. MCP
 uses the same room-content view for non-self blocks: obvious command verbs
-such as `:look` are visible, but inherited `$actor` control verbs remain
+such as `:look` (inherited) are visible, but inherited `$actor` control verbs remain
 available only when the block is the authenticated actor's `self`.
 
 Detail-tier properties stay accessible via `:get_data(name)` —

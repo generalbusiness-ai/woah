@@ -1,0 +1,10 @@
+{
+  "from_version": "0.x.x",
+  "to_version": "1.0.0",
+  "spec_version": "v1",
+  "steps": [
+    { "kind": "drop_verb", "class": "$builder", "verb": "look" },
+    { "kind": "drop_verb", "class": "$programmer", "verb": "look" },
+    { "kind": "drop_verb", "class": "$generic_editor", "verb": "look" }
+  ]
+}

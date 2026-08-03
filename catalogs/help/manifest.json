@@ -126,7 +126,7 @@
         ],
         "chat": [
           "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
-          "look asks the target to describe itself with look_self; room output is composed by the room."
+          "look asks the target to describe itself, and every object answers the same one verb; what differs is how each object renders itself. Room output is composed by the room."
         ],
         "self": [
           "You are an object in the world, and you act as that object. Tools named <you>__<verb> are verbs on your own body — typically help, home, and inventory, plus whatever else your classes and features give you. List your tools to see the actual set; only verbs written in woocode are published, so some in-world verbs on you have no tool.",

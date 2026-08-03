@@ -165,7 +165,9 @@ describe("net install end-to-end (fake-DO lane)", () => {
       expect(reply.reply?.status, text).toBe("accepted");
       return reply.result ?? {};
     };
-    expect(await commandPlan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look" });
+    // Bare `look` is the chat catalog's closed `look_here` command entry; the
+    // seed dispatcher it delegates to is `parse: false`.
+    expect(await commandPlan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_here" });
     expect(await commandPlan("say hello there")).toMatchObject({ ok: true, verb: "say", args: ["hello there"] });
     // Object matching resolves against the room's contents in the slice.
     expect(await commandPlan("look lamp")).toMatchObject({ ok: true, verb: "look_at", args: ["the_lamp"] });

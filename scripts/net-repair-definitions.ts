@@ -8,6 +8,7 @@
 import { planNetInstall } from "../src/net/install";
 import { CATALOG_SCOPE } from "../src/net/topology";
 import { BUNDLED_CATALOGS } from "../src/generated/bundled-catalogs";
+import { RETIRED_BOOTSTRAP_DEFINITIONS, retiredDefinitionId } from "../src/core/retired-definitions";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
 type DefinitionIdentity = { kind: "verb_bytecode" | "property_cell"; object: string; name: string };
@@ -52,12 +53,20 @@ export async function definitionRepairInputs(replace: readonly string[], drop: r
   const missing = replace.filter((name) => !definitions.has(requestKey(name)));
   if (missing.length > 0) throw new Error(`refused: requested ids are not bundled bootstrap definition pages: ${missing.join(", ")}`);
 
-  // Definition removals are sourced from the same bundled migration set as
-  // local catalog upgrades. This is the delete-side equivalent of mining
-  // replacement definitions from a fresh plan: the CLI cannot name an
-  // arbitrary live definition, and a page still present in the current bundle
-  // cannot be removed even if an old migration happened to mention its name.
+  // Definition removals are sourced from the bundle's own retirement records.
+  // This is the delete-side equivalent of mining replacement definitions from
+  // a fresh plan: the CLI cannot name an arbitrary live definition, and a page
+  // still present in the current bundle cannot be removed even if a record
+  // happened to mention its name.
+  //
+  // There are two such records, matching the two kinds of page this script
+  // repairs. Catalog pages are retired by a bundled catalog migration's
+  // `drop_verb` / `drop_property` step. **Bootstrap** pages are retired by
+  // `RETIRED_BOOTSTRAP_DEFINITIONS` — without it, the script could install a
+  // replacement bootstrap page but never remove the page it supersedes, so a
+  // deployed world kept both and the nearer ancestor won.
   const allowedDrops = new Set<string>();
+  for (const retired of RETIRED_BOOTSTRAP_DEFINITIONS) allowedDrops.add(retiredDefinitionId(retired));
   for (const entry of BUNDLED_CATALOGS) {
     for (const migration of entry.migrations ?? []) {
       for (const step of migration.steps ?? []) {

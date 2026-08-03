@@ -4,23 +4,23 @@
 
 import manifest0 from "../../catalogs/acts/manifest.json";
 import manifest1 from "../../catalogs/block/manifest.json";
-import manifest2 from "../../catalogs/blocks-demo/manifest.json";
-import manifest3 from "../../catalogs/casework/manifest.json";
-import manifest4 from "../../catalogs/chat/manifest.json";
-import manifest5 from "../../catalogs/core/manifest.json";
-import manifest6 from "../../catalogs/demoworld/manifest.json";
-import manifest7 from "../../catalogs/dispenser/manifest.json";
-import manifest9 from "../../catalogs/dubspace/manifest.json";
-import manifest11 from "../../catalogs/help/manifest.json";
-import manifest13 from "../../catalogs/horoscope/manifest.json";
-import manifest14 from "../../catalogs/note/manifest.json";
-import manifest17 from "../../catalogs/outliner/manifest.json";
-import manifest21 from "../../catalogs/perm/manifest.json";
-import manifest22 from "../../catalogs/pinboard/manifest.json";
-import manifest24 from "../../catalogs/prog/manifest.json";
-import manifest25 from "../../catalogs/scheduling/manifest.json";
-import manifest26 from "../../catalogs/tasks/manifest.json";
-import manifest28 from "../../catalogs/weather/manifest.json";
+import manifest3 from "../../catalogs/blocks-demo/manifest.json";
+import manifest4 from "../../catalogs/casework/manifest.json";
+import manifest5 from "../../catalogs/chat/manifest.json";
+import manifest7 from "../../catalogs/core/manifest.json";
+import manifest8 from "../../catalogs/demoworld/manifest.json";
+import manifest10 from "../../catalogs/dispenser/manifest.json";
+import manifest12 from "../../catalogs/dubspace/manifest.json";
+import manifest14 from "../../catalogs/help/manifest.json";
+import manifest16 from "../../catalogs/horoscope/manifest.json";
+import manifest17 from "../../catalogs/note/manifest.json";
+import manifest20 from "../../catalogs/outliner/manifest.json";
+import manifest25 from "../../catalogs/perm/manifest.json";
+import manifest26 from "../../catalogs/pinboard/manifest.json";
+import manifest29 from "../../catalogs/prog/manifest.json";
+import manifest31 from "../../catalogs/scheduling/manifest.json";
+import manifest32 from "../../catalogs/tasks/manifest.json";
+import manifest34 from "../../catalogs/weather/manifest.json";
 import * as uiModule0 from "../../catalogs/block/ui/block-chat";
 import * as uiModule1 from "../../catalogs/chat/ui/chat-space";
 import * as uiModule2 from "../../catalogs/demoworld/ui/demoworld-chat";
@@ -34,13 +34,13 @@ import * as uiModule9 from "../../catalogs/weather/ui/weather-badge";
 
 export const BUNDLED_CATALOG_UI = [
   { alias: "block", manifest: manifest1, modules: { "block-chat": uiModule0 } },
-  { alias: "chat", manifest: manifest4, modules: { "chat-ui": uiModule1 } },
-  { alias: "demoworld", manifest: manifest6, modules: { "demoworld-chat": uiModule2 } },
-  { alias: "dispenser", manifest: manifest7, modules: { "dispenser-chat": uiModule3 } },
-  { alias: "dubspace", manifest: manifest9, modules: { "dubspace-ui": uiModule4 } },
-  { alias: "note", manifest: manifest14, modules: { "note-chat": uiModule5 } },
-  { alias: "outliner", manifest: manifest17, modules: { "outliner-ui": uiModule6 } },
-  { alias: "pinboard", manifest: manifest22, modules: { "pinboard-ui": uiModule7 } },
-  { alias: "tasks", manifest: manifest26, modules: { "tasks-ui": uiModule8 } },
-  { alias: "weather", manifest: manifest28, modules: { "weather-ui": uiModule9 } }
+  { alias: "chat", manifest: manifest5, modules: { "chat-ui": uiModule1 } },
+  { alias: "demoworld", manifest: manifest8, modules: { "demoworld-chat": uiModule2 } },
+  { alias: "dispenser", manifest: manifest10, modules: { "dispenser-chat": uiModule3 } },
+  { alias: "dubspace", manifest: manifest12, modules: { "dubspace-ui": uiModule4 } },
+  { alias: "note", manifest: manifest17, modules: { "note-chat": uiModule5 } },
+  { alias: "outliner", manifest: manifest20, modules: { "outliner-ui": uiModule6 } },
+  { alias: "pinboard", manifest: manifest26, modules: { "pinboard-ui": uiModule7 } },
+  { alias: "tasks", manifest: manifest32, modules: { "tasks-ui": uiModule8 } },
+  { alias: "weather", manifest: manifest34, modules: { "weather-ui": uiModule9 } }
 ] as const;

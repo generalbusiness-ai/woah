@@ -15308,7 +15308,16 @@ export class WooWorld {
     // targets `me` but passes only the iobj text to set_description.
     const directObject = cmd.dobj_prefix ?? cmd.dobj;
     if (!directObject || directObject !== target) return false;
-    if (pattern.dobj !== "object") return false;
+    // `dobj` may be a single pattern or a list of alternatives — the sibling
+    // matcher `commandSlotMatches` already recurses over arrays, so a catalog
+    // can write `["object", "string"]` and have it match. A pattern that lists
+    // `object` among its alternatives is still an object-consuming dispatcher
+    // when that alternative is the one that fired, so an exact `=== "object"`
+    // test silently skips this check and hands the command to the mounted
+    // space instead of the room. No bundled catalog writes a list today; this
+    // keeps the two matchers agreeing on what a `dobj` pattern can be.
+    const dobjPatterns = Array.isArray(pattern.dobj) ? pattern.dobj : [pattern.dobj];
+    if (!dobjPatterns.includes("object")) return false;
     const argsFrom = Array.isArray(pattern.args_from) ? pattern.args_from.map((item) => String(item)) : [];
     return argsFrom.includes("dobj") || argsFrom.includes("dobj_prefix");
   }
