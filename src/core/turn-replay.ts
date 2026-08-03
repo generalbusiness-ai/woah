@@ -22,10 +22,15 @@ export async function replayRecordedTurn(serializedBefore: SerializedWorld, turn
     actor: turn.start.actor,
     target: turn.start.target,
     verb: turn.start.verb,
-    args: turn.start.args
+    ...(turn.start.verb_definer ? { verb_definer: turn.start.verb_definer } : {}),
+    args: turn.start.args,
+    ...(turn.start.body !== undefined ? { body: turn.start.body } : {})
   };
   if (turn.start.route === "direct") {
-    frame = await world.directCall(turn.start.id, turn.start.actor, turn.start.target, turn.start.verb, turn.start.args, { sessionId: turn.start.session ?? null });
+    frame = await world.directCall(turn.start.id, turn.start.actor, turn.start.target, turn.start.verb, turn.start.args, {
+      sessionId: turn.start.session ?? null,
+      ...(turn.start.verb_definer ? { verbDefiner: turn.start.verb_definer } : {})
+    });
   } else if (turn.start.session) {
     frame = await world.call(turn.start.id, turn.start.session, turn.start.scope, message);
   } else {

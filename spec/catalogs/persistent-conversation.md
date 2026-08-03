@@ -426,8 +426,15 @@ use the same metadata check.
 Browser clients send free text as a v2 command intent with the active command
 scope and raw text. The server consumes the plan and dispatches:
 
-- direct plans call the target verb directly and return `op:"result"`;
-- sequenced plans call `plan.space:call({...plan})` and return `op:"applied"`.
+- direct plans call the target's exact `(verb_definer, verb)` page and return
+  `op:"result"`;
+- sequenced plans preserve that page identity in
+  `plan.space:call({...plan})` and return `op:"applied"`.
+
+Every successful executable plan carries the selected page's canonical `verb`
+and owning `verb_definer`. Execution validates that the definer remains in the
+target's current parent/feature topology and re-checks permissions; it never
+re-resolves only the verb name.
 
 The catalog-level `:command(text)` verb remains a compatibility command surface
 for older direct callers. It consumes the same plan shape: direct plans execute

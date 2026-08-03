@@ -1909,6 +1909,7 @@ export function transcriptLogEntry(transcript: EffectTranscript): SerializedWorl
     actor: transcript.call.actor,
     target: transcript.call.target,
     verb: transcript.call.verb,
+    ...(transcript.call.verb_definer ? { verb_definer: transcript.call.verb_definer } : {}),
     args: structuredClone(transcript.call.args) as WooValue[]
   };
   return {

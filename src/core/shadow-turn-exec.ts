@@ -1522,8 +1522,9 @@ function missingAtomsFromThrownRepairableState(
   const value = error.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const map = value as Record<string, WooValue>;
-  if (map.obj !== request.call.target || map.name !== request.call.verb) return null;
-  return [missingAtomForPreimage(`read:cell:verb:${request.call.target}:${request.call.verb}`)];
+  const expectedObject = request.call.verb_definer ?? request.call.target;
+  if (map.obj !== expectedObject || map.name !== request.call.verb) return null;
+  return [missingAtomForPreimage(`read:cell:verb:${expectedObject}:${request.call.verb}`)];
 }
 
 function missingAtomForPreimage(preimage: string): ShadowMissingAtom {

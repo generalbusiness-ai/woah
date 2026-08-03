@@ -32,6 +32,7 @@ export type ShadowTurnKey = {
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  verb_definer?: ObjRef;
   // VTN11 effect mask of the turn (bitwise-OR of SHADOW_EFFECT_*).
   effects: number;
   preimages: string[];
@@ -77,6 +78,16 @@ export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): Shado
     `scope:${transcript.scope}`
   ]) preimages.add(preimage);
 
+  if (transcript.call.verb_definer) {
+    // Exact page selection is part of executor capability identity. Keep the
+    // ordinary call preimages stable, but require bound plans to advertise
+    // both the definer atom and the full receiver/page pair.
+    preimages.add(`verb_definer:${transcript.call.verb_definer}`);
+    const pageIdentity = `call_page:${transcript.call.target}:${transcript.call.verb_definer}:${transcript.call.verb}`;
+    preimages.add(pageIdentity);
+    acceptPreimages.add(pageIdentity);
+  }
+
   for (const preimage of [
     `scope:${transcript.scope}`,
     `target:${transcript.call.target}`,
@@ -113,6 +124,7 @@ export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): Shado
     actor: transcript.call.actor,
     target: transcript.call.target,
     verb: transcript.call.verb,
+    ...(transcript.call.verb_definer ? { verb_definer: transcript.call.verb_definer } : {}),
     effects: shadowTurnEffectsFromTranscript(transcript),
     preimages: sorted,
     atom_hashes: sorted.map((preimage) => shadowAtomHash(preimage)),
@@ -130,6 +142,7 @@ export function shadowTurnKeyFromCall(call: {
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  verb_definer?: ObjRef;
 }): ShadowTurnKey {
   // Static intent keys deliberately name only the routing/acceptance atoms known
   // before VM execution. Sparse executors then discover the real read/write
@@ -142,6 +155,12 @@ export function shadowTurnKeyFromCall(call: {
     `target:${call.target}`,
     `scope:${call.scope}`
   ]) preimages.add(preimage);
+  if (call.verb_definer) {
+    preimages.add(`verb_definer:${call.verb_definer}`);
+    const pageIdentity = `call_page:${call.target}:${call.verb_definer}:${call.verb}`;
+    preimages.add(pageIdentity);
+    acceptPreimages.add(pageIdentity);
+  }
   for (const preimage of [
     `scope:${call.scope}`,
     `target:${call.target}`,
@@ -159,6 +178,7 @@ export function shadowTurnKeyFromCall(call: {
     actor: call.actor,
     target: call.target,
     verb: call.verb,
+    ...(call.verb_definer ? { verb_definer: call.verb_definer } : {}),
     // A static pre-execution intent key does not yet know its effect closure;
     // claiming no effects (0) imposes no effect-subset constraint on routing —
     // the executor proves the real closure by executing or returning missing_state.

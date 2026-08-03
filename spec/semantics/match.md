@@ -22,10 +22,10 @@ A seed object with these verbs. Lives with the chat classes and scaffolding ([bo
 | Verb | Returns | Purpose |
 |---|---|---|
 | `:match_object(name, location?)` rxd | obj \| `$failed_match` \| `$ambiguous_match` | Resolve a string to an object visible from `location` (defaults to `actor.location`). |
-| `:match_verb(name, target)` rxd | verb \| null | Resolve a verb name (with alias patterns per [objects.md §9.1](objects.md#91-lookup)) on `target` using runtime lookup, including features where applicable. |
+| `:match_verb(name, target)` rxd | map \| null | Resolve a verb name (with alias patterns per [objects.md §9.1](objects.md#91-lookup)) on `target` using runtime lookup, including features where applicable. |
 | `:parse_command(text, actor, location?)` rxd | map | Full pipeline: tokenize, identify verb + dobj + iobj, return a structured `command` map. `location` defaults to `actor.location`. |
 | `:match_command_verb(cmd, target)` rxd | map \| `$failed_match` | Resolve a command-pattern verb on `target`, using the same ancestry/feature lookup as `:match_verb` but filtering by command metadata. |
-| `:plan_command(text, space)` rxd | map | Shared command planner used by `$conversational:command_plan`; returns `{ok, route, space?, target, verb, args, cmd}` or a huh plan. |
+| `:plan_command(text, space)` rxd | map | Shared command planner used by `$conversational:command_plan`; returns `{ok, route, space?, target, verb, verb_definer, args, cmd}` or a huh plan. |
 
 Returned by `:match_object`:
 - A successful objref.
@@ -105,7 +105,11 @@ The "me" and "here" pseudo-names resolve to `actor` and `actor.location` respect
 2. If no parent-chain match **and** `target` is `$actor`- or `$space`-descended, walk `target.features` in list order per [features.md §FT2](features.md#ft2-verb-lookup-with-features). For each feature `f`, search `f`'s parent chain by the same rule. First match wins.
 3. If still no match, return null.
 
-This is the *same* lookup the runtime performs on `CALL_VERB`. Surfacing it as a user-callable verb lets the chat parser (and any other text-shaped UI) preview verb resolution before dispatching, so command interpretation matches what dispatch will actually do — feature-attached verbs included.
+This is the *same* lookup the runtime performs on `CALL_VERB`. A successful
+result includes both the canonical `name` and its `definer`. Surfacing it as a
+user-callable verb lets the chat parser (and any other text-shaped UI) bind a
+command to the page it selected — feature-attached verbs included — instead of
+asking execution to repeat a name lookup that may select another page.
 
 ---
 
@@ -141,7 +145,15 @@ User code dispatches by:
 let cmd = $match:parse_command(text, actor);
 let v = $match:match_command_verb(cmd, cmd.dobj);
 if (typeof(v) == "map") {
-  dispatch(v["target"], v["verb"], v["args"]);
+  execute_command_plan({
+    ok: true,
+    route: "direct",
+    target: v["target"],
+    verb: v["verb"],
+    verb_definer: v["definer"],
+    args: v["args"],
+    cmd: cmd
+  });
 }
 ```
 
@@ -379,6 +391,42 @@ freshly-seeded world's durability comes entirely from its own cells. The
 fallback is direct-route-only: a sequenced route is already durable, so
 `persistence` on a sequenced plan (e.g. `enter`) can only come from the
 cell.
+
+### MA7.2. Exact verb-page binding
+
+Every successful executable command plan MUST carry:
+
+```text
+target:        the receiver (`this` during execution)
+verb:          the selected page's canonical name
+verb_definer:  the object that owns that exact page
+```
+
+`(verb_definer, verb)` is the page identity. It is deliberately not a source
+hash or version snapshot: editing a page preserves its identity, and execution
+runs the current authorized page while the normal transcript/page-version read
+guards concurrent Net commits. The identity prevents a different page with the
+same name on `target`, an ancestor, or another feature from intercepting the
+planned call.
+
+Before executing a bound plan, the runtime MUST verify that `verb_definer` is
+still reachable from `target` through the target's parent chain or, for a
+feature carrier, through one of its currently attached feature chains. The
+definer MUST still own a page whose canonical name is exactly `verb`. A failed
+reachability or exact-page check raises `E_VERBNF`; execution MUST NOT fall back
+to another ancestor or feature page. These checks are state reads in a Net turn
+and therefore participate in repair and commit validation.
+
+Binding is dispatch selection, not authority. Execute permission,
+`direct_callable`, presence, route, and all verb-body authorization are checked
+again at execution. A client-supplied `verb_definer` cannot make an unrelated
+page reachable.
+
+Successful plans without `verb_definer` are malformed and
+`execute_command_plan` refuses them with `E_INVARG`. Non-executable huh/handled
+plans do not require a page identity. Ordinary structured calls that are not
+derived from command planning omit `verb_definer` and retain normal name
+resolution.
 
 ---
 

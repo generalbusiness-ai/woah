@@ -3100,10 +3100,16 @@ describe("local catalogs", () => {
     if (teachPlan.op === "result") {
       const plan = teachPlan.result as Record<string, any>;
       expect(plan).toMatchObject({ ok: true, route: "sequenced", space: "the_chatroom", target: "the_cockatoo", verb: "teach", args: ["object worlds"] });
+      const selectedDefiner = String(plan.verb_definer);
+      expect(selectedDefiner).not.toBe("the_cockatoo");
+      expect(installVerb(world, "the_cockatoo", "teach", `verb :teach(text) rxd {
+  return { rebound: true, text: text };
+}`, null).ok).toBe(true);
       const applied = await world.call("teach-cockatoo-command", first.id, String(plan.space), {
         actor: first.actor,
         target: String(plan.target),
         verb: String(plan.verb),
+        verb_definer: selectedDefiner,
         args: plan.args
       });
       expect(applied.op).toBe("applied");
@@ -4351,20 +4357,23 @@ describe("local catalogs", () => {
     expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
   });
 
-  it("plans a command token that execution re-resolves, like every other command verb", async () => {
-    // A command plan carries the target and the verb NAME; execution resolves
-    // that name again. So a page installed on the target between planning and
-    // execution is what runs — for `look_here` exactly as for `say`, `go` or
-    // any other command verb. This is a property of the plan/execute split,
-    // not of this consolidation: on main, bare `look` planned the token `look`
-    // and a page installed at `the_chatroom:look` hijacked it identically.
-    //
-    // Pinned here so that if plans ever start carrying an exact page identity,
-    // this test is the one that has to change — deliberately, for all tokens
-    // at once, rather than silently for one of them.
+  it("executes the exact page selected by command planning for every command token", async () => {
+    // Planning may deliberately skip a nearer same-named page when it has no
+    // command pattern. The returned definer is therefore load-bearing: if
+    // execution repeats ordinary name lookup, the planted page below hijacks
+    // both bare look and speech. execute_command_plan must instead validate
+    // and invoke the exact selected catalog page.
     for (const token of ["look_here", "say"]) {
       const world = createWorld();
       const session = world.auth(`guest:token-${token}`);
+      const runner = installVerb(
+        world,
+        session.actor,
+        "execute_bound_plan",
+        "verb :execute_bound_plan(plan) rxd { return execute_command_plan(plan); }",
+        null
+      );
+      expect(runner.ok).toBe(true);
       const planned = await world.directCall(
         `plan-${token}`,
         session.actor,
@@ -4377,6 +4386,7 @@ describe("local catalogs", () => {
       if (planned.op !== "result") continue;
       const plan = planned.result as Record<string, unknown>;
       expect(plan.verb, token).toBe(token);
+      expect(plan.verb_definer, token).toBe("$conversational");
 
       const params = token === "say" ? "text" : "";
       const planted = installVerb(
@@ -4391,14 +4401,119 @@ describe("local catalogs", () => {
       const ran = await world.directCall(
         `run-${token}`,
         session.actor,
-        String(plan.target),
-        String(plan.verb),
-        plan.args as never,
+        session.actor,
+        "execute_bound_plan",
+        [plan as never],
         { sessionId: session.id }
       );
       expect(ran.op, token).toBe("result");
-      if (ran.op === "result") expect(ran.result, token).toMatchObject({ rebound: true });
+      if (ran.op === "result") {
+        expect(ran.result, token).not.toMatchObject({ rebound: true });
+        expect(ran.observations.some((observation) => observation.type === (token === "say" ? "said" : "looked")), token).toBe(true);
+      }
     }
+  });
+
+  it("refuses malformed, forged, and stale exact-page plans", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:exact-page-refusals");
+    expect(installVerb(
+      world,
+      session.actor,
+      "execute_bound_plan",
+      "verb :execute_bound_plan(plan) rxd { return execute_command_plan(plan); }",
+      null
+    ).ok).toBe(true);
+
+    const planned = await world.directCall(
+      "plan-exact-page-refusals",
+      session.actor,
+      "the_chatroom",
+      "command_plan",
+      ["look"],
+      { sessionId: session.id }
+    );
+    expect(planned.op).toBe("result");
+    if (planned.op !== "result") return;
+    const plan = planned.result as Record<string, WooValue>;
+
+    // A successful executable plan without identity is malformed. Execution
+    // must not quietly recover by doing the vulnerable target/name lookup.
+    const { verb_definer: _omitted, ...unbound } = plan;
+    const missing = await world.directCall(
+      "run-plan-without-definer",
+      session.actor,
+      session.actor,
+      "execute_bound_plan",
+      [unbound as WooValue],
+      { sessionId: session.id }
+    );
+    expect(missing).toMatchObject({ op: "error", error: { code: "E_INVARG" } });
+
+    // The definer is a selector, not authority: an unrelated live object
+    // cannot be named to make one of its pages executable through the target.
+    world.createObject({ id: "unrelated_plan_page", parent: "$thing", owner: "$wiz", location: "$nowhere" });
+    expect(installVerb(
+      world,
+      "unrelated_plan_page",
+      "look_here",
+      "verb :look_here() rxd { return { forged: true }; }",
+      null
+    ).ok).toBe(true);
+    const forged = await world.directCall(
+      "run-plan-with-forged-definer",
+      session.actor,
+      session.actor,
+      "execute_bound_plan",
+      [{ ...plan, verb_definer: "unrelated_plan_page" } as WooValue],
+      { sessionId: session.id }
+    );
+    expect(forged).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
+
+    // Feature attachment is part of exact-page reachability. A plan made
+    // while a feature is attached expires when that topology is detached.
+    world.createObject({ id: "$plan_feature", parent: "$thing", owner: "$wiz", location: null });
+    expect(installVerb(
+      world,
+      "$plan_feature",
+      "probe_plan_page",
+      "verb :probe_plan_page() rx { return 42; }",
+      null,
+      { argSpec: { command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } } }
+    ).ok).toBe(true);
+    const originalFeatures = world.getProp("the_chatroom", "features") as string[];
+    world.setProp("the_chatroom", "features", [...originalFeatures, "$plan_feature"]);
+    const featurePlanned = await world.directCall(
+      "plan-feature-page",
+      session.actor,
+      "the_chatroom",
+      "command_plan",
+      ["probe_plan_page"],
+      { sessionId: session.id }
+    );
+    expect(featurePlanned).toMatchObject({
+      op: "result",
+      result: { ok: true, verb: "probe_plan_page", verb_definer: "$plan_feature" }
+    });
+    const directForgery = await world.directCall(
+      "run-feature-plan-with-forged-route",
+      session.actor,
+      session.actor,
+      "execute_bound_plan",
+      [{ ...((featurePlanned as DirectResultFrame).result as Record<string, WooValue>), route: "direct", space: null } as WooValue],
+      { sessionId: session.id }
+    );
+    expect(directForgery).toMatchObject({ op: "error", error: { code: "E_DIRECT_DENIED" } });
+    world.setProp("the_chatroom", "features", originalFeatures);
+    const stale = await world.directCall(
+      "run-detached-feature-plan",
+      session.actor,
+      session.actor,
+      "execute_bound_plan",
+      [(featurePlanned as DirectResultFrame).result as WooValue],
+      { sessionId: session.id }
+    );
+    expect(stale).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
   });
 
   it("drops the retired bootstrap look page from an aged world on cold init", () => {

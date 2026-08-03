@@ -214,7 +214,7 @@ type CommandMap = {
 
 type CommandVerbSummary = {
   name: string;
-  definer?: ObjRef | null;
+  definer: ObjRef;
   direct_callable: boolean;
   skip_presence_check?: boolean;
   arg_spec?: Record<string, WooValue>;
@@ -234,6 +234,7 @@ type CommandPlan = {
   space: ObjRef | null;
   target: ObjRef;
   verb: string;
+  verb_definer: ObjRef;
   args: WooValue[];
   cmd: CommandMap;
   persistence?: "durable" | "live";
@@ -353,7 +354,11 @@ export type ExecutorContext = {
    * owning host, so cross-host stale-ref answers must come from there. */
   isRecycled?(objRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
-  dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
+  /** Dispatch an already-resolved call. `exactDefiner` selects a page; it
+   * never grants permission to execute it. Ingresses that promise external
+   * direct-call semantics set `requireDirectCallable`, which is deliberately
+   * enforced again by the host that owns the executable page. */
+  dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, exactDefiner?: ObjRef | null, requireDirectCallable?: boolean): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): Promise<void>;
   setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void>;
@@ -478,6 +483,8 @@ export type DirectCallOptions = {
    * `direct_callable` ingress gate (a scheduled turn is not client ingress)
    * and presents `caller = $system` so a fired verb can tell it was woken. */
   scheduled?: { id: string; at: number; fired_at: number };
+  /** Exact command-planned page identity. Not part of the public raw-call API. */
+  verbDefiner?: ObjRef;
   forceDirect?: boolean;
   forceReason?: string;
   sessionId?: string | null;
@@ -488,6 +495,8 @@ export type DirectCallOptions = {
 type DirectDispatchFrameOptions = {
   /** CO16.4 scheduled dispatch; see DirectCallOptions. */
   scheduled?: { id: string; at: number; fired_at: number };
+  /** Exact command-planned page identity. */
+  verbDefiner?: ObjRef;
   startedAt: number;
   sessionId: string | null;
   audience: ObjRef | null;
@@ -3983,6 +3992,75 @@ export class WooWorld {
     throw wooError("E_VERBNF", `verb not found: ${objRef}:${name}`, { obj: objRef, name });
   }
 
+  /**
+   * Resolve the exact page selected by a command plan.
+   *
+   * Ordinary dispatch stops at the first matching name. A command plan has
+   * already done that policy work, including command-pattern filtering, so
+   * repeating target-first lookup here would let a nearer same-named page
+   * intercept the call. The bound definer is still only a selector: this walk
+   * proves it remains in the target's inheritance/feature topology and the
+   * definer still owns the named canonical page.
+   */
+  private resolveExactVerbPageLive(target: ObjRef, definer: ObjRef, name: string): ResolvedVerb {
+    this.objectLive(target);
+    this.objectLive(definer);
+    const dependencies: RecordedProofDependency[] = [];
+
+    const fromChain = (start: ObjRef): ResolvedVerb | null => {
+      let current: ObjRef | null = start;
+      const seen = new Set<ObjRef>();
+      while (current && !seen.has(current)) {
+        seen.add(current);
+        const obj: WooObject | null = current === start ? this.objectLive(current) : this.parentWalkLookup(start, current);
+        if (!obj) break;
+        // Exact-page reachability is semantic input, not merely a lookup cache
+        // hint. Record each traversed lineage cell so a Net commit cannot
+        // accept a plan after chparent/detach changed the selected topology.
+        if (this.activeTurnRecorder) {
+          this.recordTurnEvent({
+            kind: "cell_read",
+            cell: { kind: "lifecycle", object: current },
+            version: this.structuralVersionForRecording("lifecycle", current),
+            value: this.lineageSemantic(obj)
+          });
+          dependencies.push({ kind: "lineage", object: current });
+        }
+        if (current === definer) {
+          const verb = obj.verbs.find((candidate: VerbDef) => candidate.name === name);
+          if (!verb) {
+            throw wooError("E_VERBNF", `exact verb page not found: ${definer}:${name}`, {
+              obj: definer,
+              target,
+              name,
+              definer
+            });
+          }
+          return { definer, verb, dependencies };
+        }
+        current = obj.parent;
+      }
+      return null;
+    };
+
+    const inherited = fromChain(target);
+    if (inherited) return inherited;
+    if (this.canCarryFeatures(target)) {
+      // featureList uses the ordinary property reader, so the attached feature
+      // vector and its inherited definition path become transcript reads.
+      for (const feature of this.featureList(target)) {
+        const resolved = fromChain(feature);
+        if (resolved) return resolved;
+      }
+    }
+    throw wooError("E_VERBNF", `verb page ${definer}:${name} is not reachable from ${target}`, {
+      obj: definer,
+      target,
+      name,
+      definer
+    });
+  }
+
   resolveVerbFrom(startRef: ObjRef | null, name: string): ResolvedVerb;
   resolveVerbFrom(startRef: ObjRef | null, name: string, required: false): ResolvedVerb | null;
   resolveVerbFrom(startRef: ObjRef | null, name: string, required = true): ResolvedVerb | null {
@@ -6997,18 +7075,39 @@ export class WooWorld {
     const plan = commandPlanFromValue(planned.result);
     if (!plan) return planned;
     if (plan.route === "direct") {
-      const frame = await this.directCallNow(frameId, this.sessionActor(sessionId), plan.target, plan.verb, plan.args, { sessionId, deferHostEffect: options.deferHostEffect });
+      const frame = await this.directCallNow(frameId, this.sessionActor(sessionId), plan.target, plan.verb, plan.args, {
+        sessionId,
+        verbDefiner: plan.verb_definer,
+        deferHostEffect: options.deferHostEffect
+      });
       return frame.op === "result" ? { ...frame, command: plan } as DirectResultFrame : frame;
     }
     const commandSpace = plan.space ?? space;
-    return await this.callNow(frameId, sessionId, commandSpace, { actor: this.sessionActor(sessionId), target: plan.target, verb: plan.verb, args: plan.args });
+    return await this.callNow(frameId, sessionId, commandSpace, {
+      actor: this.sessionActor(sessionId),
+      target: plan.target,
+      verb: plan.verb,
+      verb_definer: plan.verb_definer,
+      args: plan.args
+    });
   }
 
   async executeCommandPlan(ctx: CallContext, planValue: Record<string, WooValue>): Promise<WooValue> {
     const plan = commandPlanFromValue(planValue as unknown as WooValue);
-    if (!plan) return planValue as unknown as WooValue;
+    if (!plan) {
+      throw wooError("E_INVARG", "execute_command_plan requires a successful plan with exact verb-page identity");
+    }
     if (plan.route === "direct") {
-      return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
+      return await this.dispatch(
+        { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
+        plan.target,
+        plan.verb,
+        plan.args,
+        undefined,
+        undefined,
+        plan.verb_definer,
+        true
+      );
     }
     if (!ctx.session) throw wooError("E_NOSESSION", "sequenced command requires a live session");
     const commandSpace = plan.space ?? ctx.space;
@@ -7022,7 +7121,15 @@ export class WooWorld {
       }
       // Already inside the compatible authoritative turn: dispatch inline.
       // No second sequence, recorder envelope, or persistence boundary exists.
-      return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
+      return await this.dispatch(
+        { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
+        plan.target,
+        plan.verb,
+        plan.args,
+        undefined,
+        undefined,
+        plan.verb_definer
+      );
     }
 
     if (this.behaviorUndoScopes.length === 0) {
@@ -7056,7 +7163,13 @@ export class WooWorld {
     }
     const proofEvents = this.activeTurnRecorder?.currentBehaviorEvents() ?? [];
     throw commandPlanTransfer(
-      { space: commandSpace, target: plan.target, verb: plan.verb, args: plan.args },
+      {
+        space: commandSpace,
+        target: plan.target,
+        verb: plan.verb,
+        verb_definer: plan.verb_definer,
+        args: plan.args
+      },
       ctx.actor,
       ctx.session,
       [...proofEvents]
@@ -7142,6 +7255,7 @@ export class WooWorld {
     return hashSource(canonicalJson({
       target,
       verb,
+      verb_definer: options.verbDefiner ?? null,
       args,
       force_direct: options.forceDirect === true,
       force_reason: options.forceReason ?? null
@@ -7174,7 +7288,9 @@ export class WooWorld {
           }
         }
       }
-      const { verb } = this.resolveVerbLive(target, verbName);
+      const { verb } = options.verbDefiner
+        ? this.resolveExactVerbPageLive(target, options.verbDefiner, verbName)
+        : this.resolveVerbLive(target, verbName);
       const forceDirect = options.forceDirect === true && verb.direct_callable !== true;
       const wizard = this.isWizard(actor);
       // CO16.4: a scheduled turn is not client ingress, so the ingress flag
@@ -7205,6 +7321,7 @@ export class WooWorld {
         sessionId,
         audience,
         hostMemo,
+        ...(options.verbDefiner ? { verbDefiner: options.verbDefiner } : {}),
         ...(options.scheduled ? { scheduled: options.scheduled } : {}),
         initialObservations: forceDirect ? [{ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target }] : undefined,
         deferHostEffect: options.deferHostEffect,
@@ -7255,6 +7372,7 @@ export class WooWorld {
         actor: transfer.actor,
         target: transfer.plan.target,
         verb: transfer.plan.verb,
+        verb_definer: transfer.plan.verb_definer,
         args: transfer.plan.args
       },
       { transferredProofEvents: transfer.proofEvents }
@@ -7274,6 +7392,7 @@ export class WooWorld {
       actor,
       target,
       verb: verbName,
+      ...(options.verbDefiner ? { verb_definer: options.verbDefiner } : {}),
       args,
       // CO16.8 fire-time context, reachable from woocode as `message`. The
       // verb can tell it was woken rather than called, and how late: `at` and
@@ -7314,12 +7433,23 @@ export class WooWorld {
     };
     let liveAudiences: DirectLiveAudience = {};
     await this.withTurnRecording(
-      { id: frameId, route: "direct", scope: options.audience ?? "#-1", seq: -1, session: options.sessionId, actor, target, verb: verbName, args },
+      {
+        id: frameId,
+        route: "direct",
+        scope: options.audience ?? "#-1",
+        seq: -1,
+        session: options.sessionId,
+        actor,
+        target,
+        verb: verbName,
+        ...(options.verbDefiner ? { verb_definer: options.verbDefiner } : {}),
+        args
+      },
       async (activeRecorder) => {
         options.hostMemo.turnRecorder = activeRecorder;
         await this.withPersistencePaused(async () => {
           await this.withBehaviorSavepoint(async () => {
-            result = await this.dispatch(dispatchCtx, target, verbName, args);
+            result = await this.dispatch(dispatchCtx, target, verbName, args, undefined, undefined, options.verbDefiner);
             result = await this.enrichScopedMoveResult(dispatchCtx, result);
             // These reads are part of constructing the success frame, so they
             // belong before acceptance. A remote enrichment/audience failure
@@ -7445,7 +7575,11 @@ export class WooWorld {
       // transcript instead of producing an authority-verifiable result.
       let skipPresenceCheck = false;
       try {
-        skipPresenceCheck = this.resolveVerbLive(message.target, message.verb).verb.skip_presence_check === true;
+        skipPresenceCheck = (
+          message.verb_definer
+            ? this.resolveExactVerbPageLive(message.target, message.verb_definer, message.verb)
+            : this.resolveVerbLive(message.target, message.verb)
+        ).verb.skip_presence_check === true;
       } catch {
         // Let unresolved target verbs continue into the sequenced call body,
         // where they become applied $error observations and still consume seq.
@@ -7502,7 +7636,19 @@ export class WooWorld {
 
       try {
         await this.withTurnRecording(
-          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
+          {
+            id,
+            route: "sequenced",
+            scope: spaceRef,
+            seq,
+            session: sessionId,
+            actor: message.actor,
+            target: message.target,
+            verb: message.verb,
+            ...(message.verb_definer ? { verb_definer: message.verb_definer } : {}),
+            args: message.args,
+            body: message.body
+          },
           async (activeRecorder) => {
             if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
             // The preamble's seq allocation, recorded as ordinary transcript
@@ -7514,7 +7660,7 @@ export class WooWorld {
             // gain hidden system-authority writes.
             await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
             await this.withBehaviorSavepoint(async () => {
-              result = await this.dispatch(ctx, message.target, message.verb, message.args);
+              result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer);
               result = await this.enrichScopedMoveResult(ctx, result);
             });
             return result ?? null;
@@ -7565,7 +7711,11 @@ export class WooWorld {
         // pre-recording presence gate applies to sequenced calls.
         let skipPresenceCheck = false;
         try {
-          skipPresenceCheck = this.resolveVerbLive(message.target, message.verb).verb.skip_presence_check === true;
+          skipPresenceCheck = (
+            message.verb_definer
+              ? this.resolveExactVerbPageLive(message.target, message.verb_definer, message.verb)
+              : this.resolveVerbLive(message.target, message.verb)
+          ).verb.skip_presence_check === true;
         } catch {
           // Keep missing-verb calls on the applied-frame rollback path.
         }
@@ -7624,7 +7774,19 @@ export class WooWorld {
 
         try {
           await this.withTurnRecording(
-            { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
+            {
+              id,
+              route: "sequenced",
+              scope: spaceRef,
+              seq,
+              session: sessionId,
+              actor: message.actor,
+              target: message.target,
+              verb: message.verb,
+              ...(message.verb_definer ? { verb_definer: message.verb_definer } : {}),
+              args: message.args,
+              body: message.body
+            },
             async (activeRecorder) => {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
               // Same recorded seq allocation as the in-memory path.
@@ -7635,7 +7797,7 @@ export class WooWorld {
               // must not carry those cleanup writes.
               await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
               await this.withBehaviorSavepoint(async () => {
-                result = await this.dispatch(ctx, message.target, message.verb, message.args);
+                result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer);
                 result = await this.enrichScopedMoveResult(ctx, result);
               });
               return result ?? null;
@@ -7701,7 +7863,7 @@ export class WooWorld {
     return frame;
   }
 
-  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string): Promise<WooValue> {
+  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string, exactDefiner?: ObjRef | null, requireDirectCallable: boolean = false): Promise<WooValue> {
     // Re-entrancy: if the inbound caller is part of the chain we are
     // already running on this host, run inline (bypass the queue).
     // Without this, A → B → A (a verb that dispatches to a remote which
@@ -7710,9 +7872,9 @@ export class WooWorld {
     // mirrors normal nested verb-dispatch semantics — the callback is
     // logically part of the originating verb, not a new behavior.
     if (chainId && this.currentHostTask?.chainId === chainId) {
-      return await this.dispatch(ctx, target, verbName, args, startAt);
+      return await this.dispatch(ctx, target, verbName, args, startAt, undefined, exactDefiner, requireDirectCallable);
     }
-    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`, chainId);
+    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt, undefined, exactDefiner, requireDirectCallable), `dispatch:${target}:${verbName}`, chainId);
   }
 
   private mintChainId(): string {
@@ -7726,13 +7888,22 @@ export class WooWorld {
     return `${this.chainOriginPrefix ?? "host"}:${this.chainCounter}:${randomHex(8)}`;
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null, exactDefiner?: ObjRef | null, requireDirectCallable: boolean = false): Promise<WooValue> {
     let result: WooValue;
-    if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
+    if (
+      await this.remoteHostForObject(target, ctx.hostMemo) ||
+      (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)
+    ) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = this.effects.remoteBridgeUntrackedEffect("dispatch", { target, verb: verbName, start_at: startAt ?? null });
+      const effect = this.effects.remoteBridgeUntrackedEffect("dispatch", {
+        target,
+        verb: verbName,
+        start_at: startAt ?? null,
+        exact_definer: exactDefiner ?? null,
+        require_direct_callable: requireDirectCallable
+      });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt);
+      result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt, exactDefiner, requireDirectCallable);
     } else {
       if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
       this.callDepth += 1;
@@ -7740,11 +7911,20 @@ export class WooWorld {
         // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
         // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
         // as "no parent override" and fall back to the standard resolveVerb walk.
-        const { definer, verb, dependencies } = startAt == null
-          ? this.resolveVerbLive(target, verbName)
-          : this.resolveVerbFromLive(startAt, verbName);
+        const { definer, verb, dependencies } = exactDefiner != null
+          ? this.resolveExactVerbPageLive(target, exactDefiner, verbName)
+          : startAt == null
+            ? this.resolveVerbLive(target, verbName)
+            : this.resolveVerbFromLive(startAt, verbName);
         this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-        this.recordTurnDispatch(target, verbName, startAt, definer, verb, dependencies);
+        if (requireDirectCallable && verb.direct_callable !== true) {
+          throw wooError("E_DIRECT_DENIED", `direct call denied for ${target}:${verbName}`, {
+            target,
+            verb: verbName,
+            definer
+          });
+        }
+        this.recordTurnDispatch(target, verbName, exactDefiner ?? startAt, definer, verb, dependencies);
         const runCtx: CallContext = {
           ...ctx,
           thisObj: target,
@@ -12426,6 +12606,7 @@ export class WooWorld {
     assertObj(message.actor);
     assertObj(message.target);
     assertString(message.verb);
+    if (message.verb_definer !== undefined) assertObj(message.verb_definer);
     if (!Array.isArray(message.args)) throw wooError("E_INVARG", "message.args must be a list");
   }
 
@@ -14407,7 +14588,7 @@ export class WooWorld {
           const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
           return resolved ? {
             name: resolved.name,
-            definer: null,
+            definer: resolved.definer,
             direct_callable: resolved.direct_callable,
             skip_presence_check: resolved.skip_presence_check === true,
             arg_spec: resolved.arg_spec ?? {}
@@ -15261,7 +15442,14 @@ export class WooWorld {
     const targets = this.commandTargetOrder(cmd, space, actor);
     for (const target of targets) {
       const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
-      if (matched) return await this.commandPlanForResolved(ctx, space, matched.target, matched.verb, matched.args, cmd);
+      if (matched) {
+        return await this.commandPlanForResolved(ctx, space, matched.target, matched.verb, matched.args, cmd, {
+          name: matched.verb,
+          definer: matched.definer,
+          direct_callable: matched.direct_callable,
+          arg_spec: matched.arg_spec
+        });
+      }
     }
     return null;
   }
@@ -15279,7 +15467,7 @@ export class WooWorld {
     return out;
   }
 
-  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; definer: ObjRef; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
     const candidates = await this.commandVerbCandidates(ctx, target, cmd.verb);
     for (const candidate of candidates) {
       const pattern = commandPattern(candidate.arg_spec);
@@ -15289,6 +15477,7 @@ export class WooWorld {
       return {
         target,
         verb: candidate.name,
+        definer: candidate.definer,
         args: this.commandArgsFrom(pattern, cmd),
         direct_callable: candidate.direct_callable,
         arg_spec: candidate.arg_spec ?? {}
@@ -15430,18 +15619,32 @@ export class WooWorld {
     return await this.commandPlanForResolved(ctx, space, space, verb, args, cmd);
   }
 
-  private async commandPlanForResolved(ctx: CallContext, commandSpace: ObjRef, target: ObjRef, verbName: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
-    const resolved = await this.tryResolveVerbForCommand(ctx, target, verbName);
-    const directCallable = resolved?.direct_callable === true;
-    const routeHint = commandRouteHint(resolved?.arg_spec);
+  private async commandPlanForResolved(
+    ctx: CallContext,
+    commandSpace: ObjRef,
+    target: ObjRef,
+    verbName: string,
+    args: WooValue[],
+    cmd: CommandMap,
+    selected?: CommandVerbSummary
+  ): Promise<CommandPlan> {
+    const resolved = selected ?? await this.tryResolveVerbForCommand(ctx, target, verbName);
+    if (!resolved) {
+      throw wooError("E_VERBNF", `verb not found while binding command plan: ${target}:${verbName}`, {
+        obj: target,
+        name: verbName
+      });
+    }
+    const directCallable = resolved.direct_callable === true;
+    const routeHint = commandRouteHint(resolved.arg_spec);
     let route: "direct" | "sequenced" = routeHint ?? (directCallable ? "direct" : "sequenced");
     let space: ObjRef | null = null;
     if (route === "sequenced") {
       space = await this.isDescendantOfChecked(target, "$space", ctx.hostMemo) ? target : commandSpace;
       if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
     }
-    const verb = resolved?.name ?? verbName;
-    const persistence = commandPersistenceHint(resolved?.arg_spec)
+    const verb = resolved.name;
+    const persistence = commandPersistenceHint(resolved.arg_spec)
       ?? (route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
         ? "durable" as const
         : undefined);
@@ -15451,6 +15654,7 @@ export class WooWorld {
       space,
       target,
       verb,
+      verb_definer: resolved.definer,
       args,
       cmd,
       ...(persistence ? { persistence: persistence } : {})
@@ -15505,10 +15709,40 @@ export class WooWorld {
         if (normalizeError(err).code === "E_VERBNF") continue;
         throw err;
       }
-      if (result && typeof result === "object" && !Array.isArray(result) && "ok" in result) return result;
+      if (result && typeof result === "object" && !Array.isArray(result) && "ok" in result) {
+        return await this.bindCommandPlanValue(ctx, result);
+      }
       if (result === true) return { ok: false, route: "handled", target, verb, args: [cmd as unknown as WooValue], text: cmd.text } as unknown as WooValue;
     }
     return null;
+  }
+
+  /**
+   * Compatibility for catalog huh hooks authored before exact page binding.
+   * The hook still chooses target/name/args, but the substrate binds that
+   * choice while planning so execute_command_plan never has to resolve a bare
+   * name. Already-bound plans are preserved verbatim.
+   */
+  private async bindCommandPlanValue(ctx: CallContext, value: WooValue): Promise<WooValue> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const plan = value as Record<string, WooValue>;
+    if (plan.ok !== true) return value;
+    if (typeof plan.target !== "string" || typeof plan.verb !== "string") {
+      throw wooError("E_INVARG", "command hook returned a successful plan without target/verb");
+    }
+    if (typeof plan.verb_definer === "string") return value;
+    const resolved = await this.tryResolveVerbForCommand(ctx, plan.target, plan.verb);
+    if (!resolved) {
+      throw wooError("E_VERBNF", `command hook target verb not found: ${plan.target}:${plan.verb}`, {
+        obj: plan.target,
+        name: plan.verb
+      });
+    }
+    return {
+      ...plan,
+      verb: resolved.name,
+      verb_definer: resolved.definer
+    } as WooValue;
   }
 
   private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor, matchOptions: ObjectMatchOptions = {}): Promise<CommandMap> {
@@ -16093,13 +16327,19 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
   const map = value as Record<string, WooValue>;
   if (map.ok !== true) return null;
   const route = map.route === "direct" || map.route === "sequenced" ? map.route : null;
-  if (!route || typeof map.target !== "string" || typeof map.verb !== "string") return null;
+  if (
+    !route ||
+    typeof map.target !== "string" ||
+    typeof map.verb !== "string" ||
+    typeof map.verb_definer !== "string"
+  ) return null;
   return {
     ok: true,
     route,
     space: typeof map.space === "string" ? map.space : null,
     target: map.target,
     verb: map.verb,
+    verb_definer: map.verb_definer,
     args: Array.isArray(map.args) ? map.args : [],
     cmd: commandMapFromValue(map.cmd),
     ...(map.persistence === "durable" || map.persistence === "live" ? { persistence: map.persistence } : {})

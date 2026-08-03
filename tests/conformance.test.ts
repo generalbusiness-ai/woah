@@ -168,11 +168,11 @@ class LocalExecutorContext implements ExecutorContext {
     };
   }
 
-  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; skip_presence_check?: boolean; arg_spec: Record<string, WooValue> } | null> {
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; definer: ObjRef; direct_callable: boolean; skip_presence_check?: boolean; arg_spec: Record<string, WooValue> } | null> {
     const world = this.worldFor(target);
     try {
-      const { verb } = world.resolveVerb(target, verbName);
-      return { name: verb.name, direct_callable: verb.direct_callable === true, skip_presence_check: verb.skip_presence_check === true, arg_spec: verb.arg_spec ?? {} };
+      const { definer, verb } = world.resolveVerb(target, verbName);
+      return { name: verb.name, definer, direct_callable: verb.direct_callable === true, skip_presence_check: verb.skip_presence_check === true, arg_spec: verb.arg_spec ?? {} };
     } catch {
       return null;
     }
@@ -186,9 +186,9 @@ class LocalExecutorContext implements ExecutorContext {
     return await this.worldFor(objRef).isDescendantOfChecked(objRef, ancestorRef);
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, exactDefiner?: ObjRef | null, requireDirectCallable?: boolean): Promise<WooValue> {
     const remote = this.worldFor(startAt ?? target);
-    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt);
+    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt, undefined, exactDefiner, requireDirectCallable);
   }
 
   async moveObject(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
@@ -912,10 +912,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       home.setCatalogObjectLocation(actor, "conf_remote_room");
       home.migrationSetSessionState(session.id, { activeScope: "conf_remote_room" });
       home.setActorPresence(actor, "conf_remote_room", true);
-      home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
+      home.createObject({ id: "$conf_pingable", name: "$conf_pingable", parent: "$thing", owner: "$wiz" });
+      home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$conf_pingable", owner: "$wiz" });
       home.setCatalogObjectLocation("conf_home_widget", "conf_remote_room");
       home.setProp("conf_home_widget", "aliases", ["widget"]);
-      home.addVerb("conf_home_widget", {
+      home.addVerb("$conf_pingable", {
         kind: "native",
         name: "ping",
         aliases: ["p*ing"],
@@ -931,7 +932,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         native: "player_on_disfunc",
         direct_callable: true
       });
-      expect(installVerb(home, "conf_home_widget", "ping", `verb :ping() rxd {
+      expect(installVerb(home, "$conf_pingable", "ping", `verb :ping() rxd {
   return "pong";
 }`, 1, { argSpec: { command: { dobj: "this", prep: "any", iobj: "any", args_from: [] } } }).ok).toBe(true);
       roomHost.mirrorContents("conf_remote_room", actor, true);
@@ -958,14 +959,41 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const plan = await roomHost.directCall("plan-cross-host-widget", actor, "conf_remote_room", "command_plan", ["ping widget"]);
       expect(plan.op, plan.op === "error" ? JSON.stringify(plan.error) : "").toBe("result");
       if (plan.op === "result") {
-        expect(plan.result).toMatchObject({ ok: true, route: "direct", target: "conf_home_widget", verb: "ping", args: [] });
+        expect(plan.result).toMatchObject({ ok: true, route: "direct", target: "conf_home_widget", verb: "ping", verb_definer: "$conf_pingable", args: [] });
       }
 
       const command = await home.command("command-cross-host-widget", session.id, "conf_remote_room", "ping widget");
       expect(command.op, command.op === "error" ? JSON.stringify(command.error) : "").toBe("result");
       if (command.op === "result") {
         expect(command.result).toBe("pong");
-        expect((command as any).command).toMatchObject({ route: "direct", target: "conf_home_widget", verb: "ping", args: [] });
+        expect((command as any).command).toMatchObject({ route: "direct", target: "conf_home_widget", verb: "ping", verb_definer: "$conf_pingable", args: [] });
+      }
+
+      // Execute the already-returned plan after a nearer page appears on the
+      // remote receiver. The room host must carry the exact definer across
+      // its bridge; resolving `ping` again on the object host would return the
+      // planted page instead.
+      expect(installVerb(home, "conf_home_widget", "ping", `verb :ping() rxd {
+  return "rebound";
+}`, null).ok).toBe(true);
+      if (plan.op === "result") {
+        expect(installVerb(
+          roomHost,
+          "conf_remote_room",
+          "execute_remote_bound_plan",
+          "verb :execute_remote_bound_plan(plan) rxd { return execute_command_plan(plan); }",
+          null
+        ).ok).toBe(true);
+        const exact = await roomHost.directCall(
+          "run-cross-host-widget-plan",
+          actor,
+          "conf_remote_room",
+          "execute_remote_bound_plan",
+          [plan.result as WooValue],
+          { sessionId: session.id }
+        );
+        expect(exact.op, exact.op === "error" ? JSON.stringify(exact.error) : "").toBe("result");
+        if (exact.op === "result") expect(exact.result).toBe("pong");
       }
     } finally {
       roomHarness.cleanup();

@@ -3245,7 +3245,7 @@ export class NetGatewayDO {
   //     → authenticate, derive the actor's cluster scope (CO15 topology),
   //       session-open through the existing mint machinery, reply
   //       {session, actor, expires_at, scope}.
-  //   POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}
+  //   POST /net-api/turn {target, verb, verb_definer?, args?, route?, session, idempotency_key?}
   //     → REQUIRES a valid session (the CO14 Phase-4 rule: client-
   //       originated turns need sessions), validated from the session
   //       cell in the gateway view; defaults to sequenced, while an explicit
@@ -3262,7 +3262,7 @@ export class NetGatewayDO {
   //     validated like /net-api/turn, then the socket is accepted with
   //     the session id as its hibernation tag. Frames (JSON, `id`
   //     echoed):
-  //       {type:"turn", id?, target, verb, args?, idempotency_key?}
+  //       {type:"turn", id?, target, verb, verb_definer?, args?, idempotency_key?}
   //         → the clientTurn path on the SOCKET's session (a frame
   //           cannot speak for another session) →
   //           {type:"turn_result", id, status, ...TurnResult-or-error}
@@ -4837,6 +4837,14 @@ export class NetGatewayDO {
     if (!target || !verb) {
       return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
     }
+    const verbDefiner = body.verb_definer === undefined
+      ? null
+      : typeof body.verb_definer === "string" && body.verb_definer.length > 0
+        ? body.verb_definer
+        : "";
+    if (verbDefiner === "") {
+      return json({ error: { code: "E_INVARG", message: "turn verb_definer must be a non-empty object id", detail: { field: "verb_definer", reason: "invalid_object_id" } } }, 400);
+    }
     // The client may request an explicit route; the default is sequenced. The
     // planning-scope override below tightens this per topology (a cluster root
     // cannot host an in-world sequencer), while a room preserves the explicit
@@ -4877,6 +4885,18 @@ export class NetGatewayDO {
         400
       );
     }
+    if (verbDefiner !== null && !isConcreteRuntimeObjectId(verbDefiner)) {
+      return json(
+        {
+          error: {
+            code: "E_INVARG",
+            message: "turn verb_definer is not a valid runtime object id",
+            detail: { field: "verb_definer", reason: "invalid_object_id" }
+          }
+        },
+        400
+      );
+    }
     const args = (Array.isArray(body.args) ? body.args : []) as PlanTurnInput["call"]["args"];
 
     // planningScope from the session cell (the CO14 Phase-4 refinement):
@@ -4908,13 +4928,22 @@ export class NetGatewayDO {
     // warm the fixture. The relation's install/fanout-owned member_scope
     // is the cold routing fact. It grants no permission: normal verb,
     // presence, read, and committing-scope checks still run below.
-    const targetWarmEntries =
+    const targetWarmEntries: Array<{ scope: string; objects: string[] }> =
       targetAuthorityScope === planningScope
         ? [{ scope: planningScope, objects: [target, anchorObject] }]
         : [
             { scope: targetAuthorityScope, objects: [target] },
             { scope: planningScope, objects: [anchorObject] }
           ];
+    if (verbDefiner) {
+      const definerScope = this.clientTargetAuthorityScope(verbDefiner, anchorObject, actor, planningScope);
+      const existing = targetWarmEntries.find((entry) => entry.scope === definerScope);
+      if (existing) {
+        if (!existing.objects.includes(verbDefiner)) existing.objects.push(verbDefiner);
+      } else {
+        targetWarmEntries.push({ scope: definerScope, objects: [verbDefiner] });
+      }
+    }
     await this.warmScopes(
       targetWarmEntries,
       "net_client_pull_miss_failed"
@@ -4933,9 +4962,44 @@ export class NetGatewayDO {
       actor,
       target,
       verb,
+      ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
       args
     } as const;
     let page = this.callVerbPage(this.ensureView(), validationCall);
+    let exactMetadataPullError: unknown = null;
+    // Exact command-plan identity needs both sides of the topology proof: the
+    // receiver's lineage/features and the definer's current page. A gateway
+    // can already hold a relation-only target stub, so warmScopes above may
+    // correctly decide the object is present without having enough cells to
+    // adjudicate exact reachability. Pay one bounded owner pull for each side
+    // before distinguishing a real miss from sparse cache state.
+    if (verbDefiner && page === null) {
+      try {
+        const exactObjects = [target, verbDefiner];
+        const exactScopes = new Map<string, string[]>();
+        for (const object of exactObjects) {
+          const scope = this.clientTargetAuthorityScope(object, anchorObject, actor, planningScope);
+          const objects = exactScopes.get(scope) ?? [];
+          if (!objects.includes(object)) objects.push(object);
+          exactScopes.set(scope, objects);
+        }
+        await Promise.all(Array.from(exactScopes, ([scope, objects]) =>
+          this.pullTargeted(scope, `scope:${scope}`, objects)
+        ));
+        page = this.callVerbPage(this.ensureView(), validationCall);
+      } catch (err) {
+        exactMetadataPullError = err;
+        this.metric({
+          kind: "net_exact_verb_metadata_pull_failed",
+          scope: targetAuthorityScope,
+          target,
+          verb,
+          verb_definer: verbDefiner,
+          status: "error",
+          error: String(err)
+        });
+      }
+    }
     // A relation/room closure may have installed only the target's lineage
     // stub. That is enough to route the object but not enough to authorize a
     // direct call: missing metadata must still fail closed, while a cold but
@@ -4945,7 +5009,9 @@ export class NetGatewayDO {
     // quite correctly avoids re-pulling the whole object).
     if (route === "direct" && page === null) {
       try {
-        await this.pullTargeted(targetAuthorityScope, `scope:${targetAuthorityScope}`, [target]);
+        const metadataObject = verbDefiner ?? target;
+        const metadataScope = this.clientTargetAuthorityScope(metadataObject, anchorObject, actor, planningScope);
+        await this.pullTargeted(metadataScope, `scope:${metadataScope}`, [metadataObject]);
         page = this.callVerbPage(this.ensureView(), validationCall);
       } catch (err) {
         this.metric({
@@ -4953,6 +5019,7 @@ export class NetGatewayDO {
           scope: targetAuthorityScope,
           target,
           verb,
+          verb_definer: verbDefiner,
           status: "error",
           error: String(err)
         });
@@ -4976,6 +5043,33 @@ export class NetGatewayDO {
           error: String(err)
         });
       }
+    }
+    if (verbDefiner && page === null) {
+      // Do not turn an owner/cache outage into a definitive stale-page
+      // verdict. The caller may safely retry missing state; E_VERBNF means the
+      // topology was actually available and rejected the binding.
+      if (exactMetadataPullError !== null) {
+        return json(
+          {
+            error: {
+              code: "E_MISSING_STATE",
+              message: "exact verb-page metadata is temporarily unavailable",
+              detail: { target, verb, definer: verbDefiner }
+            }
+          },
+          503
+        );
+      }
+      return json(
+        {
+          error: {
+            code: "E_VERBNF",
+            message: `exact verb page ${verbDefiner}:${verb} is not reachable from ${target}`,
+            detail: { obj: verbDefiner, target, name: verb, definer: verbDefiner }
+          }
+        },
+        404
+      );
     }
     // External direct dispatch is metadata-gated at the ingress boundary
     // (core.md C12.2). Missing metadata fails closed: a sparse gateway must
@@ -5028,6 +5122,7 @@ export class NetGatewayDO {
       actor,
       target,
       verb,
+      ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
       args
     }, planningScope);
     // Client retries reuse their supplied idempotency key (CO2.5); an
@@ -5094,6 +5189,7 @@ export class NetGatewayDO {
         actor,
         target,
         verb,
+        ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
         args
       },
       ...(principal ? { principal } : {}),
@@ -5802,6 +5898,7 @@ export class NetGatewayDO {
       if (controlRefusal) return this.mcpToolError(id, controlRefusal);
       const requested = args.object as string;
       const verb = args.verb as string;
+      const verbDefiner = typeof args.verb_definer === "string" ? args.verb_definer : undefined;
       // `$me`/`$here` are the forms every user doc uses for "the session
       // actor" and "the space I am in". They resolved nowhere, so each of
       // those documented examples refused. They are transport-level session
@@ -5822,7 +5919,10 @@ export class NetGatewayDO {
       if (!isConcreteRuntimeObjectId(object)) {
         return this.mcpToolError(id, { code: "E_INVARG", message: "target must be a concrete runtime object id", detail: { field: "target", reason: "invalid_object_id", value: object } });
       }
-      const resolved = this.mcpResolveCall(actor, session, object, verb);
+      if (verbDefiner && !isConcreteRuntimeObjectId(verbDefiner)) {
+        return this.mcpToolError(id, { code: "E_INVARG", message: "verb_definer must be a concrete runtime object id", detail: { field: "verb_definer", reason: "invalid_object_id", value: verbDefiner } });
+      }
+      const resolved = this.mcpResolveCall(actor, session, object, verb, verbDefiner);
       if ("error" in resolved) return this.mcpToolError(id, resolved.error);
       // M4.3, gate 2: the resolved verb's own declared parameters. `woo_call`
       // cannot advertise them — its schema describes a free-form list — but
@@ -5845,7 +5945,8 @@ export class NetGatewayDO {
         positional,
         resolved.tool.route,
         this.mcpTraceOf(request),
-        operation.value
+        operation.value,
+        verbDefiner
       );
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
@@ -5910,7 +6011,8 @@ export class NetGatewayDO {
     args: unknown[],
     route: "direct" | "sequenced",
     trace?: TraceContext,
-    operationId?: string | null
+    operationId?: string | null,
+    verbDefiner?: string
   ): Promise<Response> {
     try {
       const identity = await this.catalogIdentity();
@@ -5937,6 +6039,7 @@ export class NetGatewayDO {
         {
           target: object,
           verb,
+          ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
           args,
           route,
           session,
@@ -6630,7 +6733,8 @@ export class NetGatewayDO {
     actor: string,
     session: string,
     object: string,
-    verb: string
+    verb: string,
+    verbDefiner?: string
   ): { tool: NetMcpToolDraft } | { error: { code: string; message: string; detail?: unknown } } {
     const context = this.mcpContextObjects(actor, session);
     if (!context.has(object)) {
@@ -6655,7 +6759,15 @@ export class NetGatewayDO {
       };
     }
     const drafts = this.mcpObjectToolDrafts(actor, object, this.mcpActiveCommandContext(actor, session).has(object));
-    const match = mcpMatchVerb(drafts, verb);
+    // A command plan carries the canonical name plus exact definer. Select
+    // that reachable draft directly; ordinary woo_call requests retain alias
+    // lookup and normal target-first precedence.
+    const exact = verbDefiner
+      ? drafts.find((draft) => draft.definer === verbDefiner && draft.verb === verb)
+      : undefined;
+    const match = verbDefiner
+      ? exact ? { tool: exact } : { miss: true as const }
+      : mcpMatchVerb(drafts, verb);
     if ("miss" in match) {
       // Same shape the engine raises for a missing verb (world.ts): a client
       // that already special-cases E_VERBNF keeps working.
@@ -8546,44 +8658,45 @@ export class NetGatewayDO {
     }
   }
 
-  /** Resolve only enough verb metadata to read a boolean dispatch flag the
-   * catalog declared on the target verb. Mirrors parent-first then
-   * feature-chain dispatch without executing catalog code. */
+  /** Resolve only enough verb metadata to read a boolean dispatch flag. The
+   * page resolver also honors exact command-plan identity. */
   private callReadsVerbFlag(view: CellStore, call: ShadowTurnCall, flag: "reads_room_presence" | "reads_ordered_children"): boolean {
-    const resolveChain = (start: string): boolean | null => {
-      let object: string | null = start;
-      const seen = new Set<string>();
-      while (object && !seen.has(object)) {
-        seen.add(object);
-        for (const cell of view.cellsForObject(object)) {
-          if (cell.kind !== "verb_bytecode") continue;
-          const verb = cell.value as { name?: unknown; aliases?: unknown; [k: string]: unknown };
-          const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
-          if (names.includes(call.verb)) return verb[flag] === true;
-        }
-        const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
-        object = typeof lineage?.parent === "string" ? lineage.parent : null;
-      }
-      return null;
-    };
-    const inherited = resolveChain(call.target);
-    if (inherited !== null) return inherited;
-
-    const featuresCell = view.get(cellKey("property_cell", call.target, "features"))?.value as { value?: unknown } | undefined;
-    const features = Array.isArray(featuresCell?.value)
-      ? featuresCell.value.filter((value): value is string => typeof value === "string")
-      : [];
-    for (const feature of features) {
-      const resolved = resolveChain(feature);
-      if (resolved !== null) return resolved;
-    }
-    return false;
+    return this.callVerbPage(view, call)?.[flag] === true;
   }
 
   /** Resolve the executable verb page in the same parent-first then feature-
    * chain order used by the projection metadata gates.  Metadata is catalog
    * data; callers interpret only generic fields. */
   private callVerbPage(view: CellStore, call: ShadowTurnCall): Record<string, unknown> | null {
+    if (call.verb_definer) {
+      const chainContains = (start: string, sought: string): boolean => {
+        let object: string | null = start;
+        const seen = new Set<string>();
+        while (object && !seen.has(object)) {
+          if (object === sought) return true;
+          seen.add(object);
+          const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
+          object = typeof lineage?.parent === "string" ? lineage.parent : null;
+        }
+        return false;
+      };
+      let reachable = chainContains(call.target, call.verb_definer);
+      if (!reachable) {
+        const featuresCell = view.get(cellKey("property_cell", call.target, "features"))?.value as { value?: unknown } | undefined;
+        const features = Array.isArray(featuresCell?.value)
+          ? featuresCell.value.filter((value): value is string => typeof value === "string")
+          : [];
+        reachable = features.some((feature) => chainContains(feature, call.verb_definer!));
+      }
+      if (!reachable) return null;
+      for (const cell of view.cellsForObject(call.verb_definer)) {
+        if (cell.kind !== "verb_bytecode") continue;
+        const verb = cell.value as Record<string, unknown>;
+        if (verb.name === call.verb) return verb;
+      }
+      return null;
+    }
+
     const resolveChain = (start: string): Record<string, unknown> | null => {
       let object: string | null = start;
       const seen = new Set<string>();
@@ -11676,6 +11789,7 @@ const MCP_TOOL_DEFS_CORE = [
         // predict that refusal.
         object: { type: "string", minLength: 1, description: "Canonical object id. `$me` is the session actor; `$here` is the space you are in." },
         verb: { type: "string", minLength: 1, description: "Verb name or alias." },
+        verb_definer: { type: "string", minLength: 1, description: "Exact page definer returned by command_plan. When supplied, verb must be that page's canonical name." },
         args: { type: "array", items: {}, description: "Positional arguments, in the verb's declared order." },
         operation_id: MCP_OPERATION_ID_SCHEMA
       },

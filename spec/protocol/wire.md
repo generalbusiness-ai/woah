@@ -32,7 +32,7 @@ WebSockets between client and player host. JSON frames. UTF-8. Values are encode
 // Make a sequenced call through a space.
 //   id        — client-chosen correlation token; echoed in the reply
 //   space     — the $space whose seq this call advances
-//   message   — message map: { actor, target, verb, args, body? }
+//   message   — message map: { actor, target, verb, verb_definer?, args, body? }
 { op: "call", id: string, space: ObjRef, message: Map }
 
 // Make a direct call, not through a space.

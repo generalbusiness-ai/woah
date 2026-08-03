@@ -107,7 +107,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
 | `:huh(text, reason?)` | str, str? | Compatibility wrapper that delegates parse-failure output to `actor:huh(text, reason, this)`. |
-| `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
+| `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, verb_definer, args, cmd}`. The `(verb_definer, verb)` pair binds the exact selected page. |
 | `:command(text)` | str | Compatibility command surface. Executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients normally use v2 command intents instead. |
 
 Most `$conversational` verbs are portable source, including the command planner. `$match` still uses trusted local native implementation hints for tokenizer/object-matcher primitives. Public tap installs ignore those hints and still compile the source fallback.
@@ -333,8 +333,9 @@ The parser is location-scoped rather than tied to where the actor object lives.
 If the actor is in a room hosted elsewhere, `here`, room contents, and actor
 inventory still resolve from the room and object model. If a visible object
 lives with another host, the planner reads only its display metadata and
-verb/direct-callability/arg-spec metadata, then leaves execution to normal direct or
-sequenced dispatch.
+verb/direct-callability/arg-spec metadata, including the selected page's
+definer. Direct or sequenced execution verifies that exact page is still in
+the target's inheritance/feature topology and re-checks its current authority.
 
 ```woo
 verb $conversational:command_plan(text) rxd {

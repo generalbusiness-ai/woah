@@ -28,14 +28,14 @@ import { turnEchoId } from "../net/turn-echo";
  * them minimally because src/client must not import src/worker):
  *
  *   POST /net-api/session {ttl_ms?}            → {session, actor, expires_at, scope}
- *   POST /net-api/turn {target,verb,args,route?,session,idempotency_key} → TurnResult
+ *   POST /net-api/turn {target,verb,verb_definer?,args,route?,session,idempotency_key} → TurnResult
  *   GET  /net-api/cell?key=                    → {key, cell}
  *   POST /net-api/cells {session,keys}          → {cells:[{key,cell}]}
  *   GET  /net-api/relation?relation=&owner=    → {relation, owner, members}
  *   POST /net-api/browser-metrics              → {ok, accepted, sampled}
  *   POST /net-api/ws-ticket {session}          → {ticket, expires_at}  (B3)
  *   GET  /net-api/ws?ticket=                   → WebSocket upgrade
- *     client→server frames: {type:"turn", id, route?, target, verb, args, idempotency_key}
+ *     client→server frames: {type:"turn", id, route?, target, verb, verb_definer?, args, idempotency_key}
  *                           {type:"ping", id?}
  *     server→client frames: {type:"turn_result", id, status, ...TurnResult|{error}}
  *                           {type:"observations", scope, seq, echo_id?, observations}
@@ -496,7 +496,7 @@ export class NetFeed {
    * the outcome resolves, and the turn's observations emit to
    * subscribers as source:"self".
    */
-  async turn(input: { target: string; verb: string; args?: unknown[]; route?: "direct" | "sequenced" }): Promise<NetTurnOutcome> {
+  async turn(input: { target: string; verb: string; verb_definer?: string; args?: unknown[]; route?: "direct" | "sequenced" }): Promise<NetTurnOutcome> {
     if (!this.session) throw new NetFeedError("E_NOSESSION", "open() the feed before submitting turns", 0);
     const turnId = randomTurnId();
     const echoId = turnEchoId(turnId);
@@ -515,13 +515,13 @@ export class NetFeed {
     try {
       let body: Record<string, unknown>;
       if (this.connection === "open" && this.socket) {
-        const overWs = await this.turnOverSocket(turnId, route, input.target, input.verb, args);
+        const overWs = await this.turnOverSocket(turnId, route, input.target, input.verb, args, input.verb_definer);
         body =
           overWs === WS_INTERRUPTED
-            ? await this.turnOverRest(turnId, route, input.target, input.verb, args)
+            ? await this.turnOverRest(turnId, route, input.target, input.verb, args, input.verb_definer)
             : overWs;
       } else {
-        body = await this.turnOverRest(turnId, route, input.target, input.verb, args);
+        body = await this.turnOverRest(turnId, route, input.target, input.verb, args, input.verb_definer);
       }
       const outcome = this.settleTurn(turnId, echoId, body);
       settled = true;
@@ -546,7 +546,8 @@ export class NetFeed {
     route: "direct" | "sequenced",
     target: string,
     verb: string,
-    args: unknown[]
+    args: unknown[],
+    verbDefiner?: string
   ): Promise<Record<string, unknown> | typeof WS_INTERRUPTED> {
     const socket = this.socket;
     if (!socket) return Promise.resolve(WS_INTERRUPTED);
@@ -573,7 +574,16 @@ export class NetFeed {
       }, this.wsTurnTimeoutMs);
       try {
         socket.send(
-          JSON.stringify({ type: "turn", id: turnId, route, target, verb, args, idempotency_key: turnId })
+          JSON.stringify({
+            type: "turn",
+            id: turnId,
+            route,
+            target,
+            verb,
+            ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
+            args,
+            idempotency_key: turnId
+          })
         );
       } catch {
         this.wsInFlight.delete(turnId);
@@ -587,10 +597,11 @@ export class NetFeed {
     route: "direct" | "sequenced",
     target: string,
     verb: string,
-    args: unknown[]
+    args: unknown[],
+    verbDefiner?: string
   ): Promise<Record<string, unknown>> {
     try {
-      return await this.postTurn(turnId, route, target, verb, args);
+      return await this.postTurn(turnId, route, target, verb, args, verbDefiner);
     } catch (err) {
       // M10: the session expired under an in-flight REST turn. Re-mint
       // once and retry with the SAME idempotency key — CO2.5 makes the
@@ -599,7 +610,7 @@ export class NetFeed {
       // past the streak cap throws terminally, surfacing to the caller.
       if (err instanceof NetFeedError && err.code === "E_NOSESSION") {
         await this.remintSession();
-        return await this.postTurn(turnId, route, target, verb, args);
+        return await this.postTurn(turnId, route, target, verb, args, verbDefiner);
       }
       throw err;
     }
@@ -612,11 +623,13 @@ export class NetFeed {
     route: "direct" | "sequenced",
     target: string,
     verb: string,
-    args: unknown[]
+    args: unknown[],
+    verbDefiner?: string
   ): Promise<Record<string, unknown>> {
     return (await this.fetchJson("POST", "/net-api/turn", {
       target,
       verb,
+      ...(verbDefiner ? { verb_definer: verbDefiner } : {}),
       args,
       route,
       session: this.session,

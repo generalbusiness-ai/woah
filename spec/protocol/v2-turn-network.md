@@ -409,6 +409,7 @@ type TurnCall = {
   actor: ActorRef;
   target: ObjRef;
   verb: string;
+  verb_definer?: ObjRef;
   args: WooValue[];
   caller?: ObjRef;
   route: "committed" | "live";
@@ -421,6 +422,16 @@ type LogicalInputs = {
   external?: Array<{ id: string; value_hash: Hash; value?: WooValue }>;
 };
 ```
+
+`verb_definer` carries the exact page identity selected by command planning
+([match.md §MA7.2](../semantics/match.md#ma72-exact-verb-page-binding)). A relay
+MUST preserve it through intent, planning, transcript, commit, retry
+fingerprinting, and replay. Gateways validate that the definer is in the
+target's current inheritance/feature topology and owns canonical `verb`; it is
+never treated as a client-granted dispatch capability. Calls without it use
+ordinary name resolution. Turn-key capability derivation includes both the
+definer and a receiver/page identity atom, so two same-name pages cannot share
+an execution proof.
 
 Prototype route mapping:
 
@@ -1365,7 +1376,7 @@ storing it on the ad object.
 During the browser migration, a relay MAY also accept, behind an explicit
 compatibility flag,
 `woo.turn.intent.request.v1` from a browser node. The intent contains `id`,
-`route`, `scope`, `target`, `verb`, `args`, optional `persistence`, and optional
+`route`, `scope`, `target`, `verb`, `args`, optional `verb_definer`, optional `persistence`, and optional
 `selected_ad`, but not a `TurnKey`. It is a transitional server-assisted
 planning message: the CommitScopeDO plans the deterministic transcript against
 its authoritative scope state, derives the `TurnKey`, preserves `selected_ad`

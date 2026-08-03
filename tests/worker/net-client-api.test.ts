@@ -30,6 +30,7 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
+import { cellKey } from "../../src/net/cells";
 import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
@@ -924,6 +925,71 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(direct.status, JSON.stringify(direct.body)).toBe(200);
     expect((direct.body as unknown as TurnBody).result).toBe("capi_box");
     expect((direct.body as unknown as TurnBody).reply.head).toEqual(turnBody.reply.head);
+
+    const exactDirect = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: {
+        target: "capi_box",
+        verb: "probe_target",
+        verb_definer: "capi_box",
+        args: ["capi_box"],
+        route: "direct",
+        session: sid,
+        idempotency_key: "capi-exact-direct-read"
+      }
+    });
+    expect(exactDirect.status, JSON.stringify(exactDirect.body)).toBe(200);
+    expect((exactDirect.body as unknown as TurnBody).result).toBe("capi_box");
+
+    // An authority outage is retryable missing state, not evidence that a
+    // previously selected page became unreachable. Remove only the gateway's
+    // cached page to force the exact metadata pull, then fail that RPC.
+    type GatewayView = { ensureView(): { delete(key: string): void } };
+    (h.gateway as unknown as GatewayView).ensureView().delete(cellKey("verb_bytecode", "capi_box", "probe_target"));
+    type RpcHost = { rpc(destination: string, route: string, body?: unknown): Promise<unknown> };
+    const host = (h.gateway as unknown as { host: RpcHost }).host;
+    const originalRpc = host.rpc.bind(host);
+    host.rpc = async (destination, route, body) => {
+      if (route === "/closure") throw new Error("exact metadata authority unavailable");
+      return originalRpc(destination, route, body);
+    };
+    try {
+      const unavailableExact = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: {
+          target: "capi_box",
+          verb: "probe_target",
+          verb_definer: "capi_box",
+          args: ["capi_box"],
+          route: "direct",
+          session: sid
+        }
+      });
+      expect(unavailableExact.status).toBe(503);
+      expect(unavailableExact.body.error).toMatchObject({
+        code: "E_MISSING_STATE",
+        detail: { target: "capi_box", definer: "capi_box", verb: "probe_target" }
+      });
+    } finally {
+      host.rpc = originalRpc;
+    }
+
+    const forgedExact = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: {
+        target: "capi_box",
+        verb: "probe_target",
+        verb_definer: "$root",
+        args: ["capi_box"],
+        route: "direct",
+        session: sid
+      }
+    });
+    expect(forgedExact.status).toBe(404);
+    expect(forgedExact.body.error).toMatchObject({
+      code: "E_VERBNF",
+      detail: { target: "capi_box", definer: "$root", name: "probe_target" }
+    });
 
     const deniedDirect = await clientFetch(h.gateway, "POST", "/net-api/turn", {
       token,

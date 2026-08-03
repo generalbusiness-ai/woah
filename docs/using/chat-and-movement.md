@@ -173,7 +173,9 @@ parse it.
 
 There's also `:command_plan(text)` — same parser, but it returns the
 plan instead of executing. Lets an agent inspect what would happen
-before committing.
+before committing. When executing that plan through `woo_call`, preserve all
+of `target`, canonical `verb`, `verb_definer`, and `args`; the definer pins the
+exact page selected by the parser.
 
 ## Observations you'll see
 

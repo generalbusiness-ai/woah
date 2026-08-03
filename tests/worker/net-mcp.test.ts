@@ -380,10 +380,27 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
 
     // The thin-shell command round trip: plan then execute.
     const planned = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "command_plan", args: ["look"] });
-    const cmd = planned.result?.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; args?: unknown[] };
+    const cmd = planned.result?.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; verb_definer?: string; args?: unknown[] };
     expect(cmd?.ok).toBe(true);
-    const executed = await call(aliceSession, "woo_call", { object: cmd.target as string, verb: cmd.verb as string, args: cmd.args ?? [] });
+    expect(cmd?.verb_definer).toBe("$conversational");
+    const executed = await call(aliceSession, "woo_call", {
+      object: cmd.target as string,
+      verb: cmd.verb as string,
+      verb_definer: cmd.verb_definer as string,
+      args: cmd.args ?? []
+    });
     expect(executed.result?.isError, JSON.stringify(executed).slice(0, 300)).not.toBe(true);
+
+    // Exact page identity is a selector, not an authority token. A reachable
+    // but unrelated definer cannot be forged into the command round trip.
+    const forgedDefiner = await call(aliceSession, "woo_call", {
+      object: cmd.target as string,
+      verb: cmd.verb as string,
+      verb_definer: "$root",
+      args: cmd.args ?? []
+    });
+    expect(forgedDefiner.result?.isError).toBe(true);
+    expect(forgedDefiner.result?.structuredContent?.error).toMatchObject({ code: "E_VERBNF" });
 
     // Error envelope: an unknown verb surfaces isError (unwrap() throws).
     const missing = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "no_such_verb_xyz", args: [] });

@@ -243,6 +243,7 @@ A **message** is a `map` with the canonical shape:
   actor:  obj,    // who is making the call
   target: obj,    // which object the message is directed at
   verb:   str,    // verb name on the target
+  verb_definer?: obj, // exact page selected by command planning
   args:   list,   // positional arguments
   body?:  map     // optional structured payload
 }
@@ -250,7 +251,11 @@ A **message** is a `map` with the canonical shape:
 
 (Per [core.md §C3](core.md#c3-messages-and-calls).)
 
-Required fields: `actor`, `target`, `verb`, `args`. `body` is optional. Missing required fields cause `E_INVARG` at validation time, *before* sequencing — so a malformed call does not advance any space's `seq`.
+Required fields: `actor`, `target`, `verb`, `args`. `verb_definer` and `body` are
+optional. When present, `verb_definer` names the exact canonical verb page as
+specified by [match.md §MA7.2](match.md#ma72-exact-verb-page-binding). Missing
+required fields cause `E_INVARG` at validation time, *before* sequencing — so a
+malformed call does not advance any space's `seq`.
 
 A **sequenced message**, returned from `$space:call`, wraps a message:
 
