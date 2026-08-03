@@ -4280,6 +4280,39 @@ describe("local catalogs", () => {
   });
 
 
+  it("looks with the looker's authority, not the seed page's", async () => {
+    const world = createWorld();
+    const other = world.auth("guest:look-perm-other");
+    expect((await world.directCall("lp-o", other.actor, "the_chatroom", "enter", [], { sessionId: other.id })).op).toBe("result");
+
+    // A thing whose owner has made the description unreadable. Authoring needs
+    // programmer authority, so the seed wizard owns it; the looker is an
+    // ordinary guest, which is the asymmetry under test.
+    const lamp = world.createAuthoredObject("$wiz", {
+      parent: "$thing",
+      name: "Private Lamp",
+      description: "A hidden builder lamp.",
+      location: "the_chatroom"
+    });
+    const def = world.object(lamp).propertyDefs.get("description")!;
+    world.defineProperty(lamp, { ...def, perms: "w" });
+    expect(world.propOrNullForActor(other.actor, lamp, "description")).toBeNull();
+
+    // The shared dispatcher is owned by the seed wizard, and the room's
+    // `look_self` opens with `set_task_perms(caller_perms())`. Without an
+    // explicit drop to the looker's authority first, that view would inherit
+    // WIZARD perms from the dispatcher's frame and read straight past the
+    // property's permissions. Each per-class dispatcher used to carry its own
+    // `set_task_perms`, so the chain never ran privileged; one shared page has
+    // to do it or the escalation is silent.
+    const looked = await world.directCall("lp-look", other.actor, "the_chatroom", "look", [], { sessionId: other.id });
+    expect(looked.op).toBe("result");
+    if (looked.op === "result") {
+      const room = looked.result as { contents: Array<{ id: string; description: unknown }> };
+      expect(room.contents.find((row) => row.id === lamp)).toMatchObject({ id: lamp, description: null });
+    }
+  });
+
   it("keeps look command words out of the substrate so catalog pages still win", async () => {
     const world = createWorld();
 

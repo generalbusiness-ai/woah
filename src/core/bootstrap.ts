@@ -596,6 +596,14 @@ const PLAYER_HOME_SOURCE = `verb :home() rxd {
  * The previous seat is retired in `./retired-definitions` — aged worlds still
  * carry that page, and it shadows this one until dropped. */
 const ROOT_LOOK_SOURCE = `verb :look() rxd {
+  // Drop to the looker's authority BEFORE dispatching. This page is owned by
+  // the seed wizard, and a \`look_self\` that opens with
+  // \`set_task_perms(caller_perms())\` — as the catalog room view does — would
+  // otherwise inherit wizard perms from this frame and read properties the
+  // looker cannot see. The previous catalog dispatchers each carried their own
+  // \`set_task_perms\`, so the chain never ran privileged; a single shared
+  // dispatcher has to do it here or the escalation is silent.
+  set_task_perms(actor);
   let view = this:look_self();
   let text = "";
   if (typeof(view) == "map" && has(view, "summary") && view["summary"]) {
