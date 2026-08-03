@@ -99,7 +99,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:emote(text)` | str | Third-person action. Emits `emoted {actor, text}`. |
 | `:pose(text)` / `:quote(text)` / `:self(text)` | str | Small LambdaCore-flavored speech forms for `]`, `|`, and `<`. |
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
-| `:look_at(target?, target_str?)` rxd | obj, str | The catalog's single look command entry, aliased `look`/`l`/`examine`/`ex`. `dobj` is `["object", "none"]`, so one verb serves the bare `look` and `look <target>` alike — `#3:l*ook` does the same, branching on an empty `dobjstr` in its own body. `target_str` carries that raw `dobjstr`, and is what separates *no target given* from *a target that matched nothing*; the `$failed_match` sentinel is returned for both. Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. Prefers `view.summary` for the text so a self-rendering shape reads identically here and through `$root:look`. `looked.room` is the command room so clients route output to the room panel; `looked.target` is the object inspected. |
+| `:look_at(target)` rxd | obj | The command entry for `look <target>`, aliased `look`/`l`/`examine`/`ex` over a closed `dobj: "object"` pattern. Bare `look` is answered by the seed dispatcher `$root:look`, whose pattern is closed the other way (`dobj`/`prep`/`iobj` all `none`); keeping the two disjoint is what makes `look at`, `look under mug` and `look in front of me` fail to parse instead of silently rendering the room. Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. Prefers `view.summary` for the text so a self-rendering shape reads identically here and through `$root:look`. `looked.room` is the command room so clients route output to the room panel; `looked.target` is the object inspected. |
 | `:who()` rxd | — | Returns canonical roster rows and emits a private `who` observation to the caller with `roster`. |
 | `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: live active-scope occupants plus awake/idle/sleeping status. |
 | `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |
@@ -283,9 +283,12 @@ One thing that changes the bird: the minimum lead time is **60 seconds**, so a w
 
 **Determinism.** A scheduled wake IS a sequenced turn, so the squawk lands in the log and replays. `random()` inside the woken verb is fine: it is an admitted logical input, recorded when the turn is planned and replayed from the record (per [space.md §S4](../../spec/semantics/space.md#s4-determinism-and-replay)). An earlier version of this note said otherwise. Capturing the next phrase at arming time — the LambdaMOO `fork` idiom, where the scheduled call carries the value chosen at this tick — remains a fine style, but it is no longer required for correctness.
 
-**UI discovery still partial.** `$conversational:look()` delegates to the
-room's `$room:look_self()`, so REST/WS callers and the chat client see composed
-room contents. Verb-discovery via `:describe()` on a selected object is still
+**UI discovery still partial.** A bare `look` resolves the seed dispatcher
+`$root:look` on the room, which calls the room's `$room:look_self()`, so
+REST/WS callers and the chat client see composed room contents. (This catalog
+used to carry its own `$conversational:look()` wrapper delegating to
+`:look_at(this)`; it was retired in v1.0.0 when `look` moved to the graph root
+and one dispatcher started serving every shape.) Verb-discovery via `:describe()` on a selected object is still
 tracked at [LATER.md](../../LATER.md); for now players discover object verbs by
 trying MOO-like text commands.
 

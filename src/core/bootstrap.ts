@@ -131,7 +131,30 @@ const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
     if (description) { description = description + " " + inventory; }
     else { description = inventory; }
   }
-  return { id: this, title: title, description: description, carrying: carried };
+  let view = { id: this, title: title, description: description, carrying: carried };
+  // Features are worn, not inherited, and verb lookup consults them only after
+  // the parent chain (resolveVerbLive). A feature therefore cannot OVERRIDE an
+  // inherited verb — it can only fill a gap. So a feature that wants to add to
+  // how its wearer looks cannot do it by defining look_self: this page always
+  // wins. Ask each feature to describe itself instead and merge what it
+  // contributes.
+  //
+  // Merge rule: a feature may only ADD keys. Identity and inventory belong to
+  // the wearer, so an existing key is never overwritten, and the feature's own
+  // id/title/description/carrying — an artifact of dispatching look_self on
+  // the feature object — cannot leak into the wearer's view.
+  for feature in this.features {
+    if (feature != this) {
+      let extra = null;
+      try { extra = dispatch(feature, "look_self", []); } except err { extra = null; }
+      if (typeof(extra) == "map") {
+        for key in keys(extra) {
+          if (!has(view, key)) { view[key] = extra[key]; }
+        }
+      }
+    }
+  }
+  return view;
 }`;
 
 const ACTOR_HUH_SOURCE = `verb :huh(text, reason, source) rxd {
@@ -1316,10 +1339,20 @@ function seedUniversal(world: WooWorld): void {
   sourceVerb(world, "$root", "describe", ROOT_DESCRIBE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "look_self", ROOT_LOOK_SELF_SOURCE, { directCallable: true });
-  // `parse: false` keeps this out of command matching on purpose: the textual
-  // surface reaches objects through the catalog-supplied `look_at` command
-  // entry, which owns the room-aware rendering. This page is the object-method
-  // form — what `woo_call` and the MCP tool surface dispatch.
+  // This page serves BOTH the object-method form (what `woo_call` and the MCP
+  // tool surface dispatch) and the bare `look` command. Its command pattern is
+  // fully closed — `dobj`, `prep` and `iobj` all `none` — so it matches only a
+  // truly empty command; the target search reaches the actor's space, which
+  // renders itself through its own `look_self`. `look <target>` belongs to the
+  // catalog's `look_at` entry, which owns object matching.
+  //
+  // The two patterns must stay disjoint rather than being merged into one verb
+  // accepting `dobj: ["object", "none"]`. Slots match independently, so a
+  // single widened pattern would let `look at`, `look under mug` and
+  // `look in front of me` satisfy the `none` alternative on an empty `dobj`
+  // while `prep`/`iobj` absorbed the rest — silently rendering the room
+  // instead of failing to parse. Two closed patterns reject them, and the
+  // planner falls through to `huh` as it should.
   //
   // Both dispatch flags are inherited from the per-class `look` pages this
   // replaces, and both are load-bearing:
@@ -1340,7 +1373,7 @@ function seedUniversal(world: WooWorld): void {
     skipPresenceCheck: true,
     readsRoomPresence: true,
     aliases: ["l@ook", "ex@amine"],
-    argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
+    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [], persistence: "live" } }
   });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
     directCallable: true,

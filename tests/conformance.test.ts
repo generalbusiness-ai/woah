@@ -1162,4 +1162,76 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       harness.cleanup();
     }
   });
+
+  // AGENTS.md: migrations must be test-run on a local SQLite woo. The look
+  // consolidation ships seven of them at once — six §CT14 catalog majors that
+  // drop a per-class `look`, plus the bootstrap retirement of `$thing:look`
+  // (catalogs.md §CT5.4.1) — and every one of them DELETES a definition.
+  //
+  // An in-memory fixture cannot prove those deletions. Definitions live in the
+  // repository, so the failure mode that matters is "the migration ran, the
+  // process ended, and the dropped page is still on disk when the world
+  // reopens". This test ages a real file-backed world, restarts it, and checks
+  // both what went away and what took over.
+  it("retires look pages across a persist/reopen of an aged world", async () => {
+    const harness = make();
+    try {
+      const aged = harness.world;
+
+      // Age the world in both dimensions the runtime looks at: replant the
+      // retired seed page, replant one catalog's `look` override, and wind
+      // that catalog's recorded version back behind the bundle so the major
+      // edge is a real edge rather than an already-applied no-op.
+      expect(installVerb(aged, "$thing", "look", "verb :look() rxd { return this:look_self(); }", null).ok).toBe(true);
+      expect(installVerb(aged, "$cockatoo", "look", "verb :look() rxd { return { legacy: true }; }", null).ok).toBe(true);
+      const installed = (aged.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+        .map((record) => (record.alias === "demoworld" ? { ...record, version: "0.2.0" } : record));
+      aged.setProp("$catalog_registry", "installed_catalogs", installed as never);
+      aged.setProp("$system", "catalog_migration_records", [] as never);
+      aged.setProp(
+        "$system",
+        "applied_migrations",
+        (aged.getProp("$system", "applied_migrations") as string[])
+          .filter((id) => id !== "2026-07-31-retired-bootstrap-definitions") as never
+      );
+
+      // The fixture really is aged, or the assertions below prove nothing:
+      // both replanted pages currently WIN, each shadowing $root:look for its
+      // own subtree. That shadowing is the whole reason they must be dropped.
+      expect(aged.verbInfo("the_lamp", "look").definer).toBe("$thing");
+      expect(aged.verbInfo("the_cockatoo", "look").definer).toBe("$cockatoo");
+
+      // Reopen the same file. Cold init runs the boot migration and the
+      // bundled major-version upgrade against state that came off disk.
+      const reopened = harness.restart();
+
+      expect(reopened.ownVerbExact("$thing", "look")).toBeNull();
+      expect(reopened.ownVerbExact("$cockatoo", "look")).toBeNull();
+      expect(reopened.verbInfo("the_lamp", "look").definer).toBe("$root");
+      expect(reopened.verbInfo("the_cockatoo", "look").definer).toBe("$root");
+      expect(reopened.getProp("$system", "applied_migrations")).toContain("2026-07-31-retired-bootstrap-definitions");
+      const upgraded = (reopened.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>)
+        .find((record) => record.alias === "demoworld");
+      expect(upgraded?.version).toBe("1.0.0");
+
+      // The catalog's own view survived the drop: the cockatoo's extra fields
+      // moved into look_self, so the migration removed a dispatcher without
+      // removing behavior.
+      const seen = await reopened.directCall("sqlite-cockatoo-look", "$wiz", "the_cockatoo", "look", []);
+      expect(seen.op).toBe("result");
+      if (seen.op === "result") {
+        expect(seen.result).toMatchObject({ id: "the_cockatoo", mood: "alert" });
+        expect(seen.observations.some((obs) => obs.type === "cockatoo_seen")).toBe(true);
+      }
+
+      // Reruns are safe, and — the point of doing this on SQLite — the drops
+      // stay dropped across another full close/reopen cycle.
+      const again = harness.restart();
+      expect(again.ownVerbExact("$thing", "look")).toBeNull();
+      expect(again.ownVerbExact("$cockatoo", "look")).toBeNull();
+      expect(again.verbInfo("the_lamp", "look").definer).toBe("$root");
+    } finally {
+      harness.cleanup();
+    }
+  });
 });

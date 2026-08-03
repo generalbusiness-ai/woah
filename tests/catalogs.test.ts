@@ -2025,9 +2025,7 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("pinboard-look-plan", session.actor, "the_pinboard", "command_plan", ["look"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") {
-      // One `look_at` serves both the bare and object forms; a bare `look`
-      // resolves to the space itself via the empty dobj slot.
-      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look_at", args: ["$failed_match", ""] });
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look", args: [] });
     }
     const looked = await world.directCall("pinboard-look", session.actor, "the_pinboard", "look", []);
     expect(looked.op).toBe("result");
@@ -2730,7 +2728,7 @@ describe("local catalogs", () => {
 
     runHostScopedLocalCatalogLifecycle(host, "the_chatroom");
 
-    expect(host.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: ["object", "none"], args_from: ["dobj_prefix", "dobjstr"] });
+    expect(host.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: "object", args_from: ["dobj_prefix"] });
   });
 
   it("auto-syncs local catalog schema drift without a hand-authored boot migration", () => {
@@ -3023,7 +3021,7 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("plan-look-cockatoo", first.actor, "the_chatroom", "command_plan", ["l cock"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") {
-      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_cockatoo", "cock"] });
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_cockatoo"] });
       const looked = await world.directCall("look-cockatoo-command", first.actor, String((lookPlan.result as Record<string, any>).target), String((lookPlan.result as Record<string, any>).verb), (lookPlan.result as Record<string, any>).args);
       expect(looked.op).toBe("result");
       if (looked.op === "result") {
@@ -3034,13 +3032,13 @@ describe("local catalogs", () => {
     const lookMugPlan = await world.directCall("plan-look-mug", first.actor, "the_chatroom", "command_plan", ["look mug"]);
     expect(lookMugPlan.op).toBe("result");
     if (lookMugPlan.op === "result") {
-      expect(lookMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug", "mug"] });
+      expect(lookMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
     }
 
     const lookOutlinePlan = await world.directCall("plan-look-outline", first.actor, "the_chatroom", "command_plan", ["look outline"]);
     expect(lookOutlinePlan.op).toBe("result");
     if (lookOutlinePlan.op === "result") {
-      expect(lookOutlinePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_outline", "outline"] });
+      expect(lookOutlinePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_outline"] });
       const looked = await world.directCall("look-outline-command", first.actor, "the_chatroom", "look_at", ["the_outline"]);
       expect(looked.op).toBe("result");
       if (looked.op === "result") {
@@ -3066,14 +3064,14 @@ describe("local catalogs", () => {
     const lookAtMugPlan = await world.directCall("plan-look-at-mug", first.actor, "the_chatroom", "command_plan", ["look at mug"]);
     expect(lookAtMugPlan.op).toBe("result");
     if (lookAtMugPlan.op === "result") {
-      expect(lookAtMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug", "mug"] });
+      expect(lookAtMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
       expect((lookAtMugPlan.result as Record<string, any>).cmd).toMatchObject({ prep: "at", iobj: "the_mug" });
     }
 
     const lookMePlan = await world.directCall("plan-look-me", first.actor, "the_chatroom", "command_plan", ["look me"]);
     expect(lookMePlan.op).toBe("result");
     if (lookMePlan.op === "result") {
-      expect(lookMePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: [first.actor, "me"] });
+      expect(lookMePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: [first.actor] });
       const takeLamp = await world.directCall("take-lamp-before-look-me", first.actor, "the_chatroom", "take", ["lamp"]);
       expect(takeLamp.op).toBe("result");
       const lookedMe = await world.directCall("look-me-command", first.actor, "the_chatroom", "look_at", [first.actor]);
@@ -3215,7 +3213,7 @@ describe("local catalogs", () => {
     const surfacedPlan = await world.directCall("plan-command-surface-alias", session.actor, "the_chatroom", "command_plan", ["look comet"]);
     expect(surfacedPlan.op).toBe("result");
     if (surfacedPlan.op === "result") {
-      expect(surfacedPlan.result).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["obj_title_only_stone", "comet"] });
+      expect(surfacedPlan.result).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["obj_title_only_stone"] });
     }
   });
 
@@ -4185,52 +4183,99 @@ describe("local catalogs", () => {
     }
 
     // The programmer surfaces returned a hardcoded tool list from `look` and
-    // emitted nothing. As `look_self` they compose with the inherited view via
-    // pass(), so they keep the tool list AND gain the observation.
-    // The programmer surface is feature-composed, so no seeded actor inherits
-    // $builder; look at the class itself, which is an ordinary object.
-    const prog = await world.directCall("programmer-look", "$wiz", "$programmer", "look", []);
+    // emitted nothing. As `look_self` they compose with the inherited view.
+    //
+    // This MUST be asserted on a real actor, not on `$programmer` itself. The
+    // surface is worn as a FEATURE, and verb lookup consults features only
+    // after the parent chain — so `$wiz:look_self` resolves `$player`'s page
+    // and the feature never gets a turn. Looking at the class object hides
+    // that completely, because there the feature's page is also its own.
+    expect(world.getProp("$wiz", "features")).toContain("$programmer");
+    expect(world.verbInfo("$wiz", "look_self").definer).toBe("$player");
+
+    const prog = await world.directCall("programmer-look", "$wiz", "$wiz", "look", []);
     expect(prog.op).toBe("result");
     if (prog.op === "result") {
-      expect(Array.isArray((prog.result as Record<string, unknown>).tools)).toBe(true);
-      expect(prog.result).toHaveProperty("description");
+      const view = prog.result as Record<string, unknown>;
+      // Contributed by the worn feature...
+      expect(Array.isArray(view.tools)).toBe(true);
+      expect(view.tools as string[]).toContain("eval(source, opts?)");
+      expect(view).toHaveProperty("api_version");
+      // ...while identity and inventory still belong to the wearer. A feature
+      // may only ADD keys, or dispatching look_self on the feature object
+      // would stamp the feature's own id/title over the actor's.
+      expect(view.id).toBe("$wiz");
+      expect(view).toHaveProperty("carrying");
       expect(prog.observations.some((obs) => obs.type === "looked")).toBe(true);
+    }
+
+    // An actor with no features is unchanged — the merge adds nothing and
+    // cannot introduce keys of its own.
+    const plain = await world.directCall("plain-look", "guest_1", "guest_1", "look", []);
+    expect(plain.op).toBe("result");
+    if (plain.op === "result") {
+      expect(Object.keys(plain.result as Record<string, unknown>).sort()).toEqual([
+        "carrying",
+        "description",
+        "id",
+        "title"
+      ]);
     }
   });
 
-  it("serves bare look and look <thing> from one command entry", async () => {
+  it("keeps the bare and object look commands on disjoint closed patterns", async () => {
     const world = createWorld();
     const plan = async (text: string) => {
       const result = await world.directCall(`plan-${text}`, "guest_1", "the_chatroom", "command_plan", [text]);
       return result.op === "result" ? (result.result as Record<string, unknown>) : null;
     };
 
-    // `$conversational:look` (bare) and `:look_at` (object) were two verbs for
-    // one job; `dobj: ["object", "none"]` lets the single entry serve both,
-    // matching `#3:l*ook`, which branches on an empty dobjstr in its own body.
-    expect(await plan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at" });
-    expect(await plan("l")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at" });
-    expect(await plan("look mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug", "mug"] });
+    // Bare `look` is answered by the seed dispatcher's own command pattern —
+    // `dobj`/`prep`/`iobj` all `none` — resolved on the actor's space, which
+    // renders itself. `look <target>` is the catalog's `look_at`, which owns
+    // object matching. Two closed patterns, no overlap.
+    expect(await plan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look", args: [] });
+    expect(await plan("l")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look", args: [] });
+    expect(await plan("look mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+    expect(await plan("examine mug")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
 
-    // A mounted workspace carries the same feature, so it also answers
-    // `look_at`. The command must still be handled by the room the actor is
-    // standing in — otherwise the `looked` observation lands in the workspace's
-    // own sequenced log instead of the room's. `dobj` is a LIST now, so the
-    // guard that enforces this cannot compare it with `=== "object"`.
+    // Merging both into one verb with `dobj: ["object", "none"]` looks tidy and
+    // is wrong: slots match independently, so anything that leaves `dobj` empty
+    // while `prep`/`iobj` absorb the rest satisfies the `none` alternative and
+    // silently renders the room. Each of these must fail to parse.
+    for (const malformed of ["look at", "examine at", "look under mug", "look in front of me"]) {
+      expect(await plan(malformed), malformed).toMatchObject({ ok: false, verb: "huh" });
+    }
+
+    // A mounted workspace carries the same conversational feature, so it also
+    // answers `look_at`. The command must still be handled by the room the
+    // actor is standing in — otherwise the `looked` observation lands in the
+    // workspace's own sequenced log instead of the room's.
     expect(await plan("look outline")).toMatchObject({
       ok: true,
       target: "the_chatroom",
       verb: "look_at",
-      args: ["the_outline", "outline"]
+      args: ["the_outline"]
     });
 
-    // Bare look renders the room, not a failed match: the empty dobjstr is
-    // what separates "no target given" from "named a target that missed".
-    const bare = await world.directCall("bare-look", "guest_1", "the_chatroom", "look_at", ["$failed_match", ""]);
-    expect(bare.op).toBe("result");
-    if (bare.op === "result") {
-      expect(bare.result).toMatchObject({ id: "the_chatroom" });
-      expect(bare.observations.find((obs) => obs.type === "looked")).toMatchObject({ target: "the_chatroom" });
+    // The mounted-space guard must read a `dobj` pattern the same way the slot
+    // matcher does. `commandSlotMatches` recurses over alternatives, so a
+    // catalog may legitimately write a list; an exact `=== "object"` test in
+    // the guard would skip it and let the workspace claim the command.
+    const lookAt = world.ownVerbExact("$conversational", "look_at")!;
+    world.addVerb("$conversational", {
+      ...lookAt,
+      arg_spec: { ...lookAt.arg_spec, command: { ...(lookAt.arg_spec.command as Record<string, unknown>), dobj: ["object", "string"] } },
+      version: lookAt.version + 1
+    });
+    expect(await plan("look outline")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at" });
+    world.addVerb("$conversational", { ...lookAt, version: lookAt.version + 2 });
+
+    // Standing inside the workspace, bare look renders the workspace itself.
+    const inside = await world.directCall("plan-inside", "guest_1", "the_outline", "command_plan", ["look"]);
+    expect(inside.op).toBe("result");
+    if (inside.op === "result") {
+      expect(inside.result).toMatchObject({ ok: true, target: "the_outline", verb: "look", args: [] });
     }
   });
 
@@ -4308,7 +4353,7 @@ describe("local catalogs", () => {
     expect(repaired?.source).toContain("plan_command");
     expect(world.ownVerbExact("$conversational", "huh")?.source).toContain("actor:huh");
     expect(world.ownVerbExact("$conversational", "huh_plan")?.source).toContain("target: actor");
-    expect(world.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: ["object", "none"], args_from: ["dobj_prefix", "dobjstr"] });
+    expect(world.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: "object", args_from: ["dobj_prefix"] });
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-chat-command-plan-source-repair");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-chat-actor-huh-source-repair");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-chat-look-at-command-repair");
@@ -4320,7 +4365,7 @@ describe("local catalogs", () => {
     if (plan.op === "result") expect(plan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "say", args: ["hello after repair"], persistence: "live" });
     const lookPlan = await world.directCall("repaired-look-plan", session.actor, "the_chatroom", "command_plan", ["look mug"]);
     expect(lookPlan.op).toBe("result");
-    if (lookPlan.op === "result") expect(lookPlan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug", "mug"] });
+    if (lookPlan.op === "result") expect(lookPlan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
   });
 
   it("repairs $note:read command pattern and $dispensed_note:moveto on existing installs", async () => {
