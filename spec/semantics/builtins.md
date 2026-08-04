@@ -208,9 +208,10 @@ catalog source.
 
 `execute_command_plan(plan)` consumes a command plan produced by
 `$match:plan_command`. A successful plan names `target`, the canonical `verb`,
-and `verb_definer`; execution verifies the definer remains in the target's
-parent/feature topology and invokes that exact page. It never repeats ordinary
-target-first name resolution. Missing or invalid page identity is refused as
+`verb_definer`, and `verb_slot`. Execution performs ordinary target-first
+resolution and verifies that the canonical name, definer, and slot match the
+plan before invoking it. The assertion cannot select a hidden page. Missing or
+invalid page identity is refused as
 specified by [match.md §MA7.2](match.md#ma72-exact-verb-page-binding).
 
 Direct plans return the target verb's result. A sequenced plan reached through a direct

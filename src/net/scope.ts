@@ -170,7 +170,7 @@ export type CommitSubmit = {
   replay_result_omitted?: true;
   /**
    * CO2.5: the canonical identity of the request this key answers — a hash
-   * over `{actor, target, verb, verb_definer?, args, route}`
+   * over `{actor, target, verb, verb_definer?, verb_slot?, args, route}`
    * (plan.ts requestFingerprint).
    *
    * An idempotency key is a client-chosen string, and a client that reuses
@@ -1144,7 +1144,7 @@ export class ScopeSequencer {
       // An idempotency key answers ONE request. Reusing it for a different
       // call must never hand back the first call's reply — a confidently
       // wrong answer is worse than the double execution keys prevent. The
-      // fingerprint covers actor/target/verb/verb_definer/args/route,
+      // fingerprint covers actor/target/verb/verb_definer/verb_slot/args/route,
       // canonically, so an
       // alias that resolves to the same call agrees and a changed argument
       // does not. Both sides must carry one: a submit or a recorded reply
@@ -2240,6 +2240,7 @@ export class ScopeSequencer {
         target: transcript.call.target,
         verb: transcript.call.verb,
         ...(transcript.call.verb_definer ? { verb_definer: transcript.call.verb_definer } : {}),
+        ...(transcript.call.verb_slot !== undefined ? { verb_slot: transcript.call.verb_slot } : {}),
         args: transcript.call.args
       }),
       observations: structuredClone(transcript.observations) as unknown[],

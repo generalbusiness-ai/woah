@@ -449,8 +449,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
  * - The planning anchor/scope is excluded: a turn that MOVED the actor
  *   re-plans from the new room, and that must replay cleanly rather than
  *   look like a different request.
- * - An exact `verb_definer` is included. Reusing an idempotency key after a
- *   same-name page substitution is a different request, not a retry.
+ * - Exact `verb_definer` and `verb_slot` assertions are included. Reusing an
+ *   idempotency key after a same-name page substitution is a different
+ *   request, not a retry.
  */
 function requestFingerprint(call: ShadowTurnCall): string {
   return cellVersion({
@@ -458,6 +459,7 @@ function requestFingerprint(call: ShadowTurnCall): string {
     target: call.target,
     verb: call.verb,
     verb_definer: call.verb_definer ?? null,
+    verb_slot: call.verb_slot ?? null,
     args: call.args ?? [],
     route: call.route
   });
@@ -725,7 +727,7 @@ function buildSeedSlice(view: CellStore, call: ShadowTurnCall): Set<string> {
     for (const cell of view.sessionCellsForActor(call.actor)) seed.add(cell.key);
   }
   const chain = new Set<string>();
-  for (const ref of [call.actor, call.target, call.verb_definer]) {
+  for (const ref of [call.actor, call.target]) {
     if (typeof ref === "string" && ref) chain.add(ref);
   }
   for (;;) {
@@ -1034,7 +1036,7 @@ function sparseMissingKeys(
   code: string,
   value: unknown,
   view: CellStore,
-  call: { target?: string; actor?: string; verb_definer?: string }
+  call: { target?: string; actor?: string }
 ): string[] {
   const missing = new Set<string>();
   const verbMiss = value as { obj?: unknown; name?: unknown; descriptor?: unknown; verb?: unknown } | null;
@@ -1053,7 +1055,6 @@ function sparseMissingKeys(
     typeof value === "string" ? value : null,
     typeof verbMiss?.obj === "string" ? verbMiss.obj : null,
     call.target ?? null,
-    call.verb_definer ?? null,
     call.actor ?? null
   ].filter((ref): ref is string => typeof ref === "string" && ref.length > 0);
   for (const ref of refs) {

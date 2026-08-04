@@ -1522,7 +1522,10 @@ function missingAtomsFromThrownRepairableState(
   const value = error.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const map = value as Record<string, WooValue>;
-  const expectedObject = request.call.verb_definer ?? request.call.target;
+  // Exact page metadata asserts ordinary dispatch; it does not redirect the
+  // lookup to the claimed definer. Missing-state repair therefore starts from
+  // the target's normal resolution chain.
+  const expectedObject = request.call.target;
   if (map.obj !== expectedObject || map.name !== request.call.verb) return null;
   return [missingAtomForPreimage(`read:cell:verb:${expectedObject}:${request.call.verb}`)];
 }

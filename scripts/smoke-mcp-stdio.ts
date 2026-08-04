@@ -86,13 +86,13 @@ async function main(): Promise<void> {
       name: "woo_call",
       arguments: { object: "the_chatroom", verb: "command_plan", args: ["look"] }
     }) as ToolResult);
-    const command = planned.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; verb_definer?: string; args?: unknown[] } | undefined;
-    if (!command?.ok || !command.target || !command.verb || !command.verb_definer) {
+    const command = planned.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; verb_definer?: string; verb_slot?: number; args?: unknown[] } | undefined;
+    if (!command?.ok || !command.target || !command.verb || !command.verb_definer || !command.verb_slot) {
       throw new Error(`command_plan did not return an executable command: ${JSON.stringify(command)}`);
     }
     assertOk("woo_call planned look", await client.callTool({
       name: "woo_call",
-      arguments: { object: command.target, verb: command.verb, verb_definer: command.verb_definer, args: command.args ?? [] }
+      arguments: { object: command.target, verb: command.verb, verb_definer: command.verb_definer, verb_slot: command.verb_slot, args: command.args ?? [] }
     }) as ToolResult);
     assertOk("woo_wait", await client.callTool({
       name: "woo_wait",

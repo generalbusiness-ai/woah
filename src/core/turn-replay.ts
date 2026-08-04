@@ -23,13 +23,14 @@ export async function replayRecordedTurn(serializedBefore: SerializedWorld, turn
     target: turn.start.target,
     verb: turn.start.verb,
     ...(turn.start.verb_definer ? { verb_definer: turn.start.verb_definer } : {}),
+    ...(turn.start.verb_slot !== undefined ? { verb_slot: turn.start.verb_slot } : {}),
     args: turn.start.args,
     ...(turn.start.body !== undefined ? { body: turn.start.body } : {})
   };
   if (turn.start.route === "direct") {
     frame = await world.directCall(turn.start.id, turn.start.actor, turn.start.target, turn.start.verb, turn.start.args, {
       sessionId: turn.start.session ?? null,
-      ...(turn.start.verb_definer ? { verbDefiner: turn.start.verb_definer } : {})
+      ...(turn.start.verb_definer ? { verbDefiner: turn.start.verb_definer, verbSlot: turn.start.verb_slot } : {})
     });
   } else if (turn.start.session) {
     frame = await world.call(turn.start.id, turn.start.session, turn.start.scope, message);

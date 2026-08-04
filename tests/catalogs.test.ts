@@ -3101,6 +3101,7 @@ describe("local catalogs", () => {
       const plan = teachPlan.result as Record<string, any>;
       expect(plan).toMatchObject({ ok: true, route: "sequenced", space: "the_chatroom", target: "the_cockatoo", verb: "teach", args: ["object worlds"] });
       const selectedDefiner = String(plan.verb_definer);
+      const selectedSlot = Number(plan.verb_slot);
       expect(selectedDefiner).not.toBe("the_cockatoo");
       expect(installVerb(world, "the_cockatoo", "teach", `verb :teach(text) rxd {
   return { rebound: true, text: text };
@@ -3110,10 +3111,14 @@ describe("local catalogs", () => {
         target: String(plan.target),
         verb: String(plan.verb),
         verb_definer: selectedDefiner,
+        verb_slot: selectedSlot,
         args: plan.args
       });
-      expect(applied.op).toBe("applied");
-      expect((world.getProp("the_cockatoo", "phrases") as string[]).at(-1)).toBe("object worlds");
+      // Raw sequenced calls preserve their canonical applied-error envelope;
+      // command-plan execution preflights before it reaches this low-level
+      // boundary (covered by the stale feature-plan regression below).
+      expect(applied).toMatchObject({ op: "applied", observations: [expect.objectContaining({ type: "$error", code: "E_VERBNF" })] });
+      expect((world.getProp("the_cockatoo", "phrases") as string[])).not.toContain("object worlds");
     }
 
     world.addVerb("the_cockatoo", {
@@ -4357,12 +4362,10 @@ describe("local catalogs", () => {
     expect(world.verbInfo("the_lamp", "look").definer).toBe("$root");
   });
 
-  it("executes the exact page selected by command planning for every command token", async () => {
-    // Planning may deliberately skip a nearer same-named page when it has no
-    // command pattern. The returned definer is therefore load-bearing: if
-    // execution repeats ordinary name lookup, the planted page below hijacks
-    // both bare look and speech. execute_command_plan must instead validate
-    // and invoke the exact selected catalog page.
+  it("expires command plans when ordinary dispatch changes for every command token", async () => {
+    // Exact metadata is an assertion, not a selector. A newly planted nearer
+    // page changes ordinary dispatch, so execution must refuse the stale plan
+    // rather than run either the new page or its now-hidden ancestor.
     for (const token of ["look_here", "say"]) {
       const world = createWorld();
       const session = world.auth(`guest:token-${token}`);
@@ -4387,6 +4390,7 @@ describe("local catalogs", () => {
       const plan = planned.result as Record<string, unknown>;
       expect(plan.verb, token).toBe(token);
       expect(plan.verb_definer, token).toBe("$conversational");
+      expect(plan.verb_slot, token).toEqual(expect.any(Number));
 
       const params = token === "say" ? "text" : "";
       const planted = installVerb(
@@ -4406,11 +4410,7 @@ describe("local catalogs", () => {
         [plan as never],
         { sessionId: session.id }
       );
-      expect(ran.op, token).toBe("result");
-      if (ran.op === "result") {
-        expect(ran.result, token).not.toMatchObject({ rebound: true });
-        expect(ran.observations.some((observation) => observation.type === (token === "say" ? "said" : "looked")), token).toBe(true);
-      }
+      expect(ran, token).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
     }
   });
 
@@ -4439,7 +4439,7 @@ describe("local catalogs", () => {
 
     // A successful executable plan without identity is malformed. Execution
     // must not quietly recover by doing the vulnerable target/name lookup.
-    const { verb_definer: _omitted, ...unbound } = plan;
+    const { verb_definer: _omittedDefiner, verb_slot: _omittedSlot, ...unbound } = plan;
     const missing = await world.directCall(
       "run-plan-without-definer",
       session.actor,
@@ -4450,7 +4450,7 @@ describe("local catalogs", () => {
     );
     expect(missing).toMatchObject({ op: "error", error: { code: "E_INVARG" } });
 
-    // The definer is a selector, not authority: an unrelated live object
+    // The definer is an assertion, not authority: an unrelated live object
     // cannot be named to make one of its pages executable through the target.
     world.createObject({ id: "unrelated_plan_page", parent: "$thing", owner: "$wiz", location: "$nowhere" });
     expect(installVerb(
@@ -4514,6 +4514,62 @@ describe("local catalogs", () => {
       { sessionId: session.id }
     );
     expect(stale).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
+  });
+
+  it("never lets exact-page assertions bypass a subclass override", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:page-assertion-override");
+    expect(installVerb(world, session.actor, "execute_bound_plan", "verb :execute_bound_plan(plan) rxd { return execute_command_plan(plan); }", null).ok).toBe(true);
+    world.createObject({ id: "guard_base", parent: "$thing", owner: "$wiz", location: "$nowhere" });
+    world.createObject({ id: "guard_sub", parent: "guard_base", owner: "$wiz", location: "the_chatroom", name: "guard probe" });
+    expect(installVerb(world, "guard_base", "guarded", "verb :guarded() rxd { return { ran: \"ancestor-permissive\" }; }", null).ok).toBe(true);
+    expect(installVerb(world, "guard_sub", "guarded", "verb :guarded() rxd { raise { code: \"E_PERM\", message: \"subclass refuses\" }; }", null).ok).toBe(true);
+
+    const ordinary = await world.directCall("ordinary-guarded", session.actor, "guard_sub", "guarded", [], { sessionId: session.id });
+    expect(ordinary).toMatchObject({ op: "error", error: { code: "E_PERM", message: "subclass refuses" } });
+    const ancestor = world.ownVerbExact("guard_base", "guarded")!;
+    const bypass = await world.directCall(
+      "assert-ancestor-guarded",
+      session.actor,
+      session.actor,
+      "execute_bound_plan",
+      [{
+        ok: true,
+        route: "direct",
+        space: null,
+        target: "guard_sub",
+        verb: "guarded",
+        verb_definer: "guard_base",
+        verb_slot: ancestor.slot!,
+        args: [],
+        cmd: {}
+      }],
+      { sessionId: session.id }
+    );
+    expect(bypass).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
+  });
+
+  it("refuses when a planned duplicate-name slot is not ordinary dispatch", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:duplicate-page-slot");
+    expect(installVerb(world, session.actor, "execute_bound_plan", "verb :execute_bound_plan(plan) rxd { return execute_command_plan(plan); }", null).ok).toBe(true);
+    world.createObject({ id: "duplicate_command_target", parent: "$thing", owner: "$wiz", location: "the_chatroom", name: "duplicate target" });
+    expect(installVerb(world, "duplicate_command_target", "dupcmd", "verb :dupcmd() rxd { return { page: \"A\" }; }", null, {
+      argSpec: { command: { parse: false } }
+    }).ok).toBe(true);
+    world.createObject({ id: "duplicate_page_template", parent: "$thing", owner: "$wiz", location: "$nowhere" });
+    expect(installVerb(world, "duplicate_page_template", "dupcmd", "verb :dupcmd() rxd { return { page: \"B\" }; }", null, {
+      argSpec: { command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } }
+    }).ok).toBe(true);
+    world.addVerb("duplicate_command_target", world.ownVerbExact("duplicate_page_template", "dupcmd")!, { append: true });
+
+    const planned = await world.directCall("plan-duplicate-page", session.actor, "the_chatroom", "command_plan", ["dupcmd duplicate target"], { sessionId: session.id });
+    expect(planned).toMatchObject({ op: "result", result: { ok: true, target: "duplicate_command_target", verb: "dupcmd" } });
+    if (planned.op !== "result") return;
+    const plan = planned.result as Record<string, WooValue>;
+    expect(plan.verb_slot).not.toBe(world.ownVerbExact("duplicate_command_target", "dupcmd")?.slot);
+    const ran = await world.directCall("run-duplicate-page", session.actor, session.actor, "execute_bound_plan", [plan], { sessionId: session.id });
+    expect(ran).toMatchObject({ op: "error", error: { code: "E_VERBNF" } });
   });
 
   it("drops the retired bootstrap look page from an aged world on cold init", () => {

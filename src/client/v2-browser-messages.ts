@@ -153,6 +153,7 @@ function v2AppliedFrameFromTranscript(frame: ShadowCommitAccepted, transcript: E
       target: transcript.call.target,
       verb: transcript.call.verb,
       ...(transcript.call.verb_definer ? { verb_definer: transcript.call.verb_definer } : {}),
+      ...(transcript.call.verb_slot !== undefined ? { verb_slot: transcript.call.verb_slot } : {}),
       args: transcript.call.args
     },
     observations: transcript.observations,

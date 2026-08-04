@@ -215,6 +215,7 @@ type CommandMap = {
 type CommandVerbSummary = {
   name: string;
   definer: ObjRef;
+  slot: number;
   direct_callable: boolean;
   skip_presence_check?: boolean;
   arg_spec?: Record<string, WooValue>;
@@ -235,6 +236,7 @@ type CommandPlan = {
   target: ObjRef;
   verb: string;
   verb_definer: ObjRef;
+  verb_slot: number;
   args: WooValue[];
   cmd: CommandMap;
   persistence?: "durable" | "live";
@@ -354,11 +356,10 @@ export type ExecutorContext = {
    * owning host, so cross-host stale-ref answers must come from there. */
   isRecycled?(objRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
-  /** Dispatch an already-resolved call. `exactDefiner` selects a page; it
-   * never grants permission to execute it. Ingresses that promise external
-   * direct-call semantics set `requireDirectCallable`, which is deliberately
-   * enforced again by the host that owns the executable page. */
-  dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, exactDefiner?: ObjRef | null, requireDirectCallable?: boolean): Promise<WooValue>;
+  /** Dispatch a call by ordinary target-first resolution. An expected page
+   * asserts what that resolution must produce; it never selects a page.
+   * External direct-call semantics are rechecked by the executing host. */
+  dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, expectedDefiner?: ObjRef | null, expectedSlot?: number | null, requireDirectCallable?: boolean): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): Promise<void>;
   setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void>;
@@ -485,6 +486,7 @@ export type DirectCallOptions = {
   scheduled?: { id: string; at: number; fired_at: number };
   /** Exact command-planned page identity. Not part of the public raw-call API. */
   verbDefiner?: ObjRef;
+  verbSlot?: number;
   forceDirect?: boolean;
   forceReason?: string;
   sessionId?: string | null;
@@ -497,6 +499,7 @@ type DirectDispatchFrameOptions = {
   scheduled?: { id: string; at: number; fired_at: number };
   /** Exact command-planned page identity. */
   verbDefiner?: ObjRef;
+  verbSlot?: number;
   startedAt: number;
   sessionId: string | null;
   audience: ObjRef | null;
@@ -3993,72 +3996,33 @@ export class WooWorld {
   }
 
   /**
-   * Resolve the exact page selected by a command plan.
-   *
-   * Ordinary dispatch stops at the first matching name. A command plan has
-   * already done that policy work, including command-pattern filtering, so
-   * repeating target-first lookup here would let a nearer same-named page
-   * intercept the call. The bound definer is still only a selector: this walk
-   * proves it remains in the target's inheritance/feature topology and the
-   * definer still owns the named canonical page.
+   * Assert that ordinary dispatch still resolves to the page a command plan
+   * observed. The plan fields are evidence, never a selector: resolution runs
+   * target-first exactly as an unbound call would, then both definer and slot
+   * must agree. A newly planted override therefore expires the plan instead
+   * of becoming either an interceptor or a way to invoke the hidden ancestor.
    */
-  private resolveExactVerbPageLive(target: ObjRef, definer: ObjRef, name: string): ResolvedVerb {
-    this.objectLive(target);
-    this.objectLive(definer);
-    const dependencies: RecordedProofDependency[] = [];
-
-    const fromChain = (start: ObjRef): ResolvedVerb | null => {
-      let current: ObjRef | null = start;
-      const seen = new Set<ObjRef>();
-      while (current && !seen.has(current)) {
-        seen.add(current);
-        const obj: WooObject | null = current === start ? this.objectLive(current) : this.parentWalkLookup(start, current);
-        if (!obj) break;
-        // Exact-page reachability is semantic input, not merely a lookup cache
-        // hint. Record each traversed lineage cell so a Net commit cannot
-        // accept a plan after chparent/detach changed the selected topology.
-        if (this.activeTurnRecorder) {
-          this.recordTurnEvent({
-            kind: "cell_read",
-            cell: { kind: "lifecycle", object: current },
-            version: this.structuralVersionForRecording("lifecycle", current),
-            value: this.lineageSemantic(obj)
-          });
-          dependencies.push({ kind: "lineage", object: current });
-        }
-        if (current === definer) {
-          const verb = obj.verbs.find((candidate: VerbDef) => candidate.name === name);
-          if (!verb) {
-            throw wooError("E_VERBNF", `exact verb page not found: ${definer}:${name}`, {
-              obj: definer,
-              target,
-              name,
-              definer
-            });
-          }
-          return { definer, verb, dependencies };
-        }
-        current = obj.parent;
-      }
-      return null;
-    };
-
-    const inherited = fromChain(target);
-    if (inherited) return inherited;
-    if (this.canCarryFeatures(target)) {
-      // featureList uses the ordinary property reader, so the attached feature
-      // vector and its inherited definition path become transcript reads.
-      for (const feature of this.featureList(target)) {
-        const resolved = fromChain(feature);
-        if (resolved) return resolved;
-      }
+  private resolveAssertedVerbPageLive(
+    target: ObjRef,
+    name: string,
+    expectedDefiner: ObjRef,
+    expectedSlot: number
+  ): ResolvedVerb {
+    const resolved = this.resolveVerbLive(target, name);
+    const actualSlot = resolved.verb.slot ?? 0;
+    if (resolved.definer !== expectedDefiner || actualSlot !== expectedSlot || resolved.verb.name !== name) {
+      throw wooError("E_VERBNF", `planned verb page no longer resolves for ${target}:${name}`, {
+        obj: target,
+        target,
+        name,
+        expected_definer: expectedDefiner,
+        expected_slot: expectedSlot,
+        actual_definer: resolved.definer,
+        actual_slot: actualSlot,
+        actual_name: resolved.verb.name
+      });
     }
-    throw wooError("E_VERBNF", `verb page ${definer}:${name} is not reachable from ${target}`, {
-      obj: definer,
-      target,
-      name,
-      definer
-    });
+    return resolved;
   }
 
   resolveVerbFrom(startRef: ObjRef | null, name: string): ResolvedVerb;
@@ -7078,6 +7042,7 @@ export class WooWorld {
       const frame = await this.directCallNow(frameId, this.sessionActor(sessionId), plan.target, plan.verb, plan.args, {
         sessionId,
         verbDefiner: plan.verb_definer,
+        verbSlot: plan.verb_slot,
         deferHostEffect: options.deferHostEffect
       });
       return frame.op === "result" ? { ...frame, command: plan } as DirectResultFrame : frame;
@@ -7088,6 +7053,7 @@ export class WooWorld {
       target: plan.target,
       verb: plan.verb,
       verb_definer: plan.verb_definer,
+      verb_slot: plan.verb_slot,
       args: plan.args
     });
   }
@@ -7106,6 +7072,7 @@ export class WooWorld {
         undefined,
         undefined,
         plan.verb_definer,
+        plan.verb_slot,
         true
       );
     }
@@ -7128,7 +7095,8 @@ export class WooWorld {
         plan.args,
         undefined,
         undefined,
-        plan.verb_definer
+        plan.verb_definer,
+        plan.verb_slot
       );
     }
 
@@ -7161,6 +7129,12 @@ export class WooWorld {
         effects: Array.from(disallowedKinds)
       });
     }
+    // A terminal transfer otherwise turns a stale exact-page assertion into
+    // an applied sequenced error after consuming a sequence number. Validate
+    // only after proving the wrapper is clean: a dirty wrapper must fail
+    // locally without consulting another authority. Final dispatch repeats
+    // the assertion so a topology race cannot execute a different page.
+    await this.assertCommandPlanPage(ctx, plan);
     const proofEvents = this.activeTurnRecorder?.currentBehaviorEvents() ?? [];
     throw commandPlanTransfer(
       {
@@ -7168,12 +7142,44 @@ export class WooWorld {
         target: plan.target,
         verb: plan.verb,
         verb_definer: plan.verb_definer,
+        verb_slot: plan.verb_slot,
         args: plan.args
       },
       ctx.actor,
       ctx.session,
       [...proofEvents]
     );
+  }
+
+  private async assertCommandPlanPage(ctx: CallContext, plan: CommandPlan): Promise<void> {
+    if (await this.remoteHostForObject(plan.target, ctx.hostMemo)) {
+      if (!this.executorContext?.resolveVerb) {
+        throw wooError("E_INTERNAL", "remote host bridge verb resolution unavailable");
+      }
+      // This is an execution assertion, not best-effort command discovery.
+      // Preserve remote availability failures so an outage cannot be reported
+      // as a stale plan; only a successful normal resolution may prove or
+      // disprove the planner's claimed page identity.
+      const resolved = await this.executorContext.resolveVerb(plan.target, plan.verb, ctx.hostMemo);
+      if (
+        resolved?.name !== plan.verb ||
+        resolved.definer !== plan.verb_definer ||
+        resolved.slot !== plan.verb_slot
+      ) {
+        throw wooError("E_VERBNF", `planned verb page no longer resolves for ${plan.target}:${plan.verb}`, {
+          obj: plan.target,
+          target: plan.target,
+          name: plan.verb,
+          expected_definer: plan.verb_definer,
+          expected_slot: plan.verb_slot,
+          actual_definer: resolved?.definer ?? null,
+          actual_slot: resolved?.slot ?? null,
+          actual_name: resolved?.name ?? null
+        });
+      }
+      return;
+    }
+    this.resolveAssertedVerbPageLive(plan.target, plan.verb, plan.verb_definer, plan.verb_slot);
   }
 
   private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
@@ -7256,6 +7262,7 @@ export class WooWorld {
       target,
       verb,
       verb_definer: options.verbDefiner ?? null,
+      verb_slot: options.verbSlot ?? null,
       args,
       force_direct: options.forceDirect === true,
       force_reason: options.forceReason ?? null
@@ -7271,6 +7278,11 @@ export class WooWorld {
       assertObj(target);
       assertString(verbName);
       if (!Array.isArray(args)) throw wooError("E_INVARG", "args must be a list");
+      const hasDefiner = options.verbDefiner !== undefined;
+      const hasSlot = options.verbSlot !== undefined;
+      if (hasDefiner !== hasSlot || (hasSlot && (!Number.isInteger(options.verbSlot) || options.verbSlot! <= 0))) {
+        throw wooError("E_INVARG", "verbDefiner and a positive verbSlot must be supplied together");
+      }
       transferCacheBinding = this.terminalTransferCacheBinding(frameId, actor, options);
       if (transferCacheBinding) {
         const cached = this.terminalTransferIdempotency.get(transferCacheBinding);
@@ -7289,7 +7301,7 @@ export class WooWorld {
         }
       }
       const { verb } = options.verbDefiner
-        ? this.resolveExactVerbPageLive(target, options.verbDefiner, verbName)
+        ? this.resolveAssertedVerbPageLive(target, verbName, options.verbDefiner, options.verbSlot!)
         : this.resolveVerbLive(target, verbName);
       const forceDirect = options.forceDirect === true && verb.direct_callable !== true;
       const wizard = this.isWizard(actor);
@@ -7321,7 +7333,7 @@ export class WooWorld {
         sessionId,
         audience,
         hostMemo,
-        ...(options.verbDefiner ? { verbDefiner: options.verbDefiner } : {}),
+        ...(options.verbDefiner ? { verbDefiner: options.verbDefiner, verbSlot: options.verbSlot } : {}),
         ...(options.scheduled ? { scheduled: options.scheduled } : {}),
         initialObservations: forceDirect ? [{ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target }] : undefined,
         deferHostEffect: options.deferHostEffect,
@@ -7373,6 +7385,7 @@ export class WooWorld {
         target: transfer.plan.target,
         verb: transfer.plan.verb,
         verb_definer: transfer.plan.verb_definer,
+        verb_slot: transfer.plan.verb_slot,
         args: transfer.plan.args
       },
       { transferredProofEvents: transfer.proofEvents }
@@ -7392,7 +7405,7 @@ export class WooWorld {
       actor,
       target,
       verb: verbName,
-      ...(options.verbDefiner ? { verb_definer: options.verbDefiner } : {}),
+      ...(options.verbDefiner ? { verb_definer: options.verbDefiner, verb_slot: options.verbSlot } : {}),
       args,
       // CO16.8 fire-time context, reachable from woocode as `message`. The
       // verb can tell it was woken rather than called, and how late: `at` and
@@ -7442,14 +7455,14 @@ export class WooWorld {
         actor,
         target,
         verb: verbName,
-        ...(options.verbDefiner ? { verb_definer: options.verbDefiner } : {}),
+        ...(options.verbDefiner ? { verb_definer: options.verbDefiner, verb_slot: options.verbSlot } : {}),
         args
       },
       async (activeRecorder) => {
         options.hostMemo.turnRecorder = activeRecorder;
         await this.withPersistencePaused(async () => {
           await this.withBehaviorSavepoint(async () => {
-            result = await this.dispatch(dispatchCtx, target, verbName, args, undefined, undefined, options.verbDefiner);
+            result = await this.dispatch(dispatchCtx, target, verbName, args, undefined, undefined, options.verbDefiner, options.verbSlot);
             result = await this.enrichScopedMoveResult(dispatchCtx, result);
             // These reads are part of constructing the success frame, so they
             // belong before acceptance. A remote enrichment/audience failure
@@ -7577,7 +7590,7 @@ export class WooWorld {
       try {
         skipPresenceCheck = (
           message.verb_definer
-            ? this.resolveExactVerbPageLive(message.target, message.verb_definer, message.verb)
+            ? this.resolveAssertedVerbPageLive(message.target, message.verb, message.verb_definer, message.verb_slot!)
             : this.resolveVerbLive(message.target, message.verb)
         ).verb.skip_presence_check === true;
       } catch {
@@ -7645,7 +7658,7 @@ export class WooWorld {
             actor: message.actor,
             target: message.target,
             verb: message.verb,
-            ...(message.verb_definer ? { verb_definer: message.verb_definer } : {}),
+            ...(message.verb_definer ? { verb_definer: message.verb_definer, verb_slot: message.verb_slot } : {}),
             args: message.args,
             body: message.body
           },
@@ -7660,7 +7673,7 @@ export class WooWorld {
             // gain hidden system-authority writes.
             await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
             await this.withBehaviorSavepoint(async () => {
-              result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer);
+              result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer, message.verb_slot);
               result = await this.enrichScopedMoveResult(ctx, result);
             });
             return result ?? null;
@@ -7713,7 +7726,7 @@ export class WooWorld {
         try {
           skipPresenceCheck = (
             message.verb_definer
-              ? this.resolveExactVerbPageLive(message.target, message.verb_definer, message.verb)
+              ? this.resolveAssertedVerbPageLive(message.target, message.verb, message.verb_definer, message.verb_slot!)
               : this.resolveVerbLive(message.target, message.verb)
           ).verb.skip_presence_check === true;
         } catch {
@@ -7783,7 +7796,7 @@ export class WooWorld {
               actor: message.actor,
               target: message.target,
               verb: message.verb,
-              ...(message.verb_definer ? { verb_definer: message.verb_definer } : {}),
+              ...(message.verb_definer ? { verb_definer: message.verb_definer, verb_slot: message.verb_slot } : {}),
               args: message.args,
               body: message.body
             },
@@ -7797,7 +7810,7 @@ export class WooWorld {
               // must not carry those cleanup writes.
               await this.scrubStaleSubscribersForSpace(spaceRef, ctx.hostMemo);
               await this.withBehaviorSavepoint(async () => {
-                result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer);
+                result = await this.dispatch(ctx, message.target, message.verb, message.args, undefined, undefined, message.verb_definer, message.verb_slot);
                 result = await this.enrichScopedMoveResult(ctx, result);
               });
               return result ?? null;
@@ -7863,7 +7876,7 @@ export class WooWorld {
     return frame;
   }
 
-  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string, exactDefiner?: ObjRef | null, requireDirectCallable: boolean = false): Promise<WooValue> {
+  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string, expectedDefiner?: ObjRef | null, expectedSlot?: number | null, requireDirectCallable: boolean = false): Promise<WooValue> {
     // Re-entrancy: if the inbound caller is part of the chain we are
     // already running on this host, run inline (bypass the queue).
     // Without this, A → B → A (a verb that dispatches to a remote which
@@ -7872,9 +7885,9 @@ export class WooWorld {
     // mirrors normal nested verb-dispatch semantics — the callback is
     // logically part of the originating verb, not a new behavior.
     if (chainId && this.currentHostTask?.chainId === chainId) {
-      return await this.dispatch(ctx, target, verbName, args, startAt, undefined, exactDefiner, requireDirectCallable);
+      return await this.dispatch(ctx, target, verbName, args, startAt, undefined, expectedDefiner, expectedSlot, requireDirectCallable);
     }
-    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt, undefined, exactDefiner, requireDirectCallable), `dispatch:${target}:${verbName}`, chainId);
+    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt, undefined, expectedDefiner, expectedSlot, requireDirectCallable), `dispatch:${target}:${verbName}`, chainId);
   }
 
   private mintChainId(): string {
@@ -7888,7 +7901,10 @@ export class WooWorld {
     return `${this.chainOriginPrefix ?? "host"}:${this.chainCounter}:${randomHex(8)}`;
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null, exactDefiner?: ObjRef | null, requireDirectCallable: boolean = false): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null, expectedDefiner?: ObjRef | null, expectedSlot?: number | null, requireDirectCallable: boolean = false): Promise<WooValue> {
+    if ((expectedDefiner != null) !== (expectedSlot != null) || (expectedSlot != null && (!Number.isInteger(expectedSlot) || expectedSlot <= 0))) {
+      throw wooError("E_INVARG", "expected verb definer and positive slot must be supplied together");
+    }
     let result: WooValue;
     if (
       await this.remoteHostForObject(target, ctx.hostMemo) ||
@@ -7899,11 +7915,12 @@ export class WooWorld {
         target,
         verb: verbName,
         start_at: startAt ?? null,
-        exact_definer: exactDefiner ?? null,
+        expected_definer: expectedDefiner ?? null,
+        expected_slot: expectedSlot ?? null,
         require_direct_callable: requireDirectCallable
       });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt, exactDefiner, requireDirectCallable);
+      result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt, expectedDefiner, expectedSlot, requireDirectCallable);
     } else {
       if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
       this.callDepth += 1;
@@ -7911,8 +7928,8 @@ export class WooWorld {
         // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
         // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
         // as "no parent override" and fall back to the standard resolveVerb walk.
-        const { definer, verb, dependencies } = exactDefiner != null
-          ? this.resolveExactVerbPageLive(target, exactDefiner, verbName)
+        const { definer, verb, dependencies } = expectedDefiner != null
+          ? this.resolveAssertedVerbPageLive(target, verbName, expectedDefiner, expectedSlot!)
           : startAt == null
             ? this.resolveVerbLive(target, verbName)
             : this.resolveVerbFromLive(startAt, verbName);
@@ -7924,7 +7941,7 @@ export class WooWorld {
             definer
           });
         }
-        this.recordTurnDispatch(target, verbName, exactDefiner ?? startAt, definer, verb, dependencies);
+        this.recordTurnDispatch(target, verbName, startAt, definer, verb, dependencies);
         const runCtx: CallContext = {
           ...ctx,
           thisObj: target,
@@ -12606,7 +12623,13 @@ export class WooWorld {
     assertObj(message.actor);
     assertObj(message.target);
     assertString(message.verb);
-    if (message.verb_definer !== undefined) assertObj(message.verb_definer);
+    const hasDefiner = message.verb_definer !== undefined;
+    const hasSlot = message.verb_slot !== undefined;
+    if (hasDefiner !== hasSlot) throw wooError("E_INVARG", "message.verb_definer and message.verb_slot must be supplied together");
+    if (hasDefiner) assertObj(message.verb_definer!);
+    if (hasSlot && (!Number.isInteger(message.verb_slot) || message.verb_slot! <= 0)) {
+      throw wooError("E_INVARG", "message.verb_slot must be a positive integer");
+    }
     if (!Array.isArray(message.args)) throw wooError("E_INVARG", "message.args must be a list");
   }
 
@@ -14589,6 +14612,7 @@ export class WooWorld {
           return resolved ? {
             name: resolved.name,
             definer: resolved.definer,
+            slot: resolved.slot,
             direct_callable: resolved.direct_callable,
             skip_presence_check: resolved.skip_presence_check === true,
             arg_spec: resolved.arg_spec ?? {}
@@ -14598,6 +14622,7 @@ export class WooWorld {
         return {
           name: verb.name,
           definer,
+          slot: verb.slot ?? 0,
           direct_callable: verb.direct_callable === true,
           skip_presence_check: verb.skip_presence_check === true,
           arg_spec: verb.arg_spec ?? {}
@@ -15328,6 +15353,7 @@ export class WooWorld {
     return resolved ? {
       name: resolved.verb.name,
       definer: resolved.definer,
+      slot: resolved.verb.slot ?? 0,
       direct_callable: resolved.verb.direct_callable === true,
       skip_presence_check: resolved.verb.skip_presence_check === true,
       arg_spec: resolved.verb.arg_spec ?? {}
@@ -15446,6 +15472,7 @@ export class WooWorld {
         return await this.commandPlanForResolved(ctx, space, matched.target, matched.verb, matched.args, cmd, {
           name: matched.verb,
           definer: matched.definer,
+          slot: matched.slot,
           direct_callable: matched.direct_callable,
           arg_spec: matched.arg_spec
         });
@@ -15467,7 +15494,7 @@ export class WooWorld {
     return out;
   }
 
-  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; definer: ObjRef; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; definer: ObjRef; slot: number; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
     const candidates = await this.commandVerbCandidates(ctx, target, cmd.verb);
     for (const candidate of candidates) {
       const pattern = commandPattern(candidate.arg_spec);
@@ -15478,6 +15505,7 @@ export class WooWorld {
         target,
         verb: candidate.name,
         definer: candidate.definer,
+        slot: candidate.slot,
         args: this.commandArgsFrom(pattern, cmd),
         direct_callable: candidate.direct_callable,
         arg_spec: candidate.arg_spec ?? {}
@@ -15545,6 +15573,7 @@ export class WooWorld {
           out.push({
             name: verb.name,
             definer: current,
+            slot: verb.slot ?? 0,
             direct_callable: verb.direct_callable === true,
             skip_presence_check: verb.skip_presence_check === true,
             arg_spec: verb.arg_spec ?? {}
@@ -15655,6 +15684,7 @@ export class WooWorld {
       target,
       verb,
       verb_definer: resolved.definer,
+      verb_slot: resolved.slot,
       args,
       cmd,
       ...(persistence ? { persistence: persistence } : {})
@@ -15730,7 +15760,20 @@ export class WooWorld {
     if (typeof plan.target !== "string" || typeof plan.verb !== "string") {
       throw wooError("E_INVARG", "command hook returned a successful plan without target/verb");
     }
-    if (typeof plan.verb_definer === "string") return value;
+    const hasDefiner = plan.verb_definer !== undefined;
+    const hasSlot = plan.verb_slot !== undefined;
+    if (hasDefiner !== hasSlot) throw wooError("E_INVARG", "command hook plan must bind verb_definer and verb_slot together");
+    if (hasDefiner) {
+      if (
+        typeof plan.verb_definer !== "string" ||
+        typeof plan.verb_slot !== "number" ||
+        !Number.isInteger(plan.verb_slot) ||
+        plan.verb_slot <= 0
+      ) {
+        throw wooError("E_INVARG", "command hook plan has an invalid verb-page assertion");
+      }
+      return value;
+    }
     const resolved = await this.tryResolveVerbForCommand(ctx, plan.target, plan.verb);
     if (!resolved) {
       throw wooError("E_VERBNF", `command hook target verb not found: ${plan.target}:${plan.verb}`, {
@@ -15741,7 +15784,8 @@ export class WooWorld {
     return {
       ...plan,
       verb: resolved.name,
-      verb_definer: resolved.definer
+      verb_definer: resolved.definer,
+      verb_slot: resolved.slot
     } as WooValue;
   }
 
@@ -16331,7 +16375,10 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     !route ||
     typeof map.target !== "string" ||
     typeof map.verb !== "string" ||
-    typeof map.verb_definer !== "string"
+    typeof map.verb_definer !== "string" ||
+    typeof map.verb_slot !== "number" ||
+    !Number.isInteger(map.verb_slot) ||
+    map.verb_slot <= 0
   ) return null;
   return {
     ok: true,
@@ -16340,6 +16387,7 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     target: map.target,
     verb: map.verb,
     verb_definer: map.verb_definer,
+    verb_slot: map.verb_slot,
     args: Array.isArray(map.args) ? map.args : [],
     cmd: commandMapFromValue(map.cmd),
     ...(map.persistence === "durable" || map.persistence === "live" ? { persistence: map.persistence } : {})

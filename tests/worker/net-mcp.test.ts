@@ -9,7 +9,7 @@ import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
-import { cellVersion, makeCell } from "../../src/net/cells";
+import { cellKey, cellVersion, makeCell } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -380,27 +380,51 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
 
     // The thin-shell command round trip: plan then execute.
     const planned = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "command_plan", args: ["look"] });
-    const cmd = planned.result?.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; verb_definer?: string; args?: unknown[] };
+    const cmd = planned.result?.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; verb_definer?: string; verb_slot?: number; args?: unknown[] };
     expect(cmd?.ok).toBe(true);
     expect(cmd?.verb_definer).toBe("$conversational");
-    const executed = await call(aliceSession, "woo_call", {
+    expect(cmd?.verb_slot).toEqual(expect.any(Number));
+    const unpaired = await call(aliceSession, "woo_call", {
       object: cmd.target as string,
       verb: cmd.verb as string,
       verb_definer: cmd.verb_definer as string,
       args: cmd.args ?? []
     });
+    expect(unpaired.result?.structuredContent?.error).toMatchObject({ code: "E_INVARG", detail: { reason: "unpaired_page_identity" } });
+    const executed = await call(aliceSession, "woo_call", {
+      object: cmd.target as string,
+      verb: cmd.verb as string,
+      verb_definer: cmd.verb_definer as string,
+      verb_slot: cmd.verb_slot as number,
+      args: cmd.args ?? []
+    });
     expect(executed.result?.isError, JSON.stringify(executed).slice(0, 300)).not.toBe(true);
 
-    // Exact page identity is a selector, not an authority token. A reachable
-    // but unrelated definer cannot be forged into the command round trip.
+    // Exact page identity asserts ordinary resolution; it is not an authority
+    // token or a selector for a reachable ancestor.
     const forgedDefiner = await call(aliceSession, "woo_call", {
       object: cmd.target as string,
       verb: cmd.verb as string,
       verb_definer: "$root",
+      verb_slot: cmd.verb_slot as number,
       args: cmd.args ?? []
     });
     expect(forgedDefiner.result?.isError).toBe(true);
     expect(forgedDefiner.result?.structuredContent?.error).toMatchObject({ code: "E_VERBNF" });
+
+    // A reachable ancestor is equally non-selectable. `$player:look_self`
+    // overrides `$actor:look_self` for the session actor; claiming the
+    // ancestor must refuse instead of bypassing the player view.
+    const actorLookSlot = ((gateway as any).ensureView().get(cellKey("verb_bytecode", "$actor", "look_self"))?.value as { slot?: number } | undefined)?.slot;
+    expect(actorLookSlot).toEqual(expect.any(Number));
+    const forgedAncestor = await call(aliceSession, "woo_call", {
+      object: "$me",
+      verb: "look_self",
+      verb_definer: "$actor",
+      verb_slot: actorLookSlot
+    });
+    expect(forgedAncestor.result?.isError).toBe(true);
+    expect(forgedAncestor.result?.structuredContent?.error).toMatchObject({ code: "E_VERBNF" });
 
     // Error envelope: an unknown verb surfaces isError (unwrap() throws).
     const missing = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "no_such_verb_xyz", args: [] });

@@ -926,12 +926,29 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect((direct.body as unknown as TurnBody).result).toBe("capi_box");
     expect((direct.body as unknown as TurnBody).reply.head).toEqual(turnBody.reply.head);
 
+    type GatewayView = { ensureView(): { get(key: string): { value?: unknown } | undefined; delete(key: string): void } };
+    const exactSlot = ((h.gateway as unknown as GatewayView).ensureView().get(cellKey("verb_bytecode", "capi_box", "probe_target"))?.value as { slot?: number }).slot;
+    expect(exactSlot).toEqual(expect.any(Number));
+    const unpairedExact = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: {
+        target: "capi_box",
+        verb: "probe_target",
+        verb_definer: "capi_box",
+        args: ["capi_box"],
+        route: "direct",
+        session: sid
+      }
+    });
+    expect(unpairedExact.status).toBe(400);
+    expect(unpairedExact.body.error).toMatchObject({ code: "E_INVARG", detail: { reason: "unpaired_page_identity" } });
     const exactDirect = await clientFetch(h.gateway, "POST", "/net-api/turn", {
       token,
       body: {
         target: "capi_box",
         verb: "probe_target",
         verb_definer: "capi_box",
+        verb_slot: exactSlot,
         args: ["capi_box"],
         route: "direct",
         session: sid,
@@ -944,7 +961,6 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     // An authority outage is retryable missing state, not evidence that a
     // previously selected page became unreachable. Remove only the gateway's
     // cached page to force the exact metadata pull, then fail that RPC.
-    type GatewayView = { ensureView(): { delete(key: string): void } };
     (h.gateway as unknown as GatewayView).ensureView().delete(cellKey("verb_bytecode", "capi_box", "probe_target"));
     type RpcHost = { rpc(destination: string, route: string, body?: unknown): Promise<unknown> };
     const host = (h.gateway as unknown as { host: RpcHost }).host;
@@ -960,6 +976,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
           target: "capi_box",
           verb: "probe_target",
           verb_definer: "capi_box",
+          verb_slot: exactSlot,
           args: ["capi_box"],
           route: "direct",
           session: sid
@@ -968,7 +985,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
       expect(unavailableExact.status).toBe(503);
       expect(unavailableExact.body.error).toMatchObject({
         code: "E_MISSING_STATE",
-        detail: { target: "capi_box", definer: "capi_box", verb: "probe_target" }
+        detail: { target: "capi_box", expected_definer: "capi_box", expected_slot: exactSlot }
       });
     } finally {
       host.rpc = originalRpc;
@@ -980,6 +997,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
         target: "capi_box",
         verb: "probe_target",
         verb_definer: "$root",
+        verb_slot: exactSlot,
         args: ["capi_box"],
         route: "direct",
         session: sid
@@ -988,7 +1006,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(forgedExact.status).toBe(404);
     expect(forgedExact.body.error).toMatchObject({
       code: "E_VERBNF",
-      detail: { target: "capi_box", definer: "$root", name: "probe_target" }
+      detail: { target: "capi_box", expected_definer: "$root", expected_slot: exactSlot, name: "probe_target" }
     });
 
     const deniedDirect = await clientFetch(h.gateway, "POST", "/net-api/turn", {

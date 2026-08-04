@@ -134,7 +134,7 @@ export type EffectTranscript = {
   space?: ObjRef;
   seq: number;
   session?: string | null;
-  call: Pick<TurnStart, "actor" | "target" | "verb" | "verb_definer" | "args" | "body">;
+  call: Pick<TurnStart, "actor" | "target" | "verb" | "verb_definer" | "verb_slot" | "args" | "body">;
   reads: TranscriptRead[];
   // State probes are materialization dependencies, not user-visible reads.
   // They capture negative lookup edges such as "the receiver has no `text`
@@ -386,6 +386,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
       target: turn.start.target,
       verb: turn.start.verb,
       ...(turn.start.verb_definer !== undefined ? { verb_definer: turn.start.verb_definer } : {}),
+      ...(turn.start.verb_slot !== undefined ? { verb_slot: turn.start.verb_slot } : {}),
       args: turn.start.args,
       ...(turn.start.body !== undefined ? { body: turn.start.body } : {})
     },

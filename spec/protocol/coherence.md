@@ -299,7 +299,7 @@ plausible wrong answer. A commit reply therefore distinguishes a fresh accept
 holds nothing, and receives the recorded output).
 
 A recorded reply answers exactly ONE request. It carries a canonical
-fingerprint over `{actor, target, verb, verb_definer?, args, route}` — sorted keys, the
+fingerprint over `{actor, target, verb, verb_definer?, verb_slot?, args, route}` — sorted keys, the
 resolved call, excluding session and planning anchor — and a submit reusing
 the key for a different request is refused terminally
 (`idempotency_conflict`). Returning the first request's reply to a second
@@ -1442,7 +1442,7 @@ One write path per fact (CO9), concretized:
     close the session in a `finally` path. Hidden-roster mode is not session
     garbage collection: failure to close still leaves authority state,
     subscriptions, and expiry work behind.
-  - `POST /net-api/turn {target, verb, verb_definer?, args?, route?, session, idempotency_key?}`
+  - `POST /net-api/turn {target, verb, verb_definer?, verb_slot?, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the
     AUTHENTICATED apikey actor — before planning. Omitted `route` defaults to
@@ -1549,7 +1549,7 @@ One write path per fact (CO9), concretized:
     hibernation only; no new durable copy — CO5 stands at five; a
     dropped socket loses liveness only, the session cell persists and a
     reconnect re-tags). Frames (JSON; `id` echoed): `{type:"turn",
-    target, verb, verb_definer?, args?, idempotency_key?}` runs the `/net-api/turn`
+    target, verb, verb_definer?, verb_slot?, args?, idempotency_key?}` runs the `/net-api/turn`
     path on the SOCKET's own session and replies `{type:"turn_result",
     id, status, ...}`; `{type:"ping"}` → `{type:"pong"}`; anything else
     → a named `{type:"error"}` frame, never a close.

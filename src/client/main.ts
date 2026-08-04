@@ -786,13 +786,13 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
     });
 }
 
-async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void, route: "direct" | "sequenced" = "sequenced", verbDefiner?: string) {
+async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void, route: "direct" | "sequenced" = "sequenced", verbDefiner?: string, verbSlot?: number) {
   if (!netFeed) {
     onError?.(new Error("net feed not connected"));
     return;
   }
   try {
-    const outcome = await netFeed.turn({ target, verb, ...(verbDefiner ? { verb_definer: verbDefiner } : {}), args, route });
+    const outcome = await netFeed.turn({ target, verb, ...(verbDefiner ? { verb_definer: verbDefiner, verb_slot: verbSlot } : {}), args, route });
     if (outcome.status !== "accepted" || outcome.error !== undefined) {
       onError?.(outcome.error ?? outcome.raw);
       return;
@@ -815,13 +815,14 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
     }
     try {
       const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text], route: "direct" });
-      const plan = planned.result as { target?: unknown; verb?: unknown; verb_definer?: unknown; args?: unknown; route?: unknown } | null;
+      const plan = planned.result as { target?: unknown; verb?: unknown; verb_definer?: unknown; verb_slot?: unknown; args?: unknown; route?: unknown } | null;
       if (
         planned.status !== "accepted" ||
         !plan ||
         typeof plan !== "object" ||
         typeof plan.verb !== "string" ||
-        typeof plan.verb_definer !== "string"
+        typeof plan.verb_definer !== "string" ||
+        typeof plan.verb_slot !== "number" || !Number.isInteger(plan.verb_slot) || plan.verb_slot <= 0
       ) {
         onError?.(planned.error ?? planned.raw);
         return;
@@ -833,7 +834,8 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
         onResult,
         onError,
         plan.route === "sequenced" ? "sequenced" : "direct",
-        plan.verb_definer
+        plan.verb_definer,
+        plan.verb_slot
       );
     } catch (err) {
       onError?.(err);
@@ -2948,6 +2950,7 @@ type V2TurnInput = {
   target: string;
   verb: string;
   verbDefiner?: string;
+  verbSlot?: number;
   args?: unknown[];
   persistence?: "durable" | "live";
   readOnly?: boolean;
@@ -2958,7 +2961,7 @@ type V2TurnInput = {
   onError?: (error: any) => void;
 };
 
-function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "verbDefiner" | "args" | "persistence" | "readOnly" | "skipLocalExecution" | "serverAuthoritative">): boolean {
+function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "verbDefiner" | "verbSlot" | "args" | "persistence" | "readOnly" | "skipLocalExecution" | "serverAuthoritative">): boolean {
   ensureV2BrowserWorker();
   syncV2BrowserWorkerScope(input.scope);
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
@@ -2969,7 +2972,7 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
     scope: input.scope,
     target: input.target,
     verb: input.verb,
-    ...(input.verbDefiner ? { verb_definer: input.verbDefiner } : {}),
+    ...(input.verbDefiner ? { verb_definer: input.verbDefiner, verb_slot: input.verbSlot } : {}),
     args: input.args ?? [],
     ...(input.persistence ? { persistence: input.persistence } : {}),
     // A read-only display hydration skips the local-execution attempt in the
@@ -2998,7 +3001,7 @@ function v2Turn(input: V2TurnInput): string {
   // no frame lifecycle to settle an optimistic entry against.
   if (netMode()) {
     const netId = input.id ?? crypto.randomUUID();
-    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError, input.route, input.verbDefiner);
+    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError, input.route, input.verbDefiner, input.verbSlot);
     return netId;
   }
   const id = input.id ?? crypto.randomUUID();
@@ -3012,6 +3015,7 @@ function v2Turn(input: V2TurnInput): string {
     target: input.target,
     verb: input.verb,
     verbDefiner: input.verbDefiner,
+    verbSlot: input.verbSlot,
     args: input.args ?? [],
     persistence: input.persistence,
     readOnly: input.readOnly ?? input.options?.serverRead === true,
@@ -3038,8 +3042,9 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     const target = String(plan.target ?? space);
     const verb = String(plan.verb ?? "");
     const verbDefiner = String(plan.verb_definer ?? "");
+    const verbSlot = typeof plan.verb_slot === "number" && Number.isInteger(plan.verb_slot) && plan.verb_slot > 0 ? plan.verb_slot : 0;
     let route: "direct" | "sequenced" = plan.route === "sequenced" ? "sequenced" : "direct";
-    if (!verb || !verbDefiner) {
+    if (!verb || !verbDefiner || !verbSlot) {
       render();
       return;
     }
@@ -3064,6 +3069,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
       target,
       verb,
       verbDefiner,
+      verbSlot,
       args,
       persistence
     })) {

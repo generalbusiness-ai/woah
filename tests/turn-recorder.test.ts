@@ -200,14 +200,15 @@ describe("turn recorder", () => {
     expect(turnKey.accept_preimages).toEqual(expect.arrayContaining(["call:rec_box:bump", "scope:#-1", "target:rec_box"]));
     const exactKey = shadowTurnKeyFromTranscript({
       ...transcript,
-      call: { ...transcript.call, verb_definer: "$thing" }
+      call: { ...transcript.call, verb_definer: "$thing", verb_slot: 7 }
     });
-    expect(exactKey).toMatchObject({ verb_definer: "$thing" });
+    expect(exactKey).toMatchObject({ verb_definer: "$thing", verb_slot: 7 });
     expect(exactKey.preimages).toEqual(expect.arrayContaining([
       "verb_definer:$thing",
-      "call_page:rec_box:$thing:bump"
+      "verb_slot:7",
+      "call_page:rec_box:$thing:7:bump"
     ]));
-    expect(exactKey.accept_preimages).toContain("call_page:rec_box:$thing:bump");
+    expect(exactKey.accept_preimages).toContain("call_page:rec_box:$thing:7:bump");
     const ad = buildShadowCapabilityAd({ node: "node-a", scope: turnKey.scope, atom_hashes: turnKey.atom_hashes, factor: 0.75 });
     expect(ad).toMatchObject({ kind: "woo.exec_capability_ad.shadow.v1", node: "node-a", scope: "#-1", factor: 0.75 });
     expect(ad.covers.bits_hex).toMatch(/^[a-f0-9]+$/);
@@ -1374,24 +1375,17 @@ describe("turn recorder", () => {
       null
     );
     expect(installed.ok).toBe(true);
-    const hijack = installVerb(
-      world,
-      "replay_box",
-      "bump",
-      "verb :bump() rxd { return 999; }",
-      null
-    );
-    expect(hijack.ok).toBe(true);
-
     const before = world.exportWorld();
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
     const result = await world.directCall("replay-bump", actor, "replay_box", "bump", [], {
       sessionId: session.id,
-      verbDefiner: "replay_base"
+      verbDefiner: "replay_base",
+      verbSlot: world.ownVerbExact("replay_base", "bump")!.slot
     });
     expect(result).toMatchObject({ op: "result", result: 1 });
     expect(recorder.turns[0].start.verb_definer).toBe("replay_base");
+    expect(recorder.turns[0].start.verb_slot).toBe(world.ownVerbExact("replay_base", "bump")!.slot);
 
     const replay = await replayRecordedTurn(before, recorder.turns[0]);
 

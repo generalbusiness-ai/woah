@@ -1,6 +1,6 @@
 {
   "from_version": "0.x.x",
-  "to_version": "1.0.0",
+  "to_version": "1.x.x",
   "spec_version": "v1",
   "note": "v1 moves the authoritative queue and admission indexes into an Acts projection. Old values are renamed to private genesis inputs; the first sequenced mutation records one dispenser.genesis Act, preallocates one empty artifact per legacy row, and records each as dispenser.legacy_ordered before clearing those inputs. Rate-limit history deliberately expires at cutover. No projection rows are seeded behind fold.",
   "steps": [
