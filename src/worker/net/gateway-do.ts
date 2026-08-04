@@ -5734,8 +5734,9 @@ export class NetGatewayDO {
     }
     const profile = mcpProfileFromHeader(request) ?? "classic";
     const state = this.mcpSessionState(body.session, actor);
-    // §M9.1: latch the profile so a client that sets the header once — the
-    // common MCP-host shape — keeps the surface it asked for.
+    // Keep the live state aligned for descriptor-change notifications. The
+    // profile itself is request-scoped (§M9.1): collapsed clients MUST repeat
+    // the header, because this in-memory state can disappear on DO eviction.
     state.profile = profile;
     return json(
       {
@@ -5744,12 +5745,9 @@ export class NetGatewayDO {
         result: {
           protocolVersion: "2025-06-18",
           capabilities: profile === "collapsed"
-            // Resources exist only in this profile, so only this profile
-            // advertises them. `listChanged` is honest: the LIST is constant,
-            // but the capability is what a client reads before subscribing to
-            // the notification, and we do emit it if the deployment's resource
-            // set ever changes.
-            ? { tools: { listChanged: true }, resources: { listChanged: true } }
+            // Resources exist only in this profile. Their list is constant,
+            // so it deliberately advertises no listChanged producer.
+            ? { tools: { listChanged: true }, resources: {} }
             : { tools: { listChanged: true } },
           serverInfo: { name: "woo-net", version: "1" },
           // This string is an agent's ENTIRE onboarding: many MCP clients
@@ -6021,8 +6019,10 @@ export class NetGatewayDO {
     const actor = await this.mcpSessionActor(session);
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
-    await this.warmMcpContext(actor, session);
+    // Establish this request's profile before warming. Exit objects are a
+    // collapsed-resource dependency and classic requests must not pull them.
     const profile = this.mcpProfile(request, session);
+    await this.warmMcpContext(actor, session);
     const cursor = mcpCursor(params.cursor);
     const context = this.mcpContextObjects(actor, session);
     const dynamic = this.mcpProjectedTools(actor, session, profile, context);
@@ -6065,7 +6065,7 @@ export class NetGatewayDO {
           id,
           MCP_JSONRPC_METHOD_NOT_FOUND,
           `method not found: ${method} (this session uses the classic tool profile, which advertises no resources capability; `
-            + `re-initialize with the ${MCP_PROFILE_HEADER}: collapsed header)`
+            + `send the ${MCP_PROFILE_HEADER}: collapsed header on this request)`
         ),
         200
       );
@@ -6100,8 +6100,8 @@ export class NetGatewayDO {
             text: JSON.stringify(read.value.data, null, 2)
           }
         ],
-        // The revision's cacheability hints. A room description is the same
-        // bytes for everyone standing in it; an inventory is one principal's.
+        // Resource payloads are principal-private; TTL only describes how
+        // long that principal may reuse its own projection.
         ...(read.value.ttlMs !== undefined ? { ttlMs: read.value.ttlMs } : {}),
         ...(read.value.cacheScope !== undefined ? { cacheScope: read.value.cacheScope } : {})
       }
@@ -6140,39 +6140,39 @@ export class NetGatewayDO {
       const mounts = contents.filter((object) => this.mcpIsWorkspace(object, classifier));
       return wrap({
         id: here,
-        ...this.mcpObjectFacts(here),
-        exits: this.mcpExitRecords(here),
+        ...this.mcpObjectFacts(actor, here),
+        exits: this.mcpExitRecords(actor, here),
         contents: contents
           .filter((object) => !mounts.includes(object))
-          .map((object) => ({ id: object, ...this.mcpObjectFacts(object) })),
+          .map((object) => ({ id: object, ...this.mcpObjectFacts(actor, object) })),
         // Mounted workspaces are named separately from furniture because the
         // collapsed projection treats them differently (§M9.4): their own
         // verbs appear only once the actor is inside.
         mounts: mounts.map((object) => ({
           id: object,
-          ...this.mcpObjectFacts(object),
+          ...this.mcpObjectFacts(actor, object),
           open_with: { tool: "enter", argument: "target", value: object }
         })),
-        roster: this.mcpRosterRecords(here)
+        roster: this.mcpRosterRecords(actor, here)
       });
     }
     if (uri === "woo://here/exits") {
       if (!here) return noSpace;
-      return wrap({ space: here, exits: this.mcpExitRecords(here) });
+      return wrap({ space: here, exits: this.mcpExitRecords(actor, here) });
     }
     if (uri === "woo://here/roster") {
       if (!here) return noSpace;
-      return wrap({ space: here, roster: this.mcpRosterRecords(here) });
+      return wrap({ space: here, roster: this.mcpRosterRecords(actor, here) });
     }
     if (uri === "woo://me") {
-      return wrap({ id: actor, ...this.mcpObjectFacts(actor), location: here });
+      return wrap({ id: actor, ...this.mcpObjectFacts(actor, actor), location: here });
     }
     if (uri === "woo://me/inventory") {
       return wrap({
         actor,
         inventory: this.relationMembers("contents", actor).map((row) => ({
           id: row.member,
-          ...this.mcpObjectFacts(row.member)
+          ...this.mcpObjectFacts(actor, row.member)
         }))
       });
     }
@@ -6197,14 +6197,14 @@ export class NetGatewayDO {
         value: {
           data: {
             id: object,
-            ...this.mcpObjectFacts(object),
+            ...this.mcpObjectFacts(actor, object),
             is_workspace: isWorkspace,
-            ...(isWorkspace ? { exits: this.mcpExitRecords(object) } : {})
+            ...(isWorkspace ? { exits: this.mcpExitRecords(actor, object) } : {})
           },
-          // An arbitrary object's state is world-visible, but it changes
-          // whenever anyone acts on it: public, and short.
+          // Property visibility is principal-relative even after structural
+          // reachability succeeds, so a concrete object URI is private too.
           ttlMs: 10_000,
-          cacheScope: "public"
+          cacheScope: "private"
         }
       };
     }
@@ -6221,15 +6221,81 @@ export class NetGatewayDO {
     };
   }
 
-  /** Name/title/description as the mirror holds them. Missing properties are
-   * omitted rather than nulled: an absent title is not an empty title. */
-  private mcpObjectFacts(object: string): Record<string, unknown> {
+  /** Name/title/description under ordinary Woo inherited-read semantics.
+   * Missing or unreadable properties are omitted rather than nulled: an
+   * absent title is not an empty title, and a private description is not an
+   * MCP side channel around `getPropForActor`. */
+  private mcpObjectFacts(actor: string, object: string): Record<string, unknown> {
     const out: Record<string, unknown> = {};
     for (const property of ["name", "title", "description"]) {
-      const value = this.ensureView().get(cellKey("property_cell", object, property))?.value as { value?: unknown } | undefined;
-      if (typeof value?.value === "string" && value.value) out[property] = value.value;
+      const resolved = this.mcpReadableProperty(actor, object, property);
+      if (resolved.readable && typeof resolved.value === "string" && resolved.value) {
+        out[property] = resolved.value;
+      }
     }
     return out;
+  }
+
+  /** Resolve one property from gateway cells exactly as WooWorld does: the
+   * nearest local value wins, the first definition supplies its default and
+   * permissions, and wizard/owner/read-bit authority is checked before the
+   * value leaves the mirror. An incomplete mirror fails closed. */
+  private mcpReadableProperty(
+    actor: string,
+    object: string,
+    name: string
+  ): { readable: true; value: unknown } | { readable: false } {
+    const view = this.ensureView();
+    const actorLineage = view.get(cellKey("object_lineage", actor))?.value as
+      | { flags?: { wizard?: boolean } }
+      | undefined;
+    const wizard = actorLineage?.flags?.wizard === true;
+    const objectLineage = view.get(cellKey("object_lineage", object))?.value as
+      | { name?: unknown }
+      | undefined;
+    let current: string | null = object;
+    let hasValue = false;
+    let value: unknown;
+    const walked = new Set<string>();
+    while (current && !walked.has(current)) {
+      walked.add(current);
+      const payload = view.get(cellKey("property_cell", current, name))?.value as
+        | { value?: unknown; def?: unknown }
+        | undefined;
+      // Only the receiver's own value is inherited. Ancestor objects also
+      // have values for their definitions, but Woo inherits the definition's
+      // default, never the ancestor object's mutable value.
+      if (current === object && payload && Object.prototype.hasOwnProperty.call(payload, "value")) {
+        hasValue = true;
+        value = payload.value;
+      }
+      const def = payload?.def as
+        | { defaultValue?: unknown; owner?: unknown; perms?: unknown }
+        | undefined;
+      if (def && typeof def.owner === "string") {
+        if (!wizard && def.owner !== actor && !String(def.perms ?? "").includes("r")) {
+          return { readable: false };
+        }
+        // Woo's substrate name attribute sits between a local value and an
+        // inherited default (property-read.ts). Exit instances usually have
+        // no local name cell, so returning a base class's default here labeled
+        // every exit with the class name despite its real object name.
+        const resolved = hasValue
+          ? value
+          : name === "name" && typeof objectLineage?.name === "string"
+            ? objectLineage.name
+            : def.defaultValue;
+        return { readable: true, value: resolved };
+      }
+      const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
+      current = typeof lineage?.parent === "string" ? lineage.parent : null;
+    }
+    // propertyInfo synthesizes a readable definition for the substrate name
+    // when no explicit definition exists anywhere in the chain.
+    if (name === "name" && typeof objectLineage?.name === "string") {
+      return { readable: true, value: objectLineage.name };
+    }
+    return { readable: false };
   }
 
   /**
@@ -6246,10 +6312,10 @@ export class NetGatewayDO {
    * an agent learns that south is not a way out without being handed the joke
    * (notes/2026-07-29, §Playfulness).
    */
-  private mcpExitRecords(space: string): Array<Record<string, unknown>> {
-    const view = this.ensureView();
-    const map = view.get(cellKey("property_cell", space, "exits"))?.value as { value?: unknown } | undefined;
-    const exits = mcpRecord(map?.value);
+  private mcpExitRecords(actor: string, space: string): Array<Record<string, unknown>> {
+    const exitsProperty = this.mcpReadableProperty(actor, space, "exits");
+    if (!exitsProperty.readable) return [];
+    const exits = mcpRecord(exitsProperty.value);
     // The property is alias → exit id, so several keys name one exit. Group by
     // the exit's identity: a stable id is the whole point of the record.
     const byExit = new Map<string, string[]>();
@@ -6261,19 +6327,25 @@ export class NetGatewayDO {
     }
     const out: Array<Record<string, unknown>> = [];
     for (const [exit, aliases] of [...byExit].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const property = (name: string): unknown =>
-        (view.get(cellKey("property_cell", exit, name))?.value as { value?: unknown } | undefined)?.value;
-      const destination = property("dest");
-      const refusal = property("nogo_msg");
+      const destination = this.mcpReadableProperty(actor, exit, "dest");
+      const refusal = this.mcpReadableProperty(actor, exit, "nogo_msg");
+      const label = this.mcpReadableProperty(actor, exit, "name");
+      const description = this.mcpReadableProperty(actor, exit, "description");
       out.push({
         id: exit,
-        label: typeof property("name") === "string" ? property("name") : aliases[0],
+        label: label.readable && typeof label.value === "string" ? label.value : aliases[0],
         aliases: aliases.sort(),
-        destination: typeof destination === "string" && destination ? destination : null,
+        destination: destination.readable && typeof destination.value === "string" && destination.value
+          ? destination.value
+          : null,
         // Exactly the condition the exit's own move verb applies before it
-        // moves anyone.
-        traversable: Boolean(destination) && !refusal,
-        ...(typeof property("description") === "string" ? { description: property("description") } : {})
+        // moves anyone. Missing authority fails closed rather than inferring
+        // traversability from a value the actor is not allowed to inspect.
+        traversable: destination.readable && Boolean(destination.value)
+          && refusal.readable && !refusal.value,
+        ...(description.readable && typeof description.value === "string"
+          ? { description: description.value }
+          : {})
       });
     }
     return out;
@@ -6282,14 +6354,14 @@ export class NetGatewayDO {
   /** Who the space reports as present. Read from the same presence relation
    * the gateway routes observations by, so the roster and delivery cannot
    * disagree. */
-  private mcpRosterRecords(space: string): Array<Record<string, unknown>> {
+  private mcpRosterRecords(actor: string, space: string): Array<Record<string, unknown>> {
     const seen = new Set<string>();
     const out: Array<Record<string, unknown>> = [];
     for (const row of this.clientRelationMembers(SESSION_PRESENCE_RELATION, space)) {
       const member = row.member;
       if (typeof member !== "string" || seen.has(member)) continue;
       seen.add(member);
-      out.push({ id: member, ...this.mcpObjectFacts(member) });
+      out.push({ id: member, ...this.mcpObjectFacts(actor, member) });
     }
     return out.sort((a, b) => String(a.id).localeCompare(String(b.id)));
   }
@@ -7233,22 +7305,19 @@ export class NetGatewayDO {
     return { object, route };
   }
 
-  /** The profile latched at `initialize` (§M9.1). Used where no request is in
-   * hand — the digest, and the list-changed comparison. */
+  /** The profile last seen on a live request. This is only a notification
+   * projection hint; request dispatch never trusts it across DO eviction. */
   private mcpSessionProfile(session: string): NetMcpProfile {
     return this.mcpQueues.get(session)?.profile ?? "classic";
   }
 
   /**
-   * The profile for one request. A per-request header wins over the latched
-   * value, and updates it: the gateway's session state is in-memory, so an
-   * eviction between calls would otherwise silently drop a client back to the
-   * classic surface mid-conversation. Our own stdio bridge sends the header on
-   * every request for exactly that reason.
+   * The profile for one request. Absence always means classic; a collapsed
+   * client must repeat the header on every call (§M9.1). Remembering the value
+   * only keeps live descriptor-change notifications on the same projection.
    */
   private mcpProfile(request: Request, session: string): NetMcpProfile {
-    const requested = mcpProfileFromHeader(request);
-    if (!requested) return this.mcpSessionProfile(session);
+    const requested = mcpProfileFromHeader(request) ?? "classic";
     const state = this.mcpQueues.get(session);
     if (state) state.profile = requested;
     return requested;
@@ -7557,7 +7626,7 @@ export class NetGatewayDO {
     const universal = universalDefiners(draftsByObject, actor, activeSpace);
     // An object that roots its own shared sequencer and is not the space the
     // actor is standing in is a mounted workspace, and the note's dominant measured lever: the two mounts in the
-    // seeded Living Room supplied 80 of 146 tools while the actor was in
+    // seeded Living Room supplied 82 of 151 tools while the actor was in
     // neither. Withhold their DISTINCTIVE verbs until the actor is in them.
     // They remain receivers of the universal verbs, so the handle that opens
     // one is the universal `enter` with the mount as its target — which is
@@ -11483,7 +11552,7 @@ function mcpProfileFromHeader(request: Request): NetMcpProfile | null {
 
 type NetMcpSessionState = {
   actor: string;
-  /** §M9.1. Latched at initialize; a per-request header still wins. */
+  /** Last request profile, used only for live notification projection. */
   profile: NetMcpProfile;
   buffer: unknown[];
   /** Parked `woo_wait` calls. Keyed by the class-discriminated JSON-RPC
@@ -12709,13 +12778,12 @@ const MCP_RESOURCE_TEMPLATE_DEFS = [
 
 /** How long a resource read may be reused, and by whom (§M9.5).
  *
- * A room's description and its exits are the same bytes for every actor
- * standing in it and change only when someone edits the room, so they are
- * `public` and comparatively long-lived. A roster changes whenever anyone
- * moves. An actor's own record and inventory are that principal's alone. */
+ * Every stable URI below resolves through session-relative identity or
+ * presence, and property permission filtering is principal-relative. Their
+ * TTLs may differ, but none is safe in a shared cache. */
 const MCP_RESOURCE_CACHE: Record<string, { ttlMs: number; cacheScope: "public" | "private" }> = {
-  "woo://here": { ttlMs: 30_000, cacheScope: "public" },
-  "woo://here/exits": { ttlMs: 300_000, cacheScope: "public" },
+  "woo://here": { ttlMs: 30_000, cacheScope: "private" },
+  "woo://here/exits": { ttlMs: 300_000, cacheScope: "private" },
   "woo://here/roster": { ttlMs: 5_000, cacheScope: "private" },
   "woo://me": { ttlMs: 30_000, cacheScope: "private" },
   "woo://me/inventory": { ttlMs: 5_000, cacheScope: "private" }

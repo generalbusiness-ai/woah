@@ -7,6 +7,7 @@
 // large". The world is the seeded Living Room: the actor stands in
 // `the_chatroom` alongside two mounted workspaces it is in neither of.
 import { describe, expect, it } from "vitest";
+import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
@@ -23,12 +24,21 @@ type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 type Tool = { name: string; description: string; inputSchema: Record<string, unknown> };
 
 /** One installed world plus a gateway, with an MCP helper bound to it. */
-async function bootWorld() {
+async function bootWorld(configure?: (world: ReturnType<typeof createWorld>) => void | Promise<void>) {
   const old = createWorld();
   old.createObject({ id: ACTOR, name: "Collapse Agent", parent: "$player", owner: "$wiz", location: "$nowhere" });
   old.ensureApiKey("$wiz", ACTOR, "collapse-key", "collapse-secret", "ck");
   const identity = exportIdentity(old.exportWorld());
-  const plan = await planNetInstall({ graft: async (fresh) => { importIdentity(fresh, identity); } });
+  const plan = await planNetInstall({
+    graft: async (fresh) => {
+      importIdentity(fresh, identity);
+      // Test-specific state must follow the catalog install/import merge.
+      // Otherwise bundled seed hooks can legitimately replace the same
+      // object/property while planning and the test does not exercise the
+      // world it described.
+      await configure?.(fresh);
+    }
+  });
 
   const states: QuiescentHost[] = [];
   const scopeDOs = new Map<string, NetScopeDO>();
@@ -92,6 +102,7 @@ async function bootWorld() {
     expect(session).toBeTruthy();
     await settle();
     const call = (body: Rpc) => mcp(body, { "mcp-session-id": session, ...extra });
+    const callWithoutProfile = (body: Rpc) => mcp(body, { "mcp-session-id": session });
     const tools = async (): Promise<Tool[]> => {
       const collected: Tool[] = [];
       let cursor: string | undefined;
@@ -107,7 +118,7 @@ async function bootWorld() {
       call({ jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name, arguments: args } });
     const read = (uri: string) =>
       call({ jsonrpc: "2.0", id: nextId++, method: "resources/read", params: { uri } });
-    return { session, init, call, tools, invoke, read };
+    return { session, init, call, callWithoutProfile, tools, invoke, read };
   };
 
   return { mcp, open, settle, nextId: () => nextId++ };
@@ -139,10 +150,10 @@ describe("MCP collapsed profile: tool projection", () => {
     // --- the premise: the classic surface really is what the note measured --
     // If the demo world changes shape this is the assertion that should be
     // re-measured first; every ratio below is relative to it.
-    expect(classicNames.filter((name) => !name.startsWith("woo_")).length).toBe(146);
+    expect(classicNames.filter((name) => !name.startsWith("woo_")).length).toBe(151);
 
     // --- the collapse -----------------------------------------------------
-    // 146 -> 47. The remaining gap to the note's illustrative ~29 is the
+    // 151 -> 47. The remaining gap to the note's illustrative ~29 is the
     // speech merge (`say`/`emote`/`quote`… into one `say(text, mode)`) and the
     // `look`/`look_at`/`examine_detailed` merge, both of which would require
     // core to know what those verb NAMES mean. Ancestry cannot derive them and
@@ -163,10 +174,10 @@ describe("MCP collapsed profile: tool projection", () => {
     expect(describeTargets).toContain(ACTOR);
 
     // --- mounts contribute a handle, not a room ---------------------------
-    // The dominant measured lever: `the_outline` and `the_dubspace` supplied 80
-    // of the classic 146 while the actor stands in neither.
+    // The dominant measured lever: `the_outline` and `the_dubspace` supplied 82
+    // of the classic 151 while the actor stands in neither.
     expect(classicNames.filter((name) => name.startsWith("the_outline__") || name.startsWith("the_dubspace__")).length)
-      .toBe(80);
+      .toBe(82);
     expect(dynamic.filter((name) => name.startsWith("the_outline__") || name.startsWith("the_dubspace__")))
       .toEqual([]);
     // The handle each mount keeps is its place in the universal `enter`.
@@ -201,7 +212,30 @@ describe("MCP collapsed profile: tool projection", () => {
       .toEqual(["woo_call", "woo_wait", "woo_list_reachable_tools", "woo_read"]);
     expect(classic.init.body.result.capabilities).toEqual({ tools: { listChanged: true } });
     expect(collapsed.init.body.result.capabilities)
-      .toEqual({ tools: { listChanged: true }, resources: { listChanged: true } });
+      .toEqual({ tools: { listChanged: true }, resources: {} });
+  }, 200_000);
+
+  it("requires the collapsed header on every request instead of relying on volatile gateway memory", async () => {
+    const world = await bootWorld();
+    const collapsed = await world.open("collapsed");
+
+    const omitted = await collapsed.callWithoutProfile({
+      jsonrpc: "2.0",
+      id: world.nextId(),
+      method: "resources/list",
+      params: {}
+    });
+    expect(omitted.body?.error?.code).toBe(-32601);
+
+    // A following correctly-carried request immediately restores the chosen
+    // projection; there is no durable or in-memory latch to become stale.
+    const repeated = await collapsed.call({
+      jsonrpc: "2.0",
+      id: world.nextId(),
+      method: "resources/list",
+      params: {}
+    });
+    expect(repeated.body?.result?.resources).toHaveLength(5);
   }, 200_000);
 
   it("dispatches every universal tool to the receiver it was given", async () => {
@@ -270,7 +304,24 @@ describe("MCP collapsed profile: tool projection", () => {
   }, 200_000);
 
   it("keeps a catalog verb that shadows a universal name object-qualified and callable", async () => {
-    const world = await bootWorld();
+    const world = await bootWorld(async (old) => {
+      const installed = installVerb(
+        old,
+        "$cockatoo",
+        "look",
+        "verb :look() rxd { return { description: this.description, shadow: true }; }",
+        null
+      );
+      expect(installed.ok).toBe(true);
+      const exposed = await old.directCall(
+        "collapsed-shadow-expose",
+        "$wiz",
+        "$wiz",
+        "set_verb_info",
+        ["$cockatoo", "look", { tool_exposed: true }]
+      );
+      expect(exposed.op).toBe("result");
+    });
     const collapsed = await world.open("collapsed");
     const tools = await collapsed.tools();
     const names = tools.map((tool) => tool.name);
@@ -354,14 +405,73 @@ describe("MCP collapsed profile: resources", () => {
     expect(real?.destination).toBe("the_deck");
     expect(real?.label).toBe("southeast");
 
-    // Cacheability hints, per the revision: a room's exits are the same bytes
-    // for everyone standing in it.
+    // The URI resolves relative to the session and its projected fields pass
+    // through per-principal property permissions, so shared caches are unsafe.
     const raw = (await collapsed.read("woo://here/exits")).body.result;
-    expect(raw.cacheScope).toBe("public");
+    expect(raw.cacheScope).toBe("private");
     expect(raw.ttlMs).toBeGreaterThan(0);
     const inventory = (await collapsed.read("woo://me/inventory")).body.result;
     expect(inventory.cacheScope).toBe("private");
     expect(inventory.ttlMs).toBeLessThan(raw.ttlMs);
+  }, 200_000);
+
+  it("applies inherited Woo property read permissions to resource projections", async () => {
+    const world = await bootWorld((old) => {
+      old.createObject({
+        id: "private_resource_class",
+        name: "Private resource class",
+        parent: "$thing",
+        owner: "$wiz",
+        location: "$nowhere"
+      });
+      old.defineProperty("private_resource_class", {
+        name: "title",
+        defaultValue: "Inherited public title",
+        owner: "$wiz",
+        perms: "r"
+      });
+      old.defineProperty("private_resource_class", {
+        name: "description",
+        defaultValue: "private default",
+        owner: "$wiz",
+        perms: ""
+      });
+      old.createObject({
+        id: "private_resource_thing",
+        name: "Private resource thing",
+        parent: "private_resource_class",
+        owner: "$wiz",
+        location: "the_chatroom"
+      });
+      // A local value with an inherited private definition is the subtle cell
+      // shape: value-only on the instance, def-only on the ancestor.
+      old.setProp("private_resource_thing", "description", "private local value");
+    });
+    const collapsed = await world.open("collapsed");
+
+    const read = await collapsed.read("woo://object/private_resource_thing");
+    expect(read.status, JSON.stringify(read.body)).toBe(200);
+    const data = resourceJson(read.body);
+    expect(data.title).toBe("Inherited public title");
+    expect(data).not.toHaveProperty("description");
+    expect(JSON.stringify(read.body)).not.toContain("private local value");
+    expect(read.body.result.cacheScope).toBe("private");
+  }, 200_000);
+
+  it("fails closed when an exit property is not readable by the actor", async () => {
+    const world = await bootWorld((old) => {
+      old.defineProperty("exit_living_room_southeast", {
+        name: "dest",
+        defaultValue: "the_deck",
+        owner: "$wiz",
+        perms: ""
+      });
+    });
+    const collapsed = await world.open("collapsed");
+    const exits = resourceJson((await collapsed.read("woo://here/exits")).body).exits as Array<Record<string, unknown>>;
+    const southeast = exits.find((exit) => exit.id === "exit_living_room_southeast");
+    expect(southeast?.destination).toBeNull();
+    expect(southeast?.traversable).toBe(false);
   }, 200_000);
 
   it("refuses a read of an object outside structural context, and serves woo_read identically", async () => {

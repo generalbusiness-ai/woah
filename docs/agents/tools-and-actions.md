@@ -194,6 +194,11 @@ woo-mcp-profile: collapsed
 or, through the stdio bridge, by setting `WOO_MCP_PROFILE=collapsed` in the
 environment your MCP client spawns it with.
 
+The header is deliberately required on every HTTP request. The gateway may be
+evicted between calls, so the server does not pretend an in-memory profile
+selection is durable. The bundled stdio bridge repeats the configured header
+automatically.
+
 **What changes.** Verbs that every object in view shares — the ones inherited
 from a base class or an attached feature — become ONE tool each, named by the
 verb, taking the object as an argument:
@@ -222,7 +227,7 @@ A workspace sitting in your space shows no tools of its own until you enter it.
 Enter it the way you always did, through the universal entry verb with the
 workspace as the target.
 
-Standing in the seeded Living Room this is 47 tools instead of 146.
+Standing in the seeded Living Room this is 47 tools instead of 151.
 
 **Reading the world.** This profile also serves MCP resources, which are the
 efficient way to orient:
@@ -239,6 +244,10 @@ efficient way to orient:
 `resources/list` never changes as you move — the URIs are stable and their
 contents move with you. Read `woo://here` again after a move rather than
 expecting a new resource to appear.
+
+Resource payloads are private-cache responses. Relative URIs resolve through
+your session, and every displayed property is filtered through the same
+inherited read permissions as an ordinary Woo property read.
 
 `traversable: false` means the world advertises that exit and it will not move
 you. Whether that is a locked door or a joke is for you to find out.

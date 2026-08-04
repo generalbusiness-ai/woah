@@ -1204,10 +1204,10 @@ does not replace the classic projection: a session that does not opt in sees
 exactly §M2–§M7 and nothing here applies to it.
 
 The motivation is measured, not aesthetic. In the seeded demo world, standing
-in the Living Room, the classic projection advertises 146 dynamic tools over 9
+in the Living Room, the classic projection advertises 151 dynamic tools over 9
 objects for 78 distinct verbs. `set_description` appears nine times, `look`
-eight. Two mounted workspaces the actor is standing in neither of contribute 80
-of the 146, and 56 of those are a byte-identical repeat of the generic room
+eight. Two mounted workspaces the actor is standing in neither of contribute 82
+of the surface, much of it a byte-identical repeat of the generic room
 block. The cause is that a tool is minted per `(object, verb)` pair and object
 identity is carried in the tool NAME, so every object in view multiplies the
 surface by its whole inherited verb set. An enumerating host pays that in
@@ -1231,19 +1231,23 @@ obliged to forward, and hosts commonly construct `initialize` themselves from
 configuration. A transport header is settable by every HTTP client and
 forwardable by a proxy that never parses the body.
 
-The value supplied at `initialize` is LATCHED for the session, so a client that
-sets it once keeps the surface it asked for. A header on any later request
-overrides and re-latches. Sending it on every request is recommended and is
-what the bundled stdio bridge does (`WOO_MCP_PROFILE=collapsed`): the latched
-value lives in gateway memory, and an eviction would otherwise drop a client
-back to the classic surface mid-conversation.
+The value is REQUEST-SCOPED and MUST accompany every request that uses the
+collapsed surface. An absent or unrecognised header selects `classic`, even
+when an earlier request on the same session selected `collapsed`. This rule is
+deliberate: gateway live state is evictable, so a session latch would either
+require new durable transport state or silently change profile after an
+eviction. The bundled stdio bridge repeats `WOO_MCP_PROFILE=collapsed` on every
+HTTP request.
 
 `initialize` under this profile advertises
-`capabilities: { tools: { listChanged: true }, resources: { listChanged: true } }`.
+`capabilities: { tools: { listChanged: true }, resources: {} }`.
 The classic profile advertises no `resources` capability, and every
 `resources/*` method answers JSON-RPC `-32601` there — a method a server never
 advertised must not quietly work, or capability discovery by probing sees two
 different servers on one endpoint.
+
+The resource list is constant (§M9.5), so Net does NOT advertise
+`resources.listChanged` and emits no `notifications/resources/list_changed`.
 
 The collapsed profile advertises a fourth stable control, `woo_read(uri)`
 (§M9.5). The three controls of §M2.1 are unchanged.
@@ -1366,12 +1370,21 @@ Therefore:
 
 Reads touch the gateway mirror only. No turn is planned and nothing is
 committed, which is what makes orientation free of the observation traffic a
-`look` emits.
+`look` emits. Every projected property is nevertheless resolved and authorized
+under the same inheritance rule as an ordinary Woo property read: the nearest
+local value, the first inherited definition/default, and that definition's
+owner/`r` permission (with wizard bypass). An incomplete mirror or an
+unreadable definition fails closed; optional display fields are omitted, an
+unreadable exits map produces no exit records, and an unreadable destination
+or refusal property makes an exit non-traversable without publishing the
+hidden value.
 
-`ttlMs` and `cacheScope` accompany a read where meaningful. A room's
-description and exits are the same bytes for everyone standing in it
-(`public`, longer-lived); a roster, an actor's own record and its inventory are
-one principal's (`private`, short).
+`ttlMs` and `cacheScope` accompany a read where meaningful. Every stable URI is
+principal-private: `woo://here` and its children resolve through the session's
+actor-relative location, `woo://me` is actor-relative by definition, and even
+`woo://object/{id}` filters fields through that actor's property permissions.
+No response is safe in a shared/public cache. TTLs still differ by expected
+volatility: exits are longer-lived than a roster or inventory.
 
 **Exit records.** `woo://here/exits` returns, per exit, a stable `id`, a
 `label`, every `alias` that names it, its `destination`, and `traversable`.
@@ -1402,6 +1415,6 @@ audience semantics.
 - It does not introduce `work_scope`, a mount relation, or any separation of
   physical presence from foreground work.
 
-Measured result for the seeded Living Room: **146 dynamic tools become 47**,
-with the two mounts contributing 0 instead of 80, and every remaining name
+Measured result for the seeded Living Room: **151 dynamic tools become 47**,
+with the two mounts contributing 0 instead of 82, and every remaining name
 naming one concept exactly once.
