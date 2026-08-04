@@ -1243,7 +1243,11 @@ One write path per fact (CO9), concretized:
   containers, transition rooms) plus foreign semantic observation audiences
   and ships a `relate_destinations` submit sibling; the sequencer partitions
   deltas and the shell selects observations through it, while neither learns
-  anchor topology itself.
+  anchor topology itself. The sibling `relation_member_scopes` independently
+  maps affected contents members to immutable authorities. This is required
+  for a same-turn create: its relation owner may be local while the new member's
+  cells ride to its declared anchor, and the object is not yet classifiable from
+  the gateway's pre-turn lineage.
 - `contents(parent) = { object | live:location:<object> == parent }`
   (CA4) remains the definitional truth; relation rows are its
   materialization, rebuildable by scanning live cells at the owner (the
@@ -1474,6 +1478,16 @@ One write path per fact (CO9), concretized:
     from the view, else the actor itself; the anchor classifies through
     view lineage (CO15 walk; convention pull `room:<anchor>` on miss),
     falling back to the actor's cluster when it cannot classify.
+    A resolved direct verb may instead declare
+    `arg_spec.authority.authoring_target:{arg:N}`. After validating that
+    argument as a concrete object id, the gateway warms its bounded authority
+    closure and replaces the default with the target's immutable authority
+    scope. The hashed transcript carries
+    `{authoring:{target,operation}}`; the committing scope verifies it owns the
+    target. This override changes ordering only: it grants no capability and
+    the verb body plus substrate still perform every permission/version check.
+    It also binds no-write failures and retry receipts to the edited target,
+    rather than the actor's unrelated current room.
   - A route:`sequenced` Net turn consumes a semantic-space log seq only when
     CO2.3 selects that space's authority. Pure movement remains off the room
     sequencer and is not represented as a room-log entry; any turn emitting

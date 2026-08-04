@@ -98,6 +98,7 @@
               "parent",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Change object parent",
@@ -119,6 +120,7 @@
               "id",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Recycle object",
@@ -165,6 +167,7 @@
               "value",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Set property value",
@@ -408,6 +411,7 @@
               "source",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Install verb",
@@ -430,6 +434,7 @@
               "descriptor",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Set verb metadata",
@@ -452,6 +457,7 @@
               "name",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Set property definition",
@@ -553,6 +559,7 @@
               "id",
               "opts?"
             ],
+            "authority": { "authoring_target": { "arg": 0 }, "prefetch": [{ "arg": 0 }] },
             "output_schema": { "type": "object" },
             "tool": {
               "title": "Force recycle object",

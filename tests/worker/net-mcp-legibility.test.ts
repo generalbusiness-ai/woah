@@ -440,6 +440,18 @@ describe("Net MCP surface legibility (fake-DO lane)", () => {
     // force_recycle is reachable and advertised for a programmer but is
     // wizard-only in the world. The refusal must come from the turn (E_PERM
     // with the world's own frames), not from a gateway reachability check.
+    const targetLineageResponse = await gateway.fetch(await signInternalRequest(
+      gatewayEnv,
+      new Request(`https://do/net/cell?key=${encodeURIComponent(`object_lineage:${widget}`)}`)
+    ));
+    const targetLineage = (await targetLineageResponse.json()) as { cell?: { value?: { anchor?: string | null } } | null };
+    expect(targetLineage.cell?.value?.anchor).toBe(progAgent);
+    const memberScopeRows = (gatewayState.state.storage.sql.exec(
+      "SELECT member_scope FROM net_gateway_relation WHERE relation = 'contents' AND owner = ? AND member = ?",
+      progAgent,
+      widget
+    ) as unknown as { toArray(): Array<{ member_scope: string | null }> }).toArray();
+    expect(memberScopeRows).toEqual([{ member_scope: `cluster:${progAgent}` }]);
     const wizardOnly = await call(prog.session, "woo_call", { object: progAgent, verb: "force_recycle", args: [widget] });
     await settleAll();
     expect(wizardOnly.result?.isError, JSON.stringify(wizardOnly).slice(0, 400)).toBe(true);

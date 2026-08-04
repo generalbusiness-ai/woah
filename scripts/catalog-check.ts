@@ -136,6 +136,30 @@ function toolMetadataDiagnostics(rawArgSpec: unknown): CompileDiagnostic[] {
       && (typeof argSpec.output_schema !== "object" || argSpec.output_schema === null || Array.isArray(argSpec.output_schema))) {
     fail("arg_spec.output_schema must be a JSON Schema object");
   }
+  if (argSpec.authority !== undefined) {
+    if (typeof argSpec.authority !== "object" || argSpec.authority === null || Array.isArray(argSpec.authority)) {
+      fail("arg_spec.authority must be an object");
+    } else {
+      const authority = argSpec.authority as Record<string, unknown>;
+      if (authority.authoring_target !== undefined) {
+        const target = authority.authoring_target;
+        const arg = target && typeof target === "object" && !Array.isArray(target)
+          ? (target as Record<string, unknown>).arg
+          : undefined;
+        if (typeof arg !== "number" || !Number.isInteger(arg) || arg < 0) {
+          fail("arg_spec.authority.authoring_target must be {arg: <non-negative integer>}");
+        }
+        if (!Array.isArray(authority.prefetch)
+            || !(authority.prefetch as unknown[]).some((entry) =>
+              entry !== null
+              && typeof entry === "object"
+              && !Array.isArray(entry)
+              && (entry as Record<string, unknown>).arg === arg)) {
+          fail("arg_spec.authority.authoring_target must also appear in authority.prefetch");
+        }
+      }
+    }
+  }
   if (argSpec.tool === undefined) return diagnostics;
   if (typeof argSpec.tool !== "object" || argSpec.tool === null || Array.isArray(argSpec.tool)) {
     fail("arg_spec.tool must be an object");

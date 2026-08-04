@@ -108,11 +108,11 @@ export const BUILTIN_NAMES = [
   // do the right thing through one call.
   "set_object_name",
   // Cross-host detection. Returns true if the object lives on another
-  // host (the bridge will route writes/reads). Catalog authoring
-  // surfaces (\$builder:set_property, etc.) refuse cross-host writes
-  // outright because the wrapper-level atomicity guarantees can't
-  // hold across a host boundary; they call this builtin first and
-  // raise E_CROSS_HOST_WRITE before reaching SET_PROP.
+  // host (the bridge will route writes/reads). Generic behavior and legacy
+  // catalog wrappers such as $builder can use this for topology-aware
+  // boundaries. Typed Net authoring uses the ingress-level target-authority
+  // declaration instead: caller/target inequality is not an authorization
+  // decision and must not be inferred inside the VM.
   "is_remote_object",
   "presence_status",
   "_dead_room_look_projection", "_dead_room_who_projection",

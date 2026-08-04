@@ -45,7 +45,7 @@ import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import { REPLAY_OUTPUT_BYTE_CAP, type CommitSubmit, type ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
-import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
+import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type AuthoringOperation, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
 
 export type PlanTurnInput = {
   call: ShadowTurnCall;
@@ -56,6 +56,9 @@ export type PlanTurnInput = {
   /** AU2 trace context (adopted or minted at the gateway), folded into
    * the transcript body alongside the principal. */
   trace?: TraceContext;
+  /** Trusted target-authority routing declaration resolved from the verb page
+   * by ingress. It is folded into the hashed transcript for scope/audit checks. */
+  authoring?: AuthoringOperation;
   /** The gateway's derived planning view (CO5 copy #2). */
   view: CellStore;
   /** The scope the session plans in (the read-only/ride-along fallback). */
@@ -348,7 +351,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const forSubmit = stripUnownedSequencedAllocation(withSession, selection.scope, classifier);
   const transcript = submitTranscript(forSubmit, planStore, selection.scope, {
     ...(input.principal ? { principal: input.principal } : {}),
-    ...(input.trace ? { trace: input.trace } : {})
+    ...(input.trace ? { trace: input.trace } : {}),
+    ...(input.authoring ? { authoring: input.authoring } : {})
   });
   // P1.1: attest every ordered-children projection this plan was given (a read
   // can only resolve to a supplied projection — else it misses and repairs into
@@ -662,7 +666,7 @@ function submitTranscript(
   recorded: EffectTranscript,
   view: CellStore,
   scope: string,
-  audit?: { principal?: Principal; trace?: TraceContext }
+  audit?: { principal?: Principal; trace?: TraceContext; authoring?: AuthoringOperation }
 ): EffectTranscript {
   const reads = recorded.reads.map((read) => {
     const key = netCellKeyFor(read.cell);
@@ -686,7 +690,10 @@ function submitTranscript(
     // AU3.2/AU2: attribution and trace ride the hashed body (present-
     // only-when-set keeps principal-less transcript hashes unchanged).
     ...(audit?.principal ? { principal: audit.principal } : {}),
-    ...(audit?.trace ? { trace: audit.trace } : {})
+    ...(audit?.trace ? { trace: audit.trace } : {}),
+    // A4.1: the target transaction identity is authority-visible and hashed.
+    // It is stamped from resolved catalog metadata, never request input.
+    ...(audit?.authoring ? { authoring: audit.authoring } : {})
   };
   return { ...body, hash: cellVersion(body) };
 }

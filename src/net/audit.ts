@@ -26,7 +26,7 @@ import type { Principal, ScopeAttribution } from "./attribution";
 import type { CommitSubmit } from "./scope";
 import { parseTraceparent, type TraceContext } from "./trace";
 
-export type AuditActionKind = "commit" | "auth" | "session" | "refusal" | "admin";
+export type AuditActionKind = "commit" | "authoring" | "auth" | "session" | "refusal" | "admin";
 
 export type AuditRecord = {
   /** Producer clock, ms (Host.now — never a module-level Date.now). */
@@ -84,6 +84,7 @@ function traceIdOf(trace: TraceContext | undefined): string | undefined {
 
 function subjectsOf(submit: CommitSubmit): string[] {
   const subjects = new Set<string>();
+  if (submit.transcript.authoring) subjects.add(submit.transcript.authoring.target);
   for (const write of submit.transcript.writes) subjects.add(write.cell.object);
   for (const create of submit.transcript.creates ?? []) subjects.add(create.object);
   for (const move of submit.transcript.moves ?? []) subjects.add(move.object);
@@ -112,15 +113,20 @@ export function mintCommitAuditRecords(input: {
     producer: { kind: "scope", name: submit.scope },
     idempotency: `${submit.scope}:${head.seq}`,
     action: {
-      kind: "commit",
-      verb: submit.transcript.call.verb,
-      target: submit.transcript.call.target,
+      kind: submit.transcript.authoring ? "authoring" : "commit",
+      verb: submit.transcript.authoring?.operation ?? submit.transcript.call.verb,
+      target: submit.transcript.authoring?.target ?? submit.transcript.call.target,
       scope: submit.scope,
       seq: head.seq,
       head: head.hash
     },
     outcome: principal ? "ok" : "unattributed",
-    subjects: subjectsOf(submit)
+    subjects: subjectsOf(submit),
+    // Values and source remain absent by AU9. The surface id is enough to
+    // connect the administrative operation to the actor-facing wrapper.
+    ...(submit.transcript.authoring
+      ? { detail: { authoring_surface: submit.transcript.call.target } }
+      : {})
   };
   const routed: RoutedAuditRecord[] = [];
   const actingCustomer = principal?.customer ?? null;

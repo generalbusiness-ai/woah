@@ -88,6 +88,52 @@ object host already serializes its own mutations, and `expected_version` handles
 conflicts. Routing every edit through an application `$space` would confuse
 object definition changes with domain behavior.
 
+### A4.1 Target-authority route
+
+An authoring surface may live on the actor while the object being edited lives
+under another immutable authority root. Caller/target inequality is not itself
+a cross-host atomicity failure. A mutating surface verb declares the positional
+argument that identifies its authoring target in transport-neutral `arg_spec`
+metadata:
+
+```json
+{
+  "authority": {
+    "authoring_target": { "arg": 0 },
+    "prefetch": [{ "arg": 0 }]
+  }
+}
+```
+
+The ingress resolves that argument only after authenticating the actor and
+resolving the verb page. It forces the operation onto the direct route and uses
+the target's immutable authority scope as the planning scope. The gateway may
+execute the woocode wrapper in a speculative combined view, but the authority
+host receives one transcript and performs the version, permission, schema, and
+write-set checks in one local transaction. The call retains its authenticated
+actor, effective `progr` write authorities, customer attribution, trace context,
+and caller-stable idempotency key.
+
+The target scope also owns an effect-free dry run, a failed expected-version
+check, and a client-named retry receipt. This is load-bearing: otherwise a
+failure before the first write falls back to the actor's current room and makes
+an administrative edit depend on an unrelated domain sequencer.
+
+The hashed transcript carries an `authoring` envelope naming the declared
+target and operation. The committing authority verifies that it owns the target.
+Its audit projection is typed `authoring`, cites that target, and includes no
+source or argument values. Metadata selects a transaction boundary; it grants no
+permission and cannot override the ordinary wrapper or substrate checks.
+Operational metrics classify the call by operation, outcome, and local/remote
+path without recording the target id, arguments, source, or free-form error.
+
+`E_CROSS_HOST_WRITE` remains correct only when the operation's actual atomic
+write set spans authorities that cannot participate in one supported commit.
+It MUST NOT be returned merely because the authoring surface and declared target
+have different hosts. Lifecycle changes involving a target plus a distinct
+parent, location, child, or content authority remain genuinely multi-host unless
+their published operation defines a supported atomic/saga contract.
+
 Behavior authored in the IDE may still be tested through `$space:call`. That is
 the main integration path:
 

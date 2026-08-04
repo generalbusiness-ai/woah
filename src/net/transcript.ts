@@ -71,6 +71,13 @@ export type SessionTranscriptCell = { kind: "session"; object: string };
 export type TranscriptCell = EngineTranscriptCell | SessionTranscriptCell;
 export type TranscriptRead = Omit<EngineTranscriptRead, "cell"> & { cell: TranscriptCell };
 export type TranscriptWrite = Omit<EngineTranscriptWrite, "cell"> & { cell: TranscriptCell };
+/** Administrative transaction identity stamped from the resolved verb page at
+ * trusted ingress. It selects no permissions: recorded writer authorities and
+ * the ordinary scope validator still decide what may commit. */
+export type AuthoringOperation = {
+  target: string;
+  operation: string;
+};
 export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" | "stateProbes"> & {
   reads: TranscriptRead[];
   writes: TranscriptWrite[];
@@ -120,6 +127,9 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * at the gateway; joins this commit to the operational trace and to
    * the customer's own systems. Present-only-when-set. */
   trace?: TraceContext;
+  /** Target-authority authoring envelope (minimal-ide.md A4.1). The target
+   * scope owns successes, failures, dry runs, and retry receipts alike. */
+  authoring?: AuthoringOperation;
 };
 
 /**
@@ -135,7 +145,8 @@ export const NET_FAILED_TRANSCRIPT_FIELD_CLASSIFICATION = {
   orderingReads: "proof",
   replayReads: "proof",
   principal: "envelope",
-  trace: "envelope"
+  trace: "envelope",
+  authoring: "envelope"
 } as const satisfies FailedTranscriptFieldClassification<EffectTranscript>;
 
 /**

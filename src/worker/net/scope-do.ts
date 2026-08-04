@@ -177,6 +177,11 @@ type RelateDestinations = Record<string, {
   observation_indexes?: number[];
 }>;
 
+/** Immutable authority hints for CONTENTS members affected by this submit.
+ * Owners are covered by RelateDestinations; members need an independent map
+ * because a local owner may contain a foreign-anchored object. */
+type RelationMemberScopes = Record<string, string>;
+
 /** The outbox delivery surfaces. They drain as separate lanes so a
  * destination carrying several cannot collide row ids, and adoption/
  * relation/planner delivery cannot be held behind a slow subscriber (or
@@ -897,12 +902,14 @@ export class NetScopeDO {
               submit: CommitSubmit;
               rider_destinations?: RiderDestinations;
               relate_destinations?: RelateDestinations;
+              relation_member_scopes?: RelationMemberScopes;
               live_audience?: LiveAudience;
               origin_gateway?: string;
             };
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
         const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
+        const relationMemberScopes = "submit" in raw ? (raw.relation_member_scopes ?? {}) : {};
         const liveAudience = "submit" in raw ? raw.live_audience : undefined;
         const originGateway = "submit" in raw ? raw.origin_gateway : undefined;
         // Hydrate from durable identity ONLY (no scope hint): a submit
@@ -939,6 +946,12 @@ export class NetScopeDO {
         this.catalogRiderObjects.clear();
         for (const [scope, entry] of Object.entries(relateDestinations)) {
           for (const object of entry.objects) this.relateScopeHints.set(object, scope);
+        }
+        // A same-turn create can commit at the planning/shared scope while its
+        // cells ride to the declared anchor. Defaulting that new member to the
+        // committing scope would persist a false `member_scope` on contents.
+        for (const [object, scope] of Object.entries(relationMemberScopes)) {
+          if (object && scope) this.relateScopeHints.set(object, scope);
         }
         for (const object of riderDestinations[CATALOG_SCOPE]?.objects ?? []) {
           this.catalogRiderObjects.add(object);

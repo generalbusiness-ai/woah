@@ -1295,6 +1295,28 @@ export class ScopeSequencer {
     if (submit.scope !== this.scope || submit.transcript.scope !== this.scope) {
       return this.reject(submit, "scope_mismatch", { submitted: submit.scope, transcript: submit.transcript.scope });
     }
+    // A4.1 target-authority authoring is not a gateway routing hint the scope
+    // blindly trusts. The hashed envelope must describe this exact direct
+    // call, and this authority must own the declared target. That keeps a
+    // malformed or forged declaration from pinning a retry receipt/audit row
+    // to an unrelated host even though ordinary write validation would still
+    // prevent capability escalation.
+    const authoring = submit.transcript.authoring;
+    if (authoring && (
+      submit.transcript.route !== "direct"
+      || !authoring.target
+      || authoring.operation !== submit.transcript.call.verb
+      || this.options.owns?.(authoring.target) !== true
+    )) {
+      return this.reject(submit, "scope_mismatch", {
+        authoring_target: authoring.target,
+        authoring_operation: authoring.operation,
+        call_verb: submit.transcript.call.verb,
+        route: submit.transcript.route,
+        scope: this.scope,
+        owns_target: this.options.owns?.(authoring.target) === true
+      });
+    }
     if (submit.stamp.catalog_epoch !== this.catalogEpoch) {
       return this.reject(submit, "stale_epoch", { submitted: submit.stamp.catalog_epoch, current: this.catalogEpoch });
     }

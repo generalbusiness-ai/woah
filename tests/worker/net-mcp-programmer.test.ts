@@ -72,6 +72,8 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     // carries the `features` surface, so the agent arrives feature-composed.
     const progAgent = "prog_agent";
     const plainAgent = "plain_agent";
+    const remoteRoom = "remote_authoring_room";
+    const remoteWidget = "remote_authoring_widget";
     const old = createWorld();
     old.createObject({ id: progAgent, parent: "$agent", owner: "$wiz", name: "ProgBot" });
     old.createObject({ id: plainAgent, parent: "$agent", owner: "$wiz", name: "PlainBot" });
@@ -98,7 +100,23 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     expect(old.actorHasSurface(plainAgent, "$programmer")).toBe(false);
 
     const identity = exportIdentity(old.exportWorld());
-    const plan = await planNetInstall({ graft: async (fresh) => { importIdentity(fresh, identity); } });
+    const plan = await planNetInstall({
+      graft: async (fresh) => {
+        importIdentity(fresh, identity);
+        // The widget is carried by the programmer (therefore structurally
+        // reachable) but remains immutably anchored to another room authority.
+        // This is the caller/target-host inequality A4.1 must support.
+        fresh.createObject({ id: remoteRoom, parent: "$space", owner: progAgent, name: "Remote authoring room" });
+        fresh.createObject({
+          id: remoteWidget,
+          parent: "$thing",
+          owner: progAgent,
+          name: "RemoteWidget",
+          anchor: remoteRoom,
+          location: progAgent
+        });
+      }
+    });
     const progToken = "apikey:prog-key:prog-secret";
     const plainToken = "apikey:plain-key:plain-secret";
 
@@ -164,6 +182,16 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     };
     const listNames = async (session: string): Promise<string[]> =>
       (await listTools(session)).map((tool) => tool.name as string);
+    const head = async (scope: string): Promise<{ seq: number; hash: string }> => {
+      const instance = scopeDOs.get(scope);
+      expect(instance, `missing scope ${scope}`).toBeTruthy();
+      const response = await instance!.fetch(await signInternalRequest(
+        scopeEnv,
+        new Request("https://do/net/head")
+      ));
+      expect(response.ok, `head ${scope}`).toBe(true);
+      return ((await response.json()) as { head: { seq: number; hash: string } }).head;
+    };
     // Headless SSE open: no Origin, which mcp.md §M7.1 admits. Origin
     // admission is exercised through the real Worker entry in
     // tests/worker/net-mcp-origin.test.ts — a direct DO fetch cannot see it.
@@ -244,6 +272,75 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     for (const verb of ["install_verb", "create", "eval"]) {
       expect(plainNames).not.toContain(`${pl}__${verb}`);
     }
+
+    // (4a) Target-host authoring is explicit, not a lucky consequence of a
+    // successful write set. The wrapper lives on progAgent, while this carried
+    // widget belongs to room:remote_authoring_room. A client-named operation id
+    // pins both the commit and its retry receipt at the widget authority; the
+    // actor cluster head must not move.
+    const remoteScope = `room:${remoteRoom}`;
+    const actorScope = `cluster:${progAgent}`;
+    const beforeRemote = await head(remoteScope);
+    const beforeActor = await head(actorScope);
+    const remoteInstallArgs = {
+      object: progAgent,
+      verb: "install_verb",
+      args: [remoteWidget, "remote_hi", "verb :remote_hi() rxd { return 77; }", {}],
+      operation_id: "target-host-install-1"
+    };
+    const remoteInstalled = await call(progSession, "woo_call", remoteInstallArgs);
+    await settleAll();
+    expect(remoteInstalled.result?.isError, JSON.stringify(remoteInstalled).slice(0, 800)).not.toBe(true);
+    expect(remoteInstalled.result?.structuredContent?.result?.ok).toBe(true);
+    const afterRemote = await head(remoteScope);
+    const afterActor = await head(actorScope);
+    expect(afterRemote.seq).toBeGreaterThan(beforeRemote.seq);
+    expect(afterActor).toEqual(beforeActor);
+
+    const remoteReplay = await call(progSession, "woo_call", remoteInstallArgs);
+    await settleAll();
+    expect(remoteReplay.result?.structuredContent).toMatchObject({
+      replayed: true,
+      replay_outcome: "full",
+      result: { ok: true }
+    });
+    expect(await head(remoteScope)).toEqual(afterRemote);
+    expect(await head(actorScope)).toEqual(afterActor);
+
+    // A stale expected-version check writes no object cell, so write-set
+    // routing cannot save it. The explicit authoring target must still pin the
+    // retry at the widget authority (and replay the same E_VERSION once).
+    const conflictArgs = {
+      object: progAgent,
+      verb: "install_verb",
+      args: [
+        remoteWidget,
+        "remote_hi",
+        "verb :remote_hi() rxd { return 88; }",
+        { expected_version: 999 }
+      ],
+      operation_id: "target-host-conflict-1"
+    };
+    const conflict = await call(progSession, "woo_call", conflictArgs);
+    await settleAll();
+    expect(conflict.result?.isError).toBe(true);
+    expect(conflict.result?.structuredContent?.error?.code).toBe("E_VERSION");
+    expect(await head(remoteScope)).toEqual(afterRemote);
+    expect(await head(actorScope)).toEqual(afterActor);
+    const pin = (gatewayState.state.storage.sql.exec(
+      "SELECT scope FROM net_gateway_pin WHERE idempotency_key = ?",
+      `mcp:${progAgent}:target-host-conflict-1`
+    ) as unknown as { toArray(): Array<{ scope: string }> }).toArray();
+    expect(pin).toEqual([{ scope: remoteScope }]);
+    const conflictReplay = await call(progSession, "woo_call", conflictArgs);
+    await settleAll();
+    expect(conflictReplay.result?.isError).toBe(true);
+    expect(conflictReplay.result?.structuredContent).toMatchObject({
+      replayed: true,
+      error: { code: "E_VERSION" }
+    });
+    expect(await head(remoteScope)).toEqual(afterRemote);
+    expect(await head(actorScope)).toEqual(afterActor);
 
     // (5) Author through the authoritative turn path: the builder create verb,
     // reached via the feature chain, runs over Net and attributes the object to

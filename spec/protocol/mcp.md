@@ -470,6 +470,14 @@ the tool-list digest. A title, effect, authority, availability, or result
 schema change causes the same `notifications/tools/list_changed` behavior as
 an input-schema or verb-page change.
 
+Mutating authoring tools additionally use the transport-neutral
+`arg_spec.authority.authoring_target` declaration from
+[minimal-ide.md §A4.1](../authoring/minimal-ide.md#a41-target-authority-route).
+It is routing metadata, deliberately separate from the descriptive
+`arg_spec.tool.authority` label above. MCP resolves it only after the ordinary
+tool/reachability gates and passes it to the shared `/net-api/turn` ingress;
+the declaration never grants programmer, builder, owner, or wizard authority.
+
 ### M2.3 Tool naming
 
 The base form is `<sanitized-object>__<sanitized-verb>`, where sanitizing
@@ -575,10 +583,13 @@ gateway considers at most 128 members per request. Repeated model renders or
 
 Legacy rows without `member_scope` fall back to the relation owner's scope.
 That is exact for ordinary room-owned contents and actor-owned inventory. A
-foreign-anchored legacy inventory row becomes fully routable when its next
-normal relation mutation refreshes the row. Operators upgrading an aged world
-that requires immediate completeness for such inventory must refresh those
-derived rows before declaring MCP parity; runtime global lookup is forbidden.
+foreign-anchored legacy inventory row, or an aged same-turn-create row whose
+hint incorrectly named the planning room, becomes fully routable when its next
+normal relation mutation refreshes the row. A gateway that already holds the
+member's lineage prefers that exact walk over the derived hint. Operators
+upgrading an aged world that requires immediate cold completeness must run the
+bounded `repair:net-contents` projection refresh before declaring MCP parity;
+runtime global lookup is forbidden.
 
 ## M4. Invocation and results
 

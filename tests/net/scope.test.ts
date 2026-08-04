@@ -409,6 +409,20 @@ describe("commit acceptance (CO4)", () => {
     expect(reply.status === "rejected" && reply.reason === "scope_mismatch" && !reply.retryable).toBe(true);
   });
 
+  it("refuses an authoring envelope whose declared target this scope does not own", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const t = transcript({
+      route: "direct",
+      authoring: { target: "#foreign", operation: "poke" }
+    });
+    const reply = seq.submit(submitFor(seq, t, "foreign-authoring"));
+
+    // Routing metadata is never authority. Even an effect-free request cannot
+    // pin its rejection or retry receipt to an unrelated scope.
+    expect(reply.status === "rejected" && reply.reason === "scope_mismatch" && !reply.retryable).toBe(true);
+    expect(seq.head().seq).toBe(0);
+  });
+
   it("incomplete transcripts are rejected and never relabelled (CO4)", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     // Also stale-able: base is current but reads would mismatch — the

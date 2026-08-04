@@ -99,7 +99,7 @@ import { replayPageQueryKey, replayPageVersion, validReplayLogPage, validReplayP
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
 import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, type CommitReply, type CommitSubmit, type RejectReason, type ReplayOutput, type ScheduledTurn, type ScopeHead } from "../../net/scope";
-import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
+import { netCellKeyFor, type AuthoringOperation, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
@@ -333,6 +333,8 @@ type TurnRequest = {
   /** AU2 trace context (adopted from the caller's traceparent or minted
    * here); folded into the transcript body alongside the principal. */
   trace?: TraceContext;
+  /** A4.1 target-authority envelope resolved from the trusted verb page. */
+  authoring?: AuthoringOperation;
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
@@ -2211,11 +2213,13 @@ export class NetGatewayDO {
       // itself is unchanged — both are HTTP-body siblings, not sequencer
       // input.
       const relateDestinations = this.relateDestinationsFor(request, classifier, planned, targetScope);
+      const relationMemberScopes = this.relationMemberScopesFor(request, classifier, planned);
       const originGateway = this.selfDestination();
       const submitBody = {
         submit,
         rider_destinations: this.riderDestinationsFor(request, classifier, planned),
         relate_destinations: relateDestinations,
+        ...(Object.keys(relationMemberScopes).length > 0 ? { relation_member_scopes: relationMemberScopes } : {}),
         ...(planned.liveAudience !== undefined ? { live_audience: planned.liveAudience } : {}),
         ...(originGateway ? { origin_gateway: originGateway } : {})
       };
@@ -2266,6 +2270,7 @@ export class NetGatewayDO {
           `attestations_bytes=${diagnosticBytes(submit.attestations ?? {})} ` +
           `rider_destinations_bytes=${diagnosticBytes(submitBody.rider_destinations)} ` +
           `relate_destinations_bytes=${diagnosticBytes(submitBody.relate_destinations)} ` +
+          `relation_member_scopes_bytes=${diagnosticBytes(relationMemberScopes)} ` +
           `live_audience_bytes=${diagnosticBytes(planned.liveAudience ?? {})} ` +
           `origin_gateway_bytes=${diagnosticBytes(originGateway ?? "")} ` +
           `read_buckets=${JSON.stringify(Object.fromEntries(readBuckets))}`
@@ -4919,7 +4924,8 @@ export class NetGatewayDO {
     // the actor itself (a located-nowhere actor plans at its own cluster).
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
-    const planningScope = await this.clientPlanningScope(anchorObject, actor);
+    let planningScope = await this.clientPlanningScope(anchorObject, actor);
+    const defaultPlanningScope = planningScope;
     // Planning-scope route override (topology tightens the client's request):
     // a private authority CLUSTER must invoke DIRECT — the committing Scope head
     // sequences it, and a cluster root is an actor, not a $space with
@@ -5064,6 +5070,56 @@ export class NetGatewayDO {
         404
       );
     }
+    // A4.1: mutating authoring wrappers live on the actor surface but declare
+    // which positional argument is the edited object. Resolve that declaration
+    // from the already-selected verb page, never from request-provided routing
+    // fields. It grants nothing; it makes the target authority own success,
+    // version failure, dry-run and retry-receipt ordering uniformly.
+    const authoringRoute = this.clientAuthoringOperation(page?.arg_spec, args, verb);
+    if (authoringRoute && "error" in authoringRoute) {
+      return json({ error: authoringRoute.error }, 400);
+    }
+    const authoring = authoringRoute?.value;
+    if (authoring) {
+      route = "direct";
+      const candidateScope = this.clientTargetAuthorityScope(
+        authoring.target,
+        anchorObject,
+        actor,
+        planningScope
+      );
+      await this.warmScopes(
+        [{ scope: candidateScope, objects: [authoring.target] }],
+        "net_authoring_target_pull_failed"
+      );
+      // Reclassify after the bounded pull: a relation member_scope normally
+      // makes the first answer exact, while a cold lineage target becomes
+      // exact here. Catalog definition cells remain install-pipeline-only.
+      planningScope = this.clientTargetAuthorityScope(
+        authoring.target,
+        anchorObject,
+        actor,
+        candidateScope
+      );
+      if (planningScope === CATALOG_SCOPE) {
+        return json({
+          error: {
+            code: "E_CATALOG_MUTATION",
+            message: "runtime authoring cannot mutate catalog-owned definitions; publish through the catalog install pipeline",
+            detail: { target: authoring.target, scope: planningScope }
+          }
+        }, 403);
+      }
+      if (!planningScope.startsWith("cluster:") && !planningScope.startsWith("room:")) {
+        return json({
+          error: {
+            code: "E_INVARG",
+            message: "authoring target does not resolve to a plannable authority scope",
+            detail: { field: "authoring_target", reason: "unplannable_scope", target: authoring.target, scope: planningScope }
+          }
+        }, 400);
+      }
+    }
     // External direct dispatch is metadata-gated at the ingress boundary
     // (core.md C12.2). Missing metadata fails closed: a sparse gateway must
     // never turn an unresolved verb into permission to bypass sequencing.
@@ -5172,26 +5228,60 @@ export class NetGatewayDO {
         typeof bodyTrace?.tracestate === "string" ? bodyTrace.tracestate : null,
         mintSampleDecision(spanSampleRate(this.env))
       );
-    const result = await this.turn({
-      call: {
-        kind: "woo.turn_call.shadow.v1",
-        id: key,
-        route,
-        scope: anchorObject,
-        session,
-        actor,
-        target,
-        verb,
-        ...(verbDefiner ? { verb_definer: verbDefiner, verb_slot: verbSlot as number } : {}),
-        args
-      },
-      ...(principal ? { principal } : {}),
-      trace,
-      planningScope,
-      catalog_epoch: epoch,
-      idempotency_key: key,
-      ...(retryReceipt ? { retry_receipt: true } : {})
-    });
+    let result: TurnResult;
+    try {
+      result = await this.turn({
+        call: {
+          kind: "woo.turn_call.shadow.v1",
+          id: key,
+          route,
+          scope: anchorObject,
+          session,
+          actor,
+          target,
+          verb,
+          ...(verbDefiner ? { verb_definer: verbDefiner, verb_slot: verbSlot as number } : {}),
+          args
+        },
+        ...(principal ? { principal } : {}),
+        trace,
+        ...(authoring ? { authoring } : {}),
+        planningScope,
+        catalog_epoch: epoch,
+        idempotency_key: key,
+        ...(retryReceipt ? { retry_receipt: true } : {})
+      });
+    } catch (error) {
+      if (authoring) {
+        this.metric({
+          kind: "authoring_call",
+          verb: authoring.operation,
+          path: planningScope === defaultPlanningScope ? "local" : "remote",
+          status: "error",
+          error: isNetError(error) ? error.code : "E_INTERNAL"
+        });
+      }
+      throw error;
+    }
+    if (authoring) {
+      const outcomeError = result.error && typeof result.error === "object" && !Array.isArray(result.error)
+        && typeof (result.error as { code?: unknown }).code === "string"
+        ? (result.error as { code: string }).code
+        : result.reply.status === "rejected"
+          ? result.reply.reason
+          : null;
+      const path = planningScope === defaultPlanningScope ? "local" : "remote";
+      this.metric({
+        kind: "authoring_call",
+        verb: authoring.operation,
+        path,
+        status: outcomeError ? "error" : "ok",
+        ...(outcomeError ? { error: outcomeError } : {})
+      });
+      if (outcomeError === "E_VERSION") {
+        this.metric({ kind: "authoring_conflict", verb: authoring.operation, path, status: "error", error: outcomeError });
+      }
+    }
     // H1: keep this gateway subscribed to the scope the session is NOW
     // present in — its activeScope AFTER any transition this turn folded
     // (install-on-accept already refreshed the session cell in the view).
@@ -5330,11 +5420,10 @@ export class NetGatewayDO {
     actor: string,
     planningScope: string
   ): string {
-    for (const owner of new Set([anchorObject, actor])) {
-      const row = this.relationMembers("contents", owner).find((candidate) => candidate.member === target);
-      if (row?.member_scope) return row.member_scope;
-    }
     const view = this.ensureView();
+    // A materialized lineage walk is stronger than a derived relation hint.
+    // This also self-heals gateways carrying an aged member_scope produced
+    // before same-turn create member hints existed.
     if (view.has(cellKey("object_lineage", target))) {
       const classifier = classifierFromLineage(
         (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
@@ -5346,7 +5435,53 @@ export class NetGatewayDO {
         // planning scope remains the conservative repair-loop fallback.
       }
     }
+    for (const owner of new Set([anchorObject, actor])) {
+      const row = this.relationMembers("contents", owner).find((candidate) => candidate.member === target);
+      if (row?.member_scope) return row.member_scope;
+    }
     return planningScope;
+  }
+
+  /** Resolve the generic target-authority declaration from one persisted verb
+   * page. Missing metadata preserves aged behavior; malformed PRESENT metadata
+   * is refused so a declared administrative operation cannot silently fall
+   * back to the actor's current room. */
+  private clientAuthoringOperation(
+    rawArgSpec: unknown,
+    args: readonly unknown[],
+    operation: string
+  ):
+    | { value: AuthoringOperation }
+    | { error: { code: string; message: string; detail: Record<string, unknown> } }
+    | null {
+    if (!rawArgSpec || typeof rawArgSpec !== "object" || Array.isArray(rawArgSpec)) return null;
+    const authority = (rawArgSpec as Record<string, unknown>).authority;
+    if (!authority || typeof authority !== "object" || Array.isArray(authority)) return null;
+    const declaration = (authority as Record<string, unknown>).authoring_target;
+    if (declaration === undefined) return null;
+    const arg = declaration && typeof declaration === "object" && !Array.isArray(declaration)
+      ? (declaration as { arg?: unknown }).arg
+      : undefined;
+    if (typeof arg !== "number" || !Number.isInteger(arg) || arg < 0) {
+      return {
+        error: {
+          code: "E_INVARG",
+          message: "verb authoring_target metadata must name a non-negative positional argument",
+          detail: { field: "arg_spec.authority.authoring_target", reason: "malformed_authoring_target" }
+        }
+      };
+    }
+    const target = args[arg];
+    if (typeof target !== "string" || !isConcreteRuntimeObjectId(target)) {
+      return {
+        error: {
+          code: "E_INVARG",
+          message: "authoring target argument must be a concrete runtime object id",
+          detail: { field: `args[${arg}]`, reason: "invalid_object_id", value: target ?? null }
+        }
+      };
+    }
+    return { value: { target, operation } };
   }
 
   // ---- /net-api/mcp: the MCP adapter (client-shell phase i) ---------------
@@ -10547,6 +10682,42 @@ export class NetGatewayDO {
     return out;
   }
 
+  /** Authority hints for CONTENTS members changed by this transcript. Relation
+   * owners and members are independent: a room may contain an actor-anchored
+   * object, and a same-turn create is not yet classifiable from view lineage.
+   * This submit sibling selects relation routing only; ordinary authority
+   * validation still decides whether the turn may commit. */
+  private relationMemberScopesFor(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    planned: PlanTurnResult
+  ): Record<string, string> {
+    const out: Record<string, string> = {};
+    const put = (object: string, scope: string) => {
+      if (object && scope) out[object] = scope;
+    };
+    for (const create of planned.transcript.creates ?? []) {
+      put(create.object, create.anchor ? classifier.scopeOf(create.anchor) : request.planningScope);
+    }
+    for (const move of planned.transcript.moves ?? []) {
+      put(move.object, classifier.scopeOf(move.object));
+    }
+    for (const write of planned.transcript.writes) {
+      if (write.cell.kind !== "contents") continue;
+      const members = Array.isArray(write.value) ? write.value : [write.value];
+      for (const member of members) {
+        if (typeof member !== "string" || out[member] !== undefined) continue;
+        try {
+          put(member, classifier.scopeOf(member));
+        } catch {
+          // A same-turn create was covered above. An otherwise unknown member
+          // stays on the sequencer's conservative local fallback.
+        }
+      }
+    }
+    return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));
+  }
+
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
    * of the transcript hash. */
@@ -10566,6 +10737,7 @@ export class NetGatewayDO {
       call: request.call,
       ...(request.principal ? { principal: request.principal } : {}),
       ...(request.trace ? { trace: request.trace } : {}),
+      ...(request.authoring ? { authoring: request.authoring } : {}),
       view,
       planningScope: request.planningScope,
       classifier,

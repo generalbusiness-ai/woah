@@ -101,6 +101,40 @@ describe("mintCommitAuditRecords (AU1.1/AU5)", () => {
       expect.objectContaining({ partition: OPERATOR_CUSTOMER_ID, record: expect.objectContaining({ outcome: "unattributed" }) })
     ]);
   });
+
+  it("types target-host definition changes as authoring without exposing arguments", () => {
+    const submit = submitFixture(PRINCIPAL);
+    submit.scope = "room:remote_workspace";
+    submit.transcript = {
+      ...submit.transcript,
+      scope: "room:remote_workspace",
+      route: "direct",
+      call: {
+        actor: "#actor",
+        target: "#actor",
+        verb: "install_verb",
+        args: ["#remote_widget", "secret", "verb :secret() rxd { return 1; }", {}]
+      },
+      authoring: { target: "#remote_widget", operation: "install_verb" }
+    };
+    const [routed] = mintCommitAuditRecords({
+      submit,
+      head: HEAD,
+      scopeAttribution: { customer: "acct_a", derived_via: "anchor_owner", stamped_at_epoch: "cat1" },
+      now: 1000
+    });
+    expect(routed?.record).toMatchObject({
+      action: {
+        kind: "authoring",
+        verb: "install_verb",
+        target: "#remote_widget",
+        scope: "room:remote_workspace"
+      },
+      subjects: ["#box", "#remote_widget"],
+      detail: { authoring_surface: "#actor" }
+    });
+    expect(JSON.stringify(routed?.record)).not.toContain("verb :secret");
+  });
 });
 
 describe("mintAdoptionAuditRecord (AU1 single-count)", () => {

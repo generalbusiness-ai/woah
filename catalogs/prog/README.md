@@ -67,6 +67,11 @@ that carries `$builder` sees builder tools on itself and one that carries
 mechanism lists each surface. The manifest also declares each exposed verb's
 title, effect hints, authority label, availability, and return schema in
 `arg_spec`; these improve discovery but do not grant a capability.
+Mutating object-targeted tools additionally identify argument 0 as their
+`authority.authoring_target`. The shared Net turn ingress then commits the
+administrative operation at that object's immutable authority scope even when
+the actor surface lives elsewhere; failed version checks and idempotency
+receipts use the same scope.
 
 ## Promotion path
 
@@ -108,9 +113,11 @@ The catalog ships once these are in place:
      introspection/search aggregations the catalog drives
    - `set_object_name(obj, name)` — keeps `WooObject.name` and the
      inherited `name` property in lockstep
-   - `is_remote_object(obj)` — async cross-host detector; the catalog
-     uses it to refuse cross-host writes with `E_CROSS_HOST_WRITE` before
-     any subsequent property/verb call
+   - `is_remote_object(obj)` — async cross-host detector for behavior that
+     genuinely needs topology awareness and for legacy/non-Net fallback
+     boundaries. Typed Net authoring does not use caller/target inequality as
+     a permission check; its declared target-authority route owns transaction
+     placement before the wrapper executes.
 
    Engine builtins still in core for layering reasons (woocode-ward in time):
 

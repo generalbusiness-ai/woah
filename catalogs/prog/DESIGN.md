@@ -93,6 +93,21 @@ and the structured result envelope; it does not infer risk or authority from
 actor flags, ownership, versions, and the authoritative turn remain the
 security boundary.
 
+Mutating tools whose edited object is argument 0 also declare
+`arg_spec.authority.authoring_target:{arg:0}` and prefetch that same argument.
+This is the generic target-authority transaction contract from
+`spec/authoring/minimal-ide.md` A4.1: the actor-facing wrapper may be hosted in
+the actor's cluster while the edited object belongs to another room/cluster.
+The target scope owns successful writes, dry runs, version failures, retry
+receipts, and the typed authoring audit record. The declaration changes no
+permissions; `set_task_perms(actor)`, the surface/flag gates, and the substrate
+checks still decide authority. Operations whose actual writes span unsupported
+authorities continue to fail as genuine cross-host atomic requests.
+`create(parent, opts?)` intentionally has no target declaration: its new object
+does not exist at ingress, and an explicit location may choose a different
+authority from the parent. Creation therefore retains ordinary write-set scope
+selection until a richer declarative creation-target contract is specified.
+
 ## Editor Rooms
 
 The richer programmer experience should follow LambdaCore's editor-room model

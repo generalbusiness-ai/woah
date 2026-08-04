@@ -341,10 +341,14 @@ may survive a later local recycle refusal.
 
 The VM routes ordinary remote property-value writes (`SET_PROP`) to the
 owning host, which performs the same permission checks and durable write it
-would perform for a local assignment. Property definition, property metadata
-edits, and lifecycle operations still raise `E_CROSS_HOST_WRITE` when they
-would cross hosts; those operations are authoring/lifecycle changes rather than
-ordinary object state writes.
+would perform for a local assignment. A definition or metadata edit arriving
+through the declared target-authority authoring route is planned and committed
+at that target's authority as one local transaction; the fact that its actor
+surface is hosted elsewhere is not `E_CROSS_HOST_WRITE`. Nested property
+definition, property metadata, or lifecycle operations that escape that target
+transaction still raise `E_CROSS_HOST_WRITE`: those are genuinely separate
+authority writes unless the operation publishes a supported atomic/saga
+contract.
 
 ---
 

@@ -233,8 +233,11 @@ ordinary language primitives:
 - remote `CALL_VERB` is an awaited `dispatch` RPC and may raise
   `E_HOST_CYCLE` if it would re-enter the wait chain;
 - remote property-value writes are awaited host RPCs to the owning object host;
-- property definition, property metadata, and lifecycle writes remain
-  `E_CROSS_HOST_WRITE` when they would cross hosts;
+- a declared target-authority authoring turn executes definition/metadata
+  changes as one transaction at the target authority even when its actor
+  surface is hosted elsewhere;
+- nested definition, metadata, and lifecycle writes outside that declared
+  target transaction remain `E_CROSS_HOST_WRITE` when they cross hosts;
 - long-running cross-host coordination is expressed as messages, scheduled turns,
   or sequenced calls, not as callbacks inside an open behavior turn.
 
