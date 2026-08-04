@@ -5965,6 +5965,7 @@ export class NetGatewayDO {
         resolved.tool.verb,
         positional,
         resolved.tool.route,
+        resolved.tool.toolMeta.resultSchema,
         this.mcpTraceOf(request),
         operation.value,
         verbDefiner,
@@ -6003,6 +6004,7 @@ export class NetGatewayDO {
         dynamic.verb,
         mcpNamedArgs(dynamic, args),
         receiver.route,
+        dynamic.toolMeta.resultSchema,
         this.mcpTraceOf(request),
         operation.value
       );
@@ -6374,6 +6376,7 @@ export class NetGatewayDO {
     verb: string,
     args: unknown[],
     route: "direct" | "sequenced",
+    resultSchema: Record<string, unknown>,
     trace?: TraceContext,
     operationId?: string | null,
     verbDefiner?: string,
@@ -6461,10 +6464,39 @@ export class NetGatewayDO {
         return shape(turn.error, this.mcpOwnTurnObservations(turn.observations, actor));
       }
       const resultKnown = !(replay !== undefined && turn.result === undefined && replay.outcome !== "full");
+      const ownObservations = this.mcpOwnTurnObservations(turn.observations, actor);
+      if (resultKnown) {
+        const violation = mcpSchemaViolation(resultSchema, turn.result ?? null);
+        if (violation) {
+          this.metric({
+            kind: "net_mcp_output_schema_mismatch",
+            status: "error",
+            object,
+            verb,
+            expected: mcpSchemaExpectation(resultSchema),
+            received: mcpJsonTypeOf(turn.result ?? null)
+          });
+          return this.mcpToolError(
+            id,
+            {
+              code: "E_OUTPUT_SCHEMA",
+              message: `${object}:${verb} committed, but returned a value outside its declared output schema; re-read state and do not retry under a new operation id`,
+              detail: {
+                committed: true,
+                result_omitted: true,
+                expected: mcpSchemaExpectation(resultSchema),
+                received: mcpJsonTypeOf(turn.result ?? null)
+              }
+            },
+            ownObservations,
+            replay
+          );
+        }
+      }
       return this.mcpResult(
         id,
         turn.result ?? null,
-        this.mcpOwnTurnObservations(turn.observations, actor),
+        ownObservations,
         replay,
         resultKnown
       );
@@ -7561,7 +7593,7 @@ export class NetGatewayDO {
       while (used.has(name)) name = `${base}_${suffix++}`;
       used.add(name);
       const input = mcpInputSchema(draft.argSpec);
-      const paragraph = mcpFirstParagraph(draft.source);
+      const paragraph = draft.toolMeta.description ?? mcpFirstParagraph(draft.source);
       const callForm = `${draft.object}:${draft.verb}(${input.args.join(", ")})`;
       return {
         ...draft,
@@ -7752,7 +7784,7 @@ export class NetGatewayDO {
           : [])
       ];
       const name = mcpUniqueToolName(mcpSanitizeId(draft.verb), used);
-      const paragraph = mcpFirstParagraph(draft.source);
+      const paragraph = draft.toolMeta.description ?? mcpFirstParagraph(draft.source);
       const callForm = `<${receiverParam}>:${draft.verb}(${input.args.join(", ")})`;
       // Receiver ids go in the DESCRIPTION as well as the enum: the discovery
       // control searches descriptions, and a deferring host looking for
@@ -7778,7 +7810,7 @@ export class NetGatewayDO {
     for (const draft of distinctive.sort((a, b) => byObject(a.object, b.object) || a.verb.localeCompare(b.verb))) {
       const input = mcpInputSchema(draft.argSpec);
       const name = mcpUniqueToolName(`${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`, used);
-      const paragraph = mcpFirstParagraph(draft.source);
+      const paragraph = draft.toolMeta.description ?? mcpFirstParagraph(draft.source);
       const callForm = `${draft.object}:${draft.verb}(${input.args.join(", ")})`;
       out.push({
         ...draft,
@@ -7867,6 +7899,7 @@ export class NetGatewayDO {
           seenVerbs.add(verb); // an override hides every inherited page, exposed or not
           const page = cell.value as Record<string, unknown>;
           const argSpec = mcpRecord(page.arg_spec);
+          const toolMeta = mcpCatalogToolMetadata(argSpec);
           const command = mcpRecord(argSpec.command);
           // The catalog's command contract is the one routing declaration
           // shared by shell and MCP clients. Absence stays fail-safe:
@@ -7894,6 +7927,7 @@ export class NetGatewayDO {
             // unadvertised page costs one object, not one render.
             source: typeof page.source === "string" ? page.source : "",
             argSpec,
+            toolMeta,
             // Only bytecode pages have a portable Net execution body (M2.2).
             // A native page still shadows its inherited namesakes, so it is
             // carried as a draft: that is what lets woo_call answer "native,
@@ -7903,7 +7937,8 @@ export class NetGatewayDO {
             // LISTING gate. `tool_exposed` decides whether a verb is
             // advertised; since the woo_call widening it decides nothing
             // else (M2.1).
-            exposed: page.tool_exposed === true || (allowCommandShaped && commandShaped),
+            exposed: toolMeta.availability === "implemented"
+              && (page.tool_exposed === true || (allowCommandShaped && commandShaped)),
             // Generic execute-permission prefilter. The authoritative turn
             // re-checks; this only keeps unusable descriptors out of the
             // listing and produces an early, precise refusal for woo_call.
@@ -11692,6 +11727,9 @@ type NetMcpToolDraft = {
   source: string;
   /** Compiler-owned argument metadata, kept raw for the same reason. */
   argSpec: Record<string, unknown>;
+  /** Catalog-owned presentation/risk contract. These are hints only; they
+   * never replace the execute prefilter or the authoritative verb checks. */
+  toolMeta: NetMcpCatalogToolMetadata;
   /** Bytecode-backed. A native page has no portable Net execution body. */
   bytecode: boolean;
   /** The page's raw perm string, for a refusal that can name the gate. */
@@ -11703,6 +11741,24 @@ type NetMcpToolDraft = {
   executable: boolean;
   /** Ingress flag consumed by the `direct` route (core.md C12.2). */
   directCallable: boolean;
+};
+
+type NetMcpToolEffects = {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+};
+
+type NetMcpCatalogToolMetadata = {
+  title?: string;
+  description?: string;
+  authority?: string;
+  availability: "implemented" | "deferred";
+  effects: NetMcpToolEffects;
+  /** Schema of the Woo verb's raw return value. MCP wraps it beneath
+   * `structuredContent.result` with transport observation/replay fields. */
+  resultSchema: Record<string, unknown>;
 };
 
 /** A draft plus its rendered presentation: the tool name, the derived input
@@ -12045,6 +12101,32 @@ export function mcpFirstParagraph(source: string): string {
     return mcpClampDescription(body.split(/\n[ \t]*\n/)[0].trim());
   }
   return "";
+}
+
+/** Parse the transport-neutral `arg_spec.tool` contract (§M2.2). Unknown or
+ * malformed fields are omitted, which preserves MCP's conservative annotation
+ * defaults. Only the exact `deferred` availability value suppresses listing;
+ * an aged page with no metadata remains callable and discoverable as before. */
+function mcpCatalogToolMetadata(argSpec: Record<string, unknown>): NetMcpCatalogToolMetadata {
+  const tool = mcpRecord(argSpec.tool);
+  const effects = mcpRecord(tool.effects);
+  const boolean = (key: string): boolean | undefined =>
+    typeof effects[key] === "boolean" ? effects[key] as boolean : undefined;
+  return {
+    ...(typeof tool.title === "string" && tool.title.trim() ? { title: tool.title.trim() } : {}),
+    ...(typeof tool.description === "string" && tool.description.trim()
+      ? { description: mcpClampDescription(tool.description) }
+      : {}),
+    ...(typeof tool.authority === "string" && tool.authority.trim() ? { authority: tool.authority.trim() } : {}),
+    availability: tool.availability === "deferred" ? "deferred" : "implemented",
+    effects: {
+      ...(boolean("read_only") !== undefined ? { readOnlyHint: boolean("read_only") } : {}),
+      ...(boolean("destructive") !== undefined ? { destructiveHint: boolean("destructive") } : {}),
+      ...(boolean("idempotent") !== undefined ? { idempotentHint: boolean("idempotent") } : {}),
+      ...(boolean("open_world") !== undefined ? { openWorldHint: boolean("open_world") } : {})
+    },
+    resultSchema: mcpRecord(argSpec.output_schema)
+  };
 }
 
 /** A tool description is model context: an unbounded doc paragraph is a
@@ -12528,14 +12610,49 @@ function mcpNamedArgs(tool: NetMcpDynamicTool, values: Record<string, unknown>):
  * because that verb owns the name and the value must reach it unchanged.
  * Those tools still accept the id through `_meta` (see mcpOperationId).
  */
-function mcpProtocolTool(tool: NetMcpDynamicTool): { name: string; description: string; inputSchema: Record<string, unknown> } {
-  if (tool.argNames.includes(MCP_OPERATION_ID_ARG)) {
-    return { name: tool.name, description: tool.description, inputSchema: tool.inputSchema };
-  }
+type NetMcpProtocolTool = {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  annotations?: NetMcpToolEffects;
+  _meta?: Record<string, unknown>;
+};
+
+/** MCP validates outputSchema against the complete structuredContent object,
+ * while a catalog schema describes the Woo verb's raw return value. Preserve
+ * that separation by nesting it under `result` beside transport-owned
+ * observation and replay evidence. `result` cannot be required: a committed
+ * replay may prove execution while retention has legitimately omitted it. */
+function mcpToolOutputSchema(resultSchema: Record<string, unknown>, requireResult = false): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      result: resultSchema,
+      observations: { type: "array", items: { type: "object" } },
+      replayed: { type: "boolean" },
+      replay_outcome: { type: "string", enum: ["full", "partial", "none"] },
+      replay_omitted: { type: "array", items: { type: "string" } }
+    },
+    ...(requireResult ? { required: ["result"] } : {})
+  };
+}
+
+function mcpProtocolTool(tool: NetMcpDynamicTool): NetMcpProtocolTool {
+  const base: NetMcpProtocolTool = {
+    name: tool.name,
+    ...(tool.toolMeta.title ? { title: tool.toolMeta.title } : {}),
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    outputSchema: mcpToolOutputSchema(tool.toolMeta.resultSchema),
+    ...(Object.keys(tool.toolMeta.effects).length > 0 ? { annotations: tool.toolMeta.effects } : {}),
+    ...(tool.toolMeta.authority ? { _meta: { "woo/authority": tool.toolMeta.authority } } : {})
+  };
+  if (tool.argNames.includes(MCP_OPERATION_ID_ARG)) return base;
   const properties = mcpRecord(tool.inputSchema.properties);
   return {
-    name: tool.name,
-    description: tool.description,
+    ...base,
     inputSchema: {
       ...tool.inputSchema,
       properties: { ...properties, [MCP_OPERATION_ID_ARG]: MCP_OPERATION_ID_SCHEMA }
@@ -12544,6 +12661,7 @@ function mcpProtocolTool(tool: NetMcpDynamicTool): { name: string; description: 
 }
 
 function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record<string, unknown> {
+  const protocol = mcpProtocolTool(tool);
   return {
     name: tool.name,
     object: tool.object,
@@ -12551,11 +12669,14 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
     aliases: tool.aliases,
     args: tool.argNames,
     description: tool.description,
+    ...(protocol.title ? { title: protocol.title } : {}),
+    ...(protocol.annotations ? { annotations: protocol.annotations } : {}),
+    ...(protocol._meta ? { _meta: protocol._meta } : {}),
     // The PROTOCOL schema, so `woo_list_reachable_tools` and `tools/list`
     // advertise the same call surface — including the reserved
     // `operation_id`. Handing back the raw descriptor schema here would hide
     // retry safety from exactly the agents that discover tools this way.
-    ...(includeSchema ? { input_schema: mcpProtocolTool(tool).inputSchema } : {})
+    ...(includeSchema ? { input_schema: protocol.inputSchema, output_schema: protocol.outputSchema } : {})
   };
 }
 
@@ -12569,7 +12690,15 @@ function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record
  * optional verb parameters. Hand-writing the nullable unions here instead
  * would be six chances to describe optionality differently from the dynamic
  * door. */
-const MCP_TOOL_DEFS_CORE = [
+const MCP_TOOL_DEFS_CORE: Array<{
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  resultSchema: Record<string, unknown>;
+  annotations?: NetMcpToolEffects;
+  authority?: string;
+  replayable?: boolean;
+}> = [
   {
     name: "woo_call",
     description:
@@ -12591,7 +12720,10 @@ const MCP_TOOL_DEFS_CORE = [
         operation_id: MCP_OPERATION_ID_SCHEMA
       },
       required: ["object", "verb"]
-    }
+    },
+    resultSchema: {},
+    authority: "actor",
+    replayable: true
   },
   {
     name: "woo_wait",
@@ -12604,7 +12736,17 @@ const MCP_TOOL_DEFS_CORE = [
         timeout_ms: { type: "number", description: "How long to park when the queue is empty; 0–25000, default 1000." },
         limit: { type: "number", description: "Maximum observations to drain; 1–256, default 64." }
       }
-    }
+    },
+    resultSchema: {
+      type: "object",
+      properties: {
+        observations: { type: "array", items: { type: "object" } },
+        gap: { type: "boolean" }
+      },
+      required: ["observations", "gap"]
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    authority: "session"
   },
   {
     name: "woo_list_reachable_tools",
@@ -12623,11 +12765,14 @@ const MCP_TOOL_DEFS_CORE = [
         query: { type: "string", description: "Case-insensitive match over name, object, verb, aliases, and description." },
         limit: { type: "number", description: "Page size; 1–256, default 64." },
         cursor: { type: "string", description: "Opaque cursor from a previous `next_cursor`." },
-        include_schema: { type: "boolean", description: "Add each descriptor's `input_schema`." }
+        include_schema: { type: "boolean", description: "Add each descriptor's `input_schema` and `output_schema`." }
       }
-    }
+    },
+    resultSchema: { type: "object" },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    authority: "actor"
   }
-] as const;
+];
 
 /** Widen a control's OPTIONAL properties to admit `null`, by the same rule
  * and the same helper the dynamic door uses for optional verb parameters. */
@@ -12646,11 +12791,14 @@ function mcpControlSchema(schema: Record<string, unknown>): Record<string, unkno
 }
 
 /** The PUBLISHED stable-control descriptors — what `tools/list` returns. */
-const MCP_TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> =
+const MCP_TOOL_DEFS: NetMcpProtocolTool[] =
   MCP_TOOL_DEFS_CORE.map((definition) => ({
     name: definition.name,
     description: definition.description,
-    inputSchema: mcpControlSchema(definition.inputSchema as unknown as Record<string, unknown>)
+    inputSchema: mcpControlSchema(definition.inputSchema),
+    outputSchema: mcpToolOutputSchema(definition.resultSchema, definition.replayable !== true),
+    ...(definition.annotations ? { annotations: definition.annotations } : {}),
+    ...(definition.authority ? { _meta: { "woo/authority": definition.authority } } : {})
   }));
 
 /**
@@ -12686,18 +12834,24 @@ const MCP_READ_TOOL_CORE = {
       uri: { type: "string", minLength: 1, description: "A `woo://` resource URI." }
     },
     required: ["uri"]
-  }
+  },
+  resultSchema: { type: "object" },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  authority: "actor"
 } as const;
 
 /** The stable controls advertised by the COLLAPSED profile: the three classic
  * ones plus `woo_read`. Kept as a distinct list so the classic profile's
  * `tools/list` is unchanged. */
-const MCP_COLLAPSED_TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
+const MCP_COLLAPSED_TOOL_DEFS: NetMcpProtocolTool[] = [
   ...MCP_TOOL_DEFS,
   {
     name: MCP_READ_TOOL_CORE.name,
     description: MCP_READ_TOOL_CORE.description,
-    inputSchema: mcpControlSchema(MCP_READ_TOOL_CORE.inputSchema as unknown as Record<string, unknown>)
+    inputSchema: mcpControlSchema(MCP_READ_TOOL_CORE.inputSchema as unknown as Record<string, unknown>),
+    outputSchema: mcpToolOutputSchema(MCP_READ_TOOL_CORE.resultSchema as Record<string, unknown>, true),
+    annotations: MCP_READ_TOOL_CORE.annotations,
+    _meta: { "woo/authority": MCP_READ_TOOL_CORE.authority }
   }
 ];
 

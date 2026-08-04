@@ -82,8 +82,11 @@ woo_list_reachable_tools(
 ```
 
 The result includes `total`, `next_cursor`, and descriptors with `name`,
-`object`, `verb`, `aliases`, `args`, and `description`. `include_schema:true`
-also returns each `input_schema`.
+`object`, `verb`, `aliases`, `args`, and `description`. Catalog-declared titles,
+effect hints, and required authority are returned when present; these are
+descriptive hints, not permission grants. `include_schema:true` also returns
+each `input_schema` and `output_schema`. The output schema describes the whole
+`structuredContent` envelope, with the verb's return value under `result`.
 
 No scope value performs a global scan. `object` only narrows objects already in
 your structural context.

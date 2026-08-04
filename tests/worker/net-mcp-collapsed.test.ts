@@ -142,7 +142,8 @@ describe("MCP collapsed profile: tool projection", () => {
     const classic = await world.open(null);
     const collapsed = await world.open("collapsed");
 
-    const classicNames = (await classic.tools()).map((tool) => tool.name);
+    const classicTools = await classic.tools();
+    const classicNames = classicTools.map((tool) => tool.name);
     const collapsedTools = await collapsed.tools();
     const collapsedNames = collapsedTools.map((tool) => tool.name);
     const dynamic = collapsedNames.filter((name) => !name.startsWith("woo_"));
@@ -213,6 +214,27 @@ describe("MCP collapsed profile: tool projection", () => {
     expect(classic.init.body.result.capabilities).toEqual({ tools: { listChanged: true } });
     expect(collapsed.init.body.result.capabilities)
       .toEqual({ tools: { listChanged: true }, resources: {} });
+
+    // Stable controls publish the same structuredContent envelope as dynamic
+    // tools, but their non-replayed results are required and precisely shaped.
+    const discovery = classicTools.find((tool) => tool.name === "woo_list_reachable_tools");
+    expect(discovery).toMatchObject({
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: { "woo/authority": "actor" },
+      outputSchema: {
+        type: "object",
+        properties: { result: { type: "object" } },
+        required: ["result"]
+      }
+    });
+    const read = collapsedTools.find((tool) => tool.name === "woo_read");
+    expect(read).toMatchObject({
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: { "woo/authority": "actor" },
+      outputSchema: { required: ["result"] }
+    });
+    const genericCall = classicTools.find((tool) => tool.name === "woo_call");
+    expect((genericCall as { outputSchema?: { required?: string[] } } | undefined)?.outputSchema?.required).toBeUndefined();
   }, 200_000);
 
   it("requires the collapsed header on every request instead of relying on volatile gateway memory", async () => {

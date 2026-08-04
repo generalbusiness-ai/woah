@@ -60,10 +60,13 @@ The two MCP surfaces are inherited by actors:
 - `$builder < $player`
 - `$programmer < $builder`
 
-MCP does not special-case either one. The actor object is always reachable, so
-an actor whose parent chain includes `$builder` sees builder tools on itself;
-an actor whose parent chain includes `$programmer` sees programmer tools on
-itself. The normal `tool_exposed` mechanism lists each inherited surface.
+MCP does not special-case either one. The actor object is always reachable, and
+the resolver walks both its ancestry and attached feature chains, so an actor
+that carries `$builder` sees builder tools on itself and one that carries
+`$programmer` sees programmer tools on itself. The normal `tool_exposed`
+mechanism lists each surface. The manifest also declares each exposed verb's
+title, effect hints, authority label, availability, and return schema in
+`arg_spec`; these improve discovery but do not grant a capability.
 
 ## Promotion path
 

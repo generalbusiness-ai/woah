@@ -23,6 +23,7 @@ type VerbEntry = {
   name?: unknown;
   source?: unknown;
   implementation?: unknown;
+  arg_spec?: unknown;
 };
 
 type ClassEntry = {
@@ -85,12 +86,19 @@ for (const dir of catalogDirs) {
     const verbs = Array.isArray(cls.verbs) ? (cls.verbs as VerbEntry[]) : [];
     for (const verb of verbs) {
       const verbName = typeof verb.name === "string" ? verb.name : "<unnamed>";
+      const metadataDiagnostics = toolMetadataDiagnostics(verb.arg_spec);
       // Verbs with a native implementation block carry no DSL source.
-      if (typeof verb.source !== "string") continue;
+      if (typeof verb.source !== "string") {
+        if (metadataDiagnostics.length > 0) {
+          failures.push({ catalog: catalogName, manifestPath, className, verbName, diagnostics: metadataDiagnostics });
+        }
+        continue;
+      }
       verbCount += 1;
 
       const compiled = compileVerb(verb.source);
       const diags: CompileDiagnostic[] = [];
+      diags.push(...metadataDiagnostics);
 
       if (!compiled.ok || !compiled.bytecode) {
         diags.push(...compiled.diagnostics);
@@ -113,6 +121,48 @@ for (const dir of catalogDirs) {
       }
     }
   }
+}
+
+/** Catalog tool metadata is persisted as ordinary arg_spec data and can be
+ * authored outside MCP. Validate bundled declarations here so malformed risk
+ * hints never silently ship; the runtime still ignores malformed aged/user
+ * metadata conservatively. */
+function toolMetadataDiagnostics(rawArgSpec: unknown): CompileDiagnostic[] {
+  if (typeof rawArgSpec !== "object" || rawArgSpec === null || Array.isArray(rawArgSpec)) return [];
+  const argSpec = rawArgSpec as Record<string, unknown>;
+  const diagnostics: CompileDiagnostic[] = [];
+  const fail = (message: string) => diagnostics.push({ severity: "error", code: "E_TOOL_METADATA", message });
+  if (argSpec.output_schema !== undefined
+      && (typeof argSpec.output_schema !== "object" || argSpec.output_schema === null || Array.isArray(argSpec.output_schema))) {
+    fail("arg_spec.output_schema must be a JSON Schema object");
+  }
+  if (argSpec.tool === undefined) return diagnostics;
+  if (typeof argSpec.tool !== "object" || argSpec.tool === null || Array.isArray(argSpec.tool)) {
+    fail("arg_spec.tool must be an object");
+    return diagnostics;
+  }
+  const tool = argSpec.tool as Record<string, unknown>;
+  for (const field of ["title", "description", "authority"] as const) {
+    if (tool[field] !== undefined && (typeof tool[field] !== "string" || tool[field].trim() === "")) {
+      fail(`arg_spec.tool.${field} must be a non-empty string`);
+    }
+  }
+  if (tool.availability !== undefined && tool.availability !== "implemented" && tool.availability !== "deferred") {
+    fail('arg_spec.tool.availability must be "implemented" or "deferred"');
+  }
+  if (tool.effects !== undefined) {
+    if (typeof tool.effects !== "object" || tool.effects === null || Array.isArray(tool.effects)) {
+      fail("arg_spec.tool.effects must be an object");
+    } else {
+      const effects = tool.effects as Record<string, unknown>;
+      for (const field of ["read_only", "destructive", "idempotent", "open_world"] as const) {
+        if (effects[field] !== undefined && typeof effects[field] !== "boolean") {
+          fail(`arg_spec.tool.effects.${field} must be boolean`);
+        }
+      }
+    }
+  }
+  return diagnostics;
 }
 
 const elapsedMs = Date.now() - t0;

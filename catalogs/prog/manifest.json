@@ -33,7 +33,14 @@
             "args": [
               "id",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Inspect object",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :inspect(id, opts) rxd {\n  // Builder surface check: wizard, or descendant of $builder.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Structure/data view: owner, flags, parent, children, instances, location,\n  // contents, and property summaries. No source output.\n  return authoring_inspect(id, opts, false);\n}"
         },
@@ -47,7 +54,14 @@
             "args": [
               "query",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Search objects",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :search(query, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Bounded actor-scoped search across object names and property channels.\n  // Source channels are reserved for the programmer surface.\n  return authoring_search(query, opts, false);\n}"
         },
@@ -61,7 +75,14 @@
             "args": [
               "parent",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Create object",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": false, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :create(parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Creates an object owned by the invoking actor. There is intentionally no\n  // owner option on the builder surface; creating for another actor is wizard\n  // administration, not delegated building.\n  //\n  // Placement default (LambdaMOO @create, plan §6.4): a new object with no\n  // explicit location lands in the AUTHOR'S INVENTORY. Placement is what makes\n  // a fresh object reachable — it enters the author's structural context, so\n  // `look`/inventory show it and an MCP session can target it once one of its\n  // verbs is tool_exposed. An object created into no container is invisible to\n  // every surface except its returned id. Pass an explicit `location` to place\n  // it elsewhere; pass `location: null` to deliberately leave it nowhere.\n  let create_opts = opts;\n  if (typeof(create_opts) != \"map\") { create_opts = {}; }\n  if (!has(create_opts, \"location\")) { create_opts[\"location\"] = actor; }\n  let result = builder_create_object(parent, create_opts);\n  observe({ type: \"builder_created\", actor: actor, id: result[\"id\"], parent: parent, ts: now() });\n  return result;\n}"
         },
@@ -76,7 +97,14 @@
               "id",
               "parent",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Change object parent",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :chparent(id, parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  let result = builder_chparent(id, parent, opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_chparented\", actor: actor, id: id, parent: parent, ts: now() });\n  }\n  return result;\n}"
         },
@@ -90,7 +118,14 @@
             "args": [
               "id",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Recycle object",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :recycle(id, opts) rxd {\n  // Surface gate. The wrapper is direct_callable for MCP/REST tool use,\n  // which would otherwise expose it to non-builder owners. Mirror the\n  // builder-class requirement that the other $builder verbs (:inspect,\n  // :create, :chparent, :set_property, :recycle_command) enforce, so the\n  // documented surface (catalogs/prog/README.md) holds across every\n  // call path. the_perm below still narrows from \"any builder\" to\n  // \"owner-or-wizard\" — the gate adds a class-membership precondition,\n  // it doesn't replace the perm check.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // The substrate `recycle()` builtin gates on the verb's effective\n  // principal (progr); this wrapper is catalog-owned, so progr is\n  // wizard. Two layers of defense are needed.\n  //\n  // Layer 1 — actor-side authority gate (LambdaCore @recycle pattern):\n  // route through the_perm so the auth rule lives in one place.\n  \"the_perm\":requires_perm(actor, id, \"only the owner or a wizard can recycle this object\");\n  // Layer 2 — strip user-intent wizard opts before forwarding. The\n  // substrate also gates force_reserved on actor (defense in depth at\n  // the substrate layer), but stripping here keeps the smuggle vector\n  // out of the substrate's parser entirely. force_reserved is the\n  // exclusive concern of $wiz:force_recycle.\n  let safe_opts = {};\n  if (typeof(opts) == \"map\") {\n    for k in keys(opts) {\n      if (k != \"force_reserved\") { safe_opts[k] = opts[k]; }\n    }\n  }\n  let result = recycle(id, safe_opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_recycled\", actor: actor, id: id, ts: now() });\n  }\n  return result;\n}"
         },
@@ -129,7 +164,14 @@
               "name",
               "value",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Set property value",
+              "authority": "builder",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :set_property(id, name, value, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!has_surface(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  set_task_perms(actor);\n  // Ordinary data value setting. This does not change verb source, property\n  // perms, executable metadata, wizard/programmer flags, or ownership.\n  // (1) Cross-host writes — refuse outright.\n  if (is_remote_object(id)) {\n    raise { code: \"E_CROSS_HOST_WRITE\", message: \"cross-host property writes are not atomic\", value: { obj: id, property: name } };\n  }\n  // (2) Existence probe — reject E_PROPNF here so SET_PROP doesn't\n  // reach the auto-create branch under wizard progr.\n  let info = null;\n  try {\n    info = property_info(id, name);\n  } except err {\n    if (err[\"code\"] == \"E_PROPNF\") {\n      raise { code: \"E_PROPNF\", message: \"property not found: \" + name, value: { obj: id, property: name } };\n    }\n    raise err;\n  }\n  // (3) opts.expected_version — value-version concurrency check.\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"expected_version\")) {\n      let expected = opts[\"expected_version\"];\n      if (expected != null) {\n        let current = info[\"value_version\"];\n        if (current != expected) {\n          raise { code: \"E_VERSION\", message: \"property value version conflict\", value: { expected: expected, actual: current, obj: id, property: name } };\n        }\n      }\n    }\n  }\n  // (4) Actor-side canWriteProperty.\n  let allowed = false;\n  if (has_flag(actor, \"wizard\")) { allowed = true; }\n  if (info[\"owner\"] == actor) { allowed = true; }\n  if (str_index(info[\"perms\"], \"w\") > 0) { allowed = true; }\n  if (!allowed) {\n    raise { code: \"E_PERM\", message: \"permission denied\", value: { actor: actor, obj: id, property: name } };\n  }\n  id.(name) = value;\n  let info_after = property_info(id, name);\n  return { ok: true, id: id, name: name, version: info_after[\"value_version\"], info: info_after };\n}"
         },
@@ -278,7 +320,14 @@
             "args": [
               "id",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Inspect source and structure",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :inspect(id, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Source-aware call-tree view with read filters: parent/features walk, own\n  // and inherited verbs/properties, slots, impact hints, and optional readable\n  // source summaries. No bytecode.\n  return authoring_inspect(id, opts, true);\n}"
         },
@@ -292,7 +341,14 @@
             "args": [
               "id",
               "descriptor"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Resolve verb",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :resolve_verb(id, descriptor) rxd {\n  // Programmer surface check: wizard, or programmer-flagged descendant of\n  // this surface class.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_surface(actor, $programmer)) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_flag(actor, \"programmer\")) {\n      raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor };\n    }\n  }\n  set_task_perms(actor);\n  let walk = [];\n  let definer = null;\n  if (typeof(descriptor) == \"number\") {\n    let own = verbs(id);\n    let matched = false;\n    if (descriptor >= 1) { if (descriptor <= length(own)) { matched = true; } }\n    walk = walk + [{ id: id, kind: \"slot\", slot: descriptor, matched: matched }];\n    if (!matched) {\n      raise { code: \"E_VERBNF\", message: \"verb slot not found\", value: { obj: id, slot: descriptor, actor: actor } };\n    }\n    definer = id;\n  } else {\n    let chain = [id] + parents(id);\n    for class_ref in chain {\n      if (definer == null) {\n        let class_verbs = verbs(class_ref);\n        let class_match = false;\n        for n in class_verbs { if (n == descriptor) { class_match = true; } }\n        walk = walk + [{ id: class_ref, kind: \"parent\", matched: class_match }];\n        if (class_match) { definer = class_ref; }\n      }\n    }\n    if (definer == null) {\n      raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, name: descriptor, actor: actor } };\n    }\n  }\n  let info = verb_info(definer, descriptor);\n  let source = verb_code(definer, descriptor);\n  return {\n    name: info[\"name\"],\n    slot: info[\"slot\"],\n    aliases: info[\"aliases\"],\n    definer: definer,\n    owner: info[\"owner\"],\n    perms: info[\"perms\"],\n    arg_spec: info[\"arg_spec\"],\n    version: info[\"version\"],\n    direct_callable: info[\"direct_callable\"],\n    tool_exposed: info[\"tool_exposed\"],\n    readable: true,\n    source: source,\n    line_map: {},\n    walk: walk\n  };\n}"
         },
@@ -307,7 +363,14 @@
               "id",
               "descriptor",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "List verb source",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :list_verb(id, descriptor, opts) rxd {\n  // Return readable source and metadata for one ordered verb slot. This is\n  // source-level only: no bytecode, opcode, literal-pool, or VM detail.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_surface(actor, $programmer)) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_flag(actor, \"programmer\")) {\n      raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor };\n    }\n  }\n  set_task_perms(actor);\n  let include_source = true;\n  if (typeof(opts) == \"map\") { if (has(opts, \"include_source\")) { include_source = opts[\"include_source\"]; } }\n  let walk = [];\n  let definer = null;\n  if (typeof(descriptor) == \"number\") {\n    let own = verbs(id);\n    let matched = false;\n    if (descriptor >= 1) { if (descriptor <= length(own)) { matched = true; } }\n    walk = walk + [{ id: id, kind: \"slot\", slot: descriptor, matched: matched }];\n    if (!matched) {\n      raise { code: \"E_VERBNF\", message: \"verb slot not found\", value: { obj: id, slot: descriptor, actor: actor } };\n    }\n    definer = id;\n  } else {\n    let chain = [id] + parents(id);\n    for class_ref in chain {\n      if (definer == null) {\n        let class_verbs = verbs(class_ref);\n        let class_match = false;\n        for n in class_verbs { if (n == descriptor) { class_match = true; } }\n        walk = walk + [{ id: class_ref, kind: \"parent\", matched: class_match }];\n        if (class_match) { definer = class_ref; }\n      }\n    }\n    if (definer == null) {\n      raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, name: descriptor, actor: actor } };\n    }\n  }\n  let info = verb_info(definer, descriptor);\n  let result = {\n    name: info[\"name\"],\n    slot: info[\"slot\"],\n    aliases: info[\"aliases\"],\n    definer: definer,\n    owner: info[\"owner\"],\n    perms: info[\"perms\"],\n    arg_spec: info[\"arg_spec\"],\n    version: info[\"version\"],\n    direct_callable: info[\"direct_callable\"],\n    tool_exposed: info[\"tool_exposed\"],\n    readable: true,\n    walk: walk\n  };\n  if (include_source) {\n    result[\"source\"] = verb_code(definer, descriptor);\n    result[\"line_map\"] = {};\n  }\n  return result;\n}"
         },
@@ -321,7 +384,14 @@
             "args": [
               "query",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Search source and objects",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :search(query, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Bounded actor-scoped search. opts.channels may include readable\n  // verb_source; unreadable source is omitted, not summarized.\n  return authoring_search(query, opts, true);\n}"
         },
@@ -337,7 +407,14 @@
               "descriptor",
               "source",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Install verb",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :install_verb(id, descriptor, source, opts) rxd {\n  // Programmer surface check.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Validate options. opts.perms is rejected — the source header is canonical.\n  let dry_run = false;\n  let mode = \"upsert\";\n  let expected_version = null;\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"perms\")) {\n      let fail_perms = { ok: false, dry_run: false, slot: 0, version: 0, diagnostics: [{ severity: \"error\", code: \"E_INVARG\", message: \"opts.perms is not accepted; verb source header is canonical\" }] };\n      observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: fail_perms[\"diagnostics\"], dry_run: false, ts: now() });\n      return fail_perms;\n    }\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"mode\")) { mode = opts[\"mode\"]; }\n    if (has(opts, \"expected_version\")) { expected_version = opts[\"expected_version\"]; }\n  }\n  if (mode != \"upsert\" && mode != \"define\" && mode != \"set_code\") {\n    raise { code: \"E_INVARG\", message: \"unknown install mode\", value: mode };\n  }\n  // Discover existing verb (own slot only).\n  let existing = null;\n  let existing_version = null;\n  let existing_slot = 0;\n  try {\n    let info = verb_info(id, descriptor);\n    existing = info;\n    existing_version = info[\"version\"];\n    existing_slot = info[\"slot\"];\n  } except err { existing = null; }\n  if (mode == \"define\" && existing != null) {\n    raise { code: \"E_INVARG\", message: \"verb already exists\", value: { obj: id, descriptor: descriptor } };\n  }\n  if (mode == \"set_code\" && existing == null) {\n    raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, descriptor: descriptor } };\n  }\n  if (expected_version != null) {\n    if (existing_version != expected_version) {\n      raise { code: \"E_VERSION\", message: \"verb version conflict\", value: { expected: expected_version, actual: existing_version } };\n    }\n  }\n  // Compile (pure, no mutation).\n  let compiled = compile_verb(source);\n  let target_name = descriptor;\n  if (existing != null) { target_name = existing[\"name\"]; }\n  if (compiled[\"ok\"]) {\n    let meta = compiled[\"metadata\"];\n    if (meta != null && has(meta, \"name\")) {\n      let header_name = meta[\"name\"];\n      if (typeof(header_name) == \"string\") {\n        if (typeof(target_name) == \"string\" && header_name != target_name) {\n          let fail_name = { ok: false, dry_run: dry_run, slot: existing_slot, version: existing_version, metadata: meta, diagnostics: [{ severity: \"error\", code: \"E_COMPILE\", message: \"verb header :\" + header_name + \" does not match install target :\" + target_name }] };\n          observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: fail_name[\"diagnostics\"], dry_run: dry_run, ts: now() });\n          return fail_name;\n        }\n      }\n    }\n  }\n  if (!compiled[\"ok\"]) {\n    let fail_compile = { ok: false, dry_run: dry_run, slot: existing_slot, version: existing_version, metadata: compiled[\"metadata\"], diagnostics: compiled[\"diagnostics\"] };\n    observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: compiled[\"diagnostics\"], dry_run: dry_run, ts: now() });\n    return fail_compile;\n  }\n  // Predict the slot/version that the install would land on.\n  let projected_slot = existing_slot;\n  let projected_version = 1;\n  if (existing != null) {\n    projected_version = existing_version + 1;\n  } else {\n    projected_slot = length(verbs(id)) + 1;\n  }\n  if (dry_run) {\n    return { ok: true, dry_run: true, slot: projected_slot, version: projected_version, metadata: compiled[\"metadata\"], diagnostics: [] };\n  }\n  // Apply: create stub if needed, then install code.\n  if (existing == null) {\n    let add_info = { name: target_name };\n    let add_meta = compiled[\"metadata\"];\n    if (add_meta != null) {\n      if (has(add_meta, \"perms\")) { add_info[\"perms\"] = add_meta[\"perms\"]; }\n      if (has(add_meta, \"arg_spec\")) { add_info[\"arg_spec\"] = add_meta[\"arg_spec\"]; }\n    }\n    add_verb(id, add_info);\n  }\n  let errors = set_verb_code(id, target_name, source);\n  if (length(errors) > 0) {\n    // Should not happen — compile_verb already succeeded — but if the\n    // header/name post-validation rejects, roll back the stub.\n    if (existing == null) { try { delete_verb(id, target_name); } except err { } }\n    let diag = [];\n    for msg in errors { diag = diag + [{ severity: \"error\", code: \"E_COMPILE\", message: msg }]; }\n    observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: diag, dry_run: false, ts: now() });\n    return { ok: false, dry_run: false, slot: projected_slot, version: existing_version, metadata: compiled[\"metadata\"], diagnostics: diag };\n  }\n  let info_after = verb_info(id, target_name);\n  observe({ type: \"programmer_installed\", actor: actor, id: id, verb: descriptor, slot: info_after[\"slot\"], version: info_after[\"version\"], ts: now() });\n  return { ok: true, dry_run: false, slot: info_after[\"slot\"], version: info_after[\"version\"], metadata: compiled[\"metadata\"], diagnostics: [] };\n}"
         },
@@ -352,7 +429,14 @@
               "id",
               "descriptor",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Set verb metadata",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :set_verb_info(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Metadata-only edit for aliases, arg spec, exposure flags, and perms.\n  // Permission bits are changed here, not through source install. Does not\n  // reinstall source. opts.dry_run=true validates without mutation.\n  let dry_run = false;\n  let expected_version = null;\n  let info_overrides = {};\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"expected_version\")) { expected_version = opts[\"expected_version\"]; }\n    if (has(opts, \"aliases\")) { info_overrides[\"aliases\"] = opts[\"aliases\"]; }\n    if (has(opts, \"perms\")) { info_overrides[\"perms\"] = opts[\"perms\"]; }\n    if (has(opts, \"direct_callable\")) { info_overrides[\"direct_callable\"] = opts[\"direct_callable\"]; }\n    if (has(opts, \"tool_exposed\")) { info_overrides[\"tool_exposed\"] = opts[\"tool_exposed\"]; }\n    if (has(opts, \"arg_spec\")) { info_overrides[\"arg_spec\"] = opts[\"arg_spec\"]; }\n    if (has(opts, \"owner\")) { info_overrides[\"owner\"] = opts[\"owner\"]; }\n  }\n  let before = verb_info(id, descriptor);\n  if (expected_version != null) {\n    if (before[\"version\"] != expected_version) {\n      raise { code: \"E_VERSION\", message: \"verb version conflict\", value: { expected: expected_version, actual: before[\"version\"] } };\n    }\n  }\n  if (dry_run) {\n    return { ok: true, dry_run: true, id: id, slot: before[\"slot\"], version: before[\"version\"] + 1, before: before, after: before };\n  }\n  let updated = set_verb_info(id, descriptor, info_overrides);\n  let after = verb_info(id, descriptor);\n  observe({ type: \"programmer_verb_info_changed\", actor: actor, id: id, verb: descriptor, slot: updated[\"slot\"], version: updated[\"version\"], ts: now() });\n  return { ok: true, dry_run: false, id: id, slot: updated[\"slot\"], version: updated[\"version\"], before: before, after: after };\n}"
         },
@@ -367,7 +451,14 @@
               "id",
               "name",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Set property definition",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :set_property_info(id, name, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Define/update property metadata, defaults, perms, and type hints. This is\n  // programmer authority, not the builder value-setting surface.\n  let dry_run = false;\n  let mode = \"upsert\";\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"mode\")) { mode = opts[\"mode\"]; }\n  }\n  if (mode != \"upsert\" && mode != \"define\" && mode != \"update\" && mode != \"delete\") {\n    raise { code: \"E_INVARG\", message: \"unknown property-info mode\", value: mode };\n  }\n  let existing = null;\n  try { existing = property_info(id, name); } except err { existing = null; }\n  // The substrate raises E_PROPNF when looking up a non-defined property; if\n  // the def lives on a parent class, property_info still returns it. For mode\n  // semantics we want to treat \"defined on this object directly\" as the\n  // existence test.\n  let exists_locally = false;\n  if (existing != null) {\n    if (existing[\"defined_on\"] == id) { exists_locally = true; }\n  }\n  if (mode == \"define\" && exists_locally) {\n    raise { code: \"E_INVARG\", message: \"property already exists\", value: { obj: id, property: name } };\n  }\n  if ((mode == \"update\" || mode == \"delete\") && !exists_locally) {\n    raise { code: \"E_PROPNF\", message: \"property not defined on object\", value: { obj: id, property: name } };\n  }\n  if (mode == \"delete\") {\n    let delete_before = existing;\n    if (dry_run) { return { ok: true, dry_run: true, id: id, name: name, deleted: true, before: delete_before }; }\n    set_task_perms(actor);\n    delete_property(id, name);\n    return { ok: true, dry_run: false, id: id, name: name, deleted: true, before: delete_before };\n  }\n  let perms_opt = \"rw\";\n  if (existing != null) { perms_opt = existing[\"perms\"]; }\n  let owner_opt = actor;\n  if (existing != null) { owner_opt = existing[\"owner\"]; }\n  let type_opt = null;\n  if (existing != null) { type_opt = existing[\"type_hint\"]; }\n  let default_value = null;\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"perms\")) { perms_opt = opts[\"perms\"]; }\n    if (has(opts, \"owner\")) { owner_opt = opts[\"owner\"]; }\n    if (has(opts, \"type_hint\")) { type_opt = opts[\"type_hint\"]; }\n    if (has(opts, \"default\")) { default_value = opts[\"default\"]; }\n  }\n  let info_map = { owner: owner_opt, perms: perms_opt };\n  if (type_opt != null) { info_map[\"type_hint\"] = type_opt; }\n  let before = existing;\n  if (dry_run) {\n    let projected = { name: name, owner: owner_opt, perms: perms_opt, defined_on: id, type_hint: type_opt };\n    return { ok: true, dry_run: true, id: id, name: name, before: before, after: projected };\n  }\n  set_task_perms(actor);\n  if (!exists_locally) {\n    add_property(id, name, default_value, info_map);\n  } else {\n    set_property_info(id, name, info_map);\n  }\n  let after = property_info(id, name);\n  return { ok: true, dry_run: false, id: id, name: name, version: after[\"version\"], before: before, after: after };\n}"
         },
@@ -391,6 +482,13 @@
                 { "ref": "the_verb_editor" },
                 { "arg": 0 }
               ]
+            },
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Open verb editor",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
             }
           },
           "source": "verb :edit_verb(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Door into this catalog's seeded $verb_editor instance. The editor room\n  // owns the buffer session after this point; the target object stays where it is.\n  try {\n    return editor_invoke(\"the_verb_editor\", id, descriptor, opts);\n  } except err {\n    // The substrate's editor-contract check is deliberately generic (\"editor\n    // must be space-like and define a private sessions property\") because core\n    // may not name catalog objects. This catalog OWNS the editor contract, so\n    // the legible failure belongs here: name the door, say why it is shut, and\n    // give the operator remediation for both ways it can be shut — the seed\n    // instance was never created (aged world, pre-seed-hook install) or this\n    // shard cannot warm it (aged verb page with no authority prefetch).\n    if (err[\"code\"] == \"E_TYPE\" && typeof(err[\"value\"]) == \"map\" && has(err[\"value\"], \"editor\")) {\n      raise { code: \"E_EDITOR_UNAVAILABLE\", message: \"the verb editor 'the_verb_editor' is not readable in this world, so edit_verb cannot open a buffer; install_verb and list_verb still work. An operator repairs it by reinstalling the prog catalog (its seed hook creates the editor instance) or, on a deployed world, by running repair:net-definitions for '$programmer:edit_verb' so the editor can be warmed.\", value: { editor: \"the_verb_editor\", target: id, descriptor: descriptor, remediation: \"repair:net-definitions\" } };\n    }\n    raise err;\n  }\n}"
@@ -406,7 +504,12 @@
               "id",
               "verb_name",
               "opts?"
-            ]
+            ],
+            "tool": {
+              "title": "Trace verb",
+              "authority": "programmer",
+              "availability": "deferred"
+            }
           },
           "source": "verb :trace(id, verb_name, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  // Capture source-span traces for the next N invocations. v1.1.\n  // NOT tool-exposed on purpose (see the flag above): advertising a tool that\n  // can only raise is a trap for agents. The refusal still has to say what to\n  // do instead, because a wizard on an older catalog epoch can still reach it.\n  raise { code: \"E_NOT_IMPLEMENTED\", message: \"programmer trace (next-N-invocation source spans) is not implemented in this world and is deliberately not offered as a tool. Until it lands: list_verb reads a verb's exact source, eval runs an expression under your own authority, and every raised error carries trace frames with {obj, verb, definer, line, column}.\", value: { id: id, verb_name: verb_name, status: \"deferred\" } };\n}"
         },
@@ -428,6 +531,13 @@
               "args_from": [
                 "argstr"
               ]
+            },
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Evaluate Woo source",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
             }
           },
           "source": "verb :eval(source, opts) rxd {\n  /* Compile and run a Woo expression or statement block under the calling\n   * programmer's authority. This is a strict superset of `woo_call`: any\n   * verb can be invoked as `;target:verb(arg1, arg2)`, any readable property\n   * read as `;obj.prop`, and arbitrary computation expressed inline. Ideal\n   * for chat-as-CLI use and for programmer agents that need to script the\n   * world without round-tripping through individual MCP tools.\n   *\n   * Args:\n   *   source: Woo source text. Default mode wraps as `return <source>;`,\n   *           so an expression like `#the_chatroom:say(\"hi\")` is fine.\n   *           Pass opts.mode=\"stmts\" to run a multi-statement body verbatim.\n   *   opts.mode: \"expr\" (default) | \"stmts\"\n   *   opts.dry_run: true compiles only, returns diagnostics, runs nothing.\n   *\n   * Naming objects: a bare word is a local, a verb argument, or a frame\n   * global (this, actor, caller, ...) — never an object id. Address an\n   * object by id with the objref literal `#<id>`, and a core object with\n   * `$<name>`:\n   *   ;#obj_human_2_1:ping()      // a created object, by id\n   *   ;#the_mug.description       // read one of its properties\n   *   ;$wiz.name                  // a core reference\n   * `create()` returns the bare id (`obj_human_2_1`); writing it without\n   * the `#` fails E_COMPILE \"unknown identifier\", and the diagnostic's\n   * `hint` field says so.\n   *\n   * Returns a map on success or compile failure:\n   *   { ok: true,  dry_run, value }                          // success\n   *   { ok: false, dry_run, diagnostics: [{severity,code,message,...}] }  // compile error\n   *\n   * Runtime errors thrown by the body propagate as ordinary errors so the\n   * outer direct-call transaction rolls back state, placement, and parked\n   * tasks. A failed `;create(...) ; return 1/0;` does not leave the created\n   * object behind. (LambdaCore @eval renders the traceback into chat; here\n   * the chat layer renders the propagated error frame.)\n   *\n   * Authority: the wrapped code runs with `progr = caller`, not the catalog\n   * installer that owns this verb, so eval cannot escalate. Gated on\n   * wizard-or-progbit + $programmer ancestry; non-programmers get E_PERM.\n   *\n   * Examples:\n   *   ;1 + 2                                    // -> {ok:true,value:3}\n   *   ;#the_chatroom:say(\"hello\")               // call a verb (note the #)\n   *   ;;let x = 0; for i in [1,2,3] { x = x + i; } return x;   // mode=\"stmts\"\n   */\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_surface(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  set_task_perms(actor);\n  let result = programmer_eval(source, opts);\n  if (result[\"ok\"]) {\n    if (result[\"dry_run\"]) {\n      tell(actor, \"(dry_run ok)\");\n    } else {\n      tell(actor, \"=> \" + to_string(result[\"value\"]));\n    }\n  } else {\n    let line = \"compile error\";\n    let diags = result[\"diagnostics\"];\n    if (typeof(diags) == \"list\" && length(diags) > 0) {\n      let d = diags[1];\n      line = \"compile error: \" + d[\"code\"] + \" \" + d[\"message\"];\n      if (has(d, \"hint\")) { line = line + \" (\" + d[\"hint\"] + \")\"; }\n    }\n    tell(actor, line);\n  }\n  return result;\n}"
@@ -442,7 +552,14 @@
             "args": [
               "id",
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Force recycle object",
+              "authority": "wizard",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call) and the §RC3a\n  // empty-children safety check. Routes through the unified `recycle`\n  // builtin with force_reserved + force.\n  //\n  // The substrate gates RC2 authority on `progr` (the verb's effective\n  // principal), so a wrapper verb running with wizard progr could be\n  // invoked by any actor. We additionally gate on `actor` here so a\n  // non-wizard caller cannot bypass §RC6 by calling this verb. This is\n  // the LambdaCore @recycle convention: substrate trusts progr; the\n  // user-facing wrapper trusts actor. Audited as a force_recycle\n  // wizard_action; emits a wiz_force_recycle observation. Use sparingly —\n  // for irreversible world-teardown and migration only.\n  \"the_perm\":requires_wizard(actor, \"wizard authority required for force_recycle\");\n  let merged = opts;\n  if (typeof(merged) != \"map\") { merged = {}; }\n  merged[\"force_reserved\"] = true;\n  merged[\"force\"] = true;\n  return recycle(id, merged);\n}"
         },
@@ -735,7 +852,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Inspect editor session",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :what() rxd {\n  return editor_what();\n}"
         },
@@ -750,7 +874,14 @@
           "arg_spec": {
             "args": [
               "opts?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "View editor buffer",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :view(opts) rxd {\n  return editor_view(opts);\n}"
         },
@@ -762,7 +893,14 @@
           "arg_spec": {
             "args": [
               "text"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Replace editor buffer",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :replace(text) rxd {\n  return editor_replace(text);\n}"
         },
@@ -775,7 +913,14 @@
             "args": [
               "line",
               "text"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Insert editor text",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :insert(line, text) rxd {\n  return editor_insert(line, text);\n}"
         },
@@ -788,7 +933,14 @@
             "args": [
               "start",
               "end?"
-            ]
+            ],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Delete editor text",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :delete(start, end) rxd {\n  return editor_delete(start, end);\n}"
         },
@@ -798,7 +950,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Compile editor buffer",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": true, "destructive": false, "idempotent": true, "open_world": false }
+            }
           },
           "source": "verb :dry_run() rxd {\n  return editor_dry_run();\n}"
         },
@@ -808,7 +967,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Save editor buffer",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :save() rxd {\n  return editor_save();\n}"
         },
@@ -818,7 +984,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Pause editor session",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :pause() rxd {\n  return editor_pause();\n}"
         },
@@ -828,7 +1001,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "output_schema": { "type": "object" },
+            "tool": {
+              "title": "Abort editor session",
+              "authority": "programmer",
+              "availability": "implemented",
+              "effects": { "read_only": false, "destructive": true, "idempotent": false, "open_world": false }
+            }
           },
           "source": "verb :abort() rxd {\n  return editor_abort();\n}"
         }

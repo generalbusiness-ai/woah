@@ -406,6 +406,70 @@ the declared order. `woo_call` accepts the positional list directly. Both are
 validated against the advertised schema first (§M4.3): a missing REQUIRED
 property is refused, and only an absent OPTIONAL one becomes `null`.
 
+#### M2.2.1 Effect, authority, and result metadata
+
+Tool risk and result shape belong to the callable verb, not to the MCP
+gateway. A verb MAY declare this transport-neutral metadata in `arg_spec`:
+
+```json
+{
+  "args": ["id", "descriptor"],
+  "output_schema": {"type": "object"},
+  "tool": {
+    "title": "List verb source",
+    "description": "Read one ordered verb page and its source.",
+    "authority": "programmer",
+    "availability": "implemented",
+    "effects": {
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true,
+      "open_world": false
+    }
+  }
+}
+```
+
+`title` and `description` override the source-derived presentation.
+`availability:"deferred"` suppresses standard and discovery listing but does
+not become an authority rule; `woo_call` retains §M2.1's reachability and
+world-authority semantics. Missing or malformed metadata preserves the aged
+page's listing behavior and MCP's conservative annotation defaults.
+
+The four snake-case effect fields project exactly to MCP
+`annotations.readOnlyHint`, `destructiveHint`, `idempotentHint`, and
+`openWorldHint`. The catalog declaration is a hint to clients, never a grant,
+prefilter, routing declaration, or replacement for checks inside the verb.
+`authority` is likewise descriptive and is published as the namespaced Tool
+metadata field `_meta["woo/authority"]`; the gateway MUST NOT infer it from a
+bundled class name or use it to admit a call.
+
+`output_schema` describes the raw Woo return value. MCP's `outputSchema`
+describes the complete `structuredContent` object, so the gateway nests that
+schema under `properties.result` and adds the transport-owned `observations`,
+`replayed`, `replay_outcome`, and `replay_omitted` fields from §M4.1–§M4.2.
+`result` is optional for a verb invocation — including invocation through
+`woo_call` — because an authority-confirmed partial or empty replay can
+legitimately omit the retained return value. Non-invocation stable controls
+require `result` and publish their concrete result shapes.
+`woo_list_reachable_tools` returns the
+same annotations and namespaced authority metadata as `tools/list`; with
+`include_schema:true`, it includes both `input_schema` and `output_schema`.
+
+The gateway checks the supported schema vocabulary against a successful raw
+return before publishing it. A mismatch after an accepted turn is
+`E_OUTPUT_SCHEMA` with `detail.committed:true`: the state transition already
+committed, the non-conforming result is omitted, the turn's observations keep
+their normal reply seat, and the message tells the client to re-read state and
+not retry under a new operation id. Coercing the value, pretending the turn
+rolled back, or returning structured content that violates the descriptor are
+all non-conforming.
+
+Metadata is part of the canonical protocol descriptor and therefore part of
+the tool-list digest. A title, effect, authority, availability, or result
+schema change causes the same `notifications/tools/list_changed` behavior as
+an input-schema or verb-page change.
+
 ### M2.3 Tool naming
 
 The base form is `<sanitized-object>__<sanitized-verb>`, where sanitizing

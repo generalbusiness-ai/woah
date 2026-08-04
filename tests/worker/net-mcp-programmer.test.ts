@@ -78,6 +78,17 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     old.ensureApiKey("$wiz", progAgent, "prog-key", "prog-secret", "prog");
     old.ensureApiKey("$wiz", plainAgent, "plain-key", "plain-secret", "plain");
     old.setObjectFlags("$wiz", progAgent, { programmer: true }); // flag + surface
+    // Prove availability independently of the legacy exposure bit: even an
+    // aged/operator-edited page that marks this raise-only stub exposed stays
+    // absent because its catalog metadata declares it deferred.
+    const exposedDeferred = await old.directCall(
+      "test-expose-deferred-trace",
+      "$wiz",
+      "$wiz",
+      "set_verb_info",
+      ["$programmer", "trace", { tool_exposed: true }]
+    );
+    expect(exposedDeferred.op).toBe("result");
 
     // §8.1: kind stays $agent; the surface is composed as a feature, never by
     // reparenting.
@@ -147,10 +158,12 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     };
     const call = async (session: string, name: string, args: Record<string, unknown>) =>
       (await mcp({ jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name, arguments: args } }, { "mcp-session-id": session })).body as Record<string, any>;
-    const listNames = async (session: string): Promise<string[]> => {
+    const listTools = async (session: string): Promise<Array<Record<string, any>>> => {
       const listed = await mcp({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} }, { "mcp-session-id": session });
-      return (listed.body?.result?.tools ?? []).map((t: any) => t.name);
+      return listed.body?.result?.tools ?? [];
     };
+    const listNames = async (session: string): Promise<string[]> =>
+      (await listTools(session)).map((tool) => tool.name as string);
     // Headless SSE open: no Origin, which mcp.md §M7.1 admits. Origin
     // admission is exercised through the real Worker entry in
     // tests/worker/net-mcp-origin.test.ts — a direct DO fetch cannot see it.
@@ -165,16 +178,57 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
 
     // (3) The agent's authoring verbs are advertised as dynamic Net tools —
     // resolved through the feature chain, not ancestry.
-    const progNames = await listNames(progSession);
+    const progTools = await listTools(progSession);
+    const progNames = progTools.map((tool) => tool.name as string);
     for (const verb of ["install_verb", "create", "inspect", "eval"]) {
       expect(progNames, `${verb} missing from ${JSON.stringify(progNames.filter((n) => n.startsWith(p)))}`).toContain(`${p}__${verb}`);
     }
 
-    // ...and `trace` is deliberately NOT among them. It is a v1.1 stub whose
-    // only behavior is to raise, so listing it would advertise a tool that can
-    // never succeed. Assert from the LIVE list, not the manifest flag: this is
-    // the project's repeat defect (tool_exposed in a manifest is not evidence
-    // of callability, and a flag flip here is silent).
+    // Risk and result shape come from the catalog verb page, not from a
+    // gateway list of programmer verb names. MCP projects the standard effect
+    // hints, keeps authority descriptive in namespaced metadata, and wraps the
+    // raw Woo result schema under structuredContent.result.
+    const installDescriptor = progTools.find((tool) => tool.name === `${p}__install_verb`);
+    expect(installDescriptor).toMatchObject({
+      title: "Install verb",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false
+      },
+      _meta: { "woo/authority": "programmer" },
+      outputSchema: {
+        type: "object",
+        properties: { result: { type: "object" } }
+      }
+    });
+    expect(installDescriptor?.outputSchema?.required).toBeUndefined();
+
+    const listDescriptor = progTools.find((tool) => tool.name === `${p}__list_verb`);
+    expect(listDescriptor).toMatchObject({
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: { "woo/authority": "programmer" }
+    });
+    const described = await call(progSession, "woo_list_reachable_tools", {
+      scope: "active",
+      query: "install_verb",
+      include_schema: true
+    });
+    const describedInstall = (described.result?.structuredContent?.result?.tools ?? [])
+      .find((tool: Record<string, any>) => tool.name === `${p}__install_verb`);
+    expect(describedInstall).toMatchObject({
+      title: "Install verb",
+      annotations: { destructiveHint: true },
+      _meta: { "woo/authority": "programmer" },
+      input_schema: { type: "object" },
+      output_schema: { type: "object", properties: { result: { type: "object" } } }
+    });
+
+    // ...and `trace` is deliberately NOT among them. It is a deferred stub
+    // whose only behavior is to raise. The fixture explicitly set
+    // tool_exposed=true above, so this proves availability metadata — rather
+    // than the legacy exposure bit — suppresses it from the live list.
     expect(progNames, "trace is a raise-only stub; it must not be advertised").not.toContain(`${p}__trace`);
 
     // The removed "all" scope is rejected by the MCP validator, not silently
@@ -283,6 +337,37 @@ describe("Net MCP programmer surface (fake-DO lane)", () => {
     const invokedGeneric = await call(progSession, "woo_call", { object: widget, verb: "hi", args: [] });
     await settleAll();
     expect(invokedGeneric.result?.structuredContent?.result, JSON.stringify(invokedGeneric).slice(0, 600)).toBe(42);
+
+    // A catalog/author can lie accidentally about the return type. The turn
+    // has already committed by the time that is knowable, so the gateway must
+    // not pretend it rolled back or publish non-conforming structuredContent:
+    // it omits the bad value and names the committed-state recovery rule.
+    const misdeclared = await call(progSession, "woo_call", {
+      object: progAgent,
+      verb: "set_verb_info",
+      args: [widget, "hi", {
+        arg_spec: {
+          args: [],
+          output_schema: { type: "string" },
+          tool: {
+            title: "Misdeclared test verb",
+            authority: "actor",
+            availability: "implemented",
+            effects: { read_only: true, destructive: false, idempotent: true, open_world: false }
+          }
+        }
+      }]
+    });
+    await settleAll();
+    expect(misdeclared.result?.isError, JSON.stringify(misdeclared).slice(0, 500)).not.toBe(true);
+    const mismatched = await call(progSession, `${w}__hi`, {});
+    await settleAll();
+    expect(mismatched.result?.isError).toBe(true);
+    expect(mismatched.result?.structuredContent?.error).toMatchObject({
+      code: "E_OUTPUT_SCHEMA",
+      detail: { committed: true, result_omitted: true, expected: "string", received: "integer" }
+    });
+    expect(mismatched.result?.structuredContent).not.toHaveProperty("result");
 
     // (12) Reaching the unadvertised `trace` stub anyway (eval dispatches under
     // the actor's own authority and is not tool-gated) must produce an answer

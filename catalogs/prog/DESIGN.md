@@ -83,6 +83,16 @@ internals. `install_verb(..., {dry_run: true})` is the mutation-free diagnostic
 path; it exercises the same authority, slot-resolution, version, and source
 header checks as a real install.
 
+Every tool-exposed builder, programmer, and editor verb declares its
+transport-neutral tool contract in `arg_spec.tool`: a title, required authority
+label, implementation availability, and the four effect hints.
+`arg_spec.output_schema` describes the verb's raw return value. The gateway
+projects those declarations into MCP annotations, namespaced authority metadata,
+and the structured result envelope; it does not infer risk or authority from
+`$builder`/`$programmer` names. These fields guide clients only. Wrapper gates,
+actor flags, ownership, versions, and the authoritative turn remain the
+security boundary.
+
 ## Editor Rooms
 
 The richer programmer experience should follow LambdaCore's editor-room model
