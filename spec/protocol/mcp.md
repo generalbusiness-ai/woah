@@ -18,8 +18,9 @@ rollback implementation and is not the reference for new behavior.
 
 Two PROJECTIONS of that surface exist. §M2–§M7 specify the **classic**
 projection, which is the default and the reference. §M9 specifies an optional
-**collapsed** projection, selected per session, that renders the same drafts
-under different names and adds an MCP resource channel. Everything outside §M9
+**collapsed** projection, selected by a request header that a client repeats
+consistently, that renders the same drafts under different names and adds an
+MCP resource channel. Everything outside §M9
 — authentication, the envelope, structural context, invocation, the
 observation queue, the security invariants — is shared by both, unchanged.
 
@@ -82,6 +83,47 @@ in-process world or dispatch verbs through a second host. After forwarding
 channel and forwards each server notification as one newline-delimited stdio
 message. Either successful empty acknowledgement (`202` or `204`) starts the
 channel. Closing stdio aborts that channel before deleting the Net session.
+
+**Stdio session replacement.** A Net session may expire while the stdio
+process and its client connection remain alive. The bridge retains the exact
+successful `initialize` request and the accepted
+`notifications/initialized` notification for this purpose. When a later POST
+or the GET/SSE carrier receives HTTP `401` or `404` whose decoded woo code is
+exactly `E_NOSESSION`, the bridge performs one shared replacement operation:
+
+1. re-send the retained `initialize` with the API key and require a new
+   `Mcp-Session-Id`;
+2. re-send the retained initialized notification when the client had reached
+   that phase;
+3. replace the notification carrier; and
+4. retry one interrupted client message, if there was one, using the exact
+   same serialized JSON-RPC body.
+
+Concurrent refusals for the same dead session join one replacement; they do
+not mint one session each. A retried message is never retried a second time.
+This is safe without inventing an operation id: the explicit `E_NOSESSION`
+refusal proves that the gateway rejected the bearer before accepting the
+message. When the message already carries `operation_id`, exact-body replay
+also preserves it. Network errors, empty/non-conforming refusals, other 401s,
+rate errors and permission errors are not replacement signals because their
+execution status or remediation differs.
+
+Replacement necessarily loses the old session's in-memory observation queue
+and descriptor baseline. After the new session is ready, the bridge emits both
+of these server notifications to stdio, in order:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/woo/continuity_gap",
+ "params":{"reason":"session_replaced","observations_may_be_lost":true}}
+{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
+```
+
+The first is an explicit Woo extension and is not a count of lost events; it
+means the client must re-orient before relying on prior observations. The
+second asks standard MCP clients to refresh the session-relative tool surface.
+Session bearer values are never included. If replacement fails, the bridge
+reports that failure once and returns the original correlated refusal for an
+interrupted request; it never loops on a rejected credential.
 
 ### M1.2 The response envelope
 

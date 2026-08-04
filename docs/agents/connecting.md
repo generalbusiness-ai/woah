@@ -89,6 +89,14 @@ closing, the session expires and is reaped; reconnect with the API key and
 rediscover tools.
 The stdio bridge forwards GET/SSE list-change notifications as normal stdio
 JSON-RPC messages.
+If that long-lived stdio connection outlasts its remote Net session, the bridge
+transparently mints and initializes one replacement, retries the explicitly
+rejected request once, and resumes the notification carrier. Replacement loses
+the old live observation queue and descriptor baseline, so the bridge emits
+`notifications/woo/continuity_gap` followed by
+`notifications/tools/list_changed`. Re-orient and re-list before relying on
+prior state. A refused credential or any error other than an explicit
+`E_NOSESSION` is not retried.
 Undelivered `woo_wait` observations are live, at-most-once data and do not
 survive gateway eviction. You are told when that happens: the next `woo_wait`
 reply carries `gap: true`, meaning continuity could not be proven. Re-orient

@@ -6064,7 +6064,7 @@ export class NetGatewayDO {
         mcpJsonRpcError(
           id,
           MCP_JSONRPC_METHOD_NOT_FOUND,
-          `method not found: ${method} (this session uses the classic tool profile, which advertises no resources capability; `
+          `method not found: ${method} (this request selected the classic tool profile, which advertises no resources capability; `
             + `send the ${MCP_PROFILE_HEADER}: collapsed header on this request)`
         ),
         200

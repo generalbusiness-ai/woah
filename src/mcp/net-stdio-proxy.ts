@@ -21,9 +21,9 @@ export type NetMcpStdioProxyOptions = {
   onError?: (error: unknown) => void;
   /** MCP surface profile to request (mcp.md §M9.1). Sent as the
    * `woo-mcp-profile` header on EVERY forwarded request, not just
-   * `initialize`: the gateway holds the latched value in memory, and a DO
-   * eviction mid-conversation would otherwise drop the bridge silently back
-   * to the classic surface. Absent means the server default (classic). */
+   * `initialize`: profile selection is request-scoped and must survive a DO
+   * eviction or session replacement. Absent means the server default
+   * (classic). */
   profile?: string;
 };
 
@@ -39,12 +39,25 @@ export class NetMcpStdioProxy {
   private readonly onError: (error: unknown) => void;
   private sessionId: string | null = null;
   private protocolVersion: string | null = null;
-  private readonly notificationAbort = new AbortController();
+  /** Exact accepted handshake bodies retained for transparent replacement.
+   * They are serialized once so retry cannot lose an extension field or
+   * operation identifier through parse/reconstruction. */
+  private initializeBody: string | null = null;
+  private initializedBody: string | null = null;
+  private notificationsEnabled = false;
+  /** Replacement before the client's initialized phase defers server
+   * notifications until that phase is accepted. */
+  private replacementContinuityPending = false;
+  private notificationAbort: AbortController | null = null;
   /** Cancels forwarded request POSTs. Deliberately separate from
    * `notificationAbort`: shutdown must be able to cut a hung request without
    * that being confused with the notification carrier's normal retry cycle. */
   private readonly requestAbort = new AbortController();
   private notificationTask: Promise<void> | null = null;
+  /** At most one replacement may mint for one dead session. Concurrent POST
+   * and GET refusals join this promise instead of creating competing actors'
+   * sessions and racing which bearer wins. */
+  private replacementTask: Promise<boolean> | null = null;
   private closed = false;
 
   constructor(options: NetMcpStdioProxyOptions) {
@@ -64,63 +77,9 @@ export class NetMcpStdioProxy {
   /** Forward one already-validated stdio message. Notifications produce no
    * stdout message because the Net endpoint acknowledges them with 202. */
   async forward(message: JSONRPCMessage): Promise<JSONRPCMessage | null> {
+    const body = JSON.stringify(message);
     try {
-      const headers = new Headers({
-        accept: "application/json, text/event-stream",
-        "content-type": "application/json"
-      });
-      if (this.profile) headers.set("woo-mcp-profile", this.profile);
-      if (isInitialize(message)) headers.set("mcp-token", this.token);
-      else if (this.sessionId) headers.set("mcp-session-id", this.sessionId);
-      if (!isInitialize(message) && this.protocolVersion) {
-        headers.set("mcp-protocol-version", this.protocolVersion);
-      }
-
-      // No per-request deadline: `woo_wait` legitimately blocks for tens of
-      // seconds, so a blanket transport timeout would break it. The bound that
-      // matters is shutdown, and `requestAbort` supplies it — otherwise a hung
-      // POST outlives stdin and the process ignores SIGTERM.
-      const response = await this.fetchImpl(this.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(message),
-        signal: this.requestAbort.signal
-      });
-      if (response.status === 202 || response.status === 204) {
-        if (isInitialized(message)) this.startNotifications();
-        return null;
-      }
-
-      const text = await response.text();
-      // Streamable HTTP may attach a useful JSON-RPC error to a non-2xx
-      // response. `decodeNetMcpResponse` preserves whatever diagnosis the body
-      // carries — a JSON-RPC message, an older gateway's bare woo refusal, or
-      // failing both, a short summary — and never lets a schema-validation
-      // dump take the place of the server's own message.
-      const decoded = decodeNetMcpResponse(text, response);
-      if (decoded.kind === "message") {
-        // Only a message that actually carries a `result` establishes the
-        // session. An initialize the gateway ANSWERED with a JSON-RPC error
-        // reaches the error branch below, so the client is told why the key
-        // was refused instead of "initialize response omitted mcp-session-id".
-        if (response.ok && isInitialize(message)) {
-          const session = response.headers.get("mcp-session-id");
-          if (!session) throw new Error("Net MCP initialize response omitted mcp-session-id");
-          this.sessionId = session;
-          this.protocolVersion = protocolVersionOf(decoded.message);
-        }
-        return decoded.message;
-      }
-      // An error, from any of the three shapes. A request gets it correlated
-      // to the id it sent — the gateway omits the id on a refusal raised
-      // before it could parse the body, and only this side still knows it.
-      if (hasRequestId(message)) return { jsonrpc: "2.0", id: message.id, error: decoded.error };
-      // A notification has no reply slot, so the refusal cannot be a message.
-      // It must still be legible: reporting it (stderr, via onError) is the
-      // only place the diagnosis can go, and throwing here would replace it
-      // with a bridge stack trace.
-      this.onError(new Error(`Net MCP refused ${methodOf(message) ?? "a notification"}: ${decoded.error.message}`));
-      return null;
+      return await this.forwardAttempt(message, body, true);
     } catch (error) {
       const aborted = isAbortError(error) || this.requestAbort.signal.aborted;
       if (!hasRequestId(message)) {
@@ -140,6 +99,206 @@ export class NetMcpStdioProxy {
         }
       };
     }
+  }
+
+  /** One POST attempt. A replacement-triggered replay passes
+   * `allowReplacement=false`, which is the hard one-retry bound. */
+  private async forwardAttempt(
+    message: JSONRPCMessage,
+    body: string,
+    allowReplacement: boolean
+  ): Promise<JSONRPCMessage | null> {
+    const initializing = isInitialize(message);
+    const session = initializing ? null : this.sessionId;
+    const response = await this.post(body, {
+      session,
+      token: initializing,
+      protocolVersion: initializing ? null : this.protocolVersion
+    });
+    if (response.status === 202 || response.status === 204) {
+      if (isInitialized(message)) {
+        this.initializedBody = body;
+        this.notificationsEnabled = true;
+        await this.finishReplacementContinuity();
+        this.startNotifications();
+      }
+      return null;
+    }
+
+    const text = await response.text();
+    // Streamable HTTP may attach a useful JSON-RPC error to a non-2xx
+    // response. decodeNetMcpResponse preserves the gateway's own diagnosis.
+    const decoded = decodeNetMcpResponse(text, response);
+    if (
+      allowReplacement
+      && !initializing
+      && session
+      && isUnusableSessionRefusal(response, decoded)
+    ) {
+      // Every interrupted message, including notifications/initialized, is
+      // replayed through the same hard one-attempt path. That avoids a race in
+      // which a regular request begins replacement just before the phase
+      // notification arrives and the latter joins too late to be retained.
+      if (await this.recoverSession(session)) return await this.forwardAttempt(message, body, false);
+    }
+
+    if (decoded.kind === "message") {
+      // Only a successful initialize RESULT establishes replaceable session
+      // state. Errors were unwrapped by decodeNetMcpResponse above.
+      if (response.ok && initializing) {
+        if (!("result" in decoded.message)) {
+          throw new Error("Net MCP initialize response did not carry a result");
+        }
+        const nextSession = response.headers.get("mcp-session-id");
+        if (!nextSession) throw new Error("Net MCP initialize response omitted mcp-session-id");
+        this.rotateNotificationCarrier();
+        this.sessionId = nextSession;
+        this.protocolVersion = protocolVersionOf(decoded.message);
+        this.initializeBody = body;
+        this.initializedBody = null;
+        this.notificationsEnabled = false;
+        this.replacementContinuityPending = false;
+      }
+      return decoded.message;
+    }
+    // An error, from any of the three shapes. A request gets it correlated
+    // to the id it sent — the gateway omits the id on a refusal raised
+    // before it could parse the body, and only this side still knows it.
+    if (hasRequestId(message)) return { jsonrpc: "2.0", id: message.id, error: decoded.error };
+    // A notification has no reply slot, so the refusal cannot be a message.
+    this.onError(new Error(`Net MCP refused ${methodOf(message) ?? "a notification"}: ${decoded.error.message}`));
+    return null;
+  }
+
+  /** A POST with the profile and one explicit credential class. Keeping this
+   * builder shared ensures replacement requests obey the same per-request
+   * profile and negotiated-version contract as ordinary forwarding. */
+  private async post(
+    body: string,
+    options: { session: string | null; token: boolean; protocolVersion: string | null }
+  ): Promise<Response> {
+    const headers = new Headers({
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json"
+    });
+    if (this.profile) headers.set("woo-mcp-profile", this.profile);
+    if (options.token) headers.set("mcp-token", this.token);
+    if (options.session) headers.set("mcp-session-id", options.session);
+    if (options.protocolVersion) headers.set("mcp-protocol-version", options.protocolVersion);
+    // No per-request deadline: woo_wait legitimately blocks for tens of
+    // seconds. Shutdown's requestAbort is the bound.
+    return await this.fetchImpl(this.endpoint, {
+      method: "POST",
+      headers,
+      body,
+      signal: this.requestAbort.signal
+    });
+  }
+
+  /** Join or perform the single replacement for `expectedSession`. */
+  private async recoverSession(expectedSession: string): Promise<boolean> {
+    if (this.closed || !this.initializeBody) return false;
+    if (this.sessionId !== expectedSession && this.sessionId !== null) return true;
+    if (!this.replacementTask) {
+      const task = this.replaceSession(expectedSession)
+        .catch((error) => {
+          if (!this.closed && !isAbortError(error)) {
+            this.onError(new Error(`Net MCP session replacement failed: ${errorMessage(error)}`));
+          }
+          return false;
+        })
+        .finally(() => {
+          if (this.replacementTask === task) this.replacementTask = null;
+        });
+      this.replacementTask = task;
+    }
+    return await this.replacementTask;
+  }
+
+  /** Mint and phase a replacement, then make the discontinuity explicit. */
+  private async replaceSession(expectedSession: string): Promise<boolean> {
+    if (!this.initializeBody || this.closed) return false;
+    // Another refusal may arrive after a concurrent replacement already won.
+    if (this.sessionId !== expectedSession && this.sessionId !== null) return true;
+
+    const initializedBody = this.initializedBody;
+    const opened = await this.post(this.initializeBody, {
+      session: null,
+      token: true,
+      protocolVersion: null
+    });
+    const openedText = await opened.text();
+    const decoded = decodeNetMcpResponse(openedText, opened);
+    if (!opened.ok || decoded.kind !== "message" || !("result" in decoded.message)) {
+      const reason = decoded.kind === "error"
+        ? decoded.error.message
+        : `initialize returned HTTP ${opened.status} without a result`;
+      throw new Error(reason);
+    }
+    const nextSession = opened.headers.get("mcp-session-id");
+    if (!nextSession) throw new Error("replacement initialize omitted mcp-session-id");
+    if (nextSession === expectedSession) {
+      throw new Error("replacement initialize returned the same unusable session id");
+    }
+    const nextProtocolVersion = protocolVersionOf(decoded.message);
+
+    if (initializedBody) {
+      const phased = await this.post(initializedBody, {
+        session: nextSession,
+        token: false,
+        protocolVersion: nextProtocolVersion
+      });
+      if (phased.status !== 202 && phased.status !== 204) {
+        const phasedText = await phased.text().catch(() => "");
+        const refusal = decodeNetMcpResponse(phasedText, phased);
+        await this.discardReplacementSession(nextSession, nextProtocolVersion);
+        throw new Error(
+          refusal.kind === "error"
+            ? refusal.error.message
+            : `initialized notification returned HTTP ${phased.status}`
+        );
+      }
+      this.initializedBody = initializedBody;
+    }
+
+    // Publish only a fully phased replacement. A refused initialized
+    // notification must not strand later forwards on a half-open bearer.
+    this.sessionId = nextSession;
+    this.protocolVersion = nextProtocolVersion;
+    this.notificationsEnabled = initializedBody !== null;
+    this.replacementContinuityPending = true;
+    this.rotateNotificationCarrier();
+
+    await this.finishReplacementContinuity();
+    this.startNotifications();
+    return true;
+  }
+
+  /** Emit replacement hints only after the initialized phase. MCP clients may
+   * pipeline that notification, and sending server notifications before it is
+   * accepted violates the protocol lifecycle. */
+  private async finishReplacementContinuity(): Promise<void> {
+    if (!this.replacementContinuityPending || !this.notificationsEnabled) return;
+    // A new session has neither the old live observation queue nor the old
+    // descriptor baseline. Tell the stdio client before accepting more hints.
+    await this.onNotification(MCP_STDIO_CONTINUITY_GAP_NOTIFICATION);
+    await this.onNotification(MCP_STDIO_LIST_CHANGED_NOTIFICATION);
+    this.replacementContinuityPending = false;
+  }
+
+  /** Best-effort cleanup for a replacement that minted but could not finish
+   * the initialized phase. The bound keeps an error-path courtesy from
+   * blocking the original correlated refusal. */
+  private async discardReplacementSession(session: string, protocolVersion: string | null): Promise<void> {
+    const headers = new Headers({ "mcp-session-id": session });
+    if (this.profile) headers.set("woo-mcp-profile", this.profile);
+    if (protocolVersion) headers.set("mcp-protocol-version", protocolVersion);
+    const deleted = this.fetchImpl(this.endpoint, {
+      method: "DELETE",
+      headers,
+      signal: AbortSignal.timeout(NET_MCP_STDIO_CLOSE_MS)
+    }).then((response) => response.body?.cancel()).catch(() => undefined);
+    await withDeadline(deleted, NET_MCP_STDIO_CLOSE_MS);
   }
 
   /** Cancel every in-flight forwarded request.
@@ -162,7 +321,7 @@ export class NetMcpStdioProxy {
   async close(timeoutMs = NET_MCP_STDIO_CLOSE_MS): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.notificationAbort.abort();
+    this.notificationAbort?.abort();
     this.requestAbort.abort();
     await withDeadline(this.notificationTask?.catch(() => undefined), timeoutMs);
     const session = this.sessionId;
@@ -181,21 +340,39 @@ export class NetMcpStdioProxy {
     await withDeadline(deleted, timeoutMs);
   }
 
+  /** Abort only the carrier bound to the previous session. Unlike shutdown,
+   * replacement must leave request forwarding and the next carrier usable. */
+  private rotateNotificationCarrier(): void {
+    this.notificationAbort?.abort();
+    this.notificationAbort = null;
+  }
+
   private startNotifications(): void {
     const session = this.sessionId;
-    if (!session || this.closed || this.notificationTask) return;
-    this.notificationTask = this.listenForNotifications(session)
+    if (!session || !this.notificationsEnabled || this.closed || this.notificationTask) return;
+    const abort = new AbortController();
+    this.notificationAbort = abort;
+    const task = this.listenForNotifications(session, abort.signal)
       .catch((error) => {
         if (!this.closed && !isAbortError(error)) this.onError(error);
       })
-      .finally(() => { this.notificationTask = null; });
+      .finally(() => {
+        if (this.notificationTask === task) this.notificationTask = null;
+        if (this.notificationAbort === abort) this.notificationAbort = null;
+        // A replacement may have completed while the old GET was still
+        // unwinding. Restart only after that task releases the single slot.
+        if (!this.closed && this.notificationsEnabled && this.sessionId !== session) {
+          this.startNotifications();
+        }
+      });
+    this.notificationTask = task;
   }
 
   /** Maintain the optional standalone GET/SSE carrier. Woo's server closes
    * each idle listen within 25 seconds; reconnecting is normal, while a small
    * floor prevents a misbehaving endpoint that returns immediate empty 200s
    * from becoming a tight request loop. */
-  private async listenForNotifications(session: string): Promise<void> {
+  private async listenForNotifications(session: string, signal: AbortSignal): Promise<void> {
     let retryMs = 250;
     while (!this.closed && this.sessionId === session) {
       try {
@@ -205,7 +382,7 @@ export class NetMcpStdioProxy {
         const response = await this.fetchImpl(this.endpoint, {
           method: "GET",
           headers,
-          signal: this.notificationAbort.signal
+          signal
         });
         if (response.status === 405) {
           await response.body?.cancel();
@@ -217,15 +394,13 @@ export class NetMcpStdioProxy {
           const text = await response.text().catch(() => "");
           const decoded = decodeNetMcpResponse(text, response);
           const detail = decoded.kind === "error" ? decoded.error.message : text;
-          const error = new Error(`Net MCP notification stream returned ${response.status}: ${detail}`);
-          // A dead/rejected session cannot recover by reopening the same GET.
-          // Surface it once; later ordinary MCP calls will carry the correlated
-          // JSON-RPC error that tells the client to establish a new session.
-          if (response.status === 401 || response.status === 404) {
-            this.onError(error);
+          if (isUnusableSessionRefusal(response, decoded)) {
+            // GET has no interrupted client request to replay. Replacement
+            // phases the new session and this task's finally opens its carrier.
+            await this.recoverSession(session);
             return;
           }
-          throw error;
+          throw new Error(`Net MCP notification stream returned ${response.status}: ${detail}`);
         }
         if (!response.headers.get("content-type")?.includes("text/event-stream")) {
           await response.body?.cancel();
@@ -239,7 +414,7 @@ export class NetMcpStdioProxy {
         retryMs = Math.min(retryMs * 2, 5_000);
       }
       if (!this.closed && this.sessionId === session) {
-        await abortableDelay(retryMs, this.notificationAbort.signal);
+        await abortableDelay(retryMs, signal);
       }
     }
   }
@@ -278,6 +453,22 @@ type NetMcpDecoded =
 /** JSON-RPC's implementation-defined server-error slot. The Net gateway uses
  * the same number, and the woo code always rides in `error.data.code`. */
 const NET_MCP_SERVER_ERROR = -32000;
+
+/** Extension/standard hints emitted after a transparent session replacement.
+ * Neither contains the bearer that was replaced. */
+const MCP_STDIO_CONTINUITY_GAP_NOTIFICATION: JSONRPCMessage = {
+  jsonrpc: "2.0",
+  method: "notifications/woo/continuity_gap",
+  params: {
+    reason: "session_replaced",
+    observations_may_be_lost: true
+  }
+};
+
+const MCP_STDIO_LIST_CHANGED_NOTIFICATION: JSONRPCMessage = {
+  jsonrpc: "2.0",
+  method: "notifications/tools/list_changed"
+};
 
 /** Enough of a strange body to diagnose it, bounded so a stray HTML error page
  * or a proxy dump cannot become a multi-kilobyte stdio message. */
@@ -344,6 +535,17 @@ function decodeNetMcpResponse(text: string, response: Response): NetMcpDecoded {
   // `parsed.error` is the schema report. It belongs in `data`, never in the
   // message a client shows a human.
   return { kind: "error", error: unintelligibleBody(text, status, parsed.error.message) };
+}
+
+/** Only a decoded session refusal proves that exact-body replay is safe. HTTP
+ * status alone is not enough: another 401 may mean a revoked API key, while a
+ * generic 404 may have come from an intermediary or wrong endpoint. */
+function isUnusableSessionRefusal(response: Response, decoded: NetMcpDecoded): boolean {
+  if ((response.status !== 401 && response.status !== 404) || decoded.kind !== "error") return false;
+  const data = decoded.error.data;
+  return typeof data === "object" && data !== null
+    && "code" in data
+    && (data as { code?: unknown }).code === "E_NOSESSION";
 }
 
 /** The pre-envelope woo refusal body, or null when this is something else. */

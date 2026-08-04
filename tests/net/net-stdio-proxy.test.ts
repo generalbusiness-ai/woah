@@ -119,57 +119,491 @@ describe("Net MCP stdio transport bridge", () => {
     await proxy.close();
   });
 
-  it.each([401, 404])("opens after a 204 initialized ack and reports terminal GET %s exactly once", async (status) => {
-    vi.useFakeTimers();
-    try {
-      let getCount = 0;
-      const errors: unknown[] = [];
-      const fetchImpl: typeof fetch = async (_input, init) => {
-        const method = init?.method ?? "GET";
-        if (method === "DELETE") return new Response(null, { status: 204 });
-        if (method === "GET") {
-          getCount += 1;
-          return Response.json({ error: { code: "E_NOSESSION", message: "session expired" } }, { status });
-        }
-        const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
-        if (body.method === "initialize") {
+  it.each([401, 404])("replaces a session after terminal GET %s and marks the continuity break", async (status) => {
+    let getCount = 0;
+    let initializeCount = 0;
+    const initializedSessions: Array<string | null> = [];
+    const notifications: unknown[] = [];
+    const errors: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers);
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") {
+        getCount += 1;
+        if (getCount > 1) return new Response(null, { status: 405 });
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "session expired",
+              data: { code: "E_NOSESSION", http_status: status }
+            }
+          },
+          { status }
+        );
+      }
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: { listChanged: true } },
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": `s_terminal_${status}_${initializeCount}` } }
+        );
+      }
+      if (body.method === "notifications/initialized") {
+        initializedSessions.push(headers.get("mcp-session-id"));
+      }
+      return new Response(null, { status: 204 });
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl,
+      onNotification: async (message) => { notifications.push(message); },
+      onError: (error) => { errors.push(error); }
+    });
+
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await vi.waitFor(() => expect(getCount).toBe(2));
+    expect(initializeCount).toBe(2);
+    expect(initializedSessions).toEqual([
+      `s_terminal_${status}_1`,
+      `s_terminal_${status}_2`
+    ]);
+    expect(notifications).toEqual([
+      {
+        jsonrpc: "2.0",
+        method: "notifications/woo/continuity_gap",
+        params: { reason: "session_replaced", observations_may_be_lost: true }
+      },
+      { jsonrpc: "2.0", method: "notifications/tools/list_changed" }
+    ]);
+    expect(errors).toEqual([]);
+    await proxy.close();
+  });
+
+  it("retries one refused request byte-for-byte on the replacement session", async () => {
+    let initializeCount = 0;
+    const toolBodies: string[] = [];
+    const toolSessions: Array<string | null> = [];
+    const initializedSessions: Array<string | null> = [];
+    const profileHeaders: Array<string | null> = [];
+    const notifications: unknown[] = [];
+    const errors: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers);
+      profileHeaders.push(headers.get("woo-mcp-profile"));
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const raw = String(init?.body);
+      const body = JSON.parse(raw) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: { listChanged: true } },
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": `s_request_${initializeCount}` } }
+        );
+      }
+      if (body.method === "notifications/initialized") {
+        initializedSessions.push(headers.get("mcp-session-id"));
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/call") {
+        toolBodies.push(raw);
+        toolSessions.push(headers.get("mcp-session-id"));
+        if (toolBodies.length === 1) {
           return Response.json(
             {
               jsonrpc: "2.0",
-              id: body.id,
-              result: {
-                protocolVersion: "2025-06-18",
-                capabilities: { tools: { listChanged: true } },
-                serverInfo: { name: "woo-net", version: "1" }
+              error: {
+                code: -32000,
+                message: "session expired",
+                data: { code: "E_NOSESSION", http_status: 401 }
               }
             },
-            { headers: { "mcp-session-id": `s_terminal_${status}` } }
+            { status: 401 }
           );
         }
-        return new Response(null, { status: 204 });
-      };
-      const proxy = new NetMcpStdioProxy({
-        endpoint: "http://127.0.0.1:5173/net-api/mcp",
-        token: "apikey:local-dev:secret",
-        fetchImpl,
-        onError: (error) => { errors.push(error); }
-      });
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: { content: [], structuredContent: { ok: true } } });
+      }
+      throw new Error(`unexpected method ${body.method}`);
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      profile: "collapsed",
+      fetchImpl,
+      onNotification: async (message) => { notifications.push(message); },
+      onError: (error) => { errors.push(error); }
+    });
 
-      await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
-      await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
-      await vi.waitFor(() => {
-        expect(getCount).toBe(1);
-        expect(errors).toHaveLength(1);
-      });
-      expect(String(errors[0])).toContain(String(status));
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test", version: "1" } } });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = {
+      jsonrpc: "2.0" as const,
+      id: 9,
+      method: "tools/call",
+      params: {
+        name: "the_mug__look",
+        arguments: { operation_id: "op_stdio_replacement_1" },
+        _meta: { operation_id: "op_stdio_replacement_1", extension: { keep: true } }
+      }
+    };
+    await expect(proxy.forward(call)).resolves.toMatchObject({ id: 9, result: { structuredContent: { ok: true } } });
 
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(getCount).toBe(1);
-      expect(errors).toHaveLength(1);
-      await proxy.close();
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(initializeCount).toBe(2);
+    expect(initializedSessions).toEqual(["s_request_1", "s_request_2"]);
+    expect(toolSessions).toEqual(["s_request_1", "s_request_2"]);
+    expect(toolBodies).toHaveLength(2);
+    expect(toolBodies[1]).toBe(toolBodies[0]);
+    expect(JSON.parse(toolBodies[1]!)).toEqual(call);
+    expect(profileHeaders).not.toContain(null);
+    expect(new Set(profileHeaders)).toEqual(new Set(["collapsed"]));
+    expect(notifications.map((message) => (message as { method?: string }).method)).toEqual([
+      "notifications/woo/continuity_gap",
+      "notifications/tools/list_changed"
+    ]);
+    expect(errors).toEqual([]);
+    await proxy.close();
+  });
+
+  it("phases a replacement before emitting continuity notifications when initialized itself was refused", async () => {
+    let initializeCount = 0;
+    let initializedCount = 0;
+    const events: string[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const headers = new Headers(init?.headers);
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        events.push(`initialize:${initializeCount}`);
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": `s_phase_${initializeCount}` } }
+        );
+      }
+      if (body.method === "notifications/initialized") {
+        initializedCount += 1;
+        events.push(`initialized:${headers.get("mcp-session-id")}`);
+        if (initializedCount === 1) {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "session expired before phase",
+                data: { code: "E_NOSESSION", http_status: 401 }
+              }
+            },
+            { status: 401 }
+          );
+        }
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected method ${body.method}`);
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl,
+      onNotification: async (message) => {
+        events.push((message as { method: string }).method);
+      }
+    });
+
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await expect(proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" })).resolves.toBeNull();
+    expect(events).toEqual([
+      "initialize:1",
+      "initialized:s_phase_1",
+      "initialize:2",
+      "initialized:s_phase_2",
+      "notifications/woo/continuity_gap",
+      "notifications/tools/list_changed"
+    ]);
+    await proxy.close();
+  });
+
+  it("coalesces concurrent refusals into one session replacement", async () => {
+    let initializeCount = 0;
+    let oldAttempts = 0;
+    let releaseOldAttempts!: () => void;
+    const bothOldAttempts = new Promise<void>((resolve) => { releaseOldAttempts = resolve; });
+    const notifications: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const headers = new Headers(init?.headers);
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": `s_concurrent_${initializeCount}` } }
+        );
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (headers.get("mcp-session-id") === "s_concurrent_1") {
+        oldAttempts += 1;
+        if (oldAttempts === 2) releaseOldAttempts();
+        await bothOldAttempts;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "session expired",
+              data: { code: "E_NOSESSION", http_status: 401 }
+            }
+          },
+          { status: 401 }
+        );
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl,
+      onNotification: async (message) => { notifications.push(message); }
+    });
+
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const [left, right] = await Promise.all([
+      proxy.forward({ jsonrpc: "2.0", id: 10, method: "tools/list", params: {} }),
+      proxy.forward({ jsonrpc: "2.0", id: 11, method: "tools/list", params: {} })
+    ]);
+    expect(left).toMatchObject({ id: 10, result: {} });
+    expect(right).toMatchObject({ id: 11, result: {} });
+    expect(initializeCount).toBe(2);
+    expect(notifications).toHaveLength(2);
+    await proxy.close();
+  });
+
+  it("retries an interrupted request at most once when the replacement is also refused", async () => {
+    let initializeCount = 0;
+    let attempts = 0;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": `s_once_${initializeCount}` } }
+        );
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      attempts += 1;
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "session expired again",
+            data: { code: "E_NOSESSION", http_status: 401 }
+          }
+        },
+        { status: 401 }
+      );
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl
+    });
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 12, method: "tools/list", params: {} })).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 12,
+      error: {
+        code: -32000,
+        message: "session expired again",
+        data: { code: "E_NOSESSION", http_status: 401 }
+      }
+    });
+    expect(initializeCount).toBe(2);
+    expect(attempts).toBe(2);
+    await proxy.close();
+  });
+
+  it("does not replace a session for a different 401 refusal", async () => {
+    let initializeCount = 0;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": "s_not_session_refusal" } }
+        );
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "credential policy refused this call",
+            data: { code: "E_PERM", http_status: 401 }
+          }
+        },
+        { status: 401 }
+      );
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl
+    });
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 13, method: "tools/list", params: {} })).resolves.toMatchObject({
+      id: 13,
+      error: { data: { code: "E_PERM" } }
+    });
+    expect(initializeCount).toBe(1);
+    await proxy.close();
+  });
+
+  it("reports one replacement failure and returns the original correlated refusal", async () => {
+    let initializeCount = 0;
+    let callCount = 0;
+    const errors: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "GET") return new Response(null, { status: 405 });
+      const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      if (body.method === "initialize") {
+        initializeCount += 1;
+        if (initializeCount > 1) {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "API key was revoked",
+                data: { code: "E_AUTH", http_status: 401 }
+              }
+            },
+            { status: 401 }
+          );
+        }
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "woo-net", version: "1" }
+            }
+          },
+          { headers: { "mcp-session-id": "s_recovery_failure" } }
+        );
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      callCount += 1;
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "original session expired",
+            data: { code: "E_NOSESSION", http_status: 401 }
+          }
+        },
+        { status: 401 }
+      );
+    };
+    const proxy = new NetMcpStdioProxy({
+      endpoint: "http://127.0.0.1:5173/net-api/mcp",
+      token: "apikey:local-dev:secret",
+      fetchImpl,
+      onError: (error) => { errors.push(error); }
+    });
+    await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    await expect(proxy.forward({ jsonrpc: "2.0", id: 14, method: "tools/list", params: {} })).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 14,
+      error: {
+        code: -32000,
+        message: "original session expired",
+        data: { code: "E_NOSESSION", http_status: 401 }
+      }
+    });
+    expect(initializeCount).toBe(2);
+    expect(callCount).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).toContain("API key was revoked");
+    await proxy.close();
   });
 
   it("serializes the pre-session prefix but does not let woo_wait block later messages", async () => {

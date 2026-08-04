@@ -182,8 +182,8 @@ is no `focus -> re-list -> call -> unfocus` protocol sequence.
 ## The collapsed profile (opt-in)
 
 Everything above describes the default surface. An alternative *collapsed*
-surface is available per session, and the two never mix: a session sees one or
-the other.
+surface is selected per request. Use the same selection throughout a client
+conversation; the bundled bridge repeats it automatically.
 
 Select it with a request header on every call to `/net-api/mcp`:
 
