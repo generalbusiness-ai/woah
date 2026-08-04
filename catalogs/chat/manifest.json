@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -919,6 +919,7 @@
           "name": "command",
           "perms": "rxd",
           "direct_callable": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": [
               "text"

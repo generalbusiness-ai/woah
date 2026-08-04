@@ -111,6 +111,30 @@ export async function runSmokeWalkthrough(
     await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text), waitMs, ctx.signal, cfg);
   });
 
+  // The `command` wrapper plans a verb and then dispatches it INLINE, inside
+  // the same turn — so the turn's entry verb stays `command`. The gateway reads
+  // `reads_room_presence` from that entry verb to decide whether to warm the
+  // room-roster projection, which means every roster-reading verb `command`
+  // can plan (`who`, `look`) threw `E_INTERNAL: sparse planning room roster
+  // projection missing` on a sequenced turn. It was invisible to every lane
+  // because nothing drove `command` with a roster-reading verb, and invisible
+  // to the browser client because it plans and executes as two separate turns,
+  // making the planned verb its own entry verb.
+  //
+  // Both halves matter: `say` proves the wrapper still works for a verb that
+  // reads no roster, `who` proves the warm actually happens.
+  await step("command wrapper plans a roster-reading verb", async (ctx) => {
+    const { alice } = pair;
+    const said = await alice.call("the_chatroom", "command", [`walkthrough-cmd-say-${runId}`.replace(/^/, "say ")], ctx.signal);
+    if (said && typeof said === "object" && "error" in (said as Record<string, unknown>)) {
+      throw new Error(`command 'say' failed: ${JSON.stringify((said as Record<string, unknown>).error)}`);
+    }
+    const who = await alice.call("the_chatroom", "command", ["who"], ctx.signal);
+    if (who && typeof who === "object" && "error" in (who as Record<string, unknown>)) {
+      throw new Error(`command 'who' failed: ${JSON.stringify((who as Record<string, unknown>).error)}`);
+    }
+  });
+
   // CO2.5 / §M4.2 — the OBSERVATION-ONLY half of retry safety, over the real
   // transport. `say` is `persistence:"live"`: it writes no authority cell, so
   // the scope classifies it as a pure read and would not cache it. A retry

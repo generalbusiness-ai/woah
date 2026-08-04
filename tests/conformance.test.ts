@@ -1290,7 +1290,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
           .map((record) => [String(record.alias), String(record.version)])
       );
       expect(versions.get("block")).toBe("1.0.0");
-      expect(versions.get("chat")).toBe("1.0.0");
+      expect(versions.get("chat")).toBe("1.1.0");
       expect(versions.get("demoworld")).toBe("1.0.0");
       expect(versions.get("outliner")).toBe("4.0.0");
       expect(versions.get("pinboard")).toBe("2.0.0");
