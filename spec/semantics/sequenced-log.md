@@ -44,7 +44,10 @@ Atomically within the enclosing transaction: allocates `seq = next_seq`, increme
 
 `append` is the **only** runtime-blessed mechanism for incrementing `next_seq`. User code that writes `next_seq` directly violates the contract; replay will diverge.
 
-`message` is a value (V2-encoded) of any shape. The log does not interpret it. A space subclass passes its standard `{actor, target, verb, args}` shape; an event-sourced document passes operation deltas; a turn log passes move records.
+`message` is a value (V2-encoded) of any shape. The log does not interpret it.
+A space subclass passes its standard
+`{actor, target, verb, verb_definer?, verb_slot?, args}` shape; an event-sourced document
+passes operation deltas; a turn log passes move records.
 
 **Outcome is recorded separately.** `append` creates the message row; subclasses that care about success/failure (e.g., `$space`) record the already-computed outcome through a second storage operation in the same commit transaction. See [reference/cloudflare.md §R3.2](../reference/cloudflare.md#r32-sequenced-log-commit). The pending marker exists only inside the open transaction; committed rows always carry a final outcome.
 

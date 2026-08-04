@@ -207,8 +207,14 @@ policy: parser conventions such as chat prefixes or room commands live in
 catalog source.
 
 `execute_command_plan(plan)` consumes a command plan produced by
-`$match:plan_command`. Direct plans execute through the normal dispatch path and
-return the target verb's result. A sequenced plan reached through a direct
+`$match:plan_command`. A successful plan names `target`, the canonical `verb`,
+`verb_definer`, and `verb_slot`. Execution performs ordinary target-first
+resolution and verifies that the canonical name, definer, and slot match the
+plan before invoking it. The assertion cannot select a hidden page. Missing or
+invalid page identity is refused as
+specified by [match.md §MA7.2](match.md#ma72-exact-verb-page-binding).
+
+Direct plans return the target verb's result. A sequenced plan reached through a direct
 compatibility `:command` is a **terminal ingress transfer**, not a nested second
 call. Planning before transfer is read-only and is not separately accepted.
 The original correlation/idempotency key, session, actor, and call identity

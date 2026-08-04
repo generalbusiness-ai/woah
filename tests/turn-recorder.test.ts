@@ -198,6 +198,17 @@ describe("turn recorder", () => {
     expect(turnKey.write_preimages).toContain("write:cell:prop:rec_box.counter");
     expect(turnKey.write_atom_hashes).toHaveLength(turnKey.write_preimages.length);
     expect(turnKey.accept_preimages).toEqual(expect.arrayContaining(["call:rec_box:bump", "scope:#-1", "target:rec_box"]));
+    const exactKey = shadowTurnKeyFromTranscript({
+      ...transcript,
+      call: { ...transcript.call, verb_definer: "$thing", verb_slot: 7 }
+    });
+    expect(exactKey).toMatchObject({ verb_definer: "$thing", verb_slot: 7 });
+    expect(exactKey.preimages).toEqual(expect.arrayContaining([
+      "verb_definer:$thing",
+      "verb_slot:7",
+      "call_page:rec_box:$thing:7:bump"
+    ]));
+    expect(exactKey.accept_preimages).toContain("call_page:rec_box:$thing:7:bump");
     const ad = buildShadowCapabilityAd({ node: "node-a", scope: turnKey.scope, atom_hashes: turnKey.atom_hashes, factor: 0.75 });
     expect(ad).toMatchObject({ kind: "woo.exec_capability_ad.shadow.v1", node: "node-a", scope: "#-1", factor: 0.75 });
     expect(ad.covers.bits_hex).toMatch(/^[a-f0-9]+$/);
@@ -1348,11 +1359,12 @@ describe("turn recorder", () => {
     const session = world.auth("guest:turn-replay");
     const actor = session.actor;
 
-    world.createObject({ id: "replay_box", name: "Replay Box", parent: "$thing", owner: actor });
+    world.createObject({ id: "replay_base", name: "Replay Base", parent: "$thing", owner: actor });
+    world.createObject({ id: "replay_box", name: "Replay Box", parent: "replay_base", owner: actor });
     world.defineProperty("replay_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
     const installed = installVerb(
       world,
-      "replay_box",
+      "replay_base",
       "bump",
       `verb :bump() rxd {
         let before = this.counter;
@@ -1363,12 +1375,17 @@ describe("turn recorder", () => {
       null
     );
     expect(installed.ok).toBe(true);
-
     const before = world.exportWorld();
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
-    const result = await world.directCall("replay-bump", actor, "replay_box", "bump", [], { sessionId: session.id });
-    expect(result.op).toBe("result");
+    const result = await world.directCall("replay-bump", actor, "replay_box", "bump", [], {
+      sessionId: session.id,
+      verbDefiner: "replay_base",
+      verbSlot: world.ownVerbExact("replay_base", "bump")!.slot
+    });
+    expect(result).toMatchObject({ op: "result", result: 1 });
+    expect(recorder.turns[0].start.verb_definer).toBe("replay_base");
+    expect(recorder.turns[0].start.verb_slot).toBe(world.ownVerbExact("replay_base", "bump")!.slot);
 
     const replay = await replayRecordedTurn(before, recorder.turns[0]);
 

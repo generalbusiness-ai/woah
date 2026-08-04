@@ -98,6 +98,8 @@ A message is the unit of requested action.
   actor: ObjRef,
   target: ObjRef,
   verb: string,
+  verb_definer?: ObjRef,
+  verb_slot?: number,
   args: Value[],
   body?: Map
 }
@@ -106,6 +108,14 @@ A message is the unit of requested action.
 Actors make calls by sending messages to target objects. Applying a message
 resolves the target behavior, runs it with the actor's authority, and may
 produce mutations, observations, errors, and further messages.
+
+`verb_definer` and positive integer `verb_slot` are present together only when
+a command planner has bound a page assertion ([match.md §MA7.2](match.md#ma72-exact-verb-page-binding)).
+When absent, dispatch uses ordinary target-first name lookup. When present,
+`verb` is canonical: execution resolves normally, then verifies that canonical
+name, definer, and slot match. A mismatch raises `E_VERBNF`; the fields cannot
+select a hidden ancestor page. They are preserved in sequenced messages and
+replay and do not bypass execute permissions or ingress gates.
 
 The preferred API term is **call**. The message is the payload; the call is the
 act of asking Woo to apply it. "Submit" may appear informally when discussing

@@ -22,10 +22,10 @@ A seed object with these verbs. Lives with the chat classes and scaffolding ([bo
 | Verb | Returns | Purpose |
 |---|---|---|
 | `:match_object(name, location?)` rxd | obj \| `$failed_match` \| `$ambiguous_match` | Resolve a string to an object visible from `location` (defaults to `actor.location`). |
-| `:match_verb(name, target)` rxd | verb \| null | Resolve a verb name (with alias patterns per [objects.md §9.1](objects.md#91-lookup)) on `target` using runtime lookup, including features where applicable. |
+| `:match_verb(name, target)` rxd | map \| null | Resolve a verb name (with alias patterns per [objects.md §9.1](objects.md#91-lookup)) on `target` using runtime lookup, including features where applicable. The result includes canonical `name`, `definer`, and positive `slot`. |
 | `:parse_command(text, actor, location?)` rxd | map | Full pipeline: tokenize, identify verb + dobj + iobj, return a structured `command` map. `location` defaults to `actor.location`. |
 | `:match_command_verb(cmd, target)` rxd | map \| `$failed_match` | Resolve a command-pattern verb on `target`, using the same ancestry/feature lookup as `:match_verb` but filtering by command metadata. |
-| `:plan_command(text, space)` rxd | map | Shared command planner used by `$conversational:command_plan`; returns `{ok, route, space?, target, verb, args, cmd}` or a huh plan. |
+| `:plan_command(text, space)` rxd | map | Shared command planner used by `$conversational:command_plan`; returns `{ok, route, space?, target, verb, verb_definer, verb_slot, args, cmd}` or a huh plan. |
 
 Returned by `:match_object`:
 - A successful objref.
@@ -105,7 +105,11 @@ The "me" and "here" pseudo-names resolve to `actor` and `actor.location` respect
 2. If no parent-chain match **and** `target` is `$actor`- or `$space`-descended, walk `target.features` in list order per [features.md §FT2](features.md#ft2-verb-lookup-with-features). For each feature `f`, search `f`'s parent chain by the same rule. First match wins.
 3. If still no match, return null.
 
-This is the *same* lookup the runtime performs on `CALL_VERB`. Surfacing it as a user-callable verb lets the chat parser (and any other text-shaped UI) preview verb resolution before dispatching, so command interpretation matches what dispatch will actually do — feature-attached verbs included.
+This is the *same* lookup the runtime performs on `CALL_VERB`. A successful
+result includes both the canonical `name` and its `definer`. Surfacing it as a
+user-callable verb lets the chat parser (and any other text-shaped UI) bind a
+command to the page it selected — feature-attached verbs included — instead of
+asking execution to repeat a name lookup that may select another page.
 
 ---
 
@@ -141,7 +145,16 @@ User code dispatches by:
 let cmd = $match:parse_command(text, actor);
 let v = $match:match_command_verb(cmd, cmd.dobj);
 if (typeof(v) == "map") {
-  dispatch(v["target"], v["verb"], v["args"]);
+  execute_command_plan({
+    ok: true,
+    route: "direct",
+    target: v["target"],
+    verb: v["verb"],
+    verb_definer: v["definer"],
+    verb_slot: v["slot"],
+    args: v["args"],
+    cmd: cmd
+  });
 }
 ```
 
@@ -379,6 +392,44 @@ freshly-seeded world's durability comes entirely from its own cells. The
 fallback is direct-route-only: a sequenced route is already durable, so
 `persistence` on a sequenced plan (e.g. `enter`) can only come from the
 cell.
+
+### MA7.2. Exact verb-page binding
+
+Every successful executable command plan MUST carry:
+
+```text
+target:        the receiver (`this` during execution)
+verb:          the selected page's canonical name
+verb_definer:  the object that owns that exact page
+verb_slot:     the page's positive durable per-definer slot
+```
+
+`(verb_definer, verb_slot, verb)` is the page assertion. It is deliberately not a source
+hash or version snapshot: editing a page preserves its identity, and execution
+runs the current authorized page while the normal transcript/page-version read
+guards concurrent Net commits. The slot distinguishes duplicate same-named
+pages on one definer.
+
+Before executing a bound plan, the runtime MUST perform ordinary target-first
+dispatch resolution, including normal parent, feature, exact-name, alias, and
+slot ordering. The resolved page's canonical name, definer, and slot MUST equal
+the plan assertion. Any mismatch raises `E_VERBNF`; execution MUST NOT invoke
+either the newly resolved page or a claimed hidden ancestor/feature page. These
+checks are state reads in a Net turn and therefore participate in repair and
+commit validation. A sequenced command-plan wrapper MUST perform this check
+before terminal transfer or sequence allocation, then repeat it at final
+dispatch so a topology race cannot execute a different page.
+
+Binding is a dispatch assertion, never selection or authority. Execute permission,
+`direct_callable`, presence, route, and all verb-body authorization are checked
+again at execution. Client-supplied page metadata cannot make an ancestor,
+feature, unrelated, or duplicate-name page selectable.
+
+Successful plans without both a valid `verb_definer` and positive `verb_slot` are malformed and
+`execute_command_plan` refuses them with `E_INVARG`. Non-executable huh/handled
+plans do not require a page identity. Ordinary structured calls that are not
+derived from command planning omit both fields and retain normal name
+resolution.
 
 ---
 

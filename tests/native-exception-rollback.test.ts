@@ -34,6 +34,15 @@ function addDirectNative(world: WooWorld, target: string, name: string, handler:
   });
 }
 
+/** Bind a hand-built test plan to the same durable page identity the command
+ * planner would return. These fixtures exercise transfer mechanics directly,
+ * so they deliberately avoid depending on command grammar. */
+function plannedPage(world: WooWorld, target: string, name: string): { verb_definer: string; verb_slot: number } {
+  const { definer, verb } = world.resolveVerb(target, name);
+  if (!Number.isInteger(verb.slot) || verb.slot! <= 0) throw new Error(`test verb page has no durable slot: ${definer}:${name}`);
+  return { verb_definer: definer, verb_slot: verb.slot! };
+}
+
 describe("native exception rollback", () => {
   it.each(["set", "define"] as const)(
     "restores array elements truncated through a permitted length %s",
@@ -245,6 +254,7 @@ describe("native exception rollback", () => {
       space: "the_dubspace",
       target: "the_dubspace",
       verb: "terminal_transfer_target",
+      ...plannedPage(world, "the_dubspace", "terminal_transfer_target"),
       args: [42]
     };
     const beforeSeq = Number(world.getProp("the_dubspace", "next_seq"));
@@ -357,6 +367,7 @@ describe("native exception rollback", () => {
       space: "the_dubspace",
       target: "the_dubspace",
       verb: "nested_eval_transfer_target",
+      ...plannedPage(world, "the_dubspace", "nested_eval_transfer_target"),
       args: []
     };
     const evalSource = `execute_command_plan(${JSON.stringify(plan)})`;
@@ -422,6 +433,7 @@ describe("native exception rollback", () => {
         space: "the_dubspace",
         target: "terminal_retry_target",
         verb: "commit",
+        ...plannedPage(world, "terminal_retry_target", "commit"),
         args: []
       });
     });
@@ -1917,6 +1929,7 @@ describe("native exception rollback", () => {
           space: "the_dubspace",
           target: "nested_sequenced_target",
           verb: "write",
+          ...plannedPage(world, "nested_sequenced_target", "write"),
           args: []
         });
         expect(inner).toMatchObject({ op: "applied" });
@@ -1984,6 +1997,7 @@ describe("native exception rollback", () => {
           space: "the_dubspace",
           target: "nested_accept_target",
           verb: "write",
+          ...plannedPage(world, "nested_accept_target", "write"),
           args: []
         })
       );
@@ -2034,6 +2048,10 @@ describe("native exception rollback", () => {
         space: "the_dubspace",
         target: "remote_nested_target",
         verb: "write",
+        // The wrapper is already dirty, so proof-only validation must reject
+        // before attempting to resolve this deliberately remote fixture.
+        verb_definer: "remote_nested_target",
+        verb_slot: 1,
         args: []
         });
       }

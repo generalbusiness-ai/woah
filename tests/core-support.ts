@@ -179,16 +179,16 @@ export class LocalExecutorContext implements ExecutorContext {
     return out;
   }
 
-  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; skip_presence_check?: boolean; arg_spec: Record<string, WooValue> } | null> {
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; definer: ObjRef; slot: number; direct_callable: boolean; skip_presence_check?: boolean; arg_spec: Record<string, WooValue> } | null> {
     try {
-      const { verb } = this.worldFor(target).resolveVerb(target, verbName);
-      return { name: verb.name, direct_callable: verb.direct_callable === true, skip_presence_check: verb.skip_presence_check === true, arg_spec: verb.arg_spec ?? {} };
+      const { definer, verb } = this.worldFor(target).resolveVerb(target, verbName);
+      return { name: verb.name, definer, slot: verb.slot ?? 0, direct_callable: verb.direct_callable === true, skip_presence_check: verb.skip_presence_check === true, arg_spec: verb.arg_spec ?? {} };
     } catch {
       return null;
     }
   }
 
-  async commandVerbCandidates(target: ObjRef, verbName: string): Promise<Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>> {
+  async commandVerbCandidates(target: ObjRef, verbName: string): Promise<Array<{ name: string; definer: ObjRef; slot: number; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>> {
     return this.worldFor(target).commandVerbCandidateSummaries(target, verbName);
   }
 
@@ -214,7 +214,7 @@ export class LocalExecutorContext implements ExecutorContext {
     return await memoizeTestOperation(memo.reads, key, read);
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, expectedDefiner?: ObjRef | null, expectedSlot?: number | null, requireDirectCallable?: boolean): Promise<WooValue> {
     const remote = this.worldFor(startAt ?? target);
     // Propagate the source host's active chain id so the receiver can
     // detect re-entrant dispatch (A→B→A) and run inline. Mirrors the
@@ -222,7 +222,7 @@ export class LocalExecutorContext implements ExecutorContext {
     // this the test bridge wouldn't exercise the production-path
     // re-entrancy at all.
     const chainId = ctx.world.currentTaskChainId() ?? undefined;
-    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt, chainId);
+    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt, chainId, expectedDefiner, expectedSlot, requireDirectCallable);
   }
 
   async moveObject(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {

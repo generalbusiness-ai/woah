@@ -160,7 +160,7 @@ page.
 | Tool | Contract |
 |---|---|
 | `woo_list_reachable_tools(scope?, object?, query?, limit?, cursor?, include_schema?)` | Pages and filters descriptors from the same resolver used by `tools/list` and invocation. |
-| `woo_call(object, verb, args?)` | Calls any verb on a reachable object by canonical object and verb. `args` is a positional JSON list. |
+| `woo_call(object, verb, args?, verb_definer?, verb_slot?)` | Calls any verb on a reachable object. `args` is a positional JSON list. Ordinary calls resolve the canonical verb or alias normally; command-plan round trips preserve canonical `verb` and the paired page assertion. |
 | `woo_wait(timeout_ms?, limit?)` | Long-polls the session observation queue. Returns `{observations, gap}`. |
 
 These are protocol controls, not world verbs.
@@ -176,6 +176,13 @@ Name resolution is **the world dispatcher's rule, unmodified**. Aliases are
 patterns, not literals: `l@ook` and `@exam*ine` mark an abbreviation point, a
 trailing `*` is a prefix wildcard, and `|` separates alternatives within one
 alias.
+
+`verb_definer` and positive integer `verb_slot` MUST be supplied together. When
+present, `woo_call` first performs the same ordinary target-first resolution as
+an unbound call, then verifies that its canonical name, definer, and slot match
+the assertion. A mismatch is `E_VERBNF`; the fields never select an ancestor or
+feature page. Reachability, execute permission, direct-callability, presence,
+and verb-body checks all still apply.
 
 Precedence is a **total order with two keys**, and both are normative:
 

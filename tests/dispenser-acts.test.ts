@@ -625,7 +625,7 @@ describe("Dispenser v0 to v1 migration", () => {
           migration: dispenserMigration()
         })
       );
-      expect(record.migration_state).toMatchObject({ status: "completed", to_version: "1.0.0" });
+      expect(record.migration_state).toMatchObject({ status: "completed", to_version: "1.1.0" });
       expect(world.getProp("legacy_block", "legacy_pending_orders")).toHaveLength(2);
       expect(world.getProp("legacy_block", "legacy_next_order_seq")).toBe(9);
       expect(world.propOrNull("legacy_block", "pending_orders")).toBeNull();

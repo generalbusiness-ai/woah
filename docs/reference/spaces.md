@@ -22,7 +22,7 @@ A space's verbs include:
 
 | Verb | Purpose |
 |---|---|
-| `:call(message)` | The sequencing entry point. Takes `{actor, target, verb, args, body?}`, allocates a seq, runs the call, writes the applied frame. |
+| `:call(message)` | The sequencing entry point. Takes `{actor, target, verb, verb_definer?, verb_slot?, args, body?}`, allocates a seq, runs the call, writes the applied frame. Command-plan calls carry the paired definer/slot assertion; ordinary calls omit both. |
 | `:replay(from_seq, limit)` | Read past applied frames. |
 | `:command(text)` | (chat catalog and others) Parse free-text input and dispatch as a sequenced call. |
 | `:command_plan(text)` | Same parser, returns the plan instead of executing. |

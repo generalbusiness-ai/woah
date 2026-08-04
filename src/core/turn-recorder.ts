@@ -49,6 +49,9 @@ export type TurnStart = {
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  /** Exact command-planned page assertion. Omitted for ordinary name lookup. */
+  verb_definer?: ObjRef;
+  verb_slot?: number;
   args: WooValue[];
   body?: Record<string, WooValue>;
 };

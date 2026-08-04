@@ -16,6 +16,8 @@ export type TerminalCommandPlan = {
   space: ObjRef;
   target: ObjRef;
   verb: string;
+  verb_definer: ObjRef;
+  verb_slot: number;
   args: WooValue[];
 };
 

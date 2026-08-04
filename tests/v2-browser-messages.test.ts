@@ -91,7 +91,7 @@ describe("v2 browser worker messages", () => {
       route: { kind: "local" },
       scope: "#room",
       seq: 7,
-      call: { actor: "#actor", target: "#room", verb: "say", args: ["hi"] },
+      call: { actor: "#actor", target: "#room", verb: "say", verb_definer: "$conversational", verb_slot: 4, args: ["hi"] },
       reads: [],
       writes: [],
       creates: [],
@@ -117,7 +117,7 @@ describe("v2 browser worker messages", () => {
         space: "#room",
         seq: 7,
         ts: 0,
-        message: { actor: "#actor", target: "#room", verb: "say", args: ["hi"] },
+        message: { actor: "#actor", target: "#room", verb: "say", verb_definer: "$conversational", verb_slot: 4, args: ["hi"] },
         observations: [{ type: "said", text: "hi" }],
         result: { ok: true }
       }

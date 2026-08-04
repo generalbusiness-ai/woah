@@ -162,8 +162,11 @@ To use a room parser without teaching the agent its routing rules:
 woo_call("the_chatroom", "command_plan", ["look"])
 ```
 
-Call the returned `target`, `verb`, and `args` through `woo_call`. This is the
-same thin-client path used by the Net browser.
+Call the returned `target`, `verb`, `verb_definer`, `verb_slot`, and `args`
+through `woo_call`. The definer and slot assert the page ordinary dispatch
+selected while planning. If an override or topology change makes dispatch
+resolve differently, execution refuses with `E_VERBNF`. This is the same
+thin-client path used by the Net browser.
 
 ## Navigation
 

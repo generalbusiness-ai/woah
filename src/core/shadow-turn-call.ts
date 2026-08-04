@@ -31,6 +31,9 @@ export type ShadowTurnCall = {
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  /** Exact command-planned page assertion. Omitted for ordinary name lookup. */
+  verb_definer?: ObjRef;
+  verb_slot?: number;
   args: WooValue[];
   body?: Record<string, WooValue>;
   /**
@@ -228,6 +231,7 @@ export async function runShadowTurnCallOnWorldTranscript(
     if (call.route === "direct") {
       frame = await world.directCall(call.id, call.actor, call.target, call.verb, call.args, {
         sessionId: call.session ?? null,
+        ...(call.verb_definer ? { verbDefiner: call.verb_definer, verbSlot: call.verb_slot } : {}),
         ...(call.scheduled ? { scheduled: call.scheduled } : {})
       });
     } else {
@@ -235,6 +239,8 @@ export async function runShadowTurnCallOnWorldTranscript(
         actor: call.actor,
         target: call.target,
         verb: call.verb,
+        ...(call.verb_definer ? { verb_definer: call.verb_definer } : {}),
+        ...(call.verb_slot !== undefined ? { verb_slot: call.verb_slot } : {}),
         args: call.args,
         body: call.body
       };

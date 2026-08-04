@@ -20,6 +20,10 @@ export type Message = {
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  /** Expected command-planned page definer. Omitted for ordinary name lookup. */
+  verb_definer?: ObjRef;
+  /** Definition slot paired with `verb_definer`; both fields appear together. */
+  verb_slot?: number;
   args: WooValue[];
   body?: Record<string, WooValue>;
   /**

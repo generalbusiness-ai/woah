@@ -449,12 +449,17 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
  * - The planning anchor/scope is excluded: a turn that MOVED the actor
  *   re-plans from the new room, and that must replay cleanly rather than
  *   look like a different request.
+ * - Exact `verb_definer` and `verb_slot` assertions are included. Reusing an
+ *   idempotency key after a same-name page substitution is a different
+ *   request, not a retry.
  */
 function requestFingerprint(call: ShadowTurnCall): string {
   return cellVersion({
     actor: call.actor,
     target: call.target,
     verb: call.verb,
+    verb_definer: call.verb_definer ?? null,
+    verb_slot: call.verb_slot ?? null,
     args: call.args ?? [],
     route: call.route
   });
