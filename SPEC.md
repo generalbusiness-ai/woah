@@ -96,6 +96,7 @@ Host-facing interfaces for runtime execution, transport, and client bootstrap ac
 
 - [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates, relations, sessions, topology, scheduled-turn execution, scope retirement (CO1–CO16 **adopted**, CO17 **draft**; governs where it overlaps v2-turn-network.md / cell-authority.md)
 - [transport.md](spec/protocol/transport.md) — substrate transport: the `Host.rpc` seam, destination naming, data-only payload rule, delivery/deadline/failure semantics, and transport bindings — signed-HTTP (current), platform-native DO RPC (target), non-DO transports (reserved) (TR1–TR6/TR8 **adopted**, TR7.2 **draft**)
+- [client-surface.md](spec/protocol/client-surface.md) — the client-surface operation owner behind every client dialect: admission doors, fault taxonomy and pure renderers, audit ownership, conformance guard; feed sections reserved (CS1–CS6 **draft**, CS7–CS9 reserved)
 - [hosts.md](spec/protocol/hosts.md) — three host classes, task migration, trust boundaries (§3)
 - [host-seeds.md](spec/protocol/host-seeds.md) — host-seed contents and the per-subject merge rule for cross-host reconciliation (HS1–HS5, **draft**)
 - [wire.md](spec/protocol/wire.md) — JSON WebSocket message format (§17) — **retired** (classic `/ws` transport removed; live delivery is the Net coherence path)
